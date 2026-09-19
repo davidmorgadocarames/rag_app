@@ -64,6 +64,7 @@ class Settings(BaseSettings):
 
     # --- Frontend ---
     next_public_api_url: str = Field(default="http://localhost:8000")
+    frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
 
 
 def get_settings() -> Settings:

@@ -5,17 +5,25 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from rag_app import __version__
 from rag_app.api import auth
 from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
+from rag_app.config import get_settings
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="SecRAG API", version=__version__)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[get_settings().frontend_origin],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(auth.router)
 
     @app.get("/health", response_model=HealthResponse)
