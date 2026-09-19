@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 EVAL_DIR = REPO_ROOT / "eval"
 THRESHOLDS_PATH = EVAL_DIR / "thresholds.json"
 BASELINE_PATH = EVAL_DIR / "baseline_metrics.json"
+JUDGE_VALIDATION_PATH = EVAL_DIR / "judge_validation.json"
 RESULTS_PATH = EVAL_DIR / "results.json"
 
 _REGRESSION_EPSILON = 0.02
@@ -51,6 +52,18 @@ def _load_json(path: Path) -> dict[str, float]:
     return data
 
 
+def _judge_validation_failure() -> str | None:
+    """The correctness metric is only trustworthy if the judge was validated."""
+    report = _load_json(JUDGE_VALIDATION_PATH)
+    if not report:
+        return "judge not validated (run: python -m rag_app.eval.validate_judge)"
+    kappa = report.get("cohen_kappa")
+    threshold = report.get("threshold", 0.6)
+    if kappa is None or kappa < threshold:
+        return f"judge validation kappa {kappa} < {threshold}"
+    return None
+
+
 def _check(metrics: Metrics) -> list[str]:
     failures: list[str] = []
     thresholds = _load_json(THRESHOLDS_PATH)
@@ -64,6 +77,9 @@ def _check(metrics: Metrics) -> list[str]:
         base = baseline.get(key)
         if base is not None and value < base - _REGRESSION_EPSILON:
             failures.append(f"{key}={value:.3f} regressed below baseline {base:.3f}")
+    judge_failure = _judge_validation_failure()
+    if judge_failure:
+        failures.append(judge_failure)
     return failures
 
 

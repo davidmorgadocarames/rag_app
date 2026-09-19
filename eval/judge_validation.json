@@ -1,0 +1,17 @@
+{
+  "n": 16,
+  "accuracy": 0.9375,
+  "cohen_kappa": 0.875,
+  "confusion": {
+    "tp": 7,
+    "fp": 0,
+    "tn": 8,
+    "fn": 1
+  },
+  "per_bucket_accuracy": {
+    "abstain": 1.0,
+    "edge": 0.8888888888888888,
+    "found": 1.0
+  },
+  "threshold": 0.6
+}

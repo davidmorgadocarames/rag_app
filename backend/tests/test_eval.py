@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from rag_app.eval.judge import parse_verdict
-from rag_app.eval.metrics import ItemResult, compute_metrics
+from rag_app.eval.metrics import ItemResult, cohen_kappa, compute_metrics
 
 
 def _answerable(expected: str, retrieved: list[str], *, correct: bool) -> ItemResult:
@@ -77,3 +77,12 @@ def test_parse_verdict() -> None:
     assert parse_verdict("INCORRECT") is False
     assert parse_verdict("The answer is correct.") is True
     assert parse_verdict("unclear") is False
+
+
+def test_cohen_kappa() -> None:
+    assert cohen_kappa([True, False, True, False], [True, False, True, False]) == 1.0
+    # chance-level agreement -> ~0
+    assert abs(cohen_kappa([True, True, False, False], [True, False, True, False])) < 1e-9
+    # empty and single-class-perfect both collapse to 1.0
+    assert cohen_kappa([], []) == 1.0
+    assert cohen_kappa([True, True], [True, True]) == 1.0

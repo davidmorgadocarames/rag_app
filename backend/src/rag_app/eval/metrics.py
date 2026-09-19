@@ -60,3 +60,19 @@ def compute_metrics(results: list[ItemResult]) -> Metrics:
         correctness=_ratio(correct_hits, len(answerable)),
         correct_abstention=_ratio(abstained_hits, len(negative)),
     )
+
+
+def cohen_kappa(y_true: list[bool], y_pred: list[bool]) -> float:
+    """Cohen's kappa: agreement corrected for chance (used to validate the LLM judge)."""
+    n = len(y_true)
+    if n == 0:
+        return 1.0
+    observed = sum(1 for a, b in zip(y_true, y_pred, strict=True) if a == b) / n
+    expected = 0.0
+    for label in (True, False):
+        p_true = sum(1 for a in y_true if a == label) / n
+        p_pred = sum(1 for b in y_pred if b == label) / n
+        expected += p_true * p_pred
+    if expected >= 1.0:
+        return 1.0
+    return (observed - expected) / (1.0 - expected)
