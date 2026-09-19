@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     max_agent_steps: int = 6
     max_tokens: int = 1024
 
+    # --- Agentic router ---
+    # Best rerank (cross-encoder) score below this is considered "thin" -> reformulate+retry.
+    thin_threshold: float = 0.5
+    max_query_rewrites: int = 1
+
     # --- Rate limiting (token bucket) ---
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0

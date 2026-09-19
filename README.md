@@ -159,8 +159,8 @@ correctness 0.9, correct-abstention 1.0.
 - [x] **Phase 1** — Ingestion: OWASP PDFs/MD → Markdown → chunks
 - [x] **Phase 2** — Embeddings (bge-m3) + pgvector + hybrid retrieval + rerank (bge-reranker)
 - [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention
-- [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate ← *you are here*
-- [ ] **Phase 5** — Agentic router (only if evals justify the added complexity)
+- [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate
+- [x] **Phase 5** — Agentic router benchmarked → **not adopted** (no quality gain, +latency; see [ADR 0001](docs/adr/0001-agentic-router.md)) ← *you are here*
 - [ ] **Phase 6** — Auth (email/password) + rate limiting + quotas
 - [ ] **Phase 7** — Frontend screens (chat, history, account)
 - [ ] **Phase 8** — Compliance: per-user crypto-shred

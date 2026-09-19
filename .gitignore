@@ -43,6 +43,7 @@ data/corpus_manifest.json
 
 # --- Eval run output (metrics + golden set / thresholds / baseline are tracked) ---
 eval/results.json
+eval/benchmark.json
 
 # --- Vector store / caches / models ---
 *.sqlite
