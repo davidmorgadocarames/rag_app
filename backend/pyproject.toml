@@ -21,6 +21,10 @@ plugins = ["pydantic.mypy"]
 strict = true
 warn_unused_configs = true
 
+[[tool.mypy.overrides]]
+module = ["pymupdf4llm", "pymupdf"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

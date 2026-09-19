@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     embed_model: str = "bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
 
+    # --- Ingestion / chunking ---
+    chunk_size: int = 1200
+    chunk_overlap: int = 150
+
     # --- Retrieval / agent limits ---
     top_k: int = 20
     rerank_top_n: int = 4

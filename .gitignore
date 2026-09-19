@@ -37,6 +37,8 @@ data/raw_md/*
 !data/raw_md/.gitkeep
 data/markdown/*
 !data/markdown/.gitkeep
+data/chunks/*
+!data/chunks/.gitkeep
 data/corpus_manifest.json
 
 # --- Vector store / caches / models ---

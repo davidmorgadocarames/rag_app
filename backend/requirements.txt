@@ -1,4 +1,7 @@
-# Runtime dependencies (pinned). Kept minimal for the foundation commit;
-# RAG / web / db libraries are added in their respective phases.
+# Runtime dependencies (pinned).
 pydantic==2.10.4
 pydantic-settings==2.7.1
+
+# Ingestion: PDF -> Markdown
+pymupdf4llm==1.28.2
+pymupdf==1.28.2
