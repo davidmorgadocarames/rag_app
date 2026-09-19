@@ -1,0 +1,8 @@
+{
+  "n_answerable": 10,
+  "n_negative": 4,
+  "retrieval_recall": 1.0,
+  "faithfulness": 1.0,
+  "correctness": 0.9,
+  "correct_abstention": 1.0
+}

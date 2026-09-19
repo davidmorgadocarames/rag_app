@@ -124,6 +124,23 @@ def check_groundedness(chat: OllamaChat, answer_text: str, chunks: list[Retrieve
     return parse_groundedness(chat.chat(messages, temperature=0.0))
 
 
+def answer_from_chunks(chat: OllamaChat, query: str, chunks: list[RetrievedChunk]) -> Answer:
+    """Generate a grounded, cited answer from already-retrieved chunks (or abstain)."""
+    if not chunks:
+        return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
+
+    max_tokens = get_settings().max_tokens
+    raw = chat.chat(build_messages(query, chunks), temperature=0.0, max_tokens=max_tokens)
+    answer = parse_answer(raw, chunks)
+    if answer.abstained:
+        return answer
+
+    answer.grounded = check_groundedness(chat, answer.text, chunks)
+    if not answer.grounded:
+        return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
+    return answer
+
+
 def answer_question(
     session: Session,
     query: str,
@@ -147,18 +164,7 @@ def answer_question(
     else:
         chunks = hybrid_search(session, query, top_k=top_n, version=version)
 
-    if not chunks:
-        return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
-
-    raw = chat.chat(build_messages(query, chunks), temperature=0.0, max_tokens=settings.max_tokens)
-    answer = parse_answer(raw, chunks)
-    if answer.abstained:
-        return answer
-
-    answer.grounded = check_groundedness(chat, answer.text, chunks)
-    if not answer.grounded:
-        return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
-    return answer
+    return answer_from_chunks(chat, query, chunks)
 
 
 def main(argv: list[str] | None = None) -> int:

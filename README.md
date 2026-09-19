@@ -126,6 +126,22 @@ python -m rag_app.generation "How do I configure a Cisco ASA firewall?"  # absta
 The pipeline retrieves → reranks → generates an answer that cites the numbered context,
 then runs a groundedness check and **abstains** if the corpus doesn't support an answer.
 
+### Evaluation gate (Phase 4)
+
+Measures retrieval and generation **separately**, plus **correctness vs an independent
+ground truth** (catches faithful-but-stale answers) and **correct abstention** on the
+negative set. Thresholds live in `eval/thresholds.json`; `eval/baseline_metrics.json`
+guards against regressions.
+
+```bash
+python -m rag_app.eval.gate                     # run eval; non-zero exit if below thresholds/baseline
+python -m rag_app.eval.gate --update-baseline   # refresh the baseline after an intended change
+```
+
+The pre-push hook runs this automatically (it **skips** gracefully if Postgres/Ollama
+are not running). Current baseline on the mini corpus: recall 1.0, faithfulness 1.0,
+correctness 0.9, correct-abstention 1.0.
+
 ## Documentation
 
 | Doc | Purpose |
@@ -142,8 +158,8 @@ then runs a groundedness check and **abstains** if the corpus doesn't support an
 - [x] **Phase 0** — Documentation + repo foundation (CI/CD-first)
 - [x] **Phase 1** — Ingestion: OWASP PDFs/MD → Markdown → chunks
 - [x] **Phase 2** — Embeddings (bge-m3) + pgvector + hybrid retrieval + rerank (bge-reranker)
-- [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention ← *you are here*
-- [ ] **Phase 4** — Evaluation (Ragas): retrieval + generation + regression gate in CI
+- [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention
+- [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate ← *you are here*
 - [ ] **Phase 5** — Agentic router (only if evals justify the added complexity)
 - [ ] **Phase 6** — Auth (email/password) + rate limiting + quotas
 - [ ] **Phase 7** — Frontend screens (chat, history, account)

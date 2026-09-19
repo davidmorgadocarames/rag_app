@@ -1,0 +1,6 @@
+{
+  "retrieval_recall": 0.8,
+  "faithfulness": 0.9,
+  "correctness": 0.85,
+  "correct_abstention": 0.95
+}
