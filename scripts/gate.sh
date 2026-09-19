@@ -37,14 +37,23 @@ else
   echo "  PASS"
 fi
 
-# 3. Dependencies pinned (no unpinned entries in requirements files)
+# 3. Dependencies pinned (every requirement line has ==; skip -r/options/comments)
 step "3. dependencies pinned"
-unpinned="$(grep -rhoE '^[A-Za-z0-9_.-]+' backend/requirements*.txt 2>/dev/null \
-  | while read -r pkg; do
-      grep -qE "^${pkg}(\[|==)" backend/requirements*.txt || echo "$pkg"
-    done | sort -u)"
-if [ -n "${unpinned}" ]; then
-  note_fail "unpinned dependencies: $(echo "$unpinned" | tr '\n' ' ')"
+unpinned=""
+while IFS= read -r line; do
+  case "$line" in
+    '' | '#'* | -*) continue ;;
+  esac
+  pkg="${line%%#*}"
+  pkg="$(echo "$pkg" | tr -d '[:space:]')"
+  [ -z "$pkg" ] && continue
+  case "$pkg" in
+    *==*) : ;;
+    *) unpinned="$unpinned $pkg" ;;
+  esac
+done < <(cat backend/requirements*.txt 2>/dev/null)
+if [ -n "$unpinned" ]; then
+  note_fail "unpinned dependencies:$unpinned"
 else
   echo "  PASS"
 fi
@@ -57,19 +66,19 @@ else
   note_fail "backend/.venv missing — create it and install requirements-dev.txt"
 fi
 
-# 5-8. backend quality (only if venv exists)
+# 5-9. backend quality (only if venv exists)
 if [ -x "$PY" ]; then
   step "5. ruff (lint)"
-  ( cd backend && "$RUFF" check . ) && echo "  PASS" || note_fail "ruff check"
+  (cd backend && "$RUFF" check .) && echo "  PASS" || note_fail "ruff check"
 
   step "6. ruff (format)"
-  ( cd backend && "$RUFF" format --check . ) && echo "  PASS" || note_fail "ruff format"
+  (cd backend && "$RUFF" format --check .) && echo "  PASS" || note_fail "ruff format"
 
   step "7. mypy (strict)"
-  ( cd backend && "$MYPY" src ) && echo "  PASS" || note_fail "mypy"
+  (cd backend && "$MYPY" src) && echo "  PASS" || note_fail "mypy"
 
   step "8. pytest"
-  ( cd backend && "$PYTEST" -q ) && echo "  PASS" || note_fail "pytest"
+  (cd backend && "$PYTEST" -q) && echo "  PASS" || note_fail "pytest"
 
   step "9. gitleaks (secret scan)"
   if [ -x "$PRECOMMIT" ]; then
@@ -82,7 +91,7 @@ fi
 # 10. frontend (only if dependencies are installed)
 step "10. frontend (lint / typecheck / build)"
 if [ -d frontend/node_modules ]; then
-  ( cd frontend && npm run lint && npm run typecheck && npm run build ) \
+  (cd frontend && npm run lint && npm run typecheck && npm run build) \
     && echo "  PASS" || note_fail "frontend checks"
 else
   echo "  SKIP (frontend/node_modules missing)"
@@ -91,7 +100,7 @@ fi
 # 11. eval gate (Phase 4+)
 step "11. eval gate (Phase 4+)"
 if [ -f backend/src/rag_app/eval/gate.py ]; then
-  ( cd backend && PYTHONPATH=src "$PY" -m rag_app.eval.gate ) \
+  (cd backend && PYTHONPATH=src "$PY" -m rag_app.eval.gate) \
     && echo "  PASS" || note_fail "eval gate"
 else
   echo "  SKIP (no eval gate yet)"

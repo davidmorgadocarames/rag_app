@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Git pre-push hook: enforce the project's phase gate (Definition of Done)
+# before any push. Enable once with:  git config core.hooksPath .githooks
+#
+# This is a hard, phase-agnostic barrier: it runs ALL mechanical norms
+# (environment/WSL2, secrets, lint, types, tests, frontend, eval gate) and
+# aborts the push if any fails. See docs/DEFINITION_OF_DONE.md.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+echo "[pre-push] running phase gate (scripts/gate.sh)…"
+exec bash "$REPO_ROOT/scripts/gate.sh"
