@@ -22,7 +22,7 @@ strict = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["pymupdf4llm", "pymupdf"]
+module = ["pymupdf4llm", "pymupdf", "pgvector.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -5,3 +5,12 @@ pydantic-settings==2.7.1
 # Ingestion: PDF -> Markdown
 pymupdf4llm==1.28.2
 pymupdf==1.28.2
+
+# Storage & retrieval: PostgreSQL + pgvector
+SQLAlchemy==2.0.36
+alembic==1.14.0
+psycopg[binary]==3.2.3
+pgvector==0.3.6
+
+# Embeddings client (Ollama HTTP)
+httpx==0.28.1
