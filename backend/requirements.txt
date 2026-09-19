@@ -14,3 +14,6 @@ pgvector==0.3.6
 
 # Embeddings client (Ollama HTTP)
 httpx==0.28.1
+
+# Reranking: cross-encoder (bge-reranker) via sentence-transformers (pulls torch)
+sentence-transformers==3.3.1

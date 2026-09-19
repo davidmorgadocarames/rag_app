@@ -129,7 +129,7 @@ python -m rag_app.retrieval "What rank is Injection?" --version 2025
 
 - [x] **Phase 0** — Documentation + repo foundation (CI/CD-first)
 - [x] **Phase 1** — Ingestion: OWASP PDFs/MD → Markdown → chunks
-- [~] **Phase 2** — Embeddings (bge-m3) + pgvector storage + hybrid retrieval ← *you are here* (rerank next)
+- [x] **Phase 2** — Embeddings (bge-m3) + pgvector + hybrid retrieval + rerank (bge-reranker) ← *you are here*
 - [ ] **Phase 3** — Generation with citations + groundedness check + abstention
 - [ ] **Phase 4** — Evaluation (Ragas): retrieval + generation + regression gate in CI
 - [ ] **Phase 5** — Agentic router (only if evals justify the added complexity)
