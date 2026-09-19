@@ -4,6 +4,11 @@
 # See docs/DEFINITION_OF_DONE.md for the full list of norms.
 set -uo pipefail
 
+# Prefer the locally-installed Node/Python toolchains (WSL2, no sudo) over any
+# Windows tools leaking in via WSL PATH interop.
+export PATH="$HOME/.local/bin:$PATH"
+hash -r 2>/dev/null || true
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

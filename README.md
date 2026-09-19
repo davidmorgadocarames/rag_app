@@ -176,6 +176,16 @@ Erasure is **hard delete + crypto-shred + tombstone** with a "no key → data pu
 invariant and a `replay_deletions` step for disaster recovery — see
 [ADR 0002](docs/adr/0002-data-erasure-gdpr.md).
 
+### Run the frontend (Phase 7)
+
+Next.js UI (landing, login/register, chat with citations, account with data deletion):
+
+```bash
+cd frontend && npm install && npm run dev   # → http://localhost:3000
+```
+
+Set `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8000`) to point at the backend.
+
 ## Documentation
 
 | Doc | Purpose |
@@ -196,7 +206,7 @@ invariant and a `replay_deletions` step for disaster recovery — see
 - [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate
 - [x] **Phase 5** — Agentic router benchmarked → **not adopted** (no quality gain, +latency; see [ADR 0001](docs/adr/0001-agentic-router.md)) ← *you are here*
 - [x] **Phase 6** — Auth (argon2 + JWT) + GDPR erasure + email verification + rate limiting (token bucket) + signup risk scoring ← *you are here*
-- [ ] **Phase 7** — Frontend screens (chat, history, account)
+- [x] **Phase 7** — Next.js frontend: landing, login/register, chat (with citations/abstention), account (data deletion) ← *you are here*
 - [ ] **Phase 8** — Compliance: per-user crypto-shred
 - [ ] **Phase 9** — Docker app containers + free-tier deploy (CD)
 
