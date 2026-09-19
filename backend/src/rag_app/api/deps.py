@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from typing import Annotated
 
+from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from rag_app.db.session import make_session_factory
@@ -27,3 +29,6 @@ def get_answerer() -> AnswerFn:
         return answer_question(session, question, version=version)
 
     return _answer
+
+
+SessionDep = Annotated[Session, Depends(get_session)]

@@ -5,18 +5,18 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends, FastAPI
-from sqlalchemy.orm import Session
 
 from rag_app import __version__
-from rag_app.api.deps import AnswerFn, get_answerer, get_session
+from rag_app.api import auth
+from rag_app.api.deps import AnswerFn, SessionDep, get_answerer
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
 
-SessionDep = Annotated[Session, Depends(get_session)]
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="SecRAG API", version=__version__)
+    app.include_router(auth.router)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:

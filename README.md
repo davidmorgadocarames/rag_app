@@ -155,6 +155,22 @@ curl -X POST localhost:8000/chat -H 'Content-Type: application/json' \
 
 `POST /chat` returns the grounded answer, `abstained`/`grounded` flags, and citations.
 
+### Auth & data erasure (Phase 6)
+
+Email/password auth (argon2 + JWT) and **GDPR erasure**. Needs `JWT_SECRET` and
+`DATA_MASTER_KEY` set (see `.env.example`).
+
+```
+POST   /auth/register   {email, password}  -> access token
+POST   /auth/login      {email, password}  -> access token
+GET    /auth/me         (Bearer token)     -> current user
+DELETE /account         (Bearer token)     -> erases the account
+```
+
+Erasure is **hard delete + crypto-shred + tombstone** with a "no key → data purged"
+invariant and a `replay_deletions` step for disaster recovery — see
+[ADR 0002](docs/adr/0002-data-erasure-gdpr.md).
+
 ## Documentation
 
 | Doc | Purpose |
@@ -174,7 +190,7 @@ curl -X POST localhost:8000/chat -H 'Content-Type: application/json' \
 - [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention
 - [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate
 - [x] **Phase 5** — Agentic router benchmarked → **not adopted** (no quality gain, +latency; see [ADR 0001](docs/adr/0001-agentic-router.md)) ← *you are here*
-- [ ] **Phase 6** — Auth (email/password) + rate limiting + quotas
+- [~] **Phase 6** — Auth (email/password, argon2, JWT) + **GDPR erasure** done ← *you are here*; rate limiting + email verification next
 - [ ] **Phase 7** — Frontend screens (chat, history, account)
 - [ ] **Phase 8** — Compliance: per-user crypto-shred
 - [ ] **Phase 9** — Docker app containers + free-tier deploy (CD)

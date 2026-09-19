@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # --- Auth / security ---
     jwt_secret: str = ""
     jwt_expires_minutes: int = 30
+    # Master key (urlsafe base64, 32 bytes) that wraps per-user data keys. Set in .env.
+    data_master_key: str = ""
 
     # --- Email verification (SMTP) ---
     smtp_host: str = ""
