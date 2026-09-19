@@ -142,6 +142,19 @@ The pre-push hook runs this automatically (it **skips** gracefully if Postgres/O
 are not running). Current baseline on the mini corpus: recall 1.0, faithfulness 1.0,
 correctness 0.9, correct-abstention 1.0.
 
+### Run the API (Phase 6)
+
+The FastAPI backend serves the RAG over HTTP (needs Postgres + Ollama running):
+
+```bash
+cd backend && python -m rag_app.api      # → http://localhost:8000  (Swagger UI at /docs)
+curl localhost:8000/health
+curl -X POST localhost:8000/chat -H 'Content-Type: application/json' \
+  -d '{"question":"How do I prevent SQL injection?"}'
+```
+
+`POST /chat` returns the grounded answer, `abstained`/`grounded` flags, and citations.
+
 ## Documentation
 
 | Doc | Purpose |
