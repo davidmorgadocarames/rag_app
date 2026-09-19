@@ -1,0 +1,44 @@
+name: CD
+
+# Build the app images and publish them to the GitHub Container Registry on every
+# push to main. Deploying to a host (which needs a GPU/Ollama endpoint — see
+# docs/adr/0003-deployment.md) is a separate, credentialed step.
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  images:
+    name: Build & push images (GHCR)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-backend:latest
+            ghcr.io/${{ github.repository }}-backend:${{ github.sha }}
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://localhost:8000
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-frontend:latest
+            ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}

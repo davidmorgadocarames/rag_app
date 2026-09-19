@@ -186,6 +186,22 @@ cd frontend && npm install && npm run dev   # → http://localhost:3000
 
 Set `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8000`) to point at the backend.
 
+### Containers & deploy (Phase 9)
+
+Everything is containerized; the whole stack runs with Docker:
+
+```bash
+docker compose up -d db ollama
+docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
+docker compose exec ollama ollama pull bge-m3
+JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # + backend + frontend
+```
+
+**CD**: every push to `main` builds and publishes images to GHCR
+(`ghcr.io/davidmorgadocarames/rag_app-backend` / `-frontend`) via `.github/workflows/cd.yml`.
+The model tier (Ollama) needs a GPU, so host deployment is a separate credentialed step —
+see [ADR 0003](docs/adr/0003-deployment.md).
+
 ## Documentation
 
 | Doc | Purpose |
@@ -207,8 +223,8 @@ Set `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8000`) to point at the 
 - [x] **Phase 5** — Agentic router benchmarked → **not adopted** (no quality gain, +latency; see [ADR 0001](docs/adr/0001-agentic-router.md)) ← *you are here*
 - [x] **Phase 6** — Auth (argon2 + JWT) + GDPR erasure + email verification + rate limiting (token bucket) + signup risk scoring ← *you are here*
 - [x] **Phase 7** — Next.js frontend: landing, login/register, chat (with citations/abstention), account (data deletion) ← *you are here*
-- [ ] **Phase 8** — Compliance: per-user crypto-shred
-- [ ] **Phase 9** — Docker app containers + free-tier deploy (CD)
+- [x] **Phase 8** — Compliance: per-user crypto-shred (delivered in Phase 6)
+- [x] **Phase 9** — Docker containers (backend + frontend + compose) + CD to GHCR ← *you are here*
 
 ## License
 

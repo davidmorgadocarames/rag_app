@@ -1,9 +1,11 @@
-# Local development infrastructure.
-# Usable from day 1: brings up PostgreSQL (with pgvector) and Ollama.
-# Backend and frontend containers are added later (containerization phase).
+# Full local stack: PostgreSQL (pgvector), Ollama, backend (FastAPI), frontend (Next.js).
 #
-#   docker compose up -d db ollama
+#   docker compose up -d db ollama         # infra only
+#   docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
+#   docker compose exec ollama ollama pull bge-m3
+#   JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # whole app
 #
+# JWT_SECRET and DATA_MASTER_KEY must be provided (env or a root .env; see .env.example).
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -36,6 +38,32 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
+      OLLAMA_HOST: http://ollama:11434
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      DATA_MASTER_KEY: ${DATA_MASTER_KEY:?set DATA_MASTER_KEY}
+      FRONTEND_ORIGIN: http://localhost:3000
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
 
 volumes:
   pgdata:
