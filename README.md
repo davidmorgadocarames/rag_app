@@ -161,11 +161,16 @@ Email/password auth (argon2 + JWT) and **GDPR erasure**. Needs `JWT_SECRET` and
 `DATA_MASTER_KEY` set (see `.env.example`).
 
 ```
-POST   /auth/register   {email, password}  -> access token
-POST   /auth/login      {email, password}  -> access token
+POST   /auth/register   {email, password}  -> access token  (risk-scored; sends verify email)
+GET    /auth/verify?token=...              -> marks the email verified
+POST   /auth/login      {email, password}  -> access token  (rate-limited)
 GET    /auth/me         (Bearer token)     -> current user
 DELETE /account         (Bearer token)     -> erases the account
 ```
+
+`/chat` and `/auth/login` are rate-limited with a cost-aware **token bucket** (defends
+against brute force and Denial-of-Wallet); signups are **risk-scored** (disposable-email
+and per-IP velocity) to resist Sybil abuse.
 
 Erasure is **hard delete + crypto-shred + tombstone** with a "no key → data purged"
 invariant and a `replay_deletions` step for disaster recovery — see
@@ -190,7 +195,7 @@ invariant and a `replay_deletions` step for disaster recovery — see
 - [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention
 - [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate
 - [x] **Phase 5** — Agentic router benchmarked → **not adopted** (no quality gain, +latency; see [ADR 0001](docs/adr/0001-agentic-router.md)) ← *you are here*
-- [~] **Phase 6** — Auth (email/password, argon2, JWT) + **GDPR erasure** done ← *you are here*; rate limiting + email verification next
+- [x] **Phase 6** — Auth (argon2 + JWT) + GDPR erasure + email verification + rate limiting (token bucket) + signup risk scoring ← *you are here*
 - [ ] **Phase 7** — Frontend screens (chat, history, account)
 - [ ] **Phase 8** — Compliance: per-user crypto-shred
 - [ ] **Phase 9** — Docker app containers + free-tier deploy (CD)

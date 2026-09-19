@@ -46,12 +46,14 @@ class Settings(BaseSettings):
     # --- Rate limiting (token bucket) ---
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0
+    rate_limit_chat_cost: float = 5.0  # cost-aware: an LLM answer costs more than 1 token
 
     # --- Auth / security ---
     jwt_secret: str = ""
     jwt_expires_minutes: int = 30
     # Master key (urlsafe base64, 32 bytes) that wraps per-user data keys. Set in .env.
     data_master_key: str = ""
+    require_email_verification: bool = False  # gate login on a verified email when true
 
     # --- Email verification (SMTP) ---
     smtp_host: str = ""

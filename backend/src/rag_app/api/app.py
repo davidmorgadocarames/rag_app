@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI
 
 from rag_app import __version__
 from rag_app.api import auth
-from rag_app.api.deps import AnswerFn, SessionDep, get_answerer
+from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
@@ -22,7 +22,7 @@ def create_app() -> FastAPI:
     def health() -> HealthResponse:
         return HealthResponse(status="ok")
 
-    @app.post("/chat", response_model=ChatResponse)
+    @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(rate_limit_chat)])
     def chat(
         request: ChatRequest,
         session: SessionDep,

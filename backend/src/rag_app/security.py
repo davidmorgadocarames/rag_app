@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import secrets
 
 import jwt
 from argon2 import PasswordHasher
@@ -12,6 +14,15 @@ from rag_app.config import get_settings
 
 _hasher = PasswordHasher()
 _ALGORITHM = "HS256"
+
+
+def generate_verification_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def hash_token(token: str) -> str:
+    """SHA-256 hex of a token (store the hash, not the raw token)."""
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def hash_password(password: str) -> str:
