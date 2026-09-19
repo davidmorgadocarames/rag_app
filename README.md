@@ -114,6 +114,18 @@ python -m rag_app.retrieval "How do I prevent SQL injection?"
 python -m rag_app.retrieval "What rank is Injection?" --version 2025
 ```
 
+### Ask (Phase 3 — grounded, cited answers)
+
+Also requires the `qwen` chat model (`ollama pull qwen2.5:7b-instruct-q4_K_M`):
+
+```bash
+python -m rag_app.generation "How do I prevent SQL injection?"        # cited answer
+python -m rag_app.generation "How do I configure a Cisco ASA firewall?"  # abstains (out of corpus)
+```
+
+The pipeline retrieves → reranks → generates an answer that cites the numbered context,
+then runs a groundedness check and **abstains** if the corpus doesn't support an answer.
+
 ## Documentation
 
 | Doc | Purpose |
@@ -129,8 +141,8 @@ python -m rag_app.retrieval "What rank is Injection?" --version 2025
 
 - [x] **Phase 0** — Documentation + repo foundation (CI/CD-first)
 - [x] **Phase 1** — Ingestion: OWASP PDFs/MD → Markdown → chunks
-- [x] **Phase 2** — Embeddings (bge-m3) + pgvector + hybrid retrieval + rerank (bge-reranker) ← *you are here*
-- [ ] **Phase 3** — Generation with citations + groundedness check + abstention
+- [x] **Phase 2** — Embeddings (bge-m3) + pgvector + hybrid retrieval + rerank (bge-reranker)
+- [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention ← *you are here*
 - [ ] **Phase 4** — Evaluation (Ragas): retrieval + generation + regression gate in CI
 - [ ] **Phase 5** — Agentic router (only if evals justify the added complexity)
 - [ ] **Phase 6** — Auth (email/password) + rate limiting + quotas
