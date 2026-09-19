@@ -36,8 +36,9 @@ norms are a human/agent checklist.
 
 ```bash
 # inside WSL2, from the repo root
-bash scripts/gate.sh          # runs all mechanical norms; non-zero exit = blocked
+git config core.hooksPath .githooks   # one-time: enable the pre-push gate for this clone
+bash scripts/gate.sh                   # runs all mechanical norms; non-zero exit = blocked
 ```
 
-The `git push` hook runs this automatically and blocks the push if the gate fails.
-Judgment norms (#9, #10) are confirmed by the author/agent before marking a phase done.
+The `git push` hook (`.githooks/pre-push`) runs the gate automatically and blocks the push if it
+fails. Judgment norms (#9, #10) are confirmed by the author/agent before marking a phase done.
