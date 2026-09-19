@@ -1,0 +1,116 @@
+# SecRAG — Agentic RAG assistant for OWASP security guidance
+
+A security-focused **Agentic RAG** web app that answers OWASP questions (Top 10, Cheat Sheets)
+from a **versioned PDF corpus**, running entirely on **free local models**. It is built as a
+full-stack application — with authentication, rate limiting, evaluation gates, and CI/CD — to
+demonstrate a professional engineering workflow, not just a RAG script.
+
+> Status: **foundation (commit 1)** — documentation + project skeleton with green CI. No RAG logic yet.
+> The build sequence lives in [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+
+## Why this project
+
+Most RAG demos stop at "retrieve then generate". This one is designed around the hard parts that
+matter in production:
+
+- **Version-aware answers** — the corpus contains OWASP guidance that *changed over time* (2021 vs
+  2025). The system must not answer *faithfully but with stale information*.
+- **Honest abstention** — it says "I don't know" instead of hallucinating when the answer is not in
+  the corpus.
+- **Separate evaluation** of retrieval and generation, plus **correctness vs an independent ground
+  truth** — with a regression gate that blocks deploys.
+- **Security & abuse defense** — custom auth, rate limiting (token bucket), Sybil/Denial-of-Wallet
+  mitigation, indirect-prompt-injection defense, and GDPR-style per-user data erasure (crypto-shred).
+
+## Architecture
+
+```
+Next.js (React/TS)  ──HTTP──▶  FastAPI backend
+                                   │
+                                   ├─ Auth (email/password, argon2, JWT, email verification)
+                                   ├─ Rate limiting / quotas (token bucket)
+                                   ├─ Agentic RAG
+                                   │     router → retrieve → rerank → generate → groundedness check
+                                   │
+                                   ├─ PostgreSQL + pgvector  (users + documents + chunks/vectors)
+                                   └─ Ollama  (local models)
+
+Models (only 3):
+  • qwen (Q4)      → all LLM tasks (router, generation, groundedness, judge)
+  • bge-m3         → embeddings (chunks + query)
+  • bge-reranker   → cross-encoder reranking
+```
+
+## Tech stack
+
+| Layer        | Choice                                             |
+|--------------|----------------------------------------------------|
+| Frontend     | Next.js, React, TypeScript, Tailwind CSS           |
+| Backend      | FastAPI, pydantic-settings                         |
+| Database     | PostgreSQL + pgvector                              |
+| LLM serving  | Ollama (`qwen` Q4)                                 |
+| Embeddings   | `bge-m3`                                            |
+| Reranking    | `bge-reranker` (cross-encoder)                     |
+| Ingestion    | PDF → Markdown (layout-aware parser)               |
+| Evaluation   | Ragas (retrieval + generation, regression gate)    |
+| CI/CD        | GitHub Actions → Docker → free-tier deploy         |
+
+## Getting started
+
+Prerequisites: Python 3.11+, Node 20+, Docker.
+
+> **WSL2 users:** run the project from the Linux filesystem (`~/...`), **not** `/mnt/c`, to avoid slow
+> file I/O once embeddings and the vector DB are in play.
+
+```bash
+# 1. Clone
+git clone https://github.com/davidmorgadocarames/rag_app.git
+cd rag_app
+
+# 2. Environment
+cp .env.example .env          # then fill in real values (never commit .env)
+
+# 3. Dev infrastructure (Postgres + pgvector, Ollama)
+docker compose up -d db ollama
+
+# 4. Backend
+cd backend
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+pre-commit install
+pytest
+
+# 5. Frontend
+cd ../frontend
+npm install
+npm run dev
+```
+
+## Documentation
+
+| Doc | Purpose |
+|-----|---------|
+| [PRD](docs/PRD.md)                       | Product requirements: features & acceptance criteria |
+| [TRD](docs/TRD.md)                       | Technical decisions: stack, tools, eval, security |
+| [App Flow](docs/APP_FLOW.md)             | User journey, screens, navigation |
+| [UI/UX Brief](docs/UIUX_BRIEF.md)        | Look & feel, palette, typography, components |
+| [Backend Schema](docs/BACKEND_SCHEMA.md) | Auth flow, tables, columns, relationships |
+| [Implementation Plan](docs/IMPLEMENTATION_PLAN.md) | Step-by-step build sequence |
+
+## Roadmap (high level)
+
+- [x] **Phase 0** — Documentation + repo foundation (CI/CD-first) ← *you are here*
+- [ ] **Phase 1** — Ingestion: OWASP PDFs → Markdown → chunks
+- [ ] **Phase 2** — Embeddings + pgvector storage + hybrid retrieval + rerank
+- [ ] **Phase 3** — Generation with citations + groundedness check + abstention
+- [ ] **Phase 4** — Evaluation (Ragas): retrieval + generation + regression gate in CI
+- [ ] **Phase 5** — Agentic router (only if evals justify the added complexity)
+- [ ] **Phase 6** — Auth (email/password) + rate limiting + quotas
+- [ ] **Phase 7** — Frontend screens (chat, history, account)
+- [ ] **Phase 8** — Compliance: per-user crypto-shred
+- [ ] **Phase 9** — Docker app containers + free-tier deploy (CD)
+
+## License
+
+TBD.

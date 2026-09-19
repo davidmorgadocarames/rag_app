@@ -1,0 +1,8 @@
+# Normalize line endings to LF in the repository (dev on WSL2/Linux, CI on Ubuntu).
+* text=auto eol=lf
+
+# Binary files: never normalize.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.ico binary

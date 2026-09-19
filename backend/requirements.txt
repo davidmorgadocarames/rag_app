@@ -1,0 +1,4 @@
+# Runtime dependencies (pinned). Kept minimal for the foundation commit;
+# RAG / web / db libraries are added in their respective phases.
+pydantic==2.10.4
+pydantic-settings==2.7.1

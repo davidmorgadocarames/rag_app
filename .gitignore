@@ -1,0 +1,49 @@
+# --- Secrets / environment ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- Data / corpus (kept out of git; only .gitkeep tracked) ---
+data/raw_pdfs/*
+!data/raw_pdfs/.gitkeep
+data/markdown/*
+!data/markdown/.gitkeep
+
+# --- Vector store / caches / models ---
+*.sqlite
+*.db
+.cache/
+.ollama/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

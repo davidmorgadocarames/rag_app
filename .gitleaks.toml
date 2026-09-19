@@ -1,0 +1,16 @@
+# Gitleaks configuration. Extends the default ruleset and allow-lists
+# development-only, non-secret placeholders used in examples and local infra.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Dev-only placeholders (no real secrets)"
+paths = [
+  '''\.env\.example$''',
+  '''docker-compose\.yml$''',
+]
+# Local dev credentials for the throwaway Postgres container (user:pass = rag:rag).
+regexes = [
+  '''rag:rag@''',
+  '''POSTGRES_PASSWORD:\s*rag''',
+]
