@@ -153,7 +153,12 @@ curl -X POST localhost:8000/chat -H 'Content-Type: application/json' \
   -d '{"question":"How do I prevent SQL injection?"}'
 ```
 
-`POST /chat` returns the grounded answer, `abstained`/`grounded` flags, and citations.
+`POST /chat` returns the grounded answer, `abstained`/`grounded` flags, and citations (one-shot,
+non-persisting). The app UI uses **`POST /chat/stream`** instead: an authenticated Server-Sent Events
+endpoint that streams pipeline **stages** (classifying → retrieving → reranking → generating → checking)
+and answer **tokens**, reports **token usage**, persists the conversation (encrypted), and takes a
+**chit-chat fast-path** for greetings/small talk (instant, no retrieval). Conversation history lives
+behind `GET/PATCH/DELETE /conversations…`.
 
 ### Auth & data erasure (Phase 6)
 
@@ -161,11 +166,12 @@ Email/password auth (argon2 + JWT) and **GDPR erasure**. Needs `JWT_SECRET` and
 `DATA_MASTER_KEY` set (see `.env.example`).
 
 ```
-POST   /auth/register   {email, password}  -> access token  (risk-scored; sends verify email)
-GET    /auth/verify?token=...              -> marks the email verified
-POST   /auth/login      {email, password}  -> access token  (rate-limited)
-GET    /auth/me         (Bearer token)     -> current user
-DELETE /account         (Bearer token)     -> erases the account
+POST   /auth/register             {email, password}  -> access token  (risk-scored; sends verify email)
+GET    /auth/verify?token=...                         -> marks the email verified
+POST   /auth/resend-verification  (Bearer token)      -> new token (dev: returns the link)
+POST   /auth/login                {email, password}  -> access token  (rate-limited)
+GET    /auth/me                   (Bearer token)      -> current user
+DELETE /account                   (Bearer token)      -> erases the account
 ```
 
 `/chat` and `/auth/login` are rate-limited with a cost-aware **token bucket** (defends
@@ -178,7 +184,11 @@ invariant and a `replay_deletions` step for disaster recovery — see
 
 ### Run the frontend (Phase 7)
 
-Next.js UI (landing, login/register, chat with citations, account with data deletion):
+Next.js UI: landing, login/register, a **real streaming chat** (conversation history sidebar, live stage
+indicator, per-answer + running token counts), and an account page (email verification resend + data
+deletion). The visual identity is a **vault**: an ASCII-art vault door
+(`frontend/components/VaultDoor.tsx`) whose wheel is the "open session" control on `/login`, with a
+monospace, dark-only palette derived from it (see [UI/UX Brief](docs/UIUX_BRIEF.md)).
 
 ```bash
 cd frontend && npm install && npm run dev   # → http://localhost:3000

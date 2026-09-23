@@ -6,7 +6,7 @@ comes next.
 ## 1. Screen map
 
 ```
-Landing (/)
+Landing (/)  — static vault-door hero + "Inside the vault" corpus explainer
   ├─▶ Sign up (/signup) ─▶ Verify email (/verify) ─▶ Login (/login)
   ├─▶ Login (/login) ─────────────────────────────────▶ Chat (/chat)
   └─▶ (public) About / docs links
@@ -38,8 +38,12 @@ Chat (/chat)              [authenticated]
 
 ### 2.3 Login
 
-1. User opens **`/login`**, enters credentials.
-2. On **Sign in**:
+1. User opens **`/login`**: the **vault door** fills the screen (idles with a periodic "clic"). This is
+   a purely visual layer — the auth logic below is unchanged.
+2. User presses **ABRIR** → the wheel spins, the bolts retract, the view zooms into the vault, and a
+   minimal **access panel** (email + password, ENTER, and a sign in / register toggle) fades in. With
+   `prefers-reduced-motion`, ABRIR reveals the panel immediately (no spin/zoom).
+3. User enters credentials. On **ENTER**:
    - Server checks **login rate limit** (token bucket) for the IP/account.
    - Verifies argon2 hash; requires `email_verified = true`.
    - Success → issues session/JWT → redirect to **`/chat`**.
@@ -47,25 +51,36 @@ Chat (/chat)              [authenticated]
 
 ### 2.4 Ask a question (core loop)
 
-1. On **`/chat`**, user types a question and presses **Send**.
-2. Client → `POST /api/chat`. Server:
-   - Applies **per-user rate limit / quota** (cost-aware). Over limit → 429 with a friendly message.
-   - Runs the RAG pipeline: route → retrieve → rerank → grade → generate → groundedness check.
-3. Response rendering:
-   - **Answered** → answer text + **citations** (doc title, version, effective date). Message pair
-     saved to history.
-   - **Abstained** → "I don't have a reliable source for that in the corpus." (no fabricated content).
-   - **Error/timeout** → retry affordance; nothing partial is presented as authoritative.
-4. User can ask follow-ups (same conversation) or start a new one.
+1. On **`/chat`** (a message thread with the input pinned at the bottom), the user types a question and
+   presses **Send** (Enter; Shift+Enter for a newline). Requires auth → redirects to `/login` otherwise.
+2. Client → `POST /chat/stream` (Bearer token). Server:
+   - Applies the **per-user rate limit / quota** (cost-aware). Over limit → 429.
+   - **Classifies intent.** Small talk / greetings ("hello", "thanks", "who are you") take a **fast-path**:
+     an instant, honest, non-sourced reply — no retrieval, no citations, no abstention.
+   - Security questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
+   - Streams **Server-Sent Events** back: `stage` (classifying/retrieving/reranking/generating/checking),
+     `token` deltas as the answer is written, then a final `done` with the authoritative answer.
+3. Response rendering (streamed live):
+   - A **stage indicator** shows the current step so the wait is legible.
+   - **Answered** → answer text + **citations** (heading, version, effective date) + **token usage** for
+     that answer; a **running conversation total** shows in the header.
+   - **Abstained** → dignified card ("No reliable source in the corpus") — no fabricated content.
+   - **Error** → the assistant bubble shows a clean error; nothing partial is presented as authoritative.
+4. The user + assistant messages are **persisted encrypted** (per-user key). Follow-ups continue the same
+   conversation; **New chat** starts a fresh one.
 
-### 2.5 History
+### 2.5 History (sidebar)
 
-1. **`/history`** lists the user's past conversations (most recent first).
-2. Selecting one opens it read-only in the chat view.
+1. A **left sidebar** lists the user's conversations (most recent first) with per-conversation token
+   totals; titles derive from the first message (or a user-set rename).
+2. **Select** one to load its full thread; **New chat**, inline **rename**, and **delete** are available.
+   Deleting a conversation cascades to its messages.
 
 ### 2.6 Account & data deletion
 
-1. **`/account`** shows email and account controls.
+1. **`/account`** shows email and account controls. If the email isn't verified, a **Resend
+   verification** button issues a fresh token (`POST /auth/resend-verification`); in dev (no SMTP) the
+   API returns the verification link so the user can complete `GET /auth/verify` directly.
 2. **Delete my data** → confirmation modal ("This is irreversible").
 3. On confirm → `DELETE /api/account`:
    - **Crypto-shred**: destroy the user's encryption key.
@@ -78,8 +93,9 @@ Chat (/chat)              [authenticated]
 |-------|---------------|-------|
 | `/` | no | Landing |
 | `/signup`, `/login`, `/verify` | no | Redirect to `/chat` if already authenticated |
-| `/chat`, `/history`, `/account` | yes | Redirect to `/login` if not authenticated |
-| `POST /api/chat`, `DELETE /api/account` | yes | Rate-limited |
+| `/chat`, `/account` | yes | Redirect to `/login` if not authenticated |
+| `POST /chat/stream`, `GET/PATCH/DELETE /conversations…` | yes | Chat is rate-limited (cost-aware) |
+| `POST /auth/resend-verification`, `DELETE /account` | yes | |
 
 ## 4. Key states to design for
 

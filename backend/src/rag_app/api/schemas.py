@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 from pydantic import BaseModel, Field
 
 
@@ -52,3 +54,43 @@ class UserOut(BaseModel):
 
 class MessageResponse(BaseModel):
     detail: str
+
+
+class ResendVerificationResponse(BaseModel):
+    detail: str
+    # Only populated in dev (no SMTP configured), so the UI can offer the link.
+    verification_link: str | None = None
+
+
+class ChatStreamRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = None
+    version: str | None = None
+
+
+class ConversationOut(BaseModel):
+    id: str
+    title: str
+    created_at: dt.datetime
+    total_tokens: int
+
+
+class MessageOut(BaseModel):
+    role: str
+    content: str
+    citations: list[CitationOut] = []
+    abstained: bool = False
+    grounded: bool = True
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    created_at: dt.datetime
+
+
+class ConversationDetailOut(BaseModel):
+    id: str
+    title: str
+    messages: list[MessageOut]
+
+
+class RenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)

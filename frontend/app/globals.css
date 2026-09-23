@@ -2,6 +2,52 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ---------------------------------------------------------------------------
+   Vault design tokens — derived verbatim from the vault_ascii.html prototype.
+   Dark-only: the vault is inherently a dark interior. These custom properties
+   are mirrored as Tailwind colors (colors.vault.*) in tailwind.config.ts so
+   both var(--…) and utility classes resolve to the same palette.
+   --------------------------------------------------------------------------- */
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
+
+  --bg: #0a0a0c;
+  --steel: #7d8794;
+  --steel-dark: #454c56;
+  --steel-light: #c7ccd2;
+  --amber: #d99a3f;
+  --amber-bright: #f0b968;
+  --plate: #2b2f35;
+  --danger: #c0563f;
+}
+
+body {
+  background: var(--bg);
+  color: var(--steel-light);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* Door tone classes shared by the VaultDoor <pre> renderer. */
+.c-linea {
+  color: var(--steel-light);
+}
+.c-medio {
+  color: var(--steel);
+}
+.c-hueco {
+  color: var(--steel-dark);
+}
+.c-chapa {
+  color: var(--plate);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

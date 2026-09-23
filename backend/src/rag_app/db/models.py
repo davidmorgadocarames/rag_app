@@ -111,6 +111,9 @@ class Conversation(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
+    # Optional user-set title, encrypted with the per-user key (null -> derived from
+    # the first message so nothing is stored in the clear).
+    title_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -130,6 +133,8 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(String)
     content_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

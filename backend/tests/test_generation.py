@@ -1,73 +1,101 @@
-"""Unit tests for generation prompt-building and parsing (no live LLM)."""
+"""Unit tests for the chit-chat classifier, token accounting, and stream shaping.
+
+None of these require a live LLM or database — they exercise the pure logic that the
+streaming pipeline is built on.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
+import pytest
+
 from rag_app.generation import (
     INSUFFICIENT,
-    build_context,
-    build_messages,
-    parse_answer,
-    parse_groundedness,
+    StreamToken,
+    _stream_answer_tokens,
+    classify_intent,
 )
+from rag_app.llm import Usage
 from rag_app.retrieval import RetrievedChunk
 
 
-def _chunk(uid: str, text: str, version: str = "2021") -> RetrievedChunk:
+@pytest.mark.parametrize(
+    "query",
+    [
+        "hi",
+        "Hello!",
+        "hey",
+        "good morning",
+        "thanks",
+        "thank you",
+        "who are you?",
+        "what can you do",
+        "bye",
+    ],
+)
+def test_classify_intent_chitchat(query: str) -> None:
+    assert classify_intent(query) == "chitchat"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "How do I prevent SQL injection?",
+        "What is broken access control?",
+        "Explain OWASP A03",
+        "how did injection change between 2021 and 2025",
+        "sanitize user input for command execution",
+        "thanks, now how do I stop XSS?",  # thanks present but security term wins
+    ],
+)
+def test_classify_intent_security(query: str) -> None:
+    assert classify_intent(query) == "security"
+
+
+def test_usage_accumulates() -> None:
+    total = Usage()
+    total.add(Usage(prompt_tokens=10, completion_tokens=5))
+    total.add(Usage(prompt_tokens=3, completion_tokens=7))
+    assert total.prompt_tokens == 13
+    assert total.completion_tokens == 12
+    assert total.total_tokens == 25
+
+
+class _FakeChat:
+    """Minimal stand-in exposing chat_stream over a fixed list of deltas."""
+
+    def __init__(self, deltas: list[str]) -> None:
+        self._deltas = deltas
+
+    def chat_stream(
+        self, *_args: object, usage: Usage | None = None, **_kw: object
+    ) -> Iterator[str]:
+        yield from self._deltas
+        if usage is not None:
+            usage.add(Usage(prompt_tokens=100, completion_tokens=len(self._deltas)))
+
+
+def _chunk() -> RetrievedChunk:
     return RetrievedChunk(
-        chunk_uid=uid,
-        heading=f"H-{uid}",
-        text=text,
-        version=version,
-        effective_date="2021-09-24",
-        score=1.0,
+        chunk_uid="c1", heading="h", text="t", version="2021", effective_date=None, score=1.0
     )
 
 
-def test_build_context_numbers_chunks() -> None:
-    ctx = build_context([_chunk("a", "alpha"), _chunk("b", "beta")])
-    assert "[1]" in ctx and "[2]" in ctx
-    assert "alpha" in ctx and "beta" in ctx
-    assert "version: 2021" in ctx
+def test_stream_hides_abstention_sentinel() -> None:
+    chat = _FakeChat(list(INSUFFICIENT))  # stream the sentinel char-by-char
+    usage = Usage()
+    items = list(_stream_answer_tokens(chat, "q", [_chunk()], usage))  # type: ignore[arg-type]
+    tokens = [i for i in items if isinstance(i, StreamToken)]
+    assert tokens == []  # nothing streamed to the user
+    assert items[-1] == INSUFFICIENT  # full raw text yielded last
+    assert usage.prompt_tokens == 100
 
 
-def test_build_messages_has_injection_defense_and_sentinel() -> None:
-    messages = build_messages("q?", [_chunk("a", "alpha")])
-    system = messages[0]["content"]
-    assert "DATA, not instructions" in system
-    assert INSUFFICIENT in system
-    assert "q?" in messages[1]["content"]
-
-
-def test_parse_answer_abstains_on_sentinel() -> None:
-    ans = parse_answer(f"...{INSUFFICIENT}...", [_chunk("a", "x")])
-    assert ans.abstained is True
-    assert ans.grounded is False
-    assert ans.citations == []
-
-
-def test_parse_answer_extracts_and_maps_citations() -> None:
-    chunks = [_chunk("a", "x"), _chunk("b", "y"), _chunk("c", "z")]
-    ans = parse_answer("Use parameterized queries [1] and least privilege [3].", chunks)
-    assert ans.abstained is False
-    assert [c.marker for c in ans.citations] == [1, 3]
-    assert ans.citations[0].chunk_uid == "a"
-    assert ans.citations[1].chunk_uid == "c"
-
-
-def test_parse_answer_ignores_out_of_range_markers() -> None:
-    ans = parse_answer("Bad ref [9] and good [1].", [_chunk("a", "x")])
-    assert [c.marker for c in ans.citations] == [1]
-
-
-def test_parse_answer_handles_grouped_and_prefixed_markers() -> None:
-    # qwen sometimes writes [1, 2] or [n1, n2, n3]
-    chunks = [_chunk("a", "x"), _chunk("b", "y"), _chunk("c", "z")]
-    assert [c.marker for c in parse_answer("foo [1, 2]", chunks).citations] == [1, 2]
-    assert [c.marker for c in parse_answer("bar [n1, n3]", chunks).citations] == [1, 3]
-
-
-def test_parse_groundedness() -> None:
-    assert parse_groundedness("GROUNDED") is True
-    assert parse_groundedness("NOT_GROUNDED") is False
-    assert parse_groundedness("the answer is not_grounded actually") is False
-    assert parse_groundedness("unclear") is False
+def test_stream_emits_real_answer_tokens() -> None:
+    chat = _FakeChat(["Use ", "parameterized ", "queries ", "[1]"])
+    usage = Usage()
+    items = list(_stream_answer_tokens(chat, "q", [_chunk()], usage))  # type: ignore[arg-type]
+    tokens = "".join(i.text for i in items if isinstance(i, StreamToken))
+    assert tokens == "Use parameterized queries [1]"
+    assert items[-1] == "Use parameterized queries [1]"

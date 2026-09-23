@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from rag_app import __version__
-from rag_app.api import auth
+from rag_app.api import auth, conversations
 from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
 from rag_app.config import get_settings
@@ -25,6 +25,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(auth.router)
+    app.include_router(conversations.router)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:

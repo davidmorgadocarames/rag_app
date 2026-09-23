@@ -118,7 +118,7 @@ users 1───∞ query_logs
 |--------|------|-------|
 | id | uuid (PK) | |
 | user_id | uuid (FK→users) | |
-| title | text | derived from first question |
+| title_encrypted | bytea, null | optional user-set title, encrypted with the per-user key; when null the title is derived on the fly from the first message |
 | created_at | timestamptz | |
 
 ### messages
@@ -127,17 +127,12 @@ users 1───∞ query_logs
 | id | uuid (PK) | |
 | conversation_id | uuid (FK→conversations) | |
 | role | text | `user` / `assistant` |
-| content | text | encrypted at rest (user data) |
-| abstained | boolean | assistant abstention flag |
+| content_encrypted | bytea | Fernet-encrypted **JSON** (per-user key). User: `{text}`. Assistant: `{text, citations, abstained, grounded}` — citations are embedded so they survive a reload without a separate table |
+| prompt_tokens | int, null | assistant only; backs the "conversation total" UI |
+| completion_tokens | int, null | assistant only |
 | created_at | timestamptz | |
-
-### citations  (join: message ↔ chunk)
-| Column | Type | Notes |
-|--------|------|-------|
-| id | uuid (PK) | |
-| message_id | uuid (FK→messages) | |
-| chunk_id | uuid (FK→chunks) | |
-| score | float | rerank/retrieval score |
+> Citations (marker, chunk_uid, heading, version, effective_date) are stored **inside** the encrypted
+> assistant JSON rather than a separate `citations` table, so they are covered by crypto-shred for free.
 
 ### query_logs  (observability / eval)
 | Column | Type | Notes |

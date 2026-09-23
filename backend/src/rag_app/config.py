@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     llm_model: str = "qwen2.5:7b-instruct-q4_K_M"
     embed_model: str = "bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    # Keep the model resident in VRAM between requests (avoids a cold ~5 GB reload
+    # per idle window). Ollama accepts a duration ("30m") or -1 to keep forever.
+    ollama_keep_alive: str = "30m"
 
     # --- Ingestion / chunking ---
     chunk_size: int = 1200

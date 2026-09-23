@@ -15,13 +15,14 @@ from rag_app.api.schemas import (
     LoginRequest,
     MessageResponse,
     RegisterRequest,
+    ResendVerificationResponse,
     TokenResponse,
     UserOut,
 )
 from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.db.models import EmailVerificationToken, User, UserKey
-from rag_app.emailer import send_verification_email
+from rag_app.emailer import send_verification_email, verification_link
 from rag_app.erasure import erase_user
 from rag_app.risk import is_high_risk, signup_risk_score
 from rag_app.security import (
@@ -109,6 +110,25 @@ def verify_email(token: str, session: SessionDep) -> MessageResponse:
     record.used_at = now
     session.commit()
     return MessageResponse(detail="Email verified. You can now log in.")
+
+
+@router.post("/auth/resend-verification", response_model=ResendVerificationResponse)
+def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVerificationResponse:
+    """Issue a fresh verification token. In dev (no SMTP) return the link to the UI."""
+    if user.email_verified:
+        return ResendVerificationResponse(detail="Email already verified.")
+    raw_token = generate_verification_token()
+    session.add(
+        EmailVerificationToken(
+            user_id=user.id,
+            token_hash=hash_token(raw_token),
+            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=24),
+        )
+    )
+    session.commit()
+    send_verification_email(user.email, raw_token)
+    link = None if get_settings().smtp_host else verification_link(raw_token)
+    return ResendVerificationResponse(detail="Verification email sent.", verification_link=link)
 
 
 @router.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_login)])
