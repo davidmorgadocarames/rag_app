@@ -6,7 +6,7 @@ Nothing sensitive is hardcoded; see `.env.example` for the full list of keys.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,22 @@ class Settings(BaseSettings):
 
     # --- Database (PostgreSQL + pgvector) ---
     database_url: str = "postgresql+psycopg://rag:rag@localhost:5432/rag"
+
+    @field_validator("database_url")
+    @classmethod
+    def _use_psycopg3_driver(cls, v: str) -> str:
+        """Force the psycopg (v3) driver on a bare Postgres URL.
+
+        A cloud connection string like ``postgresql://user:pass@host/db`` carries no
+        ``+driver``, so SQLAlchemy would default to psycopg2 — which we don't ship (the
+        project is psycopg v3 only). Rewriting the scheme here fixes both the app engine
+        and the Alembic migration engine, so the container can run its own migrations.
+        Any explicit driver (e.g. ``+psycopg``, ``+asyncpg``) is left untouched.
+        """
+        for scheme in ("postgresql://", "postgres://"):
+            if v.startswith(scheme):
+                return "postgresql+psycopg://" + v[len(scheme) :]
+        return v
 
     # --- Ollama / models (only 3 models across the whole system) ---
     ollama_host: str = "http://localhost:11434"
