@@ -1,260 +1,268 @@
-# SecRAG — Agentic RAG assistant for OWASP security guidance
+# SecRAG — a production-minded RAG assistant for OWASP security guidance
 
-A security-focused **Agentic RAG** web app that answers OWASP questions (Top 10, Cheat Sheets)
-from a **versioned PDF corpus**, running entirely on **free local models**. It is built as a
-full-stack application — with authentication, rate limiting, evaluation gates, and CI/CD — to
-demonstrate a professional engineering workflow, not just a RAG script.
+[![CI](https://github.com/davidmorgadocarames/rag_app/actions/workflows/ci.yml/badge.svg)](https://github.com/davidmorgadocarames/rag_app/actions/workflows/ci.yml)
+[![CD](https://github.com/davidmorgadocarames/rag_app/actions/workflows/cd.yml/badge.svg)](https://github.com/davidmorgadocarames/rag_app/actions/workflows/cd.yml)
 
-> Status: **foundation (commit 1)** — documentation + project skeleton with green CI. No RAG logic yet.
-> The build sequence lives in [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).
+SecRAG answers questions about the OWASP Top 10 and Cheat Sheets from a **versioned corpus
+of official documents**. Every answer cites its sources, and when the corpus doesn't
+support an answer, SecRAG **abstains instead of guessing**. It is a complete full-stack
+product: authentication, rate limiting, GDPR-grade data erasure, an evaluation gate that
+blocks regressions, containers, CI/CD and a cloud deployment on Azure. It is built to show
+how a RAG system is engineered for production, not just prototyped.
 
 ## Why this project
 
-Most RAG demos stop at "retrieve then generate". This one is designed around the hard parts that
-matter in production:
+Most RAG demos stop at "retrieve, then generate". The hard problems start after that, and
+this project is built around them:
 
-- **Version-aware answers** — the corpus contains OWASP guidance that *changed over time* (2021 vs
-  2025). The system must not answer *faithfully but with stale information*.
-- **Honest abstention** — it says "I don't know" instead of hallucinating when the answer is not in
-  the corpus.
-- **Separate evaluation** of retrieval and generation, plus **correctness vs an independent ground
-  truth** — with a regression gate that blocks deploys.
-- **Security & abuse defense** — custom auth, rate limiting (token bucket), Sybil/Denial-of-Wallet
-  mitigation, indirect-prompt-injection defense, and GDPR-style per-user data erasure (crypto-shred).
+- **Answers that are faithful but outdated.** OWASP guidance changes between editions.
+  Injection, for example, is A1 in 2017, A03 in 2021 and A05 in 2025. An answer can quote
+  the corpus accurately and still be wrong for the edition you asked about. SecRAG makes
+  retrieval version-aware and evaluates **correctness against an independent ground
+  truth**, not only faithfulness to the retrieved text.
+- **Honest abstention.** A groundedness check runs after generation. If the corpus doesn't
+  back an answer, the system says so instead of hallucinating.
+- **Evaluation as a release gate.** Retrieval and generation are measured separately
+  against thresholds and a stored baseline. Every push runs the eval gate, and a
+  regression blocks the push before CD can deploy it.
+- **Security and abuse resistance.** The app has its own auth (argon2 + JWT + email
+  verification) and cost-aware token-bucket rate limiting against brute force and
+  Denial-of-Wallet. Signup risk scoring resists Sybil abuse, and the pipeline defends
+  against indirect prompt injection.
+- **Privacy by design.** Each user's data is encrypted with a per-user key. Erasing an
+  account hard-deletes the data and **crypto-shreds** the key. Tombstones let the
+  deletions be replayed after any restore from backup
+  ([ADR 0002](docs/adr/0002-data-erasure-gdpr.md)).
+- **Engineering discipline.** A written Definition of Done is enforced by a pre-push gate
+  covering lint, strict typing, tests, secret scanning, the frontend build and evals.
+  Architecture decisions are recorded as ADRs.
+
+### Current evaluation baseline
+
+| Retrieval recall | Faithfulness | Correctness vs ground truth | Correct abstention |
+|:---:|:---:|:---:|:---:|
+| 1.0 | 1.0 | 0.9 | 1.0 |
 
 ## Architecture
 
-```
-Next.js (React/TS)  ──HTTP──▶  FastAPI backend
-                                   │
-                                   ├─ Auth (email/password, argon2, JWT, email verification)
-                                   ├─ Rate limiting / quotas (token bucket)
-                                   ├─ Agentic RAG
-                                   │     router → retrieve → rerank → generate → groundedness check
-                                   │
-                                   ├─ PostgreSQL + pgvector  (users + documents + chunks/vectors)
-                                   └─ Ollama  (local models)
+```mermaid
+flowchart LR
+    U[Browser] -->|HTTPS| FE[Next.js frontend]
+    FE -->|REST + SSE| API[FastAPI backend]
 
-Models (only 3):
-  • qwen (Q4)      → all LLM tasks (router, generation, groundedness, judge)
-  • bge-m3         → embeddings (chunks + query)
-  • bge-reranker   → cross-encoder reranking
+    subgraph Backend
+      API --> AUTH[Auth · JWT · email verification]
+      API --> RL[Token-bucket rate limiting · signup risk scoring]
+      API --> RAG[RAG pipeline]
+      RAG --> R1[Hybrid retrieval<br/>pgvector + full-text]
+      R1 --> R2[Cross-encoder rerank<br/>bge-reranker]
+      R2 --> R3[Cited generation]
+      R3 --> R4[Groundedness check<br/>→ answer or abstain]
+    end
+
+    R1 --> DB[(PostgreSQL + pgvector<br/>users · encrypted chats · chunks)]
+    R1 --> EMB[bge-m3 embeddings<br/>Ollama]
+    R3 --> LLM{LLM_PROVIDER}
+    LLM -->|local dev| OLL[Ollama · qwen2.5 7B Q4]
+    LLM -->|cloud| AOAI[Azure OpenAI]
+```
+
+- **Ingestion:** official OWASP PDFs and Markdown are normalized to Markdown by a
+  layout-aware parser, then split into version-tagged chunks.
+- **Retrieval:** a hybrid of dense vectors (HNSW) and full-text search, reranked by a
+  cross-encoder. The top-N passages go to the LLM as numbered context.
+- **Generation:** the answer cites the numbered context, then passes a groundedness check.
+  Chat is streamed over Server-Sent Events, showing each pipeline stage and the answer
+  token by token, and conversations are stored encrypted.
+- **Pluggable LLM:** a `ChatClient` interface lets the same code run on free local models
+  in development (Ollama + qwen on a GPU) or on Azure OpenAI in the cloud.
+- **Agentic routing was benchmarked and rejected.** An LLM router added latency without
+  improving quality, so the pipeline stays deterministic
+  ([ADR 0001](docs/adr/0001-agentic-router.md)).
+
+### Deployment
+
+```mermaid
+flowchart LR
+    DEV[git push] --> GATE[Pre-push gate<br/>lint · mypy · tests · gitleaks · eval]
+    GATE --> GH[GitHub Actions]
+    GH --> GHCR[GHCR images]
+    GHCR -->|OIDC, no stored secrets| ACA[Azure Container Apps<br/>frontend · backend · embeddings]
+    ACA --> PG[(Azure PostgreSQL<br/>Flexible Server + pgvector)]
+    ACA --> AOAI[Azure OpenAI]
 ```
 
 ## Tech stack
 
-| Layer        | Choice                                             |
-|--------------|----------------------------------------------------|
-| Frontend     | Next.js, React, TypeScript, Tailwind CSS           |
-| Backend      | FastAPI, pydantic-settings                         |
-| Database     | PostgreSQL + pgvector                              |
-| LLM serving  | Ollama (`qwen` Q4) dev · Azure OpenAI cloud        |
-| Embeddings   | `bge-m3`                                            |
-| Reranking    | `bge-reranker` (cross-encoder)                     |
-| Ingestion    | PDF → Markdown (layout-aware parser)               |
-| Evaluation   | Ragas (retrieval + generation, regression gate)    |
-| CI/CD        | GitHub Actions → GHCR → Azure Container Apps (free-tier alt: Railway/Render/Fly) |
+| Layer | Technology |
+|---|---|
+| Frontend | Next.js 15, React 19, TypeScript, Tailwind CSS |
+| Backend | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, pydantic-settings |
+| Database | PostgreSQL 16 + pgvector (HNSW) + full-text search |
+| LLM | Ollama `qwen2.5:7b-instruct` (local) · Azure OpenAI `gpt-4.1-mini` (cloud) |
+| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder) |
+| Security | argon2, JWT, Fernet envelope encryption (crypto-shred), token bucket |
+| Evaluation | Separate retrieval and generation metrics, LLM judge, regression gate |
+| Quality | ruff, mypy `--strict`, pytest, ESLint, `tsc`, pre-commit, gitleaks |
+| Delivery | Docker, Docker Compose, GitHub Actions, GHCR, Azure Container Apps (OIDC) |
 
 ## Getting started
 
-Prerequisites: Python 3.11+, Node 20+, Docker.
+### Choose your environment
 
-> **WSL2 users:** run the project from the Linux filesystem (`~/...`), **not** `/mnt/c`, to avoid slow
-> file I/O once embeddings and the vector DB are in play.
+| Option | Use it when | Notes |
+|---|---|---|
+| **WSL2 / Linux (recommended)** | You want to develop and push | Clone into the Linux filesystem (`~/...`), **not** `/mnt/c`. File I/O is much faster and CUDA works with Ollama. The pre-push gate **requires** WSL2/Linux. |
+| **Windows (native)** | You only want to run the app | Everything runs, but pushes are blocked by the gate. Use the PowerShell commands where shown. |
+| **Docker only** | You want to try it without installing Python or Node | See [Run everything with Docker](#run-everything-with-docker). |
+
+**Prerequisites:** Git, Docker, **Python 3.12** (3.11 works; avoid 3.13+, since some ML
+wheels are not yet available for it), **Node 20+** and [Ollama](https://ollama.com).
+An NVIDIA GPU is strongly recommended for the local LLM.
+
+### 1. Clone
 
 ```bash
-# 1. Clone
 git clone https://github.com/davidmorgadocarames/rag_app.git
 cd rag_app
+```
 
-# 2. Environment
-cp .env.example .env          # then fill in real values (never commit .env)
+### 2. Start the infrastructure and pull the models
 
-# 3. Dev infrastructure (Postgres + pgvector, Ollama)
-docker compose up -d db ollama
+```bash
+docker compose up -d db                        # PostgreSQL 16 + pgvector on :5432
+ollama serve &                                 # or run Ollama as a desktop app / service
+ollama pull bge-m3                             # embeddings
+ollama pull qwen2.5:7b-instruct-q4_K_M         # chat model
+```
 
-# 4. Backend
+If you don't want to install Ollama on the host, `docker compose up -d db ollama` runs it
+in a container instead (GPU passthrough needs `nvidia-container-toolkit`). Pull the models
+with `docker compose exec ollama ollama pull <model>`. Run only one Ollama at a time,
+since both listen on port 11434.
+
+### 3. Backend: virtual environment and configuration
+
+**WSL2 / Linux / macOS**
+
+```bash
 cd backend
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python3.12 -m venv .venv                       # or: uv venv --python 3.12 .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt            # includes torch for the reranker
+export PYTHONPATH=src
+cp ../.env.example .env                        # the backend reads backend/.env
+```
+
+**Windows (PowerShell)**
+
+```powershell
+cd backend
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements-dev.txt
-pre-commit install
-pytest
-
-# 5. Frontend
-cd ../frontend
-npm install
-npm run dev
+$env:PYTHONPATH = "src"
+Copy-Item ..\.env.example .env
 ```
 
-## Corpus & ingestion
-
-The corpus is a mini, injection-focused set of official OWASP documents. Download it and
-build the chunks (run from the repo root, with the backend venv active):
+Fill in two required secrets in `backend/.env` (it is git-ignored and must never be committed):
 
 ```bash
-python scripts/fetch_corpus.py          # → data/raw_pdfs/, data/raw_md/, data/corpus_manifest.json
-python -m rag_app.ingestion --data-dir data   # → data/markdown/ (normalized) + data/chunks/chunks.jsonl
+python -c "import secrets; print('JWT_SECRET=' + secrets.token_urlsafe(64))"
+python -c "from cryptography.fernet import Fernet; print('DATA_MASTER_KEY=' + Fernet.generate_key().decode())"
 ```
 
-Injection is a deliberate version-drift showcase: it ranks **A1 (2017) → A03 (2021) → A05 (2025)**,
-so version-aware answers and the *faithful-but-stale* failure mode can be tested. All downloaded and
-generated data is git-ignored and regenerated by these two commands.
+SMTP is optional. Without it, email-verification links are written to the backend log.
 
-### Index & query (Phase 2)
+### 4. Build the corpus and the index
 
-Requires Postgres+pgvector and Ollama running, with the `bge-m3` model pulled:
+All commands below run from `backend/` with the virtual environment active.
 
 ```bash
-docker compose up -d db ollama         # infra
-ollama pull bge-m3                      # embedding model
-cd backend && alembic upgrade head      # schema (pgvector, HNSW, full-text)
-python -m rag_app.indexing              # embed chunks -> pgvector
-python -m rag_app.retrieval "How do I prevent SQL injection?"
+python ../scripts/fetch_corpus.py              # download the official OWASP documents → data/
+python -m rag_app.ingestion --data-dir ../data # PDF/MD → normalized Markdown → chunks.jsonl
+alembic upgrade head                           # schema: pgvector, HNSW, full-text, auth tables
+python -m rag_app.indexing                     # embed chunks with bge-m3 → pgvector
+```
+
+Try it from the command line:
+
+```bash
 python -m rag_app.retrieval "What rank is Injection?" --version 2025
+python -m rag_app.generation "How do I prevent SQL injection?"            # cited answer
+python -m rag_app.generation "How do I configure a Cisco ASA firewall?"   # abstains
 ```
 
-### Ask (Phase 3 — grounded, cited answers)
-
-Also requires the `qwen` chat model (`ollama pull qwen2.5:7b-instruct-q4_K_M`):
+### 5. Run the API
 
 ```bash
-python -m rag_app.generation "How do I prevent SQL injection?"        # cited answer
-python -m rag_app.generation "How do I configure a Cisco ASA firewall?"  # abstains (out of corpus)
+uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000   # Swagger UI at http://localhost:8000/docs
 ```
 
-The pipeline retrieves → reranks → generates an answer that cites the numbered context,
-then runs a groundedness check and **abstains** if the corpus doesn't support an answer.
+### 6. Run the frontend
 
-### Evaluation gate (Phase 4)
-
-Measures retrieval and generation **separately**, plus **correctness vs an independent
-ground truth** (catches faithful-but-stale answers) and **correct abstention** on the
-negative set. Thresholds live in `eval/thresholds.json`; `eval/baseline_metrics.json`
-guards against regressions.
+In a second terminal:
 
 ```bash
-python -m rag_app.eval.gate                     # run eval; non-zero exit if below thresholds/baseline
-python -m rag_app.eval.gate --update-baseline   # refresh the baseline after an intended change
+cd frontend
+npm install
+npm run dev                                    # http://localhost:3000
 ```
 
-The pre-push hook runs this automatically (it **skips** gracefully if Postgres/Ollama
-are not running). Current baseline on the mini corpus: recall 1.0, faithfulness 1.0,
-correctness 0.9, correct-abstention 1.0.
+The frontend calls `http://localhost:8000` by default. To use a different backend, set
+`NEXT_PUBLIC_API_URL` (it is read at build time).
 
-### Run the API (Phase 6)
-
-The FastAPI backend serves the RAG over HTTP (needs Postgres + Ollama running):
+### 7. Tests, quality checks and the eval gate
 
 ```bash
-cd backend && python -m rag_app.api      # → http://localhost:8000  (Swagger UI at /docs)
-curl localhost:8000/health
-curl -X POST localhost:8000/chat -H 'Content-Type: application/json' \
-  -d '{"question":"How do I prevent SQL injection?"}'
+# from backend/ (venv active)
+pytest
+ruff check . && mypy
+python -m rag_app.eval.gate                    # fails if metrics drop below thresholds/baseline
+python -m rag_app.eval.gate --update-baseline  # only after an intended quality change
+
+# from frontend/
+npm run lint && npm run typecheck && npm run build
 ```
 
-`POST /chat` returns the grounded answer, `abstained`/`grounded` flags, and citations (one-shot,
-non-persisting). The app UI uses **`POST /chat/stream`** instead: an authenticated Server-Sent Events
-endpoint that streams pipeline **stages** (classifying → retrieving → reranking → generating → checking)
-and answer **tokens**, reports **token usage**, persists the conversation (encrypted), and takes a
-**chit-chat fast-path** for greetings/small talk (instant, no retrieval). Conversation history lives
-behind `GET/PATCH/DELETE /conversations…`.
-
-### Auth & data erasure (Phase 6)
-
-Email/password auth (argon2 + JWT) and **GDPR erasure**. Needs `JWT_SECRET` and
-`DATA_MASTER_KEY` set (see `.env.example`).
-
-```
-POST   /auth/register             {email, password}  -> access token  (risk-scored; sends verify email)
-GET    /auth/verify?token=...                         -> marks the email verified
-POST   /auth/resend-verification  (Bearer token)      -> new token (dev: returns the link)
-POST   /auth/login                {email, password}  -> access token  (rate-limited)
-GET    /auth/me                   (Bearer token)      -> current user
-DELETE /account                   (Bearer token)      -> erases the account
-```
-
-`/chat` and `/auth/login` are rate-limited with a cost-aware **token bucket** (defends
-against brute force and Denial-of-Wallet); signups are **risk-scored** (disposable-email
-and per-IP velocity) to resist Sybil abuse.
-
-Erasure is **hard delete + crypto-shred + tombstone** with a "no key → data purged"
-invariant and a `replay_deletions` step for disaster recovery — see
-[ADR 0002](docs/adr/0002-data-erasure-gdpr.md).
-
-### Run the frontend (Phase 7)
-
-Next.js UI: landing, login/register, a **real streaming chat** (conversation history sidebar, live stage
-indicator, per-answer + running token counts), and an account page (email verification resend + data
-deletion). The visual identity is a **vault**: an ASCII-art vault door
-(`frontend/components/VaultDoor.tsx`) whose wheel is the "open session" control on `/login`, with a
-monospace, dark-only palette derived from it (see [UI/UX Brief](docs/UIUX_BRIEF.md)).
+To contribute, enable the hooks once from the repo root:
 
 ```bash
-cd frontend && npm install && npm run dev   # → http://localhost:3000
+pre-commit install                             # lint/format/secret scan on every commit
+git config core.hooksPath .githooks            # full phase gate on every push (WSL2/Linux)
+bash scripts/gate.sh                           # run the same gate manually
 ```
 
-Set `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8000`) to point at the backend.
-
-### Containers & deploy (Phase 9)
-
-Everything is containerized; the whole stack runs with Docker:
+### Run everything with Docker
 
 ```bash
 docker compose up -d db ollama
-docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
 docker compose exec ollama ollama pull bge-m3
-JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # + backend + frontend
+docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
+JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # backend :8000 + frontend :3000
 ```
 
-**CD**: every push to `main` builds and publishes images to GHCR
-(`ghcr.io/davidmorgadocarames/rag_app-backend` / `-frontend`) via `.github/workflows/cd.yml`.
-The model tier (Ollama) needs a GPU, so host deployment is a separate credentialed step —
-see [ADR 0003](docs/adr/0003-deployment.md).
+The backend container applies its migrations on startup. To build the index, run the
+ingestion and indexing steps from [step 4](#4-build-the-corpus-and-the-index) against the
+same database.
 
-### Cloud deployment (Phase 10)
+## API at a glance
 
-The web/data tier deploys to **Azure Container Apps** + **Azure Database for PostgreSQL
-Flexible Server**; the GPU-bound model tier is swapped for **Azure OpenAI** via
-`LLM_PROVIDER` (local dev stays on Ollama). Minimal provisioning:
+| Endpoint | Purpose |
+|---|---|
+| `POST /auth/register` · `POST /auth/login` · `GET /auth/me` | Account creation (risk-scored), login (rate-limited), current user |
+| `GET /auth/verify` · `POST /auth/resend-verification` | Email verification |
+| `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage |
+| `POST /chat` | One-shot, non-persisting answer with citations and `abstained`/`grounded` flags |
+| `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |
+| `DELETE /account` | GDPR erasure: hard delete, crypto-shred and tombstone |
 
-```bash
-az postgres flexible-server create -g $RG -n $PG --version 16 --public-access 0.0.0.0
-az postgres flexible-server parameter set -g $RG -s $PG --name azure.extensions --value vector
-az containerapp env create -g $RG -n $ENV -l $LOCATION
-az containerapp secret set -g $RG -n $BACKEND_APP --secrets \
-  database-url=$DATABASE_URL jwt-secret=$JWT_SECRET data-master-key=$DATA_MASTER_KEY \
-  azure-openai-key=$AZURE_OPENAI_API_KEY
-```
+## Architecture decision records
 
-**CD**: after the GHCR push, `.github/workflows/cd.yml` logs in to Azure with OIDC
-federated credentials and rolls both Container Apps to the new image tag; the pre-push
-eval gate still guards the deploy — see [ADR 0004](docs/adr/0004-cloud-deployment-azure.md).
-
-## Documentation
-
-| Doc | Purpose |
-|-----|---------|
-| [PRD](docs/PRD.md)                       | Product requirements: features & acceptance criteria |
-| [TRD](docs/TRD.md)                       | Technical decisions: stack, tools, eval, security |
-| [App Flow](docs/APP_FLOW.md)             | User journey, screens, navigation |
-| [UI/UX Brief](docs/UIUX_BRIEF.md)        | Look & feel, palette, typography, components |
-| [Backend Schema](docs/BACKEND_SCHEMA.md) | Auth flow, tables, columns, relationships |
-| [Implementation Plan](docs/IMPLEMENTATION_PLAN.md) | Step-by-step build sequence |
-
-## Roadmap (high level)
-
-- [x] **Phase 0** — Documentation + repo foundation (CI/CD-first)
-- [x] **Phase 1** — Ingestion: OWASP PDFs/MD → Markdown → chunks
-- [x] **Phase 2** — Embeddings (bge-m3) + pgvector + hybrid retrieval + rerank (bge-reranker)
-- [x] **Phase 3** — Generation (qwen) with citations + groundedness check + abstention
-- [x] **Phase 4** — Evaluation: separate retrieval/generation + correctness-vs-truth + regression gate
-- [x] **Phase 5** — Agentic router benchmarked → **not adopted** (no quality gain, +latency; see [ADR 0001](docs/adr/0001-agentic-router.md)) ← *you are here*
-- [x] **Phase 6** — Auth (argon2 + JWT) + GDPR erasure + email verification + rate limiting (token bucket) + signup risk scoring ← *you are here*
-- [x] **Phase 7** — Next.js frontend: landing, login/register, chat (with citations/abstention), account (data deletion) ← *you are here*
-- [x] **Phase 8** — Compliance: per-user crypto-shred (delivered in Phase 6)
-- [x] **Phase 9** — Docker containers (backend + frontend + compose) + CD to GHCR ← *you are here*
-- [ ] **Phase 10** — Cloud deployment: Azure Container Apps (backend+frontend) + Azure Database for PostgreSQL Flexible Server (pgvector) + pluggable LLM provider (Ollama dev / Azure OpenAI cloud)
+- [ADR 0001 — Agentic router: benchmarked, not adopted](docs/adr/0001-agentic-router.md)
+- [ADR 0002 — Data erasure (GDPR): crypto-shred + tombstones](docs/adr/0002-data-erasure-gdpr.md)
+- [ADR 0003 — Containerization and delivery](docs/adr/0003-deployment.md)
+- [ADR 0004 — Cloud deployment on Azure](docs/adr/0004-cloud-deployment-azure.md)
 
 ## License
 
