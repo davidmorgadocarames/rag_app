@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/davidmorgadocarames/rag_app/actions/workflows/ci.yml/badge.svg)](https://github.com/davidmorgadocarames/rag_app/actions/workflows/ci.yml)
 [![CD](https://github.com/davidmorgadocarames/rag_app/actions/workflows/cd.yml/badge.svg)](https://github.com/davidmorgadocarames/rag_app/actions/workflows/cd.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 SecRAG answers questions about the OWASP Top 10 and Cheat Sheets from a **versioned corpus
 of official documents**. Every answer cites its sources, and when the corpus doesn't
@@ -266,4 +267,4 @@ same database.
 
 ## License
 
-TBD.
+[MIT](LICENSE) © 2026 David Morgado Carames
