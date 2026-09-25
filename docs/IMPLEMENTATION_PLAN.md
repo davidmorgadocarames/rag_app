@@ -72,6 +72,20 @@ Phase 4 on, must pass the evaluation gate before deploy. Phases map to the roadm
 - GitHub Actions: test + eval gate → build → push (GHCR) → deploy to free tier.
 - **Done when**: a merge to `main` deploys automatically after passing the gate.
 
+## Phase 10 — Cloud deployment (Azure)
+
+- Add the `ChatClient` interface + `AzureOpenAIChat`; `LLM_PROVIDER` setting, default `ollama`.
+- Provision Azure Database for PostgreSQL Flexible Server; enable `pgvector`; run
+  `alembic upgrade head` against it.
+- Provision two Azure Container Apps (backend, frontend) pulling from the existing GHCR
+  images; wire env vars/secrets (`DATABASE_URL`, `JWT_SECRET`, `DATA_MASTER_KEY`,
+  `LLM_PROVIDER=azure_openai`, `AZURE_OPENAI_*`, `NEXT_PUBLIC_API_URL`).
+- Extend `cd.yml` with the Azure deploy step (OIDC, no stored secrets).
+- **Done when**: a merge to `main` deploys automatically to a public Azure URL, the eval
+  gate still blocks a bad deploy exactly as it does for Phase 9, and a real question
+  answered end-to-end through the public URL returns a grounded, cited answer (or a
+  correct abstention).
+
 ## Cross-cutting (every phase)
 
 - No secrets committed; config via env; deps pinned.

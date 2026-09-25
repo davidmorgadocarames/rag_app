@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from rag_app.config import get_settings
 from rag_app.generation import Answer, answer_from_chunks
-from rag_app.llm import Message, OllamaChat
+from rag_app.llm import ChatClient, Message, make_chat_client
 from rag_app.retrieval import RetrievedChunk
 
 if TYPE_CHECKING:
@@ -50,7 +50,7 @@ def is_thin(chunks: list[RetrievedChunk], threshold: float) -> bool:
     return _best_score(chunks) < threshold
 
 
-def reformulate(chat: OllamaChat, query: str) -> str:
+def reformulate(chat: ChatClient, query: str) -> str:
     messages: list[Message] = [
         {"role": "system", "content": _REWRITE_SYSTEM},
         {"role": "user", "content": query},
@@ -62,7 +62,7 @@ def answer_agentic(
     session: Session,
     query: str,
     *,
-    chat: OllamaChat | None = None,
+    chat: ChatClient | None = None,
     reranker: CrossEncoderReranker | None = None,
     top_n: int | None = None,
     version: str | None = None,
@@ -72,7 +72,7 @@ def answer_agentic(
 
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
-    chat = chat or OllamaChat()
+    chat = chat or make_chat_client()
     reranker = reranker or CrossEncoderReranker()
 
     chunks = retrieve(session, query, reranker=reranker, top_n=top_n, version=version)

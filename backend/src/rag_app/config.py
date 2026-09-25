@@ -6,7 +6,7 @@ Nothing sensitive is hardcoded; see `.env.example` for the full list of keys.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,22 @@ class Settings(BaseSettings):
     # --- Database (PostgreSQL + pgvector) ---
     database_url: str = "postgresql+psycopg://rag:rag@localhost:5432/rag"
 
+    @field_validator("database_url")
+    @classmethod
+    def _use_psycopg3_driver(cls, v: str) -> str:
+        """Force the psycopg (v3) driver on a bare Postgres URL.
+
+        A cloud connection string like ``postgresql://user:pass@host/db`` carries no
+        ``+driver``, so SQLAlchemy would default to psycopg2 — which we don't ship (the
+        project is psycopg v3 only). Rewriting the scheme here fixes both the app engine
+        and the Alembic migration engine, so the container can run its own migrations.
+        Any explicit driver (e.g. ``+psycopg``, ``+asyncpg``) is left untouched.
+        """
+        for scheme in ("postgresql://", "postgres://"):
+            if v.startswith(scheme):
+                return "postgresql+psycopg://" + v[len(scheme) :]
+        return v
+
     # --- Ollama / models (only 3 models across the whole system) ---
     ollama_host: str = "http://localhost:11434"
     llm_model: str = "qwen2.5:7b-instruct-q4_K_M"
@@ -30,6 +46,15 @@ class Settings(BaseSettings):
     # Keep the model resident in VRAM between requests (avoids a cold ~5 GB reload
     # per idle window). Ollama accepts a duration ("30m") or -1 to keep forever.
     ollama_keep_alive: str = "30m"
+
+    # --- LLM provider selection ---
+    # "ollama" (local/free, the dev default) or "azure_openai" (hosted, cloud path).
+    # The Azure_* keys are only read when llm_provider == "azure_openai"; see ADR 0004.
+    llm_provider: str = "ollama"
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
+    azure_openai_deployment: str = ""
+    azure_openai_api_version: str = "2024-10-21"
 
     # --- Ingestion / chunking ---
     chunk_size: int = 1200

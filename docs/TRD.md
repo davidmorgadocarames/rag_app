@@ -25,7 +25,7 @@ Next.js (React/TS)  ──REST/JSON──▶  FastAPI backend
 | Config         | pydantic-settings | Typed config from env; no hardcoding |
 | Database       | PostgreSQL 16 + pgvector | One store for relational data **and** vectors |
 | Migrations     | Alembic | Versioned schema |
-| LLM serving    | Ollama | Free, local, simple HTTP API |
+| LLM serving    | Ollama (dev, default) / Azure OpenAI (cloud, opt-in via `LLM_PROVIDER`) | Free & local for dev; hosted LLM for the cloud path (no GPU on Container Apps) |
 | Auth hashing   | argon2 (argon2-cffi) | Modern password hashing |
 | Ingestion      | PDF → Markdown (`pymupdf4llm` / Docling) | Layout-aware, preserves tables |
 | Retrieval      | pgvector (ANN) + BM25 (hybrid) | Vectors miss exact terms/IDs |
@@ -33,7 +33,7 @@ Next.js (React/TS)  ──REST/JSON──▶  FastAPI backend
 | Evaluation     | Ragas + pytest | Retrieval + generation metrics, gated in CI |
 | Observability  | Structured tracing (Langfuse/self-hosted or JSON logs) | Find the failing/slow stage |
 | Containers     | Docker + docker-compose | Reproducible dev + deploy |
-| CI/CD          | GitHub Actions → free tier (Railway/Render/Fly) | Test → gate → build → deploy |
+| CI/CD          | GitHub Actions → GHCR → Azure Container Apps (free-tier alt: Railway/Render/Fly) | Test → gate → build → push → deploy |
 
 ## 3. Models (exactly three)
 
@@ -117,3 +117,17 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
 - Docker images for backend and frontend; `docker-compose` for local (db + ollama + apps).
 - GitHub Actions: on merge to `main`, run tests + eval gate → build images → push to registry (GHCR) →
   deploy to the free tier. GPU inference runs where a GPU is available (self-hosted runner or local).
+
+## 11. Cloud deployment (Azure)
+
+- **Web/data tier**: two **Azure Container Apps** (backend, frontend) pull the existing GHCR images;
+  **Azure Database for PostgreSQL Flexible Server** with the `pgvector` extension enabled holds the
+  data (run `alembic upgrade head` against it).
+- **Model tier**: the Container Apps consumption plan has no practical GPU, so `qwen`/Ollama is **not**
+  deployed there — **Azure OpenAI** replaces it for the cloud path only, selected via `LLM_PROVIDER`
+  (Ollama stays the local default). See [ADR 0004](adr/0004-cloud-deployment-azure.md).
+- **Secrets**: supplied as Container Apps built-in secrets (`DATABASE_URL`, `JWT_SECRET`,
+  `DATA_MASTER_KEY`, `AZURE_OPENAI_*`); escalate to Key Vault only if a real need shows up.
+- **CD**: after the GHCR push, `cd.yml` authenticates to Azure with **OIDC federated credentials**
+  (no stored secrets) and rolls both apps to the new image tag; the pre-push eval gate still guards
+  the deploy.
