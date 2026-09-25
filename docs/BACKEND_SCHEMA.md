@@ -147,8 +147,10 @@ users 1───∞ query_logs
 | groundedness | float | |
 | latency_ms | int | |
 | token_cost | int | for cost-aware limits |
+| llm_provider | text, null | *optional (Phase 10)*: which model tier served this answer — e.g. `ollama` / `azure_openai`; denormalised so cost/quality can be compared per provider |
 | created_at | timestamptz | |
 > Contains user content → **must be included in crypto-shred / erasure**.
+> The `llm_provider` value is non-PII, so it needs no special erasure handling.
 
 ## 4. Erasure coverage (GDPR)
 

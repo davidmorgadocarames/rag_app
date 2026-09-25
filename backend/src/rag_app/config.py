@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # per idle window). Ollama accepts a duration ("30m") or -1 to keep forever.
     ollama_keep_alive: str = "30m"
 
+    # --- LLM provider selection ---
+    # "ollama" (local/free, the dev default) or "azure_openai" (hosted, cloud path).
+    # The Azure_* keys are only read when llm_provider == "azure_openai"; see ADR 0004.
+    llm_provider: str = "ollama"
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
+    azure_openai_deployment: str = ""
+    azure_openai_api_version: str = "2024-10-21"
+
     # --- Ingestion / chunking ---
     chunk_size: int = 1200
     chunk_overlap: int = 150

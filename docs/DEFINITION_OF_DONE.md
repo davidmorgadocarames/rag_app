@@ -31,6 +31,13 @@ norms are a human/agent checklist.
   their thresholds; results do not regress below `baseline_metrics.json`; the LLM-judge is
   validated against human labels; correct-abstention rate on the negative set meets its threshold.
   Enforced by `scripts/gate.sh` once `rag_app.eval` exists.
+- **Phase 10 (cloud)** — the deployed Azure URL responds to a health check; the eval gate
+  ran and passed **before** the Azure deploy step (not just before the GHCR push) — the
+  pre-push gate blocks the very push that triggers CD, and the deploy job is
+  `needs: [images]`; Azure credentials/secrets are supplied via OIDC federated credentials
+  and Container Apps secrets, never committed (this extends norm #2, it is not a new
+  mechanism). Note: norm #1 (**WSL2**) governs where the code is *written and tested* — it
+  does **not** conflict with a container that *runs in production* on Azure.
 
 ## How to run
 

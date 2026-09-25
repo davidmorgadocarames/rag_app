@@ -48,12 +48,12 @@ Models (only 3):
 | Frontend     | Next.js, React, TypeScript, Tailwind CSS           |
 | Backend      | FastAPI, pydantic-settings                         |
 | Database     | PostgreSQL + pgvector                              |
-| LLM serving  | Ollama (`qwen` Q4)                                 |
+| LLM serving  | Ollama (`qwen` Q4) dev · Azure OpenAI cloud        |
 | Embeddings   | `bge-m3`                                            |
 | Reranking    | `bge-reranker` (cross-encoder)                     |
 | Ingestion    | PDF → Markdown (layout-aware parser)               |
 | Evaluation   | Ragas (retrieval + generation, regression gate)    |
-| CI/CD        | GitHub Actions → Docker → free-tier deploy         |
+| CI/CD        | GitHub Actions → GHCR → Azure Container Apps (free-tier alt: Railway/Render/Fly) |
 
 ## Getting started
 
@@ -212,6 +212,25 @@ JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # + backend + 
 The model tier (Ollama) needs a GPU, so host deployment is a separate credentialed step —
 see [ADR 0003](docs/adr/0003-deployment.md).
 
+### Cloud deployment (Phase 10)
+
+The web/data tier deploys to **Azure Container Apps** + **Azure Database for PostgreSQL
+Flexible Server**; the GPU-bound model tier is swapped for **Azure OpenAI** via
+`LLM_PROVIDER` (local dev stays on Ollama). Minimal provisioning:
+
+```bash
+az postgres flexible-server create -g $RG -n $PG --version 16 --public-access 0.0.0.0
+az postgres flexible-server parameter set -g $RG -s $PG --name azure.extensions --value vector
+az containerapp env create -g $RG -n $ENV -l $LOCATION
+az containerapp secret set -g $RG -n $BACKEND_APP --secrets \
+  database-url=$DATABASE_URL jwt-secret=$JWT_SECRET data-master-key=$DATA_MASTER_KEY \
+  azure-openai-key=$AZURE_OPENAI_API_KEY
+```
+
+**CD**: after the GHCR push, `.github/workflows/cd.yml` logs in to Azure with OIDC
+federated credentials and rolls both Container Apps to the new image tag; the pre-push
+eval gate still guards the deploy — see [ADR 0004](docs/adr/0004-cloud-deployment-azure.md).
+
 ## Documentation
 
 | Doc | Purpose |
@@ -235,6 +254,7 @@ see [ADR 0003](docs/adr/0003-deployment.md).
 - [x] **Phase 7** — Next.js frontend: landing, login/register, chat (with citations/abstention), account (data deletion) ← *you are here*
 - [x] **Phase 8** — Compliance: per-user crypto-shred (delivered in Phase 6)
 - [x] **Phase 9** — Docker containers (backend + frontend + compose) + CD to GHCR ← *you are here*
+- [ ] **Phase 10** — Cloud deployment: Azure Container Apps (backend+frontend) + Azure Database for PostgreSQL Flexible Server (pgvector) + pluggable LLM provider (Ollama dev / Azure OpenAI cloud)
 
 ## License
 

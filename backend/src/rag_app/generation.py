@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from rag_app.config import get_settings
-from rag_app.llm import Message, OllamaChat, Usage
+from rag_app.llm import ChatClient, Message, Usage, make_chat_client
 from rag_app.retrieval import RetrievedChunk, hybrid_search
 
 INSUFFICIENT = "INSUFFICIENT_CONTEXT"
@@ -112,7 +112,7 @@ def parse_groundedness(raw: str) -> bool:
     return "GROUNDED" in upper
 
 
-def check_groundedness(chat: OllamaChat, answer_text: str, chunks: list[RetrievedChunk]) -> bool:
+def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[RetrievedChunk]) -> bool:
     context = build_context(chunks)
     user = (
         f"CONTEXT:\n{context}\n\nANSWER:\n{answer_text}\n\n"
@@ -125,7 +125,7 @@ def check_groundedness(chat: OllamaChat, answer_text: str, chunks: list[Retrieve
     return parse_groundedness(chat.chat(messages, temperature=0.0))
 
 
-def answer_from_chunks(chat: OllamaChat, query: str, chunks: list[RetrievedChunk]) -> Answer:
+def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk]) -> Answer:
     """Generate a grounded, cited answer from already-retrieved chunks (or abstain)."""
     if not chunks:
         return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
@@ -146,7 +146,7 @@ def answer_question(
     session: Session,
     query: str,
     *,
-    chat: OllamaChat | None = None,
+    chat: ChatClient | None = None,
     top_n: int | None = None,
     use_rerank: bool = True,
     version: str | None = None,
@@ -154,7 +154,7 @@ def answer_question(
     """Full RAG: retrieve -> generate -> groundedness check -> cited answer or abstention."""
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
-    chat = chat or OllamaChat()
+    chat = chat or make_chat_client()
 
     if use_rerank:
         from rag_app.reranking import CrossEncoderReranker, retrieve
@@ -249,7 +249,7 @@ StreamEvent = StreamStage | StreamToken | StreamResult
 
 
 def _stream_answer_tokens(
-    chat: OllamaChat, query: str, chunks: list[RetrievedChunk], usage: Usage
+    chat: ChatClient, query: str, chunks: list[RetrievedChunk], usage: Usage
 ) -> Iterator[StreamToken | str]:
     """Stream generation deltas, hiding the abstention sentinel; yield the full text last.
 
@@ -283,7 +283,7 @@ def answer_question_stream(
     session: Session,
     query: str,
     *,
-    chat: OllamaChat | None = None,
+    chat: ChatClient | None = None,
     top_n: int | None = None,
     use_rerank: bool = True,
     version: str | None = None,
@@ -295,7 +295,7 @@ def answer_question_stream(
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
-    chat = chat or OllamaChat()
+    chat = chat or make_chat_client()
     usage = Usage()
 
     yield StreamStage(stage="classifying")
@@ -346,7 +346,7 @@ def answer_question_stream(
 
 
 def _check_groundedness_counted(
-    chat: OllamaChat, answer_text: str, chunks: list[RetrievedChunk], usage: Usage
+    chat: ChatClient, answer_text: str, chunks: list[RetrievedChunk], usage: Usage
 ) -> bool:
     """Groundedness check that also accounts the tokens it spends (via streaming)."""
     context = build_context(chunks)

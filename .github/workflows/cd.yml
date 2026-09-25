@@ -1,8 +1,10 @@
 name: CD
 
-# Build the app images and publish them to the GitHub Container Registry on every
-# push to main. Deploying to a host (which needs a GPU/Ollama endpoint — see
-# docs/adr/0003-deployment.md) is a separate, credentialed step.
+# On every push to main: build the app images, publish them to the GitHub Container
+# Registry, then deploy to Azure Container Apps. The cloud path uses a hosted LLM
+# (Azure OpenAI via LLM_PROVIDER) instead of GPU/Ollama; see
+# docs/adr/0004-cloud-deployment-azure.md. The eval gate that guards a bad deploy runs
+# in the pre-push hook (scripts/gate.sh), which blocks the very push that triggers this.
 on:
   push:
     branches: ["main"]
@@ -36,9 +38,41 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
+          # NEXT_PUBLIC_* is baked at build time, so the public backend URL must be set
+          # here (repo variable) for the cloud image; falls back to localhost for a
+          # local/dev build.
           build-args: |
-            NEXT_PUBLIC_API_URL=http://localhost:8000
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:8000' }}
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-frontend:latest
             ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: [images]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC: mint a short-lived token, no long-lived secrets stored
+      contents: read
+    steps:
+      - name: Azure login (OIDC federated credentials)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy new images to the Container Apps
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az containerapp update \
+              --name "${{ vars.AZURE_BACKEND_APP }}" \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --image "ghcr.io/${{ github.repository }}-backend:${{ github.sha }}"
+            az containerapp update \
+              --name "${{ vars.AZURE_FRONTEND_APP }}" \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --image "ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}"
