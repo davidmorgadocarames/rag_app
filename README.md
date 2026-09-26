@@ -254,7 +254,7 @@ same database.
 | `POST /auth/register` · `POST /auth/login` · `GET /auth/me` | Account creation (risk-scored), login (rate-limited), current user |
 | `GET /auth/verify` · `POST /auth/resend-verification` | Email verification |
 | `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage |
-| `POST /chat` | One-shot, non-persisting answer with citations and `abstained`/`grounded` flags |
+| `POST /chat` | Authenticated one-shot, non-persisting answer with citations and `abstained`/`grounded` flags |
 | `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |
 | `DELETE /account` | GDPR erasure: hard delete, crypto-shred and tombstone |
 

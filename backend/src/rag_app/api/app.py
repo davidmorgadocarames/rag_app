@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from rag_app import __version__
 from rag_app.api import auth, conversations
+from rag_app.api.auth import get_current_user
 from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
 from rag_app.config import get_settings
@@ -31,7 +32,13 @@ def create_app() -> FastAPI:
     def health() -> HealthResponse:
         return HealthResponse(status="ok")
 
-    @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(rate_limit_chat)])
+    # Authenticated like /chat/stream: every answer costs an LLM call, so anonymous callers
+    # must not reach it. Auth runs before the rate limit so they don't consume a bucket.
+    @app.post(
+        "/chat",
+        response_model=ChatResponse,
+        dependencies=[Depends(get_current_user), Depends(rate_limit_chat)],
+    )
     def chat(
         request: ChatRequest,
         session: SessionDep,
