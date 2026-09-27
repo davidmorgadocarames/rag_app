@@ -5,13 +5,77 @@ name: CD
 # (Azure OpenAI via LLM_PROVIDER) instead of GPU/Ollama; see
 # docs/adr/0004-cloud-deployment-azure.md. The eval gate that guards a bad deploy runs
 # in the pre-push hook (scripts/gate.sh), which blocks the very push that triggers this.
+#
+# Manual runs (workflow_dispatch) default to dry_run=true and only echo what they would
+# do. A real manual deploy needs dry_run=false AND the main branch. The workflow_run job
+# is echo-only for now: it exercises the "after CI succeeded" path before Phase 11a moves
+# deploys onto it. No job uses `environment:`, so the OIDC subject stays
+# repo:<owner>/<repo>:ref:refs/heads/main (see the runbook, gotcha 8).
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only echo what would be built and deployed"
+        type: boolean
+        default: true
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["main"]
+
+# Real deploys are serialised in one group and never cancelled mid-flight; dry runs and
+# echo runs get their own group so they can never replace a pending real deploy.
+concurrency:
+  group: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)) && 'cd-main' || format('cd-noop-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
+  dry-run:
+    name: Dry run (echo only)
+    if: github.event_name == 'workflow_dispatch' && !(github.ref == 'refs/heads/main' && inputs.dry_run == false)
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Echo what a real deploy would do
+        run: |
+          echo "ref=${{ github.ref }} sha=${{ github.sha }} dry_run=${{ inputs.dry_run }}"
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "Not main: a real deploy is never run from this ref."
+          fi
+          echo "Would build and push:"
+          echo "  ghcr.io/${{ github.repository }}-backend:${{ github.sha }}"
+          echo "  ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}"
+          echo "Would deploy to: ${{ vars.AZURE_BACKEND_APP }}, ${{ vars.AZURE_FRONTEND_APP }} (rg ${{ vars.AZURE_RESOURCE_GROUP }})"
+
+  after-ci:
+    name: After CI on main (echo only)
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: read
+    steps:
+      - name: Echo the CI run and the last deployed SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "CI succeeded for ${{ github.event.workflow_run.head_branch }}@${{ github.event.workflow_run.head_sha }}"
+          # Last deployed SHA = the newest deployment whose latest status is success.
+          last=""
+          for row in $(gh api "repos/$REPO/deployments?environment=azure&per_page=30" --jq '.[] | "\(.id):\(.sha)"'); do
+            state=$(gh api "repos/$REPO/deployments/${row%%:*}/statuses?per_page=1" --jq '.[0].state // ""')
+            if [ "$state" = "success" ]; then last="${row#*:}"; break; fi
+          done
+          echo "Last deployed SHA: ${last:-none recorded yet}"
+
   images:
     name: Build & push images (GHCR)
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,11 +115,28 @@ jobs:
   deploy:
     name: Deploy to Azure Container Apps
     needs: [images]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # OIDC: mint a short-lived token, no long-lived secrets stored
       contents: read
+      deployments: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
     steps:
+      # Recorded through the REST API rather than a job `environment:` key, which would
+      # change the OIDC subject and break the federated credential.
+      - name: Record deployment (GitHub Deployments API)
+        id: record
+        run: |
+          id=$(jq -n --arg ref "$GITHUB_SHA" \
+                 '{ref: $ref, environment: "azure", auto_merge: false, required_contexts: [],
+                   description: "CD deploy to Azure Container Apps"}' \
+               | gh api -X POST "repos/$REPO/deployments" --input - --jq .id)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          gh api -X POST "repos/$REPO/deployments/$id/statuses" -f state=in_progress > /dev/null
+
       - name: Azure login (OIDC federated credentials)
         uses: azure/login@v2
         with:
@@ -76,3 +157,9 @@ jobs:
               --name "${{ vars.AZURE_FRONTEND_APP }}" \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --image "ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}"
+
+      - name: Record deployment status
+        if: always() && steps.record.outputs.id != ''
+        run: |
+          gh api -X POST "repos/$REPO/deployments/${{ steps.record.outputs.id }}/statuses" \
+            -f state="${{ job.status == 'success' && 'success' || 'failure' }}" > /dev/null
