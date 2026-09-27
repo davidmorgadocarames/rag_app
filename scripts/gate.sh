@@ -135,6 +135,13 @@ step_shellcheck() {
   local files=()
   mapfile -t files < <(git ls-files -- '*.sh' '.githooks/*')
   echo "  ${#files[@]} files: ${files[*]}"
+  # Executable bit as committed: a hook without it is silently ignored by git.
+  local not_exec
+  not_exec="$(git ls-files -s -- '*.sh' '.githooks/*' | awk '$1 != "100755" {printf " %s", $4}')"
+  if [ -n "$not_exec" ]; then
+    echo "  FAIL: not executable in git (git update-index --chmod=+x):$not_exec"
+    return 1
+  fi
   shellcheck -x "${files[@]}"
 }
 
