@@ -128,9 +128,18 @@ Azure CLI. One script installs all of them as user binaries (no `sudo`) under
 OK / KO / PENDING (PENDING = a login or a repository/Azure setting that only the owner can do):
 
 ```bash
-bash scripts/prereqs/install.sh    # pinned versions, SHA-256 verified, idempotent
+bash scripts/prereqs/install.sh    # pinned versions, verified, atomic, idempotent
 bash scripts/prereqs/check.sh      # exit 0 only when every item is OK
 ```
+
+Every download is pinned and checked against a SHA-256 (npm packages through npm's own
+registry integrity check). The Linux Azure CLI and all of its Python dependencies install
+from a committed hashed lock file (`scripts/prereqs/azure-cli.lock.txt`, installed with
+`--require-hashes`) into a venv on a pinned uv-managed Python; bumping it is a deliberate
+change (`install.sh --lock-az`, steps in the script header). The Linux CLI keeps its own
+config and token cache in `~/.azure-linux` — never in a Windows profile reached through
+`~/.azure` — and `install.sh --link-az` makes it the default `az` in WSL; then log in once
+with `az login --use-device-code`.
 
 Downloads use IPv4 only: from WSL2, IPv6 connections to the npm registry can hang. If
 `npm install`/`npm ci` stalls, run it with `NODE_OPTIONS=--dns-result-order=ipv4first`.

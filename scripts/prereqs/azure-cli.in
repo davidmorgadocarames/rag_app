@@ -1,0 +1,2 @@
+# Top-level input for azure-cli.lock.txt (see install.sh: bumping the Azure CLI).
+azure-cli==2.90.0

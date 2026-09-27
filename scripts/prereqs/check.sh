@@ -7,6 +7,11 @@
 #
 # Read-only: it never logs in, never changes GitHub or Azure settings. GitHub queries use
 # the Linux `gh` when it is logged in, otherwise the Windows `gh.exe` through interop.
+# The Linux Azure CLI is only run through the ~/.local/bin/az-linux wrapper (own config
+# dir, never the Windows profile under /mnt/c).
+#
+# Optional input: BACKUP_STORAGE_SCOPE=<resource id of the backup Storage Account>
+# (exists from row 40) scopes the Storage Blob Data Reader check; unset → PENDING.
 set -uo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -23,7 +28,7 @@ AZ_LINUX_DIR_GLOB="$HOME/.local/opt/azure-cli-*"
 n_ko=0
 n_pending=0
 report() { # report <OK|KO|PENDING> <item> <detail>
-  printf '%-8s %-44s %s\n' "$1" "$2" "$3"
+  printf '%-8s %-46s %s\n' "$1" "$2" "$3"
   case "$1" in
     KO) n_ko=$((n_ko + 1)) ;;
     PENDING) n_pending=$((n_pending + 1)) ;;
@@ -145,7 +150,7 @@ if [ -n "$GH" ] && [ -n "$REPO_SLUG" ]; then
   vis="$("$GH" api "users/$owner/packages/container/$JOBS_PACKAGE" --jq .visibility 2>/dev/null)" || vis=""
   case "$vis" in
     public) report OK "GHCR visibility of $JOBS_PACKAGE" "public" ;;
-    "") report PENDING "GHCR visibility of $JOBS_PACKAGE" "decision (user): public like the other images, or registry credentials for the Jobs; package not pushed yet" ;;
+    "") report PENDING "GHCR visibility of $JOBS_PACKAGE" "orchestrator (row 40): package not pushed yet; set public when first pushed (D-2026-09-27-1)" ;;
     *) report PENDING "GHCR visibility of $JOBS_PACKAGE" "$vis — the Jobs need registry credentials, or make it public (user)" ;;
   esac
 else
@@ -156,7 +161,13 @@ fi
 
 # The deploy job declares `deployments: write` (T10.5.7); the repository default
 # token permissions only matter for jobs without an explicit `permissions:` block.
-if awk '/^  deploy:/{d=1} d && /deployments: write/{f=1} END{exit !f}' .github/workflows/cd.yml 2>/dev/null; then
+# Only lines inside the `deploy:` job block count (it ends at the next job key or a
+# top-level key).
+if awk '
+  /^[^[:space:]#]/ { d = 0 }
+  /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ { d = ($1 == "deploy:") }
+  d && /^[[:space:]]+deployments:[[:space:]]*write([[:space:]]|#|$)/ { f = 1 }
+  END { exit !f }' .github/workflows/cd.yml 2>/dev/null; then
   detail="declared on the deploy job in cd.yml"
   if [ -n "$GH" ] && [ -n "$REPO_SLUG" ]; then
     def="$("$GH" api "repos/$REPO_SLUG/actions/permissions/workflow" --jq .default_workflow_permissions 2>/dev/null)"
@@ -190,34 +201,82 @@ else
   report KO "az (Windows interop), trap on SIGINT" "no Windows az on PATH"
 fi
 
-AZL=""
+# The Linux CLI is only ever run through the wrapper that install.sh generates: it
+# pins AZURE_CONFIG_DIR to ~/.azure-linux, so nothing here reads or writes the Windows
+# profile that ~/.azure points to. Never call the venv's az directly.
+AZL_DIR=""
 for d in $AZ_LINUX_DIR_GLOB; do
-  [ -x "$d/bin/az" ] && AZL="$d/bin/az"
+  [ -x "$d/bin/az" ] && [ -f "$d/.secrag-install-complete" ] && AZL_DIR="$d"
 done
-if [ -n "$AZL" ]; then
-  report OK "Linux Azure CLI (user venv)" "$("$AZL" version --query '"azure-cli"' -o tsv 2>/dev/null) at $AZL"
-  if [ "$(readlink -f "$(command -v az)")" = "$(readlink -f "$AZL")" ]; then
-    report OK "Linux Azure CLI is the default az" "$(command -v az)"
+AZW="$HOME/.local/bin/az-linux"
+is_wrapper() { [ -f "$1" ] && grep -q SECRAG_AZ_WRAPPER "$1" 2>/dev/null; }
+
+# az_config_dir <entry point>: the config dir that entry point would use.
+az_config_dir() {
+  if is_wrapper "$1"; then
+    readlink -m "${AZURE_CONFIG_DIR:-$HOME/.azure-linux}"
   else
-    report PENDING "Linux Azure CLI is the default az" "orchestrator: scripts/prereqs/install.sh --link-az (now: az-linux)"
+    readlink -m "${AZURE_CONFIG_DIR:-$HOME/.azure}"
   fi
-  if "$AZL" account show --output none >/dev/null 2>&1; then
-    report OK "Linux Azure CLI logged in" "az account show"
-    # Data-plane read access to the backups (shared-key access will be disabled).
-    oid="$("$AZL" ad signed-in-user show --query id -o tsv 2>/dev/null)"
-    n="$("$AZL" role assignment list --assignee "${oid:-none}" --all \
-          --query "length([?roleDefinitionName=='Storage Blob Data Reader'])" -o tsv 2>/dev/null)"
-    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
-      report OK "Storage Blob Data Reader for the user" "$n assignment(s)"
-    else
-      report PENDING "Storage Blob Data Reader for the user" "orchestrator (Azure write, row 40, after the Storage Account exists)"
-    fi
+}
+
+if [ -n "$AZL_DIR" ]; then
+  v="$("$AZL_DIR/bin/python" -c 'import importlib.metadata as m; print(m.version("azure-cli"))' 2>/dev/null)"
+  report OK "Linux Azure CLI (user venv, hashed lock)" "${v:-?} at $AZL_DIR"
+else
+  report KO "Linux Azure CLI (user venv, hashed lock)" "missing or incomplete — run scripts/prereqs/install.sh az"
+fi
+
+az_safe=0
+if [ -n "$AZL_DIR" ] && is_wrapper "$AZW"; then
+  cfg="$(az_config_dir "$AZW")"
+  case "$cfg" in
+    /mnt/*) report KO "Linux Azure CLI config dir not on /mnt" "$cfg is a Windows profile — unset AZURE_CONFIG_DIR / fix ~/.azure-linux" ;;
+    *) report OK "Linux Azure CLI config dir not on /mnt" "$cfg"; az_safe=1 ;;
+  esac
+elif [ -n "$AZL_DIR" ]; then
+  report KO "Linux Azure CLI config dir not on /mnt" "az-linux is not the config-dir wrapper (would use $(az_config_dir "$AZW")) — run scripts/prereqs/install.sh az"
+fi
+
+AZ_DEFAULT="$(command -v az 2>/dev/null)"
+if is_wrapper "$AZ_DEFAULT"; then
+  report OK "Linux Azure CLI is the default az" "$AZ_DEFAULT (wrapper)"
+elif [ -n "$AZ_DEFAULT" ] && [[ "$(readlink -f "$AZ_DEFAULT")" == "$HOME"/.local/opt/azure-cli-*/bin/az ]]; then
+  report KO "Linux Azure CLI is the default az" "$AZ_DEFAULT links to the venv without the wrapper (uses ~/.azure) — run scripts/prereqs/install.sh --link-az"
+else
+  report PENDING "Linux Azure CLI is the default az" "orchestrator: scripts/prereqs/install.sh --link-az (now: ${AZ_DEFAULT:-none})"
+fi
+
+# Real token check (the profile alone is not a login): output discarded, only the
+# status is printed. Runs only when the wrapper keeps the config dir off /mnt.
+az_logged_in=0
+if [ "$az_safe" = 1 ]; then
+  if "$AZW" account get-access-token --output none >/dev/null 2>&1; then
+    report OK "Linux Azure CLI logged in" "access token obtained (not shown)"
+    az_logged_in=1
   else
-    report PENDING "Linux Azure CLI logged in" "user: run 'az-linux login'"
-    report PENDING "Storage Blob Data Reader for the user" "needs a logged-in Linux Azure CLI to check"
+    report PENDING "Linux Azure CLI logged in" "user, after --link-az: az login --use-device-code (in WSL)"
   fi
 else
-  report KO "Linux Azure CLI (user venv)" "missing — run scripts/prereqs/install.sh az"
+  report PENDING "Linux Azure CLI logged in" "not checked: fix the Linux CLI wrapper / config dir first"
+fi
+
+# Data-plane read access to the backups (shared-key access will be disabled), scoped
+# to the backup Storage Account: BACKUP_STORAGE_SCOPE=<its resource id> (row 40).
+BACKUP_STORAGE_SCOPE="${BACKUP_STORAGE_SCOPE:-}"
+if [ -z "$BACKUP_STORAGE_SCOPE" ]; then
+  report PENDING "Storage Blob Data Reader on the backup account" "orchestrator (row 40): create the account + role, then rerun with BACKUP_STORAGE_SCOPE=<account resource id>"
+elif [ "$az_logged_in" = 1 ]; then
+  oid="$("$AZW" ad signed-in-user show --query id -o tsv 2>/dev/null)"
+  n="$("$AZW" role assignment list --assignee "${oid:-none}" --scope "$BACKUP_STORAGE_SCOPE" \
+        --include-inherited --role "Storage Blob Data Reader" --query "length(@)" -o tsv 2>/dev/null)"
+  if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+    report OK "Storage Blob Data Reader on the backup account" "$n assignment(s) at or above ${BACKUP_STORAGE_SCOPE##*/}"
+  else
+    report PENDING "Storage Blob Data Reader on the backup account" "orchestrator (Azure write, row 40): none at ${BACKUP_STORAGE_SCOPE##*/}"
+  fi
+else
+  report PENDING "Storage Blob Data Reader on the backup account" "needs a logged-in Linux Azure CLI to check"
 fi
 
 echo ""

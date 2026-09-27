@@ -19,7 +19,7 @@ norms are a human/agent checklist.
 | 5 | Lint + format clean (`ruff check`, `ruff format --check`) | gate |
 | 6 | Types clean (`mypy` strict) | gate |
 | 7 | Tests green (`pytest`); new logic has tests | gate |
-| 8 | Frontend touched → `eslint` + `tsc --noEmit` + `next build`, with Node 22 (≥ 22.13) and npm ≥ 11 from `~/.local/bin` | gate (if `frontend/node_modules`; wrong toolchain fails) |
+| 8 | Frontend touched → `eslint` + `tsc --noEmit` + `next build`, with Node 22 (≥ 22.13) and npm ≥ 11 (`frontend/package.json` `engines`; installed in `~/.local/bin` by `scripts/prereqs/install.sh`, which the gate puts first on `PATH`) | gate (if `frontend/node_modules`; checks the versions it runs with — wrong toolchain fails) |
 | 9 | **Verified end-to-end** — actually exercised, not only unit tests | judgment (checklist) |
 | 10 | Docs updated (README roadmap + relevant docs) | judgment |
 | 11 | CI green after push; conventional commit message | CI + review |
