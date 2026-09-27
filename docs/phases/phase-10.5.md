@@ -48,13 +48,22 @@ deploy. A separate job also keeps the real jobs free of dry-run branches.
   deployment.
 - Dispatch `dry_run=false` from a temporary branch: run 36318863934 ✓ — "Not main", only the
   dry-run job ran, still one deployment; the branch was deleted afterwards.
-- Scale check afterwards: every Container App at min 0 / max 1.
+- Scale check afterwards: every Container App at max 1; min 0 on the backend and Ollama. The
+  frontend's `minReplicas` is **unset** (`null`, effective default 0), not an explicit 0 — it is
+  set explicitly in Phase 11a's Azure pre-merge.
 
 ## Cost
 
-Budget for the phase ≈ €0.10. The hotfix deploys and the T10.5.7 push were image rollouts of an
-otherwise idle, scale-to-zero app plus a few smoke requests: a few cents, within budget. No new
-Azure resources were created.
+Budget for the phase ≈ €0.10. No new Azure resources were created; the hotfix deploys and the
+T10.5.7 push were image rollouts plus a few smoke requests.
+
+Measured (Azure Cost Management, actual cost, whole subscription, read-only query on
+2026-09-27): **€2.41 on 2026-09-26**, all of it Azure Container Apps (PostgreSQL and Log
+Analytics €0.00); 2026-09-25 was €3.30. The figure for 2026-09-27 had not been posted yet
+(Cost Management lags by up to a day) and is added at the next cost check. Cost is not
+separable per phase: this is the running cost of the deployment on the days of the phase, and
+it is **above** the phase estimate, which assumed an idle scale-to-zero app. Why the Container
+Apps cost that much while mostly idle is analysed in Phase 11a's cost check.
 
 ## Issues found during the smoke (moved to Phase 11a)
 
