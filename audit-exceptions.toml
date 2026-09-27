@@ -1,0 +1,245 @@
+# Dependency-audit exceptions (T11.0.7). Read by scripts/gate.sh step dependency-audit
+# (rag_app.devtools.dependency_audit). One [[exception]] per advisory:
+#   advisory  id reported by the tool (or one of its aliases: GHSA-/CVE-/PYSEC-)
+#   package   affected package; ecosystem: pypi | npm
+#   reason    why it is accepted for now and what removes it
+#   expires   TOML date; a past date FAILS the gate (review, fix or re-justify)
+# An unlisted advisory fails the gate. Keep entries sorted by ecosystem/package.
+
+[[exception]]
+advisory = "GHSA-6g55-p6wh-862q"
+package = "postcss"
+ecosystem = "npm"
+reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Build-time CSS processing of our own styles only. Accepted until Phase 15 (supply chain); the date is a backstop."
+expires = 2027-06-30
+
+[[exception]]
+advisory = "GHSA-fxqj-rqcc-2cmp"
+package = "postcss"
+ecosystem = "npm"
+reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Build-time CSS processing of our own styles only. Accepted until Phase 15 (supply chain); the date is a backstop."
+expires = 2027-06-30
+
+[[exception]]
+advisory = "GHSA-qx2v-qp2m-jg93"
+package = "postcss"
+ecosystem = "npm"
+reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Build-time CSS processing of our own styles only. Accepted until Phase 15 (supply chain); the date is a backstop."
+expires = 2027-06-30
+
+[[exception]]
+advisory = "GHSA-r28c-9q8g-f849"
+package = "postcss"
+ecosystem = "npm"
+reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Build-time CSS processing of our own styles only. Accepted until Phase 15 (supply chain); the date is a backstop."
+expires = 2027-06-30
+
+[[exception]]
+advisory = "GHSA-537c-gmf6-5ccf"
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-1284"  # CVE-2024-12797, GHSA-79v4-65xg-pq4g
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-2141"  # CVE-2026-26007, GHSA-r6ph-v2qm-q3c2
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-35"  # CVE-2026-34073, GHSA-m959-cc7f-wv43
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-3552"  # CVE-2026-69247, GHSA-g6cj-pr64-35w5
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-3553"  # CVE-2026-69249, GHSA-jwv3-5hgf-82ww
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-3554"  # CVE-2026-69248, GHSA-m2h6-j472-rp4c
+package = "cryptography"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): cryptography 44.0.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2025-183"  # CVE-2025-45768
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-120"  # CVE-2026-32597, GHSA-752w-5fwx-jx9f
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-175"  # CVE-2026-48522, GHSA-993g-76c3-p5m4
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-176"  # CVE-2026-48523, GHSA-jq35-7prp-9v3f
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-177"  # CVE-2026-48524, GHSA-fhv5-28vv-h8m8
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-178"  # CVE-2026-48525, GHSA-w7vc-732c-9m39
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-179"  # CVE-2026-48526, GHSA-xgmm-8j9v-c9wx
+package = "pyjwt"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pyjwt 2.10.1 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-1845"  # CVE-2025-71176, GHSA-6w46-j5rx-g56g
+package = "pytest"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): pytest 8.3.4 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2025-49"  # CVE-2025-47273, GHSA-5rjg-fvgr-3xxf
+package = "setuptools"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): setuptools 78.1.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2025-49"  # BIT-setuptools-2025-47273, CVE-2025-47273, GHSA-5rjg-fvgr-3xxf
+package = "setuptools"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): setuptools 78.1.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-3447"  # BIT-setuptools-2026-59890, CVE-2026-59890, GHSA-h35f-9h28-mq5c
+package = "setuptools"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): setuptools 78.1.0 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-161"  # CVE-2026-48710, GHSA-86qp-5c8j-p5mr, X41-2026-002
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-1941"  # CVE-2025-54121, GHSA-2c2j-9gv5-cj73
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-1942"  # CVE-2025-62727, GHSA-7f5h-v6xp-fcq8
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-2280"  # CVE-2026-48817, GHSA-x746-7m8f-x49c
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-2281"  # CVE-2026-48818, GHSA-wqp7-x3pw-xc5r
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-248"  # CVE-2026-54282, GHSA-jp82-jpqv-5vv3
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-249"  # CVE-2026-54283, GHSA-82w8-qh3p-5jfq
+package = "starlette"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): starlette 0.41.3 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2025-217"  # CVE-2025-14929
+package = "transformers"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): transformers 4.57.6 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-2288"  # CVE-2026-1839, GHSA-69w3-r845-3855
+package = "transformers"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): transformers 4.57.6 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-2289"  # CVE-2026-4372, GHSA-29pf-2h5f-8g72
+package = "transformers"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): transformers 4.57.6 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-2290"  # CVE-2026-5241, GHSA-fgcw-684q-jj6r
+package = "transformers"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): transformers 4.57.6 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31
+
+[[exception]]
+advisory = "PYSEC-2026-3929"  # CVE-2026-9856, GHSA-xrqw-3rrv-vx5w
+package = "transformers"
+ecosystem = "pypi"
+reason = "INTERIM (D-2026-09-27-6): transformers 4.57.6 pinned before the advisory; bump pending the user decision on the Python dependency upgrade."
+expires = 2026-10-31

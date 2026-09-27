@@ -16,9 +16,12 @@ from rag_app.config import get_settings  # noqa: E402
 from rag_app.db.models import Base  # noqa: E402
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# A URL set programmatically (the test DB harness) wins; otherwise the app settings.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", get_settings().database_url)
 
-if config.config_file_name is not None:
+# Callers embedding Alembic (the test harness) keep their own logging configuration.
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

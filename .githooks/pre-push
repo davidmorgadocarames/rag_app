@@ -1,12 +1,68 @@
 #!/usr/bin/env bash
-# Git pre-push hook: enforce the project's phase gate (Definition of Done)
-# before any push. Enable once with:  git config core.hooksPath .githooks
+# Git pre-push hook: run the phase gate (docs/DEFINITION_OF_DONE.md) on what is pushed.
+# Enable once per clone with:  git config core.hooksPath .githooks
 #
-# This is a hard, phase-agnostic barrier: it runs ALL mechanical norms
-# (environment/WSL2, secrets, lint, types, tests, frontend, eval gate) and
-# aborts the push if any fails. See docs/DEFINITION_OF_DONE.md.
+# - Reads the pushed refs from stdin (<local ref> <local sha> <remote ref> <remote sha>).
+# - Only deletions (local sha all zeros, e.g. `git push --delete`) → nothing to check, exit 0.
+# - Any ref pushed to refs/heads/main → `scripts/gate.sh --full` (isolated gate project,
+#   stack required); otherwise `--fast`.
+# - The gate runs from a temporary worktree at each pushed SHA (W22), so uncommitted or
+#   unpushed local changes cannot make it pass. Tooling for that worktree: the backend venv,
+#   seed (.gate/) and data/ come from the main tree (gate.sh GATE_MAIN_ROOT); .env files
+#   are linked from the main tree; frontend dependencies are installed with `npm ci`.
+#
+# Test hook: SECRAG_PREPUSH_DRY_RUN=1 prints the plan (mode + SHAs) and exits 0.
 set -euo pipefail
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-echo "[pre-push] running phase gate (scripts/gate.sh)…"
-exec bash "$REPO_ROOT/scripts/gate.sh"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+MAIN_ROOT="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+
+mode="--fast"
+shas=()
+while read -r local_ref local_sha remote_ref _remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+  if [ -z "${local_sha//0/}" ]; then
+    echo "[pre-push] $remote_ref: deletion — nothing to check"
+    continue
+  fi
+  [ "$remote_ref" = "refs/heads/main" ] && mode="--full"
+  case " ${shas[*]:-} " in *" $local_sha "*) ;; *) shas+=("$local_sha") ;; esac
+done
+
+if [ "${#shas[@]}" -eq 0 ]; then
+  echo "[pre-push] only deletions pushed — gate not needed"
+  exit 0
+fi
+
+if [ "${SECRAG_PREPUSH_DRY_RUN:-0}" = 1 ]; then
+  echo "[pre-push] plan: gate $mode on ${shas[*]}"
+  exit 0
+fi
+
+WT=""
+cleanup() {
+  if [ -n "$WT" ]; then
+    git -C "$MAIN_ROOT" worktree remove --force "$WT" >/dev/null 2>&1 || rm -rf "$WT"
+    git -C "$MAIN_ROOT" worktree prune >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+for sha in "${shas[@]}"; do
+  WT="$(mktemp -d "${TMPDIR:-/tmp}/secrag-gate-wt.XXXXXX")"
+  echo "[pre-push] gate $mode on ${sha:0:12} (worktree $WT)"
+  git -C "$MAIN_ROOT" worktree add --quiet --detach "$WT" "$sha"
+  for envfile in .env backend/.env; do
+    if [ -f "$MAIN_ROOT/$envfile" ] && [ ! -e "$WT/$envfile" ]; then
+      ln -s "$MAIN_ROOT/$envfile" "$WT/$envfile"
+    fi
+  done
+  if [ -f "$WT/frontend/package-lock.json" ]; then
+    echo "[pre-push] npm ci (worktree frontend)"
+    (cd "$WT/frontend" && PATH="$HOME/.local/bin:$PATH" \
+      NODE_OPTIONS=--dns-result-order=ipv4first npm ci --no-audit --no-fund --loglevel=error)
+  fi
+  GATE_MAIN_ROOT="$MAIN_ROOT" bash "$WT/scripts/gate.sh" "$mode"
+  cleanup
+  WT=""
+done

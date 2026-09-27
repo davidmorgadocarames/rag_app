@@ -1,0 +1,36 @@
+# Isolated gate project for `scripts/gate.sh --full` / `--make-seed` (T11.0.5, X5).
+#
+# Self-contained (not an override of docker-compose.yml): its own project name, its own
+# explicitly named volume and no port shared with the development stack, so the gate can
+# never read, write or remove development data. gate.sh always runs it as
+#   docker compose -p secrag-gate -f compose.gate.yml …
+# and tears it down with `down -v` at the end of every run (only this project's resources).
+#
+# The gate DB is published on 127.0.0.1 only, port GATE_DB_PORT (default 15432): the native
+# steps (pytest, eval, alembic) run in WSL and reach it through Docker Desktop's localhost
+# forwarding. 15432, not the planned 55432: Windows reserves blocks of its dynamic port range
+# (49152-65535) for Hyper-V, and 55432 fell inside one on the development machine.
+# The password is generated per run by gate.sh (GATE_DB_PASSWORD); the volume dies with the
+# run. Ollama is not part of this project: native steps use OLLAMA_HOST (DoD "Gate modes").
+name: secrag-gate
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: secrag_gate
+      POSTGRES_PASSWORD: ${GATE_DB_PASSWORD:?gate.sh sets GATE_DB_PASSWORD}
+      POSTGRES_DB: secrag_gate
+    ports:
+      - "127.0.0.1:${GATE_DB_PORT:-15432}:5432"
+    volumes:
+      - gate_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secrag_gate -d secrag_gate"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  gate_pgdata:
+    name: secrag_gate_pgdata

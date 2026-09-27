@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from rag_app.eval.judge import parse_verdict
 from rag_app.eval.metrics import ItemResult, cohen_kappa, compute_metrics
 
@@ -86,3 +88,13 @@ def test_cohen_kappa() -> None:
     # empty and single-class-perfect both collapse to 1.0
     assert cohen_kappa([], []) == 1.0
     assert cohen_kappa([True, True], [True, True]) == 1.0
+
+
+def test_eval_gate_skips_or_fails_when_the_stack_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rag_app.eval import gate
+
+    monkeypatch.setattr(gate, "_stack_available", lambda: False)
+    assert gate.main([]) == 0  # by hand: SKIP
+    assert gate.main(["--require-stack"]) == 1  # gate --full: FAIL

@@ -1,8 +1,8 @@
 """Evaluation gate: run the eval, enforce thresholds + no-regression, block on failure.
 
-Called by scripts/gate.sh (step 11) and thus by the pre-push hook. If the eval stack
-(Postgres + Ollama) is not reachable, it SKIPS (exit 0) rather than failing, so
-doc-only pushes are not blocked; the authoritative gate runs when the stack is up.
+Called by scripts/gate.sh (step ``eval``, part of ``--full`` / ``--only eval``) with
+``--require-stack``: an unreachable stack (Postgres + Ollama) then FAILS the gate. Run by
+hand without that flag, an unreachable stack is reported as SKIP (exit 0).
 """
 
 from __future__ import annotations
@@ -91,9 +91,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write current metrics to baseline_metrics.json (establish/refresh baseline)",
     )
+    parser.add_argument(
+        "--require-stack",
+        action="store_true",
+        help="fail (instead of skipping) when Postgres/Ollama are not reachable (gate --full)",
+    )
     args = parser.parse_args(argv)
 
     if not _stack_available():
+        if args.require_stack:
+            settings = get_settings()
+            print(
+                "eval gate: FAIL — stack not reachable (Postgres or Ollama at"
+                f" {settings.ollama_host}); start it or fix OLLAMA_HOST / DATABASE_URL"
+            )
+            return 1
         print("eval gate: SKIP (Postgres/Ollama not reachable)")
         return 0
 

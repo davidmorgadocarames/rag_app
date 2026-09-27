@@ -5,3 +5,6 @@ ruff==0.8.4
 mypy==1.14.1
 pytest==8.3.4
 pre-commit==4.0.1
+# Gate tooling: dependency-audit step (T11.0.7) and the gate-project isolation test.
+pip-audit==2.10.1
+PyYAML==6.0.3

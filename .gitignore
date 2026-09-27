@@ -56,3 +56,6 @@ eval/benchmark.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# --- Gate state (seed dump for the isolated gate project; scripts/gate.sh --make-seed) ---
+.gate/
