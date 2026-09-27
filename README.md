@@ -24,8 +24,8 @@ this project is built around them:
 - **Honest abstention.** A groundedness check runs after generation. If the corpus doesn't
   back an answer, the system says so instead of hallucinating.
 - **Evaluation as a release gate.** Retrieval and generation are measured separately
-  against thresholds and a stored baseline. Every push runs the eval gate, and a
-  regression blocks the push before CD can deploy it.
+  against thresholds and a stored baseline. Every push to `main` runs the eval gate in an
+  isolated gate stack, and a regression blocks the push before CD can deploy it.
 - **Security and abuse resistance.** The app has its own auth (argon2 + JWT + email
   verification) and cost-aware token-bucket rate limiting against brute force and
   Denial-of-Wallet. Signup risk scoring resists Sybil abuse, and the pipeline defends
@@ -35,7 +35,8 @@ this project is built around them:
   deletions be replayed after any restore from backup
   ([ADR phase 6](docs/adr/adr_phase06_gdpr_erasure.md)).
 - **Engineering discipline.** A written Definition of Done is enforced by a pre-push gate
-  covering lint, strict typing, tests, secret scanning, the frontend build and evals.
+  covering lint, strict typing, tests (including DB tests on a throw-away database), secret
+  scanning, dependency audit, the frontend build and evals.
   Architecture decisions are recorded as ADRs.
 
 ### Current evaluation baseline
@@ -138,8 +139,13 @@ from a committed hashed lock file (`scripts/prereqs/azure-cli.lock.txt`, install
 `--require-hashes`) into a venv on a pinned uv-managed Python; bumping it is a deliberate
 change (`install.sh --lock-az`, steps in the script header). The Linux CLI keeps its own
 config and token cache in `~/.azure-linux` — never in a Windows profile reached through
-`~/.azure` — and `install.sh --link-az` makes it the default `az` in WSL; then log in once
-with `az login --use-device-code`.
+`~/.azure`, nor on any Windows drive (the wrapper refuses a config dir under `/mnt` or on a
+9p/drvfs mount) — and `install.sh --link-az` makes it the default `az` in WSL; then log in
+once with the browser flow, `BROWSER=explorer.exe az login --tenant <tenant>` (device-code
+login is blocked by tenants with security defaults). The installer needs
+[uv](https://docs.astral.sh/uv/) **≥ 0.12.17** (the version that generated the lock);
+`check.sh` reports an older one as KO. A PGDG package that downloads but does not match its
+pinned SHA-256 stops the installer (no silent fallback to the archive mirror).
 
 Downloads use IPv4 only: from WSL2, IPv6 connections to the npm registry can hang. If
 `npm install`/`npm ci` stalls, run it with `NODE_OPTIONS=--dns-result-order=ipv4first`.
@@ -240,7 +246,7 @@ The frontend calls `http://localhost:8000` by default. To use a different backen
 
 ```bash
 # from backend/ (venv active)
-pytest
+pytest                                         # unit tests; DB tests skip without TEST_DATABASE_URL
 ruff check . && mypy
 python -m rag_app.eval.gate                    # fails if metrics drop below thresholds/baseline
 python -m rag_app.eval.gate --update-baseline  # only after an intended quality change
@@ -253,9 +259,27 @@ To contribute, enable the hooks once from the repo root:
 
 ```bash
 pre-commit install                             # lint/format/secret scan on every commit
-git config core.hooksPath .githooks            # full phase gate on every push (WSL2/Linux)
-bash scripts/gate.sh                           # run the same gate manually
+git config core.hooksPath .githooks            # phase gate on every push (WSL2/Linux)
 ```
+
+**The phase gate** (`scripts/gate.sh`, rules in
+[Definition of Done](docs/DEFINITION_OF_DONE.md)) has named steps with time budgets:
+
+```bash
+bash scripts/gate.sh --fast          # default: lint, types, unit tests, gitleaks, shellcheck,
+                                     # schema-check, adr-links, frontend, dependency-audit
+bash scripts/gate.sh --make-seed     # once (and when the corpus changes): build the gate seed
+bash scripts/gate.sh --full          # fast + DB tests + eval in an isolated gate project
+bash scripts/gate.sh --only eval     # one or more steps (comma-separated); --list shows them
+```
+
+`--full` runs in its own Docker Compose project (`compose.gate.yml`: project `secrag-gate`,
+volume `secrag_gate_pgdata`, database on `127.0.0.1:15432` only) and removes it at the end,
+so it never touches the development database. It needs Docker and Ollama (native
+`ollama serve`, or `GATE_OLLAMA_HOST`); anything unreachable fails the gate. DB tests use a
+harness that creates a throw-away database and **refuses** the development one (port 5432 or
+database `rag`). Pushing a phase branch runs `--fast`, pushing `main` runs `--full`, both
+from a temporary worktree at the pushed commit; deleting a remote branch runs nothing.
 
 ### Run everything with Docker
 

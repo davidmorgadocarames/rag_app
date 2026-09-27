@@ -32,7 +32,12 @@ inventory (rate-limit buckets, signup tracker, singletons); the red `restart_che
 
 *To be completed as 11a/11b land.* Planned sections:
 
-1. Fixed development volume and an isolated gate project.
+1. Fixed development volume and an isolated gate project. *Landed in 11.0 (gate part):*
+   `compose.gate.yml` (project `secrag-gate`, volume `secrag_gate_pgdata`, DB on
+   `127.0.0.1:15432` — the planned 55432 sits in a Hyper-V reserved port block on the
+   development machine), seeded from a git-ignored dump (`gate.sh --make-seed`) and removed
+   with `down -v` after every `--full`; a test DB harness that refuses the development
+   database; see [Definition of Done — Gate modes](../DEFINITION_OF_DONE.md#gate-modes).
 2. Fail-fast settings validation in the API lifespan; master-key fingerprint.
 3. Migrations out of the container command: compose one-shot service and an Azure
    migration Job run by CD before the apps; expand/contract rule.
