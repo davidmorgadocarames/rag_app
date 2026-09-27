@@ -118,8 +118,22 @@ flowchart LR
 | **Docker only** | You want to try it without installing Python or Node | See [Run everything with Docker](#run-everything-with-docker). |
 
 **Prerequisites:** Git, Docker, **Python 3.12** (3.11 works; avoid 3.13+, since some ML
-wheels are not yet available for it), **Node 20+** and [Ollama](https://ollama.com).
-An NVIDIA GPU is strongly recommended for the local LLM.
+wheels are not yet available for it), **Node 22 (≥ 22.13) with npm 11** and
+[Ollama](https://ollama.com). An NVIDIA GPU is strongly recommended for the local LLM.
+
+**Contributor toolchain (WSL2).** The gate and the operations scripts also need the
+PostgreSQL 16 client (`psql`/`pg_dump`), `age`, `shellcheck`, the GitHub CLI and the Linux
+Azure CLI. One script installs all of them as user binaries (no `sudo`) under
+`~/.local/opt`, with entry points in `~/.local/bin`; another prints every prerequisite as
+OK / KO / PENDING (PENDING = a login or a repository/Azure setting that only the owner can do):
+
+```bash
+bash scripts/prereqs/install.sh    # pinned versions, SHA-256 verified, idempotent
+bash scripts/prereqs/check.sh      # exit 0 only when every item is OK
+```
+
+Downloads use IPv4 only: from WSL2, IPv6 connections to the npm registry can hang. If
+`npm install`/`npm ci` stalls, run it with `NODE_OPTIONS=--dns-result-order=ipv4first`.
 
 ### 1. Clone
 
