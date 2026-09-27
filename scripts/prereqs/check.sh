@@ -8,7 +8,7 @@
 # Read-only: it never logs in, never changes GitHub or Azure settings. GitHub queries use
 # the Linux `gh` when it is logged in, otherwise the Windows `gh.exe` through interop.
 # The Linux Azure CLI is only run through the ~/.local/bin/az-linux wrapper (own config
-# dir, never the Windows profile under /mnt/c).
+# dir, never a Windows profile: not under /mnt and not on any 9p/drvfs mount).
 #
 # Optional input: BACKUP_STORAGE_SCOPE=<resource id of the backup Storage Account>
 # (exists from row 40) scopes the Storage Blob Data Reader check; unset → PENDING.
@@ -87,6 +87,20 @@ if command -v age >/dev/null && command -v age-keygen >/dev/null; then
   report OK "age + age-keygen" "$(age --version)"
 else
   report KO "age + age-keygen" "missing — run scripts/prereqs/install.sh age"
+fi
+
+# uv installs the pinned CPython for the Azure CLI venv and enforces the lock's hashes
+# (DA-A2-3); keep UV_MIN_VERSION in sync with install.sh.
+UV_MIN_VERSION="0.12.17"
+if command -v uv >/dev/null; then
+  v="$(uv --version | awk '{print $2}')"
+  if version_ge "$v" "$UV_MIN_VERSION"; then
+    report OK "uv >= $UV_MIN_VERSION" "$v at $(command -v uv)"
+  else
+    report KO "uv >= $UV_MIN_VERSION" "$v — run: uv self update"
+  fi
+else
+  report KO "uv >= $UV_MIN_VERSION" "missing — install from https://docs.astral.sh/uv/ into ~/.local/bin"
 fi
 
 if command -v shellcheck >/dev/null; then
@@ -228,14 +242,31 @@ else
 fi
 
 az_safe=0
+# windows_fs <path>: prints the reason when <path> is on a Windows drive — under /mnt, or
+# on a 9p/drvfs filesystem wherever it is mounted (DA-A2-1); the nearest existing
+# ancestor decides when the directory does not exist yet.
+windows_fs() {
+  case "$1" in /mnt/*) echo "under /mnt"; return 0 ;; esac
+  local p="$1" fs
+  while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+  fs="$(stat -f -c %T "$p" 2>/dev/null) $(findmnt -T "$p" -no FSTYPE 2>/dev/null)"
+  case " $fs " in
+    *" v9fs "* | *" 9p "* | *" drvfs "*) echo "on a Windows drive ($fs at $p)"; return 0 ;;
+  esac
+  return 1
+}
+
+CFG_ITEM="Linux Azure CLI config dir not on a Windows drive"
 if [ -n "$AZL_DIR" ] && is_wrapper "$AZW"; then
   cfg="$(az_config_dir "$AZW")"
-  case "$cfg" in
-    /mnt/*) report KO "Linux Azure CLI config dir not on /mnt" "$cfg is a Windows profile — unset AZURE_CONFIG_DIR / fix ~/.azure-linux" ;;
-    *) report OK "Linux Azure CLI config dir not on /mnt" "$cfg"; az_safe=1 ;;
-  esac
+  if why="$(windows_fs "$cfg")"; then
+    report KO "$CFG_ITEM" "$cfg is $why — unset AZURE_CONFIG_DIR / fix ~/.azure-linux"
+  else
+    report OK "$CFG_ITEM" "$cfg"
+    az_safe=1
+  fi
 elif [ -n "$AZL_DIR" ]; then
-  report KO "Linux Azure CLI config dir not on /mnt" "az-linux is not the config-dir wrapper (would use $(az_config_dir "$AZW")) — run scripts/prereqs/install.sh az"
+  report KO "$CFG_ITEM" "az-linux is not the config-dir wrapper (would use $(az_config_dir "$AZW")) — run scripts/prereqs/install.sh az"
 fi
 
 AZ_DEFAULT="$(command -v az 2>/dev/null)"
@@ -255,7 +286,7 @@ if [ "$az_safe" = 1 ]; then
     report OK "Linux Azure CLI logged in" "access token obtained (not shown)"
     az_logged_in=1
   else
-    report PENDING "Linux Azure CLI logged in" "user, after --link-az: az login --use-device-code (in WSL)"
+    report PENDING "Linux Azure CLI logged in" "user: az login in WSL (browser flow: BROWSER=explorer.exe az login --tenant <tenant>; device code is blocked by the tenant's security defaults)"
   fi
 else
   report PENDING "Linux Azure CLI logged in" "not checked: fix the Linux CLI wrapper / config dir first"
