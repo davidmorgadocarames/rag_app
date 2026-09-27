@@ -95,9 +95,19 @@ fi
 
 # 10. frontend (only if dependencies are installed)
 step "10. frontend (lint / typecheck / build)"
+# Toolchain floor: Node >= 22.13 (22.x) and npm >= 11, as user binaries in
+# ~/.local/bin (first on PATH above; install with scripts/prereqs/install.sh node).
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+node_v="$(node --version 2>/dev/null | tr -d v)"
+npm_v="$(npm --version 2>/dev/null)"
 if [ -d frontend/node_modules ]; then
-  (cd frontend && npm run lint && npm run typecheck && npm run build) \
-    && echo "  PASS" || note_fail "frontend checks"
+  if [ "${node_v%%.*}" != 22 ] || ! version_ge "$node_v" 22.13.0 || ! version_ge "${npm_v:-0}" 11.0.0; then
+    note_fail "frontend toolchain: node ${node_v:-missing} / npm ${npm_v:-missing}; need node 22.x >= 22.13 and npm >= 11 (scripts/prereqs/install.sh node)"
+  else
+    echo "  toolchain: node $node_v, npm $npm_v"
+    (cd frontend && npm run lint && npm run typecheck && npm run build) \
+      && echo "  PASS" || note_fail "frontend checks"
+  fi
 else
   echo "  SKIP (frontend/node_modules missing)"
 fi

@@ -19,7 +19,7 @@ norms are a human/agent checklist.
 | 5 | Lint + format clean (`ruff check`, `ruff format --check`) | gate |
 | 6 | Types clean (`mypy` strict) | gate |
 | 7 | Tests green (`pytest`); new logic has tests | gate |
-| 8 | Frontend touched → `eslint` + `tsc --noEmit` + `next build` | gate (if `frontend/node_modules`) |
+| 8 | Frontend touched → `eslint` + `tsc --noEmit` + `next build`, with Node 22 (≥ 22.13) and npm ≥ 11 from `~/.local/bin` | gate (if `frontend/node_modules`; wrong toolchain fails) |
 | 9 | **Verified end-to-end** — actually exercised, not only unit tests | judgment (checklist) |
 | 10 | Docs updated (README roadmap + relevant docs) | judgment |
 | 11 | CI green after push; conventional commit message | CI + review |
@@ -43,6 +43,8 @@ norms are a human/agent checklist.
 
 ```bash
 # inside WSL2, from the repo root
+bash scripts/prereqs/install.sh       # one-time: user-level toolchain (Node/npm, pg16 client, age, …)
+bash scripts/prereqs/check.sh         # prerequisites: every item OK / KO / PENDING
 git config core.hooksPath .githooks   # one-time: enable the pre-push gate for this clone
 bash scripts/gate.sh                   # runs all mechanical norms; non-zero exit = blocked
 ```
