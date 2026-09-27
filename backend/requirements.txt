@@ -24,5 +24,5 @@ uvicorn[standard]==0.34.0
 
 # Auth & compliance (password hashing, JWT, per-user encryption)
 argon2-cffi==23.1.0
-PyJWT==2.10.1
+PyJWT==2.13.0
 cryptography==44.0.0
