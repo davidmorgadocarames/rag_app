@@ -33,7 +33,7 @@ this project is built around them:
 - **Privacy by design.** Each user's data is encrypted with a per-user key. Erasing an
   account hard-deletes the data and **crypto-shreds** the key. Tombstones let the
   deletions be replayed after any restore from backup
-  ([ADR 0002](docs/adr/0002-data-erasure-gdpr.md)).
+  ([ADR phase 6](docs/adr/adr_phase06_gdpr_erasure.md)).
 - **Engineering discipline.** A written Definition of Done is enforced by a pre-push gate
   covering lint, strict typing, tests, secret scanning, the frontend build and evals.
   Architecture decisions are recorded as ADRs.
@@ -79,7 +79,7 @@ flowchart LR
   in development (Ollama + qwen on a GPU) or on Azure OpenAI in the cloud.
 - **Agentic routing was benchmarked and rejected.** An LLM router added latency without
   improving quality, so the pipeline stays deterministic
-  ([ADR 0001](docs/adr/0001-agentic-router.md)).
+  ([ADR phase 5](docs/adr/adr_phase05_agentic_router.md)).
 
 ### Deployment
 
@@ -274,10 +274,11 @@ same database.
 
 ## Architecture decision records
 
-- [ADR 0001 — Agentic router: benchmarked, not adopted](docs/adr/0001-agentic-router.md)
-- [ADR 0002 — Data erasure (GDPR): crypto-shred + tombstones](docs/adr/0002-data-erasure-gdpr.md)
-- [ADR 0003 — Containerization and delivery](docs/adr/0003-deployment.md)
-- [ADR 0004 — Cloud deployment on Azure](docs/adr/0004-cloud-deployment-azure.md)
+- [ADR phase 5 — Agentic router: benchmarked, not adopted](docs/adr/adr_phase05_agentic_router.md)
+- [ADR phase 6 — Data erasure (GDPR): crypto-shred + tombstones](docs/adr/adr_phase06_gdpr_erasure.md)
+- [ADR phase 9 — Containerization and delivery](docs/adr/adr_phase09_deployment.md)
+- [ADR phase 10 — Cloud deployment on Azure](docs/adr/adr_phase10_azure.md)
+- [ADR phase 11 — Stability: data persistence and rerank latency](docs/adr/adr_phase11_stability.md) (in progress)
 
 ## License
 

@@ -3,7 +3,7 @@ name: CD
 # On every push to main: build the app images, publish them to the GitHub Container
 # Registry, then deploy to Azure Container Apps. The cloud path uses a hosted LLM
 # (Azure OpenAI via LLM_PROVIDER) instead of GPU/Ollama; see
-# docs/adr/0004-cloud-deployment-azure.md. The eval gate that guards a bad deploy runs
+# docs/adr/adr_phase10_azure.md. The eval gate that guards a bad deploy runs
 # in the pre-push hook (scripts/gate.sh), which blocks the very push that triggers this.
 #
 # Manual runs (workflow_dispatch) default to dry_run=true and only echo what they would

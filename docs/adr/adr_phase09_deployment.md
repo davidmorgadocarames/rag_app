@@ -1,4 +1,4 @@
-# ADR 0003 — Deployment (containers + CD to GHCR)
+# ADR phase 9 — Deployment (containers + CD to GHCR)
 
 - **Status:** Accepted (2026-09-19)
 - **Context:** Phase 9. The CI/CD-first goal needs the app packaged and shipped
@@ -37,7 +37,7 @@ quality before anything ships.
 ## Backups & retention
 
 Postgres backups follow the retention/erasure policy in
-[ADR 0002](0002-data-erasure-gdpr.md): put beyond use, 7-day rotation, replay deletions
+[ADR phase 6](adr_phase06_gdpr_erasure.md): put beyond use, 7-day rotation, replay deletions
 on restore.
 
 ## Consequences

@@ -1,4 +1,4 @@
-# ADR 0001 — Agentic router is not the default (kept behind a benchmark)
+# ADR phase 5 — Agentic router is not the default (kept behind a benchmark)
 
 - **Status:** Accepted (2026-09-19)
 - **Context:** Phase 5. We proposed an agentic router (CRAG-lite): detect "thin"

@@ -1,6 +1,6 @@
 """GDPR erasure: hard delete + crypto-shred + tombstone, with a no-key purge invariant.
 
-See docs/adr/0002-data-erasure-gdpr.md. Deleting a user cascades (FK ON DELETE CASCADE)
+See docs/adr/adr_phase06_gdpr_erasure.md. Deleting a user cascades (FK ON DELETE CASCADE)
 to their key, conversations and messages — hard-deleting the data and crypto-shredding
 in one step. A tombstone is retained so deletions can be replayed after a restore.
 """

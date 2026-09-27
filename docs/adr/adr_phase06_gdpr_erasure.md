@@ -1,4 +1,4 @@
-# ADR 0002 — GDPR data erasure (crypto-shred + hard delete + replay)
+# ADR phase 6 — GDPR data erasure (crypto-shred + hard delete + replay)
 
 - **Status:** Accepted (2026-09-19)
 - **Context:** Phase 6b. When a user leaves, their personal data must be erased from

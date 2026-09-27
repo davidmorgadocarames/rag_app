@@ -125,7 +125,7 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
   data (run `alembic upgrade head` against it).
 - **Model tier**: the Container Apps consumption plan has no practical GPU, so `qwen`/Ollama is **not**
   deployed there — **Azure OpenAI** replaces it for the cloud path only, selected via `LLM_PROVIDER`
-  (Ollama stays the local default). See [ADR 0004](adr/0004-cloud-deployment-azure.md).
+  (Ollama stays the local default). See [ADR phase 10](adr/adr_phase10_azure.md).
 - **Secrets**: supplied as Container Apps built-in secrets (`DATABASE_URL`, `JWT_SECRET`,
   `DATA_MASTER_KEY`, `AZURE_OPENAI_*`); escalate to Key Vault only if a real need shows up.
 - **CD**: after the GHCR push, `cd.yml` authenticates to Azure with **OIDC federated credentials**

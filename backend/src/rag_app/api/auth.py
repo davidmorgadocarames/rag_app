@@ -148,7 +148,10 @@ def me(user: CurrentUserDep) -> UserOut:
 
 @router.delete("/account", response_model=MessageResponse)
 def delete_account(user: CurrentUserDep, session: SessionDep) -> MessageResponse:
-    """GDPR erasure: hard-delete + crypto-shred + tombstone (see docs/adr/0002)."""
+    """GDPR erasure: hard-delete + crypto-shred + tombstone.
+
+    See docs/adr/adr_phase06_gdpr_erasure.md.
+    """
     erase_user(session, user.id)
     return MessageResponse(
         detail=(

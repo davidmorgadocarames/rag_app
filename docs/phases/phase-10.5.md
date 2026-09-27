@@ -4,7 +4,7 @@
 - **Why this phase existed:** a review of the live Phase 10 deployment found issues that had to
   be fixed on Azure before starting Phase 11 (stability).
 - **ADR:** no new ADR; the Azure design stays in
-  [ADR 0004 — Cloud deployment (Azure)](../adr/0004-cloud-deployment-azure.md).
+  [ADR phase 10 — Cloud deployment (Azure)](../adr/adr_phase10_azure.md).
 
 ## What was done
 

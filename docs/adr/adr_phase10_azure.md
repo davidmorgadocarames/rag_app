@@ -1,11 +1,11 @@
-# ADR 0004 — Cloud deployment (Azure)
+# ADR phase 10 — Cloud deployment (Azure)
 
 - **Status:** Accepted (2026-09-25)
 - **Context:** Phase 10. The app is containerized and CD-published to GHCR
-  ([ADR 0003](0003-deployment.md)), but "host deployment" was left as a separate,
+  ([ADR phase 9](adr_phase09_deployment.md)), but "host deployment" was left as a separate,
   credentialed step with no named cloud provider — and, crucially, the model tier
-  (**Ollama + `qwen`, needs a GPU**) can't run on the free tiers ADR 0003 pointed at.
-  ADR 0003 already anticipated the exit: *"swapping the model tier for a hosted LLM later
+  (**Ollama + `qwen`, needs a GPU**) can't run on the free tiers ADR phase 9 pointed at.
+  ADR phase 9 already anticipated the exit: *"swapping the model tier for a hosted LLM later
   only changes `OLLAMA_HOST` / the LLM client — the rest is unaffected."* Phase 10 cashes
   that promise in.
 
@@ -19,7 +19,7 @@
   implementations — `OllamaChat` (local) and `AzureOpenAIChat` (hosted) — selected by a
   new `LLM_PROVIDER` setting (default `ollama`). The cloud deployment sets
   `LLM_PROVIDER=azure_openai`; **local development stays free and local by default.** This
-  is the single seam ADR 0003 predicted: only the LLM client changes.
+  is the single seam ADR phase 9 predicted: only the LLM client changes.
 - **Azure OpenAI, not a GPU host.** The Container Apps consumption plan has no practical
   GPU, so `qwen`/Ollama is not deployed there; Azure OpenAI serves the cloud path instead.
 
@@ -47,7 +47,7 @@
 - **The eval gate still guards the deploy.** The pre-push gate (`scripts/gate.sh`) runs
   the eval gate and blocks the very push that triggers CD, and the Azure deploy job is
   `needs: [images]`, so a bad build never reaches Azure — same guarantee as Phase 9.
-- **Container runs its own migrations.** Per ADR 0003 the backend image runs
+- **Container runs its own migrations.** Per ADR phase 9 the backend image runs
   `alembic upgrade head` before uvicorn. A managed Postgres connection string carries no
   `+driver`, which would default to psycopg2 (not shipped — the project is psycopg v3
   only), so `DATABASE_URL` is normalized to `postgresql+psycopg://` in one place

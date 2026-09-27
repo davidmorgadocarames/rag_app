@@ -77,7 +77,7 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
 - **Free / local by default**: for development the LLM tier runs via Ollama on a single consumer GPU
   (8 GB VRAM) — exactly three models: one `qwen` (Q4) for all LLM tasks, `bge-m3` for embeddings,
   `bge-reranker` for reranking. Azure OpenAI is an **opt-in production configuration** behind
-  `LLM_PROVIDER` (see ADR 0004): anyone running the project locally keeps the free/local path, so it
+  `LLM_PROVIDER` (see ADR phase 10): anyone running the project locally keeps the free/local path, so it
   remains the default rather than an absolute constraint of the whole system.
 - **CI/CD-first**: no deploy without passing tests and the evaluation gate; no secrets committed.
 - Corpus is **mini** (~10-20 documents) to keep cost and latency low and evaluation tractable.

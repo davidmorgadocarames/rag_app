@@ -49,7 +49,7 @@ class Settings(BaseSettings):
 
     # --- LLM provider selection ---
     # "ollama" (local/free, the dev default) or "azure_openai" (hosted, cloud path).
-    # The Azure_* keys are only read when llm_provider == "azure_openai"; see ADR 0004.
+    # The Azure_* keys are only read when llm_provider == "azure_openai"; see ADR phase 10.
     llm_provider: str = "ollama"
     azure_openai_endpoint: str = ""
     azure_openai_api_key: str = ""
