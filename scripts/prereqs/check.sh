@@ -120,6 +120,28 @@ else
   report KO "docker compose >= 2.20" "docker not reachable from WSL — enable Docker Desktop's WSL integration (user)"
 fi
 
+# --- Pre-push gate (DA-B-1) ------------------------------------------------------------
+# Git runs .githooks/pre-push from the working tree and silently ignores it when
+# core.hooksPath does not point there or the file lost its exec bit (UNC writes do that).
+
+hooks_path="$(git config --get core.hooksPath 2>/dev/null)"
+if [ "$hooks_path" = .githooks ]; then
+  report OK "pre-push gate active (core.hooksPath)" ".githooks"
+else
+  report KO "pre-push gate active (core.hooksPath)" "'${hooks_path:-unset}' — run: git config core.hooksPath .githooks"
+fi
+if [ -x .githooks/pre-push ]; then
+  report OK "pre-push hook executable on disk" ".githooks/pre-push"
+else
+  report KO "pre-push hook executable on disk" "run: chmod +x .githooks/pre-push (git ignores it silently)"
+fi
+not_exec="$(git ls-files -s -- '*.sh' '.githooks/*' | awk '$1 != "100755" {printf " %s", $4}')"
+if [ -z "$not_exec" ]; then
+  report OK "tracked scripts 100755 in git" "*.sh, .githooks/*"
+else
+  report KO "tracked scripts 100755 in git" "git update-index --chmod=+x$not_exec"
+fi
+
 # --- GitHub CLI ----------------------------------------------------------------------
 
 GH=""

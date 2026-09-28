@@ -47,10 +47,14 @@ def test_empty_stdin_does_nothing() -> None:
     assert "only deletions pushed" in proc.stdout
 
 
+DRY_RUN_RC = 10  # never 0: a forgotten SECRAG_PREPUSH_DRY_RUN blocks the push (DA-B-11)
+
+
 def test_phase_branch_push_runs_fast() -> None:
     proc = _hook(f"refs/heads/phase-11a {SHA_A} refs/heads/phase-11a {SHA_B}\n")
-    assert proc.returncode == 0
+    assert proc.returncode == DRY_RUN_RC
     assert f"plan: gate --fast on {SHA_A}" in proc.stdout
+    assert "push BLOCKED" in proc.stderr
 
 
 def test_push_to_main_runs_full_and_skips_deletions() -> None:
@@ -60,6 +64,6 @@ def test_push_to_main_runs_full_and_skips_deletions() -> None:
         f"refs/heads/phase-11a {SHA_A} refs/heads/phase-11a {SHA_B}\n"
     )
     proc = _hook(stdin)
-    assert proc.returncode == 0
+    assert proc.returncode == DRY_RUN_RC
     assert f"plan: gate --full on {SHA_A}\n" in proc.stdout  # one SHA, checked once
     assert "refs/heads/tmp: deletion" in proc.stdout

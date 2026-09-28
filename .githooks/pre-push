@@ -7,11 +7,14 @@
 # - Any ref pushed to refs/heads/main → `scripts/gate.sh --full` (isolated gate project,
 #   stack required); otherwise `--fast`.
 # - The gate runs from a temporary worktree at each pushed SHA (W22), so uncommitted or
-#   unpushed local changes cannot make it pass. Tooling for that worktree: the backend venv,
-#   seed (.gate/) and data/ come from the main tree (gate.sh GATE_MAIN_ROOT); .env files
-#   are linked from the main tree; frontend dependencies are installed with `npm ci`.
+#   unpushed local changes cannot make it pass. Tooling for that worktree: the seed (.gate/)
+#   and data/ come from the main tree (gate.sh GATE_MAIN_ROOT); the backend venv is one that
+#   matches the pushed requirement pins (gate.sh: the main venv when it matches, otherwise a
+#   cached venv per requirements hash); .env files are linked from the main tree; frontend
+#   dependencies are installed with `npm ci`.
 #
-# Test hook: SECRAG_PREPUSH_DRY_RUN=1 prints the plan (mode + SHAs) and exits 0.
+# Test hook: SECRAG_PREPUSH_DRY_RUN=1 prints the plan (mode + SHAs) and exits 10 — never 0,
+# so a forgotten export blocks the push instead of skipping the gate (DA-B-11).
 set -euo pipefail
 
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
@@ -36,7 +39,8 @@ fi
 
 if [ "${SECRAG_PREPUSH_DRY_RUN:-0}" = 1 ]; then
   echo "[pre-push] plan: gate $mode on ${shas[*]}"
-  exit 0
+  echo "[pre-push] SECRAG_PREPUSH_DRY_RUN=1: dry run only — push BLOCKED (unset it to push)" >&2
+  exit 10
 fi
 
 WT=""

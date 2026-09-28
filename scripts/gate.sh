@@ -7,9 +7,11 @@
 #   scripts/gate.sh --full            fast + stack steps, in the isolated gate project
 #                                     (compose.gate.yml): up → seed → steps → down -v.
 #                                     A missing tool or an unreachable stack FAILS.
-#   scripts/gate.sh --only a,b        just these steps (stack started only if one needs it)
+#   scripts/gate.sh --only a,b        just these steps (stack started only if one needs it);
+#                                     a missing tool FAILS, as in --full
 #   scripts/gate.sh --make-seed       (re)build the gate seed dump from data/chunks with
-#                                     Ollama embeddings (run when the corpus changes)
+#                                     Ollama embeddings (corpus, embedding model or
+#                                     migrations changed)
 #   scripts/gate.sh --list            step names, modes and time budgets
 #
 # Every step runs in its own process under `timeout <budget>`; exceeding the budget fails.
@@ -17,8 +19,10 @@
 # development database: in --fast the DB URL points at the (stopped) gate port (GATE_DB_PORT, default 15432).
 #
 # Paths: REPO_ROOT is the tree being checked (a temporary worktree at the pushed SHA when
-# run by .githooks/pre-push); MAIN_ROOT is the main working tree, which provides the backend
-# venv, the git-ignored seed (.gate/), data/ and .env files.
+# run by .githooks/pre-push); MAIN_ROOT is the main working tree, which provides the
+# git-ignored seed (.gate/), data/ and .env files. The backend venv must match REPO_ROOT's
+# pins (DA-B-4): the main venv when it does, otherwise a venv cached per requirements hash
+# under the git common dir (built with uv). GATE_VENV=<dir> overrides the choice.
 set -uo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -27,13 +31,22 @@ hash -r 2>/dev/null || true
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "$SELF")/.." && pwd)" || exit 1
 cd "$REPO_ROOT" || exit 1
-MAIN_ROOT="${GATE_MAIN_ROOT:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$REPO_ROOT/.git")")}"
-VENV="${GATE_VENV:-$MAIN_ROOT/backend/.venv}"
+GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$REPO_ROOT/.git")"
+MAIN_ROOT="${GATE_MAIN_ROOT:-$(dirname "$GIT_COMMON")}"
+MAIN_VENV="$MAIN_ROOT/backend/.venv"
+VENV="${GATE_VENV:-$MAIN_VENV}"   # final choice: resolve_venv
 PY="$VENV/bin/python"
 GATE_STATE="$MAIN_ROOT/.gate"
 SEED="$GATE_STATE/seed.dump"
 SEED_META="$GATE_STATE/seed.meta"
 CHUNKS="$MAIN_ROOT/data/chunks/chunks.jsonl"
+
+# Venvs for trees whose pins differ from the main venv (DA-B-4).
+VENV_CACHE="$GIT_COMMON/secrag-gate/venvs"
+VENV_RECIPE=1                     # bump when build_venv changes
+TORCH_INDEX="https://download.pytorch.org/whl/cpu"   # as in backend/Dockerfile
+VENV_BUILD_BUDGET=900
+VENV_CACHE_KEEP=3
 
 COMPOSE_PROJECT="secrag-gate"
 COMPOSE_FILE="$REPO_ROOT/compose.gate.yml"
@@ -48,6 +61,7 @@ FULL_TARGET_SECONDS=1800   # X5: --full target in Phase 11
 STEP_TABLE="
 environment      - 10
 secrets          - 10
+git-modes        - 10
 pinned-deps      - 10
 venv             - 10
 ruff-lint        - 60
@@ -77,16 +91,46 @@ export PYTHONPATH="$REPO_ROOT/backend/src"
 
 # --- helpers used inside steps ---------------------------------------------------------
 
-# missing_tool <message>: SKIP in --fast, FAIL in --full (W22: nothing silently skipped).
+# missing_tool <message>: SKIP only in --fast; FAIL in --full and --only (W22, DA-B-2:
+# a step that was asked for, or a promotion gate, never passes without running).
 missing_tool() {
-  if [ "$GATE_MODE" = full ]; then
-    echo "  FAIL (missing tooling under --full): $1"
+  if [ "$GATE_MODE" != fast ]; then
+    echo "  FAIL (missing tooling under --$GATE_MODE): $1"
     return 1
   fi
   echo "  SKIP (missing tooling): $1"
   return 3
 }
 need_venv() { [ -x "$PY" ] || { echo "  FAIL: backend venv missing at $VENV"; return 1; }; }
+
+# Every tracked shell script: *.sh, .githooks/*, and any file with a sh/bash shebang.
+tracked_scripts() {
+  local path
+  while IFS= read -r path; do
+    case "$path" in
+      *.sh | .githooks/*) echo "$path"; continue ;;
+    esac
+    [ -f "$path" ] || continue
+    head -n 1 "$path" 2>/dev/null | grep -Eq '^#!.*[/ ](ba)?sh([[:space:]]|$)' && echo "$path"
+  done < <(git ls-files)
+}
+
+# hook_status <clone root>: the pre-push gate is active for that clone (DA-B-1). Git runs
+# the hook from the working-tree file and silently ignores it when it is not executable
+# or when core.hooksPath does not point at .githooks.
+hook_status() {
+  local root="$1" hooks_path
+  hooks_path="$(git -C "$root" config --get core.hooksPath 2>/dev/null)"
+  if [ "$hooks_path" != .githooks ]; then
+    echo "  FAIL: core.hooksPath is '${hooks_path:-unset}' in $root — the pre-push gate is NOT active (git config core.hooksPath .githooks)"
+    return 1
+  fi
+  if [ ! -x "$root/.githooks/pre-push" ]; then
+    echo "  FAIL: $root/.githooks/pre-push is not executable on disk — git ignores it silently (chmod +x .githooks/pre-push)"
+    return 1
+  fi
+  echo "  pre-push hook active in $root (core.hooksPath=.githooks, executable on disk)"
+}
 
 # --- steps ------------------------------------------------------------------------------
 
@@ -101,6 +145,31 @@ step_secrets() {
   [ -z "$tracked" ] || { echo "  FAIL: .env files tracked by git: $tracked"; return 1; }
 }
 
+# Scripts executable in git and on disk; the pushing clone's pre-push hook active (DA-B-1).
+step_git-modes() {
+  local scripts=() path bad_index="" bad_disk="" rc=0
+  mapfile -t scripts < <(tracked_scripts)
+  echo "  ${#scripts[@]} tracked scripts"
+  for path in "${scripts[@]}"; do
+    [ "$(git ls-files -s -- "$path" | awk '{print $1}')" = 100755 ] || bad_index="$bad_index $path"
+    [ -x "$path" ] || bad_disk="$bad_disk $path"
+  done
+  if [ -n "$bad_index" ]; then
+    echo "  FAIL: not 100755 in git (git update-index --chmod=+x):$bad_index"
+    rc=1
+  fi
+  if [ -n "$bad_disk" ]; then
+    echo "  FAIL: not executable on disk (chmod +x; UNC writes from Windows drop it):$bad_disk"
+    rc=1
+  fi
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    echo "  pre-push hook activation: not applicable in CI (checked locally by gate.sh and check.sh)"
+  else
+    hook_status "$MAIN_ROOT" || rc=1
+  fi
+  return "$rc"
+}
+
 step_pinned-deps() {
   local unpinned="" line pkg
   while IFS= read -r line; do
@@ -112,7 +181,14 @@ step_pinned-deps() {
   [ -z "$unpinned" ] || { echo "  FAIL: unpinned dependencies:$unpinned"; return 1; }
 }
 
-step_venv() { need_venv && echo "  $("$PY" --version 2>&1) at $VENV"; }
+# The venv has exactly this tree's pins (DA-B-4): otherwise tests, mypy and the audit
+# would describe other packages than the ones being pushed.
+step_venv() {
+  need_venv || return 1
+  echo "  $("$PY" --version 2>&1) at $VENV"
+  "$PY" -m rag_app.devtools.venv_sync --root "$REPO_ROOT" 2>&1 | sed 's/^/  /'
+  [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "  FAIL: fix with: $VENV/bin/pip install -r backend/requirements-dev.txt"; return 1; }
+}
 
 step_ruff-lint() { need_venv && (cd backend && "$VENV/bin/ruff" check .); }
 step_ruff-format() { need_venv && (cd backend && "$VENV/bin/ruff" format --check .); }
@@ -133,15 +209,8 @@ step_shellcheck() {
   command -v shellcheck >/dev/null \
     || { missing_tool "shellcheck (scripts/prereqs/install.sh shellcheck)"; return; }
   local files=()
-  mapfile -t files < <(git ls-files -- '*.sh' '.githooks/*')
+  mapfile -t files < <(tracked_scripts)
   echo "  ${#files[@]} files: ${files[*]}"
-  # Executable bit as committed: a hook without it is silently ignored by git.
-  local not_exec
-  not_exec="$(git ls-files -s -- '*.sh' '.githooks/*' | awk '$1 != "100755" {printf " %s", $4}')"
-  if [ -n "$not_exec" ]; then
-    echo "  FAIL: not executable in git (git update-index --chmod=+x):$not_exec"
-    return 1
-  fi
   shellcheck -x "${files[@]}"
 }
 
@@ -186,6 +255,85 @@ step_eval() {
   (cd backend && "$PY" -m rag_app.eval.gate --require-stack)
 }
 
+# --- backend venv matching the pins (DA-B-4) --------------------------------------------
+
+req_hash() { # req_hash <tree>: build recipe + both requirement files
+  {
+    echo "recipe=$VENV_RECIPE torch-index=$TORCH_INDEX"
+    cat "$1/backend/requirements.txt" "$1/backend/requirements-dev.txt" 2>/dev/null
+  } | sha256sum | cut -c1-16
+}
+
+venv_in_sync() { # venv_in_sync <venv dir>: installed == REPO_ROOT's pins
+  [ -x "$1/bin/python" ] \
+    && "$1/bin/python" -m rag_app.devtools.venv_sync --root "$REPO_ROOT" >/dev/null 2>&1
+}
+
+# build_venv <dir>: runs in its own process under timeout (--build-venv).
+build_venv() {
+  local dir="$1" torch_pin="" py_version="3.12"
+  command -v uv >/dev/null || { echo "FAIL: uv not found (needed to build the gate venv)"; return 1; }
+  mkdir -p "$VENV_CACHE" || return 1
+  exec 9>"$VENV_CACHE/.lock"
+  flock 9
+  [ -f "$dir/.secrag-complete" ] && return 0   # a concurrent run built it
+  rm -rf "$dir"
+  if [ -x "$MAIN_VENV/bin/python" ]; then
+    # Same interpreter and torch build as the main venv (torch is not in the pins).
+    py_version="$("$MAIN_VENV/bin/python" -c 'import platform; print(platform.python_version())')"
+    torch_pin="$("$MAIN_VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("torch"))' 2>/dev/null)"
+  fi
+  uv venv --quiet --seed --python "$py_version" "$dir" || return 1
+  uv pip install --quiet --python "$dir/bin/python" --index-url "$TORCH_INDEX" \
+    "torch${torch_pin:+==$torch_pin}" || return 1
+  uv pip install --quiet --python "$dir/bin/python" -r "$REPO_ROOT/backend/requirements-dev.txt" \
+    || return 1
+  "$dir/bin/python" -m rag_app.devtools.venv_sync --root "$REPO_ROOT" || return 1
+  touch "$dir/.secrag-complete"
+}
+
+prune_venv_cache() { # keep the VENV_CACHE_KEEP most recently used cached venvs
+  local old
+  find "$VENV_CACHE" -mindepth 2 -maxdepth 2 -name .secrag-complete -printf '%T@ %h\n' 2>/dev/null \
+    | sort -rn | tail -n +"$((VENV_CACHE_KEEP + 1))" | cut -d' ' -f2- \
+    | while IFS= read -r old; do
+        case "$old" in "$VENV_CACHE"/*) rm -rf "$old" ;; esac
+      done
+}
+
+VENV_ERROR=""
+resolve_venv() {
+  local t0=$SECONDS want have dir
+  if [ -n "${GATE_VENV:-}" ]; then
+    echo "venv: GATE_VENV=$VENV (explicit; the venv step checks it against the pins)"
+    return 0
+  fi
+  want="$(req_hash "$REPO_ROOT")"
+  have="$(req_hash "$MAIN_ROOT")"
+  if [ "$want" = "$have" ] && venv_in_sync "$MAIN_VENV"; then
+    VENV="$MAIN_VENV"
+    echo "venv: main venv (requirements hash $want matches, installed == pins)"
+  elif [ "$REPO_ROOT" = "$MAIN_ROOT" ]; then
+    VENV="$MAIN_VENV"   # never rebuilt behind the developer's back: the venv step fails
+    echo "venv: main venv is out of sync with the pins — the venv step will fail"
+  else
+    dir="$VENV_CACHE/$want"
+    if [ ! -f "$dir/.secrag-complete" ]; then
+      echo "venv: pins differ from the main venv → building cached venv $want (budget ${VENV_BUILD_BUDGET}s)"
+      timeout -k 10 "$VENV_BUILD_BUDGET" bash "$SELF" --build-venv "$dir" 2>&1 | sed 's/^/  /'
+      if [ "${PIPESTATUS[0]}" -ne 0 ] || [ ! -f "$dir/.secrag-complete" ]; then
+        VENV_ERROR="could not build the gate venv for requirements hash $want"
+      fi
+    fi
+    [ -n "$VENV_ERROR" ] || touch "$dir/.secrag-complete"   # last use, for pruning
+    VENV="$dir"
+    echo "venv: cached venv $dir ($((SECONDS - t0))s)"
+    prune_venv_cache
+  fi
+  PY="$VENV/bin/python"
+  export VENV PY
+}
+
 # --- gate project (stack) ---------------------------------------------------------------
 
 STACK_STARTED=0
@@ -207,6 +355,15 @@ resolve_ollama_host() {
 }
 
 ollama_reachable() { curl -4 -fsS -m 5 -o /dev/null "${OLLAMA_HOST%/}/api/tags" 2>/dev/null; }
+
+# "<model> <digest>" of the embedding model Ollama serves now (DA-B-9); empty on error.
+embed_model_digest() {
+  (cd "$REPO_ROOT/backend" && "$PY" -m rag_app.devtools.ollama_digest --host "$OLLAMA_HOST" 2>/dev/null)
+}
+
+db_alembic_head() {
+  compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT version_num FROM alembic_version'
+}
 
 stack_down() {
   [ "$STACK_STARTED" = 1 ] || return 0
@@ -255,7 +412,8 @@ stack_up() {
     SEED_ERROR="no gate seed at $SEED — run: scripts/gate.sh --make-seed (needs Ollama)"
     return 2
   fi
-  local seeded_hash current_hash
+  # Staleness (DA-B-9): corpus, embedding model build and schema must match the seed.
+  local seeded_hash current_hash seeded_model current_model seeded_head current_head
   seeded_hash="$(sed -n 's/^corpus_sha256=//p' "$SEED_META" 2>/dev/null)"
   if [ -f "$CHUNKS" ]; then
     current_hash="$(sha256sum "$CHUNKS" | cut -d' ' -f1)"
@@ -264,12 +422,30 @@ stack_up() {
       return 2
     fi
   fi
+  seeded_model="$(sed -n 's/^embed_model=//p' "$SEED_META" 2>/dev/null)"
+  if [ -z "$seeded_model" ]; then
+    SEED_ERROR="the seed does not record its embedding model digest (older seed) — run: scripts/gate.sh --make-seed"
+    return 2
+  fi
+  if ollama_reachable; then   # unreachable: eval fails on its own with a clear message
+    current_model="$(embed_model_digest)"
+    if [ "$seeded_model" != "$current_model" ]; then
+      SEED_ERROR="the embedding model changed since the seed was made (seed: $seeded_model; Ollama now: ${current_model:-not served}) — run: scripts/gate.sh --make-seed"
+      return 2
+    fi
+  fi
+  seeded_head="$(sed -n 's/^alembic_head=//p' "$SEED_META" 2>/dev/null)"
+  current_head="$(db_alembic_head)"
+  if [ "$seeded_head" != "$current_head" ]; then
+    SEED_ERROR="migrations changed since the seed was made (seed at ${seeded_head:-?}, head ${current_head:-?}) — run: scripts/gate.sh --make-seed"
+    return 2
+  fi
   if ! compose exec -T db pg_restore -U "$GATE_DB_USER" -d "$GATE_DB_NAME" \
          --data-only --disable-triggers --no-owner <"$SEED"; then
     SEED_ERROR="seed restore failed"
     return 2
   fi
-  echo "  seed restored: $(sed -n 's/^chunks=//p' "$SEED_META") chunks ($(sed -n 's/^created=//p' "$SEED_META"))"
+  echo "  seed restored: $(sed -n 's/^chunks=//p' "$SEED_META") chunks ($(sed -n 's/^created=//p' "$SEED_META"); $seeded_model; alembic $seeded_head)"
 }
 
 make_seed() {
@@ -281,27 +457,33 @@ make_seed() {
     echo "Ollama not reachable at $OLLAMA_HOST — start it (native: ollama serve) or set GATE_OLLAMA_HOST"
     return 1
   fi
+  local model
+  model="$(embed_model_digest)"
+  [ -n "$model" ] || { echo "  FAIL: the embedding model is not served by $OLLAMA_HOST (ollama pull it)"; return 1; }
   trap 'stack_down' EXIT
   trap 'exit 130' INT TERM
   echo "== make-seed: gate project up =="
   stack_up 0 || { echo "  FAIL: $STACK_ERROR"; return 1; }
-  echo "== make-seed: index $CHUNKS (embeddings via $OLLAMA_HOST) =="
+  echo "== make-seed: index $CHUNKS (embeddings via $OLLAMA_HOST, $model) =="
   (cd backend && "$PY" -m rag_app.indexing --chunks "$CHUNKS") || { echo "  FAIL: indexing"; return 1; }
+  [ "$(embed_model_digest)" = "$model" ] \
+    || { echo "  FAIL: the embedding model changed while indexing — run --make-seed again"; return 1; }
   mkdir -p "$GATE_STATE"
   chmod 700 "$GATE_STATE"
   compose exec -T db pg_dump -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -Fc --data-only \
     -t documents -t chunks >"$SEED.tmp" || { echo "  FAIL: pg_dump"; rm -f "$SEED.tmp"; return 1; }
   local chunks head
   chunks="$(compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT count(*) FROM chunks')"
-  head="$(compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT version_num FROM alembic_version')"
+  head="$(db_alembic_head)"
   mv -f "$SEED.tmp" "$SEED"
   {
     echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "corpus_sha256=$(sha256sum "$CHUNKS" | cut -d' ' -f1)"
+    echo "embed_model=$model"
     echo "alembic_head=$head"
     echo "chunks=$chunks"
   } >"$SEED_META"
-  echo "seed written: $SEED ($chunks chunks, alembic $head) in $((SECONDS - t0))s"
+  echo "seed written: $SEED ($chunks chunks, $model, alembic $head) in $((SECONDS - t0))s"
 }
 
 # --- runner -----------------------------------------------------------------------------
@@ -339,7 +521,7 @@ run_step() {
   RESULTS+=("$(printf '%-17s %-5s %5ss / %ss' "$name" "$status" "$elapsed" "$budget")")
 }
 
-usage() { sed -n '2,21p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local mode=fast only="" arg
@@ -347,6 +529,7 @@ main() {
     arg="$1"
     case "$arg" in
       --run-step) shift; "step_$1"; return ;;
+      --build-venv) shift; build_venv "$1"; return ;;
       --fast) mode=fast ;;
       --full) mode=full ;;
       --only) shift; mode=only; only="$only,${1:-}" ;;
@@ -369,8 +552,6 @@ main() {
   OLLAMA_HOST="$(resolve_ollama_host)"
   export OLLAMA_HOST
 
-  if [ "$mode" = seed ]; then make_seed; return; fi
-
   local steps=() name
   case "$mode" in
     fast) mapfile -t steps < <(awk 'NF==3 && $2=="-" {print $1}' <<<"$STEP_TABLE") ;;
@@ -381,7 +562,25 @@ main() {
         is_step "$name" || { echo "unknown step: $name (see --list)" >&2; return 2; }
       done ;;
   esac
-  if [ "$mode" = full ]; then export GATE_MODE=full; else export GATE_MODE=fast; fi
+  case "$mode" in
+    full | only) export GATE_MODE="$mode" ;;
+    *) export GATE_MODE=fast ;;
+  esac
+
+  echo "gate: mode=$mode, tree=$REPO_ROOT${REPO_ROOT:+ @ $(git rev-parse --short HEAD 2>/dev/null)}"
+  local t0=$SECONDS v0=$SECONDS
+  resolve_venv
+  if [ -n "$VENV_ERROR" ]; then
+    echo "  FAIL: $VENV_ERROR"
+    fail=1
+  fi
+  RESULTS+=("$(printf '%-17s %-5s %5ss' venv-resolve "$([ -z "$VENV_ERROR" ] && echo PASS || echo FAIL)" "$((SECONDS - v0))")")
+
+  if [ "$mode" = seed ]; then
+    [ -z "$VENV_ERROR" ] || return 1
+    make_seed
+    return
+  fi
 
   local needs_stack=0
   for name in "${steps[@]}"; do
@@ -391,8 +590,6 @@ main() {
     esac
   done
 
-  echo "gate: mode=$mode, tree=$REPO_ROOT${REPO_ROOT:+ @ $(git rev-parse --short HEAD 2>/dev/null)}"
-  local t0=$SECONDS
   trap 'stack_down' EXIT
   trap 'exit 130' INT TERM
   if [ "$needs_stack" != 0 ]; then
@@ -423,7 +620,7 @@ main() {
   echo "============================================"
   printf '%s\n' "${RESULTS[@]}"
   echo "--------------------------------------------"
-  echo "total ${total}s (mode $mode)"
+  echo "total ${total}s (mode $mode) @ $(git rev-parse HEAD 2>/dev/null)"
   if [ "$mode" = full ] && [ "$total" -gt "$FULL_TARGET_SECONDS" ]; then
     echo "WARNING: --full took ${total}s, over the ${FULL_TARGET_SECONDS}s target (X5)"
   fi
