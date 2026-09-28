@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI
@@ -12,13 +14,20 @@ from rag_app.api import auth, conversations
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
-from rag_app.config import get_settings
+from rag_app.config import check_dev_only_flags, get_settings
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Start-up checks: fail closed before serving anything (T11.0.10; 11.2 adds more)."""
+    check_dev_only_flags(get_settings())
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="SecRAG API", version=__version__)
+    app = FastAPI(title="SecRAG API", version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[get_settings().frontend_origin],

@@ -204,6 +204,9 @@ python -c "from cryptography.fernet import Fernet; print('DATA_MASTER_KEY=' + Fe
 
 SMTP is optional. Without it, email-verification links are written to the backend log.
 
+Keep `ENV=dev` (from `.env.example`) on a local machine. When `ENV` is unset the app assumes
+`prod`, and in `prod` it refuses to start if any development-only feature flag is enabled.
+
 ### 4. Build the corpus and the index
 
 All commands below run from `backend/` with the virtual environment active.

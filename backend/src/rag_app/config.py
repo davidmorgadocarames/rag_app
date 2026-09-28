@@ -6,8 +6,21 @@ Nothing sensitive is hardcoded; see `.env.example` for the full list of keys.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Literal
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Settings fields that enable a feature which must never run in production (PHASE_PLANNING
+# §1 rule 2, "fail-closed flags"). Each such feature adds its boolean field name here when it
+# lands: fake LLM provider (Phase 16), defence lab (13), data explorer (19), code-fix (20).
+# With ENV=prod (the default) the API refuses to start while any of them is enabled.
+DEV_ONLY_FLAGS: list[str] = []
+
+
+class DevOnlyFlagInProdError(RuntimeError):
+    """A development-only feature is enabled while ENV=prod."""
 
 
 class Settings(BaseSettings):
@@ -18,6 +31,11 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # --- Environment (T11.0.10) ---
+    # "prod" unless ENV says otherwise: a missing or forgotten ENV can never switch on a
+    # development-only feature. The local .env sets ENV=dev; Azure never sets it.
+    env: Literal["dev", "prod"] = "prod"
 
     # --- Database (PostgreSQL + pgvector) ---
     database_url: str = "postgresql+psycopg://rag:rag@localhost:5432/rag"
@@ -98,3 +116,26 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the application settings loaded from the environment."""
     return Settings()
+
+
+def enabled_dev_only_flags(settings: Settings, flags: Iterable[str] | None = None) -> list[str]:
+    """Names of the development-only flags that are switched on in ``settings``."""
+    names = DEV_ONLY_FLAGS if flags is None else flags
+    return [name for name in names if bool(getattr(settings, name, False))]
+
+
+def check_dev_only_flags(settings: Settings, flags: Iterable[str] | None = None) -> None:
+    """Start-up guard: refuse any development-only flag while ``ENV=prod``.
+
+    Called from the API lifespan, so a misconfigured production container crashes at start
+    instead of serving a development-only feature.
+    """
+    if settings.env != "prod":
+        return
+    enabled = enabled_dev_only_flags(settings, flags)
+    if enabled:
+        raise DevOnlyFlagInProdError(
+            "ENV=prod but development-only flags are enabled: "
+            + ", ".join(sorted(enabled))
+            + " — disable them, or set ENV=dev on a local machine"
+        )
