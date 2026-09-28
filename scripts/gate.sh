@@ -202,7 +202,9 @@ step_pytest() {
 
 step_gitleaks() {
   [ -x "$VENV/bin/pre-commit" ] || { missing_tool "pre-commit not installed in the venv"; return; }
-  "$VENV/bin/pre-commit" run gitleaks --all-files
+  # The committed history of the checked tree (as CI scans it) and the staged changes.
+  "$VENV/bin/pre-commit" run gitleaks-history --hook-stage manual --all-files \
+    && "$VENV/bin/pre-commit" run gitleaks --all-files
 }
 
 step_shellcheck() {

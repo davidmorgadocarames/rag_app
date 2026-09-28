@@ -1,0 +1,8 @@
+# Gitleaks findings reviewed and accepted (fingerprint = commit:file:rule:line).
+# d0ed80a: dummy HS256 keys in unit tests ("test-secret-…-32-bytes-long", "secret-A/B-…"),
+# never used anywhere else; replaced by low-entropy constants in the next commit.
+d0ed80a6c6ecb5e6b0d6141a36f45e8f3448af5c:backend/tests/test_security.py:generic-api-key:18
+d0ed80a6c6ecb5e6b0d6141a36f45e8f3448af5c:backend/tests/test_security.py:generic-api-key:24
+d0ed80a6c6ecb5e6b0d6141a36f45e8f3448af5c:backend/tests/test_security.py:generic-api-key:29
+d0ed80a6c6ecb5e6b0d6141a36f45e8f3448af5c:backend/tests/test_security.py:generic-api-key:31
+d0ed80a6c6ecb5e6b0d6141a36f45e8f3448af5c:backend/tests/test_security.py:generic-api-key:36

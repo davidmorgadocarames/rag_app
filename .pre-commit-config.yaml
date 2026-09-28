@@ -25,7 +25,15 @@ repos:
         files: ^backend/
 
   # --- Secret scanning: blocks committing .env / keys / tokens ---
+  # Same gitleaks version as CI's gitleaks-action (8.24.3 on 2026-09-28).
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.21.2
+    rev: v8.24.3
     hooks:
       - id: gitleaks
+      # Gate step `gitleaks` (manual stage): the committed history, like CI. The hook above
+      # only sees staged changes, which are empty at push time.
+      - id: gitleaks
+        alias: gitleaks-history
+        name: Detect hardcoded secrets (git history)
+        entry: gitleaks git --redact --no-banner .
+        stages: [manual]

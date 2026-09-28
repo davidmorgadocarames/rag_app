@@ -13,7 +13,7 @@ are a human/agent checklist.
 | # | Norm | Enforced by (gate step) |
 |---|------|-------------|
 | 1 | Developed and run in **WSL2 Ubuntu** (GPU used where relevant) | `environment` (`/proc/version`) |
-| 2 | No secrets committed: `.env` files git-ignored, gitleaks clean | `secrets`, `gitleaks` |
+| 2 | No secrets committed: `.env` files git-ignored, gitleaks clean | `secrets`, `gitleaks` (committed history + staged changes, same gitleaks version as CI; reviewed false positives in `.gitleaksignore`) |
 | 3 | No hardcoding of config — everything via `pydantic-settings` | review |
 | 4 | Dependencies pinned, and the gate runs with exactly those pins | `pinned-deps` (`==` in every requirements file), `venv` (installed == pins) |
 | 5 | Lint + format clean (`ruff check`, `ruff format --check`) | `ruff-lint`, `ruff-format` |

@@ -8,3 +8,6 @@ pre-commit==4.0.1
 # Gate tooling: dependency-audit step (T11.0.7) and the gate-project isolation test.
 pip-audit==2.10.1
 PyYAML==6.0.3
+# The installer itself is in the audited venv: a fresh `python -m venv` seeds an old,
+# vulnerable pip (CI found pip 25.0.1), so it is pinned like everything else.
+pip==26.2.1
