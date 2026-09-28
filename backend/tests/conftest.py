@@ -3,12 +3,14 @@
 See ``db_harness.py``. ``TEST_DATABASE_URL`` unset → ``db`` tests are skipped, unless
 ``SECRAG_REQUIRE_DB_TESTS=1`` (gate ``--full`` / CI), which turns the skip into an error.
 A ``TEST_DATABASE_URL`` that could be the development database aborts the whole run before
-any test executes or any connection is made.
+any test executes or any connection is made. During ``db`` tests the app's own
+``DATABASE_URL`` points at the harness database (DA-B-3).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterator
 
 import pytest
@@ -20,12 +22,20 @@ from db_harness import (
     apply_roles,
     assert_harness_database,
     check_admin_url,
+    check_app_url,
     create_database,
     drop_database,
     migrate,
 )
 
 REQUIRE_ENV = "SECRAG_REQUIRE_DB_TESTS"
+
+# Module-level caches in app code that hold an engine/session factory built from settings.
+# Reset around every DB test so nothing built from another DATABASE_URL survives.
+APP_ENGINE_CACHES = (
+    ("rag_app.api.deps", "_session_factory"),
+    ("rag_app.api.conversations", "_stream_sessions"),
+)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -56,6 +66,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         item.add_marker(skip)
 
 
+def reset_app_engine_caches() -> None:
+    for module_name, attr in APP_ENGINE_CACHES:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, attr, None)
+
+
 @pytest.fixture(scope="session")
 def admin_url() -> URL:
     return check_admin_url(os.environ["TEST_DATABASE_URL"])
@@ -63,8 +80,11 @@ def admin_url() -> URL:
 
 @pytest.fixture(scope="session")
 def db_url(admin_url: URL) -> Iterator[URL]:
-    """A fresh, migrated database created by the harness for this session."""
+    """A fresh, migrated database created by the harness for this session. While it exists,
+    ``DATABASE_URL`` — what the app's settings, ``make_engine()`` and the API read — is the
+    harness database, whatever the shell or ``backend/.env`` say."""
     url = create_database(admin_url)
+    previous = os.environ.get("DATABASE_URL")
     try:
         engine = create_engine(url, future=True)
         try:
@@ -73,9 +93,35 @@ def db_url(admin_url: URL) -> Iterator[URL]:
             apply_roles(engine)
         finally:
             engine.dispose()
+        os.environ["DATABASE_URL"] = url.render_as_string(hide_password=False)
         yield url
     finally:
+        if previous is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous
+        reset_app_engine_caches()
         drop_database(admin_url, url)
+
+
+@pytest.fixture(autouse=True)
+def _db_tests_use_the_harness_database(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Every ``db`` test: app code resolves the harness database, or the run aborts."""
+    if request.node.get_closest_marker("db") is None:
+        yield
+        return
+    request.getfixturevalue("db_url")
+    from rag_app.config import get_settings
+
+    try:
+        check_app_url(get_settings().database_url)
+    except HarnessRefusal as exc:
+        pytest.exit(f"test DB harness: {exc}", returncode=4)
+    reset_app_engine_caches()
+    try:
+        yield
+    finally:
+        reset_app_engine_caches()
 
 
 @pytest.fixture()

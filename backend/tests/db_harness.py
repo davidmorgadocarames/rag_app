@@ -11,6 +11,13 @@ project's Postgres on 127.0.0.1:15432 by default, or the CI service). The harnes
 4. migrates it (``alembic upgrade head``), applies ``db/roles.sql`` when that file exists,
    and drops it at the end of the session.
 
+5. points the **app's own configuration** at that database for every ``db`` test:
+   ``DATABASE_URL`` (the only setting the app builds its engine from) is set to the harness
+   database for the session, the app's cached session factories are reset around each test,
+   and a test aborts the run (rc 4) if app code would still resolve anything else — so a DB
+   test calling ``get_settings()``, ``make_engine()`` or the API can never reach the
+   development database on 5432 / ``rag`` (DA-B-3).
+
 Selection (see ``conftest.py``): tests marked ``db`` are skipped when ``TEST_DATABASE_URL``
 is unset (``gate.sh --fast``), and that skip becomes an error when
 ``SECRAG_REQUIRE_DB_TESTS=1`` (``gate.sh --full`` and CI).
@@ -60,6 +67,15 @@ def check_admin_url(raw: str) -> URL:
         raise HarnessRefusal(f"refusing database {url.database!r}: the development database")
     if url.drivername == "postgresql":
         url = url.set(drivername="postgresql+psycopg")
+    return url
+
+
+def check_app_url(raw: str) -> URL:
+    """The URL app code resolves (``DATABASE_URL`` via settings) during a DB test must be a
+    harness database: the admin-URL rules plus the ``secrag_test_`` name (DA-B-3)."""
+    url = check_admin_url(raw)
+    if not (url.database or "").startswith(DB_PREFIX):
+        raise HarnessRefusal(f"app code would use database {url.database!r}, not a harness one")
     return url
 
 
