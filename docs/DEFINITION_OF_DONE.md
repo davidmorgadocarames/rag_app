@@ -15,7 +15,7 @@ are a human/agent checklist.
 | 1 | Developed and run in **WSL2 Ubuntu** (GPU used where relevant) | `environment` (`/proc/version`) |
 | 2 | No secrets committed: `.env` files git-ignored, gitleaks clean | `secrets`, `gitleaks` |
 | 3 | No hardcoding of config — everything via `pydantic-settings` | review |
-| 4 | Dependencies pinned | `pinned-deps` (`==` in every requirements file) |
+| 4 | Dependencies pinned, and the gate runs with exactly those pins | `pinned-deps` (`==` in every requirements file), `venv` (installed == pins) |
 | 5 | Lint + format clean (`ruff check`, `ruff format --check`) | `ruff-lint`, `ruff-format` |
 | 6 | Types clean (`mypy` strict) | `mypy` |
 | 7 | Tests green (`pytest`); new logic has tests; DB tests run through the **test DB harness** | `pytest` (unit), `db-tests` (`--full` / CI) |
@@ -23,9 +23,10 @@ are a human/agent checklist.
 | 9 | **Verified end-to-end** — actually exercised, not only unit tests | judgment (checklist) |
 | 10 | Docs updated (README roadmap + relevant docs); relative links resolve | judgment + `adr-links` |
 | 11 | CI green after push; conventional commit message | CI + review |
-| 12 | Shell scripts clean | `shellcheck` (every tracked `*.sh` and `.githooks/*`) |
+| 12 | Shell scripts clean | `shellcheck` (every tracked `*.sh`, `.githooks/*` and sh/bash-shebang file) |
 | 13 | No known vulnerable dependency without a dated, justified exception | `dependency-audit` |
 | 14 | Evaluation data well-formed (golden set, judge labels, thresholds, baseline) | `schema-check` |
+| 15 | The gate cannot be skipped silently: tracked scripts `100755` in git and executable on disk; the pushing clone has `core.hooksPath = .githooks` and an executable `.githooks/pre-push` | `git-modes` (+ `scripts/prereqs/check.sh`; CI job `cheap-checks` for the modes) |
 
 ## Phase-specific norms
 
@@ -43,6 +44,13 @@ are a human/agent checklist.
   does **not** conflict with a container that *runs in production* on Azure.
 - **Phase 11+ (gate hygiene, X5)** — `--full` runs only in the isolated gate project; every
   sub-phase closes with `--full` or `--only <the steps it adds>`; target `--full` ≤ 30 min.
+- **Promotion evidence (Phase 11+, D-2026-09-27-7 a)** — the pre-push hook can be bypassed
+  (`--no-verify`, a lost exec bit, an unset `core.hooksPath`), so a promotion to `main`
+  (PHASE_TASKS rows 40/41) needs the **`--full` PASS log for the exact SHA pushed**: the
+  gate's summary prints `total … @ <full SHA>` and `GATE: PASS`; the log is attached to the
+  phase report / PR. CI's `cheap-checks` job is the server-side backstop for the cheap steps
+  (git modes, shellcheck, venv, dependency-audit, adr-links). A GitHub commit status that CD
+  requires before deploying (D-7 b) is added with the CD rework (row 9).
 
 ## Gate modes
 
@@ -50,8 +58,8 @@ are a human/agent checklist.
 |---|---|---|
 | `--fast` (default) | pre-push on phase branches | every step marked `-` below; no stack needed |
 | `--full` | pre-push to `main` (promotion), before a PR is ready | fast + stack steps in the gate project: up → migrate → seed → steps → `down -v`. A missing tool or an unreachable stack **fails** (never skips) |
-| `--only a,b` | closing a sub-phase, debugging | just the named steps (the gate project is started only if one needs it) |
-| `--make-seed` | once, and whenever `data/chunks/chunks.jsonl` changes | builds the git-ignored seed `.gate/seed.dump` (documents + chunks, embedded with Ollama) in the gate project |
+| `--only a,b` | closing a sub-phase, debugging, CI `cheap-checks` | just the named steps (the gate project is started only if one needs it). A missing tool **fails**, as in `--full` — a step that was asked for never passes without running |
+| `--make-seed` | once, and whenever the corpus (`data/chunks/chunks.jsonl`), the embedding model build (Ollama digest) or the migrations head changes | builds the git-ignored seed `.gate/seed.dump` (documents + chunks, embedded with Ollama) in the gate project; `seed.meta` records corpus hash, `embed_model` digest and `alembic_head`, and `eval` fails on any mismatch |
 | `--list` | — | step names, stack needs and budgets |
 
 Steps and time budgets (a step that exceeds its budget is killed and fails):
@@ -60,15 +68,26 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 |---|---|---|---|---|---|
 | `environment` | - | 10 s | `gitleaks` | - | 180 s |
 | `secrets` | - | 10 s | `shellcheck` | - | 60 s |
-| `pinned-deps` | - | 10 s | `schema-check` | - | 30 s |
-| `venv` | - | 10 s | `adr-links` | - | 30 s |
-| `ruff-lint` | - | 60 s | `frontend` | - | 600 s |
-| `ruff-format` | - | 60 s | `dependency-audit` | - | 240 s |
-| `mypy` | - | 240 s | `db-tests` | gate DB | 300 s |
-| `pytest` | - | 300 s | `eval` | gate DB + seed + Ollama | 1200 s |
+| `git-modes` | - | 10 s | `schema-check` | - | 30 s |
+| `pinned-deps` | - | 10 s | `adr-links` | - | 30 s |
+| `venv` | - | 10 s | `frontend` | - | 600 s |
+| `ruff-lint` | - | 60 s | `dependency-audit` | - | 240 s |
+| `ruff-format` | - | 60 s | `db-tests` | gate DB | 300 s |
+| `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
+| `pytest` | - | 300 s | | | |
 
-Gate-project setup (up + migrate + seed restore) has its own 300 s budget. Measured on the
-development machine (2026-09-27): `--fast` ≈ 26 s, `--full` ≈ 3 min (eval ≈ 2.5 min).
+Gate-project setup (up + migrate + seed restore) has its own 300 s budget; building a
+cached venv (below) has 900 s. Measured on the development machine (2026-09-27): `--fast`
+≈ 26 s, `--full` ≈ 3 min (eval ≈ 2.5 min).
+
+**Venv matching the pins** (DA-B-4). The gate resolves the backend venv before any step: the
+main tree's `backend/.venv` when the checked tree's requirements hash equals the main tree's
+and the installed versions equal the pins; otherwise (a pushed commit that changes the pins)
+a venv cached per requirements hash under `$(git rev-parse --git-common-dir)/secrag-gate/venvs/`
+(built once with `uv`: same Python and CPU torch as the main venv, then
+`requirements-dev.txt`; the three most recent are kept). In the main tree a drifted venv is
+never rebuilt behind the developer's back: the `venv` step fails with the install command.
+`GATE_VENV=<dir>` overrides the choice (CI); the `venv` step still checks it.
 
 **Isolation.** `compose.gate.yml` is self-contained: project `secrag-gate`, volume
 `secrag_gate_pgdata`, database published on `127.0.0.1:${GATE_DB_PORT:-15432}` only (not
@@ -87,19 +106,34 @@ maintenance connection on a local test server; the harness refuses port 5432, da
 marker comment, refuses any database without that marker, migrates it (`alembic upgrade
 head`), applies `db/roles.sql` when present and drops it at the end. Without
 `TEST_DATABASE_URL` the `db` tests are skipped — unless `SECRAG_REQUIRE_DB_TESTS=1`
-(`--full`, CI), where that is an error.
+(`--full`, CI), where that is an error. While the harness database exists, the app's own
+`DATABASE_URL` points at it (whatever the shell or `backend/.env` say), the app's cached
+session factories are reset around each `db` test, and a `db` test aborts the run (rc 4) if
+app code (`get_settings()`, `make_engine()`, the API) would resolve anything but a
+`secrag_test_*` database on a loopback, non-5432 port. `alembic.ini` keeps `sqlalchemy.url`
+empty (tested), so Alembic always follows `DATABASE_URL`.
 
 **Dependency audit.** `pip-audit` over the backend venv and `npm audit --omit=dev` over the
 frontend. Every advisory must match an entry of `audit-exceptions.toml` (advisory, package,
-ecosystem, reason, `expires` date); an expired entry fails even if the advisory is gone.
+ecosystem, reason, `expires` date); an expired entry fails even if the advisory is gone, and
+a duplicated entry is invalid. Each reason states how (or whether) the vulnerable code is
+reachable in SecRAG; `INTERIM` entries expire with the block that fixes them, `PERMANENT`
+ones (no fixed version) carry a re-review date. A package pip-audit cannot find on PyPI
+because of a local version label (`torch 2.14.0+cpu` from the PyTorch CPU index) is audited
+by its base version through the OSV API; any other unauditable package fails. CI runs the
+same step in the `cheap-checks` job.
 
 **Links.** `adr-links` checks every relative link and heading anchor in tracked Markdown;
 with `RUNBOOK_PATH=<private runbook>` it also checks the runbook (unset → explicit SKIP).
 
 **Pre-push hook.** `.githooks/pre-push` reads the pushed refs from stdin: only deletions →
 exit 0; any ref to `refs/heads/main` → `--full`, otherwise `--fast`. It runs the gate from a
-temporary worktree at each pushed SHA (the backend venv, `.gate/` seed and `data/` come from
-the main tree, `.env` files are linked from it, the frontend gets `npm ci`).
+temporary worktree at each pushed SHA (`.gate/` seed and `data/` come from the main tree,
+`.env` files are linked from it, the backend venv matches the pushed pins — see above — and
+the frontend gets `npm ci`). `SECRAG_PREPUSH_DRY_RUN=1` (tests only) prints the plan and
+exits **10**, so a forgotten export blocks the push instead of skipping the gate. After
+editing files from Windows through `\\wsl.localhost`, check `git diff --summary` for mode
+changes before committing (`git-modes` and `check.sh` catch a hook that lost its exec bit).
 
 ## How to run
 
