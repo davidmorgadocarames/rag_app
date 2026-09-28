@@ -46,7 +46,7 @@ VENV_CACHE="$GIT_COMMON/secrag-gate/venvs"
 VENV_RECIPE=1                     # bump when build_venv changes
 TORCH_INDEX="https://download.pytorch.org/whl/cpu"   # as in backend/Dockerfile
 VENV_BUILD_BUDGET=900
-VENV_CACHE_KEEP=3
+VENV_CACHE_KEEP=2                 # ~1.5 GB each (torch)
 
 COMPOSE_PROJECT="secrag-gate"
 COMPOSE_FILE="$REPO_ROOT/compose.gate.yml"
@@ -331,7 +331,9 @@ resolve_venv() {
     prune_venv_cache
   fi
   PY="$VENV/bin/python"
-  export VENV PY
+  # Steps run as `bash gate.sh --run-step`, which re-derives VENV from GATE_VENV.
+  GATE_VENV="$VENV"
+  export VENV PY GATE_VENV
 }
 
 # --- gate project (stack) ---------------------------------------------------------------

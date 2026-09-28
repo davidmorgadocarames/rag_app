@@ -47,7 +47,13 @@ def _make_repo(tmp_path: Path, hooks_path: str | None = ".githooks") -> Path:
 
 
 def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
-    base = {k: v for k, v in os.environ.items() if k not in {"GITHUB_ACTIONS", "GATE_MODE"}}
+    # Drop what an enclosing gate run exports (GATE_MAIN_ROOT, GATE_VENV, GATE_MODE, …) so
+    # the copy checks only the throwaway repository.
+    base = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("GATE_") and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE"}
+    }
     return subprocess.run(
         ["bash", str(repo / "scripts" / "gate.sh"), *args],
         cwd=repo,
