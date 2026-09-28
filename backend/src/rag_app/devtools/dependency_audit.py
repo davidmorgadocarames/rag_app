@@ -11,12 +11,19 @@ advisory id (the id or any alias, e.g. ``GHSA-…`` / ``CVE-…`` / ``PYSEC-…`
 ``advisory``, ``package``, ``ecosystem`` (``pypi`` | ``npm``), ``reason`` and an ``expires``
 date; a **past expiry fails** even if the advisory is no longer reported, so exceptions
 cannot be forgotten. Entries that match nothing are listed as stale (not a failure: the CI
-and local environments can differ).
+and local environments can differ). A duplicated (ecosystem, package, advisory) entry is
+invalid (DA-B-8).
+
+Packages pip-audit cannot look up on PyPI (DA-B-6): a version with a local label, such as
+``torch 2.14.0+cpu`` from the PyTorch CPU wheel index, is audited by its public base version
+(``2.14.0``) through the OSV API. Any other package pip-audit skips is a failure, so an
+unaudited dependency can never pass as a note.
 
     python -m rag_app.devtools.dependency_audit [--root REPO]
-        [--pip-json FILE] [--npm-json FILE] [--today YYYY-MM-DD]
+        [--pip-json FILE] [--npm-json FILE] [--osv-json FILE] [--today YYYY-MM-DD]
 
-``--pip-json`` / ``--npm-json`` read saved reports instead of running the tools (tests).
+``--pip-json`` / ``--npm-json`` read saved reports instead of running the tools, and
+``--osv-json`` a saved ``{"<package>": <OSV response>}`` map instead of querying OSV (tests).
 Exit code: 0 clean, 1 unexcepted finding / expired or invalid exception / tool failure.
 """
 
@@ -24,17 +31,23 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.metadata
 import json
 import subprocess
 import sys
 import tomllib
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 EXCEPTIONS_FILE = "audit-exceptions.toml"
+OSV_QUERY_URL = "https://api.osv.dev/v1/query"
 _ECOSYSTEMS = ("pypi", "npm")
 _REQUIRED = ("advisory", "package", "ecosystem", "reason", "expires")
+
+OsvLookup = Callable[[str, str], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -77,6 +90,7 @@ def load_exceptions(path: Path) -> tuple[list[AuditException], list[str]]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     entries: list[AuditException] = []
     errors: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
     for index, raw in enumerate(data.get("exception", []), start=1):
         missing = [key for key in _REQUIRED if not raw.get(key)]
         if missing:
@@ -89,6 +103,11 @@ def load_exceptions(path: Path) -> tuple[list[AuditException], list[str]]:
         if raw["ecosystem"] not in _ECOSYSTEMS:
             errors.append(f"exception #{index}: ecosystem must be one of {_ECOSYSTEMS}")
             continue
+        key = (str(raw["ecosystem"]), _norm(str(raw["package"])), str(raw["advisory"]))
+        if key in seen:
+            errors.append(f"exception #{index}: duplicate entry for {key[1]} {key[2]}")
+            continue
+        seen.add(key)
         entries.append(
             AuditException(
                 advisory=str(raw["advisory"]),
@@ -116,6 +135,80 @@ def parse_pip_audit(report: dict[str, Any]) -> list[Finding]:
                 )
             )
     return sorted(findings, key=lambda f: (f.package, f.advisory))
+
+
+def _installed_version(name: str) -> str:
+    # This module runs with the audited venv's interpreter (gate.sh uses "$PY").
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+
+
+def skipped_packages(report: dict[str, Any]) -> list[tuple[str, str]]:
+    """(name, version) of every dependency pip-audit skipped (its JSON omits the version
+    of a skipped dependency, so the installed one is used)."""
+    return [
+        (str(dep["name"]), str(dep.get("version") or _installed_version(str(dep["name"]))))
+        for dep in report.get("dependencies", [])
+        if "skip_reason" in dep
+    ]
+
+
+def query_osv(package: str, version: str) -> dict[str, Any]:
+    """OSV lookup of a PyPI package version (network)."""
+    body = json.dumps({"package": {"name": package, "ecosystem": "PyPI"}, "version": version})
+    request = urllib.request.Request(
+        OSV_QUERY_URL, data=body.encode(), headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data: dict[str, Any] = json.loads(response.read())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"OSV query for {package} {version} failed: {exc}") from exc
+    return data
+
+
+def audit_skipped(
+    skipped: list[tuple[str, str]], osv: OsvLookup
+) -> tuple[list[Finding], list[str], list[str]]:
+    """Audit what pip-audit skipped; returns (findings, notes, errors).
+
+    A local version label (``2.14.0+cpu``) is audited by its base version through OSV;
+    anything else pip-audit could not audit is an error.
+    """
+    findings: list[Finding] = []
+    notes: list[str] = []
+    errors: list[str] = []
+    for name, version in skipped:
+        base, sep, local = version.partition("+")
+        if not sep or not base:
+            errors.append(
+                f"pypi {name} {version or '?'}: pip-audit could not audit it (not on PyPI)"
+                " — install it from PyPI or extend the audit"
+            )
+            continue
+        try:
+            report = osv(name, base)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            continue
+        vulns = report.get("vulns", [])
+        for vuln in vulns:
+            findings.append(
+                Finding(
+                    ecosystem="pypi",
+                    package=name,
+                    version=version,
+                    advisory=str(vuln["id"]),
+                    aliases=frozenset(vuln.get("aliases", [])),
+                )
+            )
+        notes.append(
+            f"{name} {version}: not on PyPI (local label +{local}); audited as"
+            f" {name}=={base} via OSV: {len(vulns)} advisories"
+        )
+    return findings, notes, errors
 
 
 def parse_npm_audit(report: dict[str, Any]) -> list[Finding]:
@@ -187,12 +280,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--pip-json", type=Path)
     parser.add_argument("--npm-json", type=Path)
+    parser.add_argument("--osv-json", type=Path)
     parser.add_argument("--today", type=dt.date.fromisoformat, default=dt.date.today())
     args = parser.parse_args(argv)
     root: Path = args.root.resolve()
 
+    osv: OsvLookup = query_osv
+    if args.osv_json:
+        saved: dict[str, dict[str, Any]] = json.loads(args.osv_json.read_text(encoding="utf-8"))
+
+        def _saved_osv(package: str, _version: str) -> dict[str, Any]:
+            return saved.get(package, {})
+
+        osv = _saved_osv
+
     exceptions, errors = load_exceptions(root / EXCEPTIONS_FILE)
     findings: list[Finding] = []
+    audit_notes: list[str] = []
     try:
         if args.pip_json:
             pip_report = json.loads(args.pip_json.read_text(encoding="utf-8"))
@@ -202,9 +306,9 @@ def main(argv: list[str] | None = None) -> int:
                 root,
             )
         findings += parse_pip_audit(pip_report)
-        for dep in pip_report.get("dependencies", []):
-            if "skip_reason" in dep:
-                print(f"dependency-audit: note: {dep['skip_reason']}")
+        extra, audit_notes, skip_errors = audit_skipped(skipped_packages(pip_report), osv)
+        findings += extra
+        errors += skip_errors
         if args.npm_json:
             npm_report = json.loads(args.npm_json.read_text(encoding="utf-8"))
         else:
@@ -219,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         f"dependency-audit: {len(findings)} advisories found, {len(exceptions)} exceptions,"
         f" {len(failures)} failures"
     )
-    for note in notes:
+    for note in audit_notes + notes:
         print(f"  {note}")
     for failure in failures:
         print(f"  FAIL {failure}", file=sys.stderr)

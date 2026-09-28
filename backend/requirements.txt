@@ -17,6 +17,9 @@ httpx==0.28.1
 
 # Reranking: cross-encoder (bge-reranker) via sentence-transformers (pulls torch)
 sentence-transformers==3.3.1
+# torch requires setuptools on Python >= 3.12; pinned so its advisory fix is not left to
+# whatever version the installer brings (D-2026-09-27-6 a1).
+setuptools==84.0.0
 
 # Web API
 fastapi==0.115.6
@@ -24,5 +27,5 @@ uvicorn[standard]==0.34.0
 
 # Auth & compliance (password hashing, JWT, per-user encryption)
 argon2-cffi==23.1.0
-PyJWT==2.10.1
-cryptography==44.0.0
+PyJWT==2.15.0
+cryptography==50.0.1

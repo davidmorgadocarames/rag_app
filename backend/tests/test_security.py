@@ -15,24 +15,24 @@ def test_password_roundtrip() -> None:
 
 
 def test_jwt_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("JWT_SECRET", "test-secret-123")
+    monkeypatch.setenv("JWT_SECRET", "test-secret-123-at-least-32-bytes-long")
     token = create_token("user-1", expires_minutes=5)
     assert decode_token(token) == "user-1"
 
 
 def test_jwt_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("JWT_SECRET", "test-secret-123")
+    monkeypatch.setenv("JWT_SECRET", "test-secret-123-at-least-32-bytes-long")
     assert decode_token("not-a-jwt") is None
 
 
 def test_jwt_rejects_wrong_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("JWT_SECRET", "secret-A")
+    monkeypatch.setenv("JWT_SECRET", "secret-A-at-least-32-bytes-long-for-hs256")
     token = create_token("user-1")
-    monkeypatch.setenv("JWT_SECRET", "secret-B")
+    monkeypatch.setenv("JWT_SECRET", "secret-B-at-least-32-bytes-long-for-hs256")
     assert decode_token(token) is None
 
 
 def test_jwt_rejects_expired(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("JWT_SECRET", "test-secret-123")
+    monkeypatch.setenv("JWT_SECRET", "test-secret-123-at-least-32-bytes-long")
     token = create_token("user-1", expires_minutes=-1)
     assert decode_token(token) is None

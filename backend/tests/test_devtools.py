@@ -123,12 +123,23 @@ expires = 2026-10-31
 """
 
 
-def _audit(tmp_path: Path, exceptions: str, today: str = "2026-09-27") -> int:
+OSV_CLEAN: dict[str, Any] = {"torch": {}}
+
+
+def _audit(
+    tmp_path: Path,
+    exceptions: str,
+    today: str = "2026-09-27",
+    pip_report: dict[str, Any] | None = None,
+    osv: dict[str, Any] | None = None,
+) -> int:
     (tmp_path / "audit-exceptions.toml").write_text(exceptions, encoding="utf-8")
     pip_json = tmp_path / "pip.json"
     npm_json = tmp_path / "npm.json"
-    pip_json.write_text(json.dumps(PIP_REPORT), encoding="utf-8")
+    osv_json = tmp_path / "osv.json"
+    pip_json.write_text(json.dumps(pip_report or PIP_REPORT), encoding="utf-8")
     npm_json.write_text(json.dumps(NPM_REPORT), encoding="utf-8")
+    osv_json.write_text(json.dumps(OSV_CLEAN if osv is None else osv), encoding="utf-8")
     return dependency_audit.main(
         [
             "--root",
@@ -137,6 +148,8 @@ def _audit(tmp_path: Path, exceptions: str, today: str = "2026-09-27") -> int:
             str(pip_json),
             "--npm-json",
             str(npm_json),
+            "--osv-json",
+            str(osv_json),
             "--today",
             today,
         ]
@@ -166,12 +179,65 @@ def test_an_invalid_entry_fails(tmp_path: Path) -> None:
     assert _audit(tmp_path, broken) == 1
 
 
+def test_a_duplicated_entry_is_invalid(tmp_path: Path) -> None:
+    duplicated = EXCEPTIONS + "[[exception]]" + EXCEPTIONS.split("[[exception]]", 2)[2]
+    entries, errors = dependency_audit.load_exceptions(
+        _write(tmp_path / "audit-exceptions.toml", duplicated)
+    )
+    assert len(entries) == 2
+    assert errors and "duplicate" in errors[0]
+    assert _audit(tmp_path, duplicated) == 1
+
+
+def test_a_local_version_is_audited_by_its_base_version_via_osv(tmp_path: Path) -> None:
+    vulnerable = {"torch": {"vulns": [{"id": "PYSEC-2099-1", "aliases": ["CVE-2099-1"]}]}}
+    assert _audit(tmp_path, EXCEPTIONS, osv=vulnerable) == 1
+    excepted = EXCEPTIONS + (
+        '\n[[exception]]\nadvisory = "CVE-2099-1"\npackage = "torch"\necosystem = "pypi"\n'
+        'reason = "test"\nexpires = 2027-01-01\n'
+    )
+    assert _audit(tmp_path, excepted, osv=vulnerable) == 0
+
+
+def test_osv_is_queried_with_the_base_version() -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake(package: str, version: str) -> dict[str, Any]:
+        calls.append((package, version))
+        return {}
+
+    findings, notes, errors = dependency_audit.audit_skipped([("torch", "2.14.0+cpu")], fake)
+    assert calls == [("torch", "2.14.0")]
+    assert (findings, errors) == ([], [])
+    assert "audited as torch==2.14.0 via OSV" in notes[0]
+
+
+def test_an_unauditable_package_fails(tmp_path: Path) -> None:
+    report = {"dependencies": [{"name": "private-pkg", "version": "1.0", "skip_reason": "x"}]}
+    assert _audit(tmp_path, EXCEPTIONS.split("[[exception]]", 2)[0], pip_report=report) == 1
+
+
+def test_an_osv_failure_fails_the_audit() -> None:
+    def broken(package: str, version: str) -> dict[str, Any]:
+        raise RuntimeError("OSV query failed")
+
+    _, _, errors = dependency_audit.audit_skipped([("torch", "2.14.0+cpu")], broken)
+    assert errors == ["OSV query failed"]
+
+
 def test_the_repository_exceptions_file_is_valid() -> None:
     entries, errors = dependency_audit.load_exceptions(REPO_ROOT / "audit-exceptions.toml")
     assert errors == []
     postcss = [e for e in entries if e.package == "postcss"]
     assert postcss and all(e.ecosystem == "npm" for e in postcss)
     assert all(e.expires > dt.date(2026, 9, 27) for e in entries)
+    # D-6 a1: these were bumped; no exception may come back for them silently.
+    bumped = {"cryptography", "pyjwt", "pytest", "setuptools"}
+    assert not [e for e in entries if e.package.lower() in bumped]
+    # DA-B-7: every entry states its class and a reason longer than a boilerplate line.
+    python = [e for e in entries if e.ecosystem == "pypi"]
+    assert all(e.reason.startswith(("INTERIM", "PERMANENT")) for e in python)
+    assert all("reachab" in e.reason.lower() for e in python)
 
 
 # --- schema-check ---------------------------------------------------------------------
