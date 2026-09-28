@@ -116,6 +116,33 @@ def test_only_with_missing_tooling_fails_instead_of_skipping(tmp_path: Path) -> 
     assert "GATE: FAIL" in proc.stdout
 
 
+@needs_tools
+def test_only_fails_in_the_main_tree_when_the_venv_drifted_from_the_pins(tmp_path: Path) -> None:
+    """DA-B2-2: `--only <step>` without the venv step must not pass on a drifted venv."""
+    repo = _make_repo(tmp_path)
+    fake_python = repo / "backend" / ".venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")  # venv_sync: drift
+    fake_python.chmod(0o755)
+    # No GATE_VENV: the gate resolves the main tree's venv (the fake one above).
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("GATE_") and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE"}
+    }
+    proc = subprocess.run(
+        ["bash", str(repo / "scripts" / "gate.sh"), "--only", "git-modes"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "does not match this tree's pins" in proc.stdout
+    assert "GATE: FAIL" in proc.stdout
+
+
 def test_the_real_hook_and_gate_are_executable_in_git() -> None:
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("needs a git checkout")

@@ -316,8 +316,11 @@ resolve_venv() {
     VENV="$MAIN_VENV"
     echo "venv: main venv (requirements hash $want matches, installed == pins)"
   elif [ "$REPO_ROOT" = "$MAIN_ROOT" ]; then
-    VENV="$MAIN_VENV"   # never rebuilt behind the developer's back: the venv step fails
-    echo "venv: main venv is out of sync with the pins — the venv step will fail"
+    # Never rebuilt behind the developer's back. Every step fails (VENV_ERROR), not only the
+    # venv step: `--only pytest` must not pass against drifted packages (DA-B2-2).
+    VENV="$MAIN_VENV"
+    VENV_ERROR="the main venv ($MAIN_VENV) does not match this tree's pins — fix with: $MAIN_VENV/bin/pip install -r backend/requirements-dev.txt"
+    echo "venv: main venv is out of sync with the pins"
   else
     dir="$VENV_CACHE/$want"
     if [ ! -f "$dir/.secrag-complete" ]; then
