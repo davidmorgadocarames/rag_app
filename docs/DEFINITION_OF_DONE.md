@@ -58,7 +58,8 @@ are a human/agent checklist.
   not posted by the repository owner (`vars.GATE_STATUS_CREATOR` overrides). Under the
   pre-push hook the commit is not on GitHub yet, so a detached publisher posts the status
   once the push lands (log: `.git/secrag-gate/publish-status.log`); CD waits up to 10 min
-  for it. A dirty tree, a missing `gh` or `SECRAG_GATE_PUBLISH=0` → no status (said in the
+  for it. A dirty tree (at start or end), a HEAD that moved during the run, a missing `gh`
+  or `SECRAG_GATE_PUBLISH=0` → no status (said in the
   gate output) → CD refuses. By hand, after a `--full` PASS on a pushed SHA:
   `bash scripts/cd/gate_status.sh publish <sha>`. A status can still be posted without
   running the gate — that is a deliberate act, not an accident (accepted in D-7).

@@ -619,8 +619,15 @@ make_seed() {
 # background publisher — a copy of scripts/cd/gate_status.sh outside the temporary
 # worktree — posts it once the push arrives. Never changes the gate result.
 publish_gate_status() {
-  local total="$1" sha dirty desc repo rc dir
-  sha="$(git rev-parse HEAD)"
+  local total="$1" sha="$GATE_START_SHA" dirty desc repo rc dir
+  if [ "$(git rev-parse HEAD 2>/dev/null)" != "$sha" ]; then
+    echo "gate status: NOT published — HEAD moved during the run (started at $sha), so this PASS describes no single commit"
+    return 0
+  fi
+  if [ "$GATE_START_DIRTY" != 0 ]; then
+    echo "gate status: NOT published — the tree had uncommitted or untracked changes when the gate started"
+    return 0
+  fi
   if [ "${SECRAG_GATE_PUBLISH:-1}" != 1 ]; then
     echo "gate status: not published (SECRAG_GATE_PUBLISH=${SECRAG_GATE_PUBLISH})"
     return 0
@@ -734,6 +741,10 @@ main() {
   esac
 
   echo "gate: mode=$mode, tree=$REPO_ROOT${REPO_ROOT:+ @ $(git rev-parse --short HEAD 2>/dev/null)}"
+  # The commit a --full PASS may vouch for: fixed now, re-checked before publishing.
+  GATE_START_SHA="$(git rev-parse HEAD 2>/dev/null)"
+  GATE_START_DIRTY=1
+  [ -z "$(git status --porcelain 2>/dev/null)" ] && GATE_START_DIRTY=0
   local t0=$SECONDS v0=$SECONDS
   resolve_venv
   if [ -n "$VENV_ERROR" ]; then

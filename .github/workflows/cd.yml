@@ -82,9 +82,10 @@ jobs:
           echo "real=$REAL" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
+      # The workflow's own revision (for scripts/cd) with full history: the SHAs to compare
+      # are read from git, never checked out (an older head_sha has no scripts/cd).
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.mode.outputs.sha }}
           fetch-depth: 0
 
       - name: Changed files vs the last deployed SHA

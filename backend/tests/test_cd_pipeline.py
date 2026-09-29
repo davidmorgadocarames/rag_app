@@ -105,6 +105,14 @@ def test_concurrency_keeps_real_deploys_in_one_uncancelled_group(cd: dict) -> No
     assert cd["concurrency"]["cancel-in-progress"] is False
 
 
+def test_plan_uses_the_workflow_scripts_not_the_planned_commit(cd: dict) -> None:
+    """Found by a dry run: an older head_sha has no scripts/cd, so it must not be checked out."""
+    checkout = next(
+        s for s in cd["jobs"]["plan"]["steps"] if "actions/checkout" in s.get("uses", "")
+    )
+    assert checkout["with"] == {"fetch-depth": 0}
+
+
 def test_real_jobs_need_the_plan_and_the_gate_status(cd: dict) -> None:
     jobs = cd["jobs"]
     assert set(jobs) == {"plan", "gate-status", "dry-run", "images", "deploy"}
