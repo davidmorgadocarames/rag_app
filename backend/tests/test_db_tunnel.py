@@ -57,8 +57,24 @@ if argv[:3] == ["postgres", "flexible-server", "firewall-rule"]:
                  if (m and r["name"].startswith(m.group(1))) or (e and r["name"] == e.group(1))]
         print("\n".join(names))
     elif verb == "create":
-        rules.append({"name": opt("-n"), "start": opt("--start-ip-address"),
-                      "end": opt("--end-ip-address")})
+        rule = {"name": opt("-n"), "start": opt("--start-ip-address"),
+                "end": opt("--end-ip-address")}
+        if os.environ.get("FAKE_AZ_CREATE_LATE"):
+            # The ARM operation outlives this client: a detached helper adds the rule after a
+            # delay, while this `az` process hangs until the test interrupts it (DA-D-4).
+            import subprocess, time
+            helper = (
+                "import json, sys, time\n"
+                "time.sleep(float(sys.argv[3]))\n"
+                "s = json.load(open(sys.argv[1]))\n"
+                "s['rules'].append(json.loads(sys.argv[2]))\n"
+                "json.dump(s, open(sys.argv[1], 'w'))\n"
+            )
+            subprocess.Popen([sys.executable, "-c", helper, state_path, json.dumps(rule),
+                              os.environ["FAKE_AZ_CREATE_LATE"]], start_new_session=True)
+            open(state_path + ".creating", "w").close()
+            time.sleep(60)
+        rules.append(rule)
         save()
     elif verb == "delete":
         if "--yes" not in argv:
@@ -93,10 +109,15 @@ echo "$ip"
 """
 
 FAKE_PSQL = r"""
-import json, os, sys, time
+import json, os, signal, sys, time
+if os.environ.get("FAKE_PSQL_IGNORE_INT"):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # like interactive psql at its prompt
 state = json.load(open(os.environ["FAKE_AZ_STATE"], encoding="utf-8"))
 pgpass = os.environ.get("PGPASSFILE")
 record = {
+    "pid": os.getpid(),
+    "sigint": str(signal.getsignal(signal.SIGINT)),
+    "stdin": sys.stdin.read() if os.environ.get("FAKE_PSQL_STDIN") else None,
     "argv": sys.argv[1:],
     "rules": state["rules"],
     "env": {k: os.environ.get(k) for k in (
@@ -229,13 +250,14 @@ def test_rule_removed_when_the_command_fails(fake) -> None:
     assert fake.rules() == []
 
 
-@pytest.mark.parametrize(
-    ("sig", "rc"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)], ids=["SIGINT", "SIGTERM"]
-)
-def test_rule_removed_on_a_signal(fake, sig: signal.Signals, rc: int) -> None:
+SIGNALS = [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)]
+SIGNAL_IDS = ["SIGINT", "SIGTERM", "SIGHUP"]
+
+
+def _start_long_psql(fake, **env: str) -> subprocess.Popen[str]:
     proc = subprocess.Popen(
         ["bash", str(TUNNEL), *APP_ARGS],
-        env={**fake.env, "FAKE_PSQL_SLEEP": "30"},
+        env={**fake.env, "FAKE_PSQL_SLEEP": "30", "DB_TUNNEL_GRACE": "1", **env},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -248,11 +270,93 @@ def test_rule_removed_on_a_signal(fake, sig: signal.Signals, rc: int) -> None:
         assert time.monotonic() < deadline, "psql never started"
         time.sleep(0.05)
     assert len(fake.rules()) == 1
-    os.killpg(proc.pid, sig)  # Ctrl-C reaches the whole foreground group
+    return proc
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    status = Path(f"/proc/{pid}/stat")
+    return not (status.exists() and status.read_text().split()[2] == "Z")
+
+
+@pytest.mark.parametrize(("sig", "rc"), SIGNALS, ids=SIGNAL_IDS)
+def test_rule_removed_on_a_signal_to_the_process_group(fake, sig: signal.Signals, rc: int) -> None:
+    proc = _start_long_psql(fake)
+    os.killpg(proc.pid, sig)  # Ctrl-C / a closed terminal reach the whole foreground group
     _, err = proc.communicate(timeout=30)
     assert proc.returncode == rc, err
     assert fake.rules() == []
     assert "removed" in err
+
+
+@pytest.mark.parametrize(("sig", "rc"), SIGNALS, ids=SIGNAL_IDS)
+def test_a_signal_to_the_script_pid_only_ends_the_tunnel_promptly(
+    fake, sig: signal.Signals, rc: int
+) -> None:
+    """DA-D-4: `kill <script pid>` while psql runs is handled at once (not after psql exits):
+    forwarded to psql, the rule removed, psql gone. FAKE_PSQL_IGNORE_INT: a psql that ignores
+    the forwarded signal (interactive psql on SIGINT) is ended by the watchdog."""
+    proc = _start_long_psql(fake, FAKE_PSQL_IGNORE_INT="1")
+    t0 = time.monotonic()
+    os.kill(proc.pid, sig)  # the script only
+    _, err = proc.communicate(timeout=30)
+    elapsed = time.monotonic() - t0
+    assert proc.returncode == rc, err
+    assert elapsed < 12, f"took {elapsed:.1f}s (psql would have run 30 s)"
+    assert fake.rules() == []
+    assert "removed" in err and f"received {sig.name}" in err
+    assert not _alive(fake.psql()["pid"])
+
+
+def test_the_command_keeps_default_sigint_and_the_callers_stdin(fake) -> None:
+    """Background children of a non-interactive shell would ignore SIGINT and read /dev/null;
+    the tunnel restores both (psql's Ctrl-C handling, `psql -f -`, interactive use)."""
+    proc = subprocess.run(
+        ["bash", str(TUNNEL), *APP_ARGS],
+        env={**fake.env, "FAKE_PSQL_STDIN": "1"},
+        input="select 42;\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    rec = fake.psql()
+    assert rec["stdin"] == "select 42;\n"
+    assert "default_int_handler" in rec["sigint"]
+
+
+def test_an_interrupted_create_is_watched_for_a_late_rule(fake) -> None:
+    """DA-D-4: Ctrl-C during `fw create` kills the az client, but the ARM operation completes
+    later and adds the rule; the cleanup keeps watching and removes it."""
+    proc = subprocess.Popen(
+        ["bash", str(TUNNEL), *APP_ARGS],
+        env={
+            **fake.env,
+            "FAKE_AZ_CREATE_LATE": "1.5",
+            "DB_TUNNEL_RECHECK": "5",
+            "DB_TUNNEL_RECHECK_POLL": "0.5",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    creating = Path(str(fake.state) + ".creating")
+    deadline = time.monotonic() + 30
+    while not creating.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.monotonic() < deadline, "create never started"
+        time.sleep(0.05)
+    assert fake.rules() == []  # not there yet
+    os.killpg(proc.pid, signal.SIGINT)
+    _, err = proc.communicate(timeout=60)
+    assert proc.returncode == 130, err
+    assert "late rule" in err and "removed" in err
+    assert fake.rules() == []
+    assert not fake.psql_out.exists()
 
 
 def test_stale_rules_are_swept_at_the_start_of_every_call(fake) -> None:
@@ -329,6 +433,13 @@ def test_without_the_app_secret_the_admin_login_and_db_are_used(fake) -> None:
         ["bash", "-c", "true"],
         ["psql", "postgresql://u:p@h/db"],
         ["psql", "host=h password=p"],
+        # DA-D-5: a URI or password anywhere in an argument, not only at its start
+        ["psql", "--dbname=postgresql://u:p@h/db"],
+        ["psql", "--dbname=postgres://u@h/db"],
+        ["psql", "-dpostgresql://u:p@h/db"],
+        ["psql", "-d", "postgresql://u@h/db"],
+        ["psql", "-d", "dbname=rag password=p"],
+        ["pg_dump", "--dbname=host=h PASSWORD=p"],
         [],
     ],
 )

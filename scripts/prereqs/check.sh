@@ -220,6 +220,32 @@ else
   report KO "workflow permission deployments: write" "not declared on the deploy job in cd.yml"
 fi
 
+# --- local secret files (DA-D-8) -------------------------------------------------------
+
+# Every local .env file (JWT secret, master key, DB/role passwords) and the key-recovery
+# candidate file must be private: no group/other bits (chmod 600; directories 700).
+loose=""
+while IFS= read -r f; do
+  case "$f" in *.example) continue ;; esac
+  mode="$(stat -c %a "$f" 2>/dev/null)" || continue
+  [ $((8#$mode & 8#077)) -eq 0 ] || loose="$loose ${f#./} ($mode)"
+done < <(find . \( -path ./frontend/node_modules -o -path ./backend/.venv -o -path ./.git \) -prune \
+           -o -type f \( -name '.env' -o -name '.env.*' -o -name '*.env' \) -print 2>/dev/null)
+RECOVERY_DIR="$HOME/.secrag-recovery"
+if [ -e "$RECOVERY_DIR" ]; then
+  mode="$(stat -c %a "$RECOVERY_DIR")"
+  [ $((8#$mode & 8#077)) -eq 0 ] || loose="$loose ~/.secrag-recovery ($mode)"
+  if [ -e "$RECOVERY_DIR/candidates" ]; then
+    mode="$(stat -c %a "$RECOVERY_DIR/candidates")"
+    [ $((8#$mode & 8#077)) -eq 0 ] || loose="$loose ~/.secrag-recovery/candidates ($mode)"
+  fi
+fi
+if [ -z "$loose" ]; then
+  report OK "local secret files private (0600/0700)" ".env files and key-recovery files: no group/other access"
+else
+  report KO "local secret files private (0600/0700)" "chmod 600 (dirs 700):$loose"
+fi
+
 # --- Azure CLI -----------------------------------------------------------------------
 
 # Windows `az` through interop: must be callable from a shell trap on Ctrl-C.

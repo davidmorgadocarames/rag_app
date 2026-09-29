@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Temporary, self-removing access to the Azure PostgreSQL Flexible Server (T11.1.2).
 #
-#   scripts/azure/db-tunnel.sh [options] -- psql|pg_dump [args...]
+#   scripts/azure/db-tunnel.sh [options] -- psql|pg_dump|scripts/azure/key_recovery.sh [args...]
 #   scripts/azure/db-tunnel.sh --sweep          # only remove stale rules, then exit
 #
 # 1. Sweep: every firewall rule named "secrag-tunnel-*" left by an earlier run (killed with
@@ -14,6 +14,12 @@
 #    (default_transaction_read_only=on); --read-write lifts it.
 # 5. ALWAYS removes the rule — success, error, Ctrl-C (SIGINT), SIGTERM, SIGHUP — and then
 #    checks it is gone; if it cannot confirm that, it prints the manual command and fails.
+#    The command runs as a child the script WAITS for, so a signal sent only to the script's
+#    PID (`kill <pid>`) is handled at once (DA-D-4): it is forwarded to the command, which
+#    gets DB_TUNNEL_GRACE seconds (default 5) to end before SIGTERM, then SIGKILL — a signal
+#    always ends the tunnel promptly, also for an interactive psql. When the signal arrived
+#    while the rule was being CREATED, the cleanup keeps watching for a late rule (the ARM
+#    operation may still complete) for DB_TUNNEL_RECHECK seconds (default 60) and removes it.
 #
 # Options:
 #   --password-from-app [APP]  user, database and password from the Container App's
@@ -64,12 +70,19 @@ if [ "$sweep_only" = 0 ]; then
   [ $# -gt 0 ] || usage
   case "$(basename "$1")" in
     psql | pg_dump) ;;
-    *) die "only psql or pg_dump can run through the tunnel (got '$1')" ;;
+    key_recovery.sh)
+      # This repository's key-recovery tool only (D-2026-09-29-2): it reads the wrapped keys
+      # through libpq inside the tunnel, never the candidates' way out.
+      [ "$(readlink -f "$1")" = "$(readlink -f "$(dirname "${BASH_SOURCE[0]}")/key_recovery.sh")" ] \
+        || die "only this repository's scripts/azure/key_recovery.sh may run through the tunnel" ;;
+    *) die "only psql, pg_dump or scripts/azure/key_recovery.sh can run through the tunnel (got '$1')" ;;
   esac
-  # The password must never reach argv (ps, shell history, CI logs).
+  # The password must never reach argv (ps, shell history, CI logs), and a URI would override
+  # the tunnel's connection. Anywhere in an argument (DA-D-5): `--dbname=postgresql://…`,
+  # `-dpostgresql://…`, `-d "host=… password=…"` are refused like a bare URI.
   for a in "$@"; do
     case "$a" in
-      *assword=* | postgres://* | postgresql://*)
+      *assword=* | *postgres://* | *postgresql://* | *PASSWORD=*)
         die "no connection strings or passwords in the command; the tunnel sets the connection" ;;
     esac
   done
@@ -156,18 +169,42 @@ else
 fi
 
 # --- the rule lives only while the command runs ----------------------------------------------
-rule="" passfile=""
+rule="" passfile="" creating=0 child="" watchdog="" signal_rc=""
+GRACE="${DB_TUNNEL_GRACE:-5}"
+RECHECK="${DB_TUNNEL_RECHECK:-60}"
+RECHECK_POLL="${DB_TUNNEL_RECHECK_POLL:-5}"
+
+# shellcheck disable=SC2329  # used by cleanup (the EXIT trap)
+rule_left() { fw list --query "[?name=='$rule'].name" -o tsv 2>/dev/null; }
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap
 cleanup() {
-  local rc=$? left
+  local rc=$? left end
   # A second Ctrl-C must not abort the removal (SIG_IGN is inherited by az too).
   trap '' INT TERM HUP
   trap - EXIT
+  [ -z "$signal_rc" ] || rc="$signal_rc"
+  if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
+    kill -TERM "$child" 2>/dev/null || true
+  fi
+  [ -z "$watchdog" ] || kill "$watchdog" 2>/dev/null || true
   [ -z "$passfile" ] || rm -f "$passfile"
   if [ -n "$rule" ]; then
     fw delete -n "$rule" --yes -o none >/dev/null 2>&1 || true
-    if left="$(fw list --query "[?name=='$rule'].name" -o tsv 2>/dev/null)" && [ -z "$left" ]; then
+    if [ "$creating" = 1 ]; then
+      # Interrupted during `create`: the ARM operation may still finish and add the rule
+      # AFTER this delete. Keep watching and remove it if it shows up (DA-D-4).
+      log "the create was interrupted: watching ${RECHECK}s for a late rule $rule"
+      end=$((SECONDS + RECHECK))
+      while [ "$SECONDS" -lt "$end" ]; do
+        if left="$(rule_left)" && [ -n "$left" ]; then
+          log "late rule $rule appeared — removing it"
+          fw delete -n "$rule" --yes -o none >/dev/null 2>&1 || true
+        fi
+        sleep "$RECHECK_POLL"
+      done
+    fi
+    if left="$(rule_left)" && [ -z "$left" ]; then
       log "firewall rule $rule removed"
     else
       echo "[db-tunnel] ERROR: could not confirm that firewall rule $rule is gone. Remove it NOW:" >&2
@@ -185,8 +222,10 @@ trap 'exit 129' HUP
 
 rule="$PREFIX$(date -u +%Y%m%dT%H%M%SZ)-$$"
 log "creating firewall rule $rule for $ip/32 on $SERVER (removed when the command ends)"
+creating=1
 fw create -n "$rule" --start-ip-address "$ip" --end-ip-address "$ip" -o none >/dev/null \
   || die "could not create the firewall rule"
+creating=0
 
 export PGHOST="$host" PGPORT=5432 PGUSER="$user" PGDATABASE="$db"
 export PGSSLMODE=require PGCONNECT_TIMEOUT=20 PGAPPNAME=secrag-db-tunnel
@@ -207,8 +246,48 @@ if [ -n "$password" ]; then
 fi
 
 log "running $(basename "$1") as $user on $db (sslmode=require)"
+
+# on_signal <SIG> <rc>: forward to the command; if it has not ended after GRACE seconds,
+# SIGTERM, then SIGKILL 3 s later (a watchdog, so `wait` below returns as soon as it ends).
+# shellcheck disable=SC2329  # invoked by the traps below
+on_signal() {
+  [ -n "$signal_rc" ] || signal_rc="$2"
+  log "received SIG$1 — ending $(basename "$cmd0") and removing the firewall rule"
+  kill -"$1" "$child" 2>/dev/null || true
+  if [ -z "$watchdog" ]; then
+    (
+      trap - INT TERM HUP
+      sleep "$GRACE"
+      kill -TERM "$child" 2>/dev/null || exit 0
+      sleep 3
+      kill -KILL "$child" 2>/dev/null || true
+    ) &
+    watchdog=$!
+  fi
+}
+
+cmd0="$1"
 set +e
-"$@"
-rc=$?
+# The command runs as a waited-for child (DA-D-4). Without job control an asynchronous command
+# would ignore SIGINT and read /dev/null: restore both (default SIGINT/QUIT/TERM/HUP, the
+# script's own stdin on fd 3), so psql's Ctrl-C handling, `psql -f -` and interactive use work.
+exec 3<&0
+( trap - INT QUIT TERM HUP; exec "$@" <&3 3<&- ) &
+child=$!
+exec 3<&-
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+trap 'on_signal HUP 129' HUP
+while :; do
+  wait "$child"
+  rc=$?
+  # `wait` returns early (> 128) when a trapped signal arrives; the child may still run (or
+  # be an unreaped zombie): wait again until it has really ended.
+  if [ "$rc" -gt 128 ] && [ -n "$signal_rc" ] && kill -0 "$child" 2>/dev/null; then
+    continue
+  fi
+  break
+done
+child=""
 set -e
-exit "$rc"
+exit "${signal_rc:-$rc}"
