@@ -45,6 +45,20 @@ are a human/agent checklist.
   does **not** conflict with a container that *runs in production* on Azure.
 - **Phase 11+ (gate hygiene, X5)** — `--full` runs only in the isolated gate project; every
   sub-phase closes with `--full` or `--only <the steps it adds>`; target `--full` ≤ 30 min.
+- **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
+  it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
+  image that is still running (and the previous image in a rollback) keeps working on the
+  migrated schema. A **destructive** change — drop/rename a column or table, `SET NOT NULL`,
+  a narrower type, a new constraint existing rows may violate — is split: (1) *expand* in one
+  release (new column/table, the code writes both or reads the new one with a fallback,
+  backfill), (2) *contract* in a **later** promotion, once no deployed image reads the old
+  shape. Migrations run **before** the apps (compose `migrate` one-shot; the Azure migration
+  Job started by CD), never at container start. A downgrade is only guaranteed on a database
+  without data for that migration and may refuse (0005 refuses while erased users exist); it
+  is **never a rollback path** — roll back images instead. Each migration that grants checks
+  that its roles exist and its `downgrade` revokes (PHASE_PLANNING migration map, X4).
+  Applies from 0005; rationale in the
+  [ADR phase 11](adr/adr_phase11_stability.md#decisions) (decision 3).
 - **Promotion evidence (Phase 11+, D-2026-09-27-7 a)** — the pre-push hook can be bypassed
   (`--no-verify`, a lost exec bit, an unset `core.hooksPath`), so a promotion to `main`
   (PHASE_TASKS rows 40/41) needs the **`--full` PASS log for the exact SHA pushed**: the
@@ -93,14 +107,28 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `ruff-format` | - | 60 s | `db-tests` | gate DB | 300 s |
 | `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
+| | | | `restart-check` | own throwaway projects | 900 s |
 
-`migrations-roundtrip` (T11.0.13; the CI leg and the broken-downgrade test come with
-T11.2.9): a fresh database on the gate server → `db/roles.sql` → `alembic upgrade head` →
+`migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
+`db/roles.sql` → `alembic upgrade head` →
 `pg_dump` as `secrag_backup` (only the default privileges can make the new tables readable)
 → `roles.sql` again with the catalog compared (roles, grants, default privileges, every
 table/sequence ACL: identical) → `secrag_purger` / `secrag_backup` log in with the gate
 passwords → `downgrade -1` → `upgrade head`. The local role passwords live in the
-git-ignored `.gate/roles.env` (0600, generated once).
+git-ignored `.gate/roles.env` (0600, generated once). CI runs the same round trip on its
+Postgres service (after `roles.sql`), and a DB test proves that a broken downgrade makes
+`alembic downgrade -1` fail (`test_startup_db.py`).
+
+`restart-check` (T11.2.8, `scripts/restart_check.sh`; not in `--fast`): the **real**
+`docker-compose.yml` plus `scripts/restart_check.compose.yml`, which swaps the external dev
+volume for a throwaway one and publishes only the API on `127.0.0.1:18000` (no DB port), as
+projects `secrag-gate-rc` → `secrag-gate-rc2`: the backend image alone must not migrate →
+`up` (roles → `migrate` one-shot exits 0 → backend) → a dedicated account + one encrypted
+message → `down` (no `-v`) → `up` as the other project → login + decrypted read → `up` with
+a new random `DATA_MASTER_KEY` must be **refused** (fingerprint mismatch) → the original key
+starts again → the account is erased. It refuses the development projects/volumes, an
+existing throwaway volume and a busy API port, and removes everything it created. It can run
+while the development stack is up.
 
 Gate-project setup (up + roles + migrate + seed restore) has its own 300 s budget; building a
 cached venv (below) has 900 s. Measured on the development machine (2026-09-27): `--fast`
