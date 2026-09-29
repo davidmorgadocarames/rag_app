@@ -139,8 +139,26 @@ jobs:
       - name: Frontend dependencies (npm audit needs the lock tree)
         working-directory: frontend
         run: npm ci --no-audit --no-fund
+      # The runner's apt shellcheck (0.9.x) flags cases the local 0.11.0 accepts, so a local
+      # PASS did not guarantee CI's (F-2026-09-29-1, DA-C-7). Same version and SHA-256 as
+      # scripts/prereqs/install.sh (a unit test keeps them equal); put first on PATH.
+      - name: shellcheck (pinned, checksum-verified)
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+        run: |
+          tarball="shellcheck-v$SHELLCHECK_VERSION.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSION/$tarball"
+          echo "$SHELLCHECK_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/shellcheck" --strip-components=1
+          "$RUNNER_TEMP/shellcheck/shellcheck" --version | grep -qx "version: $SHELLCHECK_VERSION"
+          echo "$RUNNER_TEMP/shellcheck" >> "$GITHUB_PATH"
       - name: Tool versions
-        run: shellcheck --version && node --version && npm --version
+        run: |
+          shellcheck --version | grep -x "version: 0.11.0"
+          node --version && npm --version
       - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links
         env:
           GATE_VENV: ${{ github.workspace }}/backend/.venv

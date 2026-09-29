@@ -204,3 +204,23 @@ def test_a_bare_model_name_means_latest() -> None:
 def test_a_model_not_served_has_no_digest() -> None:
     assert ollama_digest.model_digest(TAGS, "nomic-embed-text") is None
     assert ollama_digest.model_digest({}, "bge-m3") is None
+
+
+def test_ci_pins_the_same_shellcheck_as_the_local_installer() -> None:
+    """F-2026-09-29-1 / DA-C-7: local and CI shellcheck results can only agree on one version."""
+    import re
+
+    import yaml
+
+    install = (REPO_ROOT / "scripts" / "prereqs" / "install.sh").read_text(encoding="utf-8")
+    local = {
+        key: re.search(rf"^{key}=\"([^\"]+)\"", install, re.M).group(1)  # type: ignore[union-attr]
+        for key in ("SHELLCHECK_VERSION", "SHELLCHECK_SHA256")
+    }
+    ci = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = ci["jobs"]["cheap-checks"]["steps"]
+    pin = next(s for s in steps if s.get("env", {}).get("SHELLCHECK_SHA256"))
+    assert pin["env"] == local
+    assert "sha256sum -c -" in pin["run"] and "GITHUB_PATH" in pin["run"]
+    gate = next(i for i, s in enumerate(steps) if "gate.sh --only" in s.get("run", ""))
+    assert steps.index(pin) < gate
