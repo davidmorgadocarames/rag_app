@@ -13,16 +13,25 @@ name: CD
 #   gate-status  the SHA must carry the commit status `secrag/gate-full` = success, posted by
 #                `scripts/gate.sh --full` for exactly that SHA (D-2026-09-27-7 b); otherwise
 #                the deploy is REFUSED (a skipped pre-push hook can no longer reach Azure)
-#   images       build + push, tagged with the SHA; deployed BY DIGEST
-#   deploy       re-checks the gate status, records a deployment, updates the apps
+#   images       build + push backend, frontend and the slim jobs image, tagged with the SHA;
+#                deployed BY DIGEST
+#   migrate      re-checks the gate status; the migration Job gets the jobs image (digest) and
+#                is started with no overrides; CD waits and STOPS on a failure, before the apps
+#                (scripts/cd/azure_jobs.sh, T11.2.6)
+#   deploy       re-checks the gate status, records a deployment, updates the apps, then the
+#                purge and backup Jobs' images (digest, X1; T11.2.11)
+#
+# Order: images → migrate Job → apps → Job images. Job names come from repo variables
+# (AZURE_MIGRATE_JOB, AZURE_PURGE_JOB, AZURE_BACKUP_JOB); the Jobs themselves are created by
+# hand from deploy/azure/jobs/*.yaml (runbook) — CD never applies YAML or enables schedules.
 #
 # One SHA everywhere: head_sha of the CI run (workflow_run) or the dispatched commit.
 # Manual runs (workflow_dispatch) default to dry_run=true: plan + gate-status run (read-only)
 # and an echo job prints what a real run would do. A real manual deploy needs dry_run=false
-# AND the main branch. base_sha/head_sha/skip_tip_check exist to test the plan in dry runs only.
+# AND the main branch. base_sha/head_sha/skip_tip_check exist to test the plan in dry runs only,
+# simulate_failure to show the migrate-failure path in a dry run.
 # No job uses `environment:`, so the OIDC subject stays repo:<owner>/<repo>:ref:refs/heads/main
-# (runbook, gotcha 8). CD never enables Job schedules and never applies Job YAML (X1); the
-# migration Job and Job image updates come with T11.2.6.
+# (runbook, gotcha 8). CD never enables Job schedules and never applies Job YAML (X1).
 on:
   workflow_run:
     workflows: ["CI"]
@@ -44,6 +53,10 @@ on:
         default: ""
       skip_tip_check:
         description: "Dry runs only: plan head_sha even if it is not the ref's tip"
+        type: boolean
+        default: false
+      simulate_failure:
+        description: "Dry runs only: the migration Job 'fails', to show the pipeline stops there"
         type: boolean
         default: false
 
@@ -80,6 +93,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SKIP_TIP_CHECK: ${{ inputs.skip_tip_check }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
           # DA-C2-3: every expression reaches the shell through env, never pasted into
           # `run:` (a ref name may contain `$(`, `;` or backticks).
           EVENT: ${{ github.event_name }}
@@ -92,8 +106,8 @@ jobs:
           if [ "$EVENT" = workflow_run ]; then
             echo "CI succeeded for $CI_BRANCH@$CI_SHA"
           fi
-          if [ "$REAL" = true ] && { [ -n "$BASE_SHA$HEAD_SHA" ] || [ "$SKIP_TIP_CHECK" = true ]; }; then
-            echo "::error::base_sha/head_sha/skip_tip_check are for dry runs only; a real deploy uses the dispatched commit"
+          if [ "$REAL" = true ] && { [ -n "$BASE_SHA$HEAD_SHA" ] || [ "$SKIP_TIP_CHECK" = true ] || [ "$SIMULATE_FAILURE" = true ]; }; then
+            echo "::error::base_sha/head_sha/skip_tip_check/simulate_failure are for dry runs only; a real deploy uses the dispatched commit"
             exit 1
           fi
           echo "real=$REAL" >> "$GITHUB_OUTPUT"
@@ -179,20 +193,27 @@ jobs:
     needs: [plan, gate-status]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.real != 'true'
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      contents: read
+    # The same order as a real run, one step per stage: a failing stage skips the later ones.
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      REPO: ${{ github.repository }}
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || '<AZURE_RESOURCE_GROUP>' }}
+      # Placeholder digest: a dry run builds nothing.
+      JOBS_IMAGE: ghcr.io/${{ github.repository }}-jobs@sha256:<digest-of-the-jobs-image>
     steps:
-      - name: Echo what a real deploy would do
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/cd
+      - name: 0. Plan and gate status
+        id: plan
         env:
-          SHA: ${{ needs.plan.outputs.sha }}
           DEPLOY: ${{ needs.plan.outputs.deploy }}
           REASON: ${{ needs.plan.outputs.reason }}
           GATE: ${{ needs.gate-status.result }}
           REF: ${{ github.ref }}
           DRY_RUN: ${{ inputs.dry_run }}
-          REPO: ${{ github.repository }}
-          BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
-          FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
         run: |
           echo "ref=$REF sha=$SHA dry_run=$DRY_RUN"
           if [ "$REF" != "refs/heads/main" ]; then
@@ -201,17 +222,47 @@ jobs:
           echo "Plan: deploy=$DEPLOY — $REASON"
           if [ "$DEPLOY" != true ]; then
             echo "Would skip build and deploy."
+            echo "go=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           case "$GATE" in
             success) echo "Gate status: secrag/gate-full=success — deploy allowed." ;;
             *) echo "Gate status: DEPLOY REFUSED (no successful secrag/gate-full for $SHA; job result: $GATE)." ;;
           esac
-          echo "Would build and push (order: images → apps; tags = SHA, deploy by digest):"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+      - name: 1. Images (build + push, tags = SHA, deployed by digest)
+        if: steps.plan.outputs.go == 'true'
+        run: |
+          echo "Would build and push:"
           echo "  ghcr.io/$REPO-backend:$SHA"
           echo "  ghcr.io/$REPO-frontend:$SHA"
-          echo "Would deploy by digest to: $BACKEND_APP, $FRONTEND_APP (rg $RESOURCE_GROUP)"
-          echo "Jobs: none updated yet (migration Job + Job digests come with T11.2.6); schedules are never enabled by CD."
+          echo "  ghcr.io/$REPO-jobs:$SHA   (slim jobs image: migrations, purge, backup)"
+      - name: 2. Migration Job (jobs image by digest, start, wait — a failure stops here)
+        if: steps.plan.outputs.go == 'true'
+        env:
+          MIGRATE_JOB: ${{ vars.AZURE_MIGRATE_JOB || '<AZURE_MIGRATE_JOB>' }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
+        run: |
+          args=(migrate --rg "$RESOURCE_GROUP" --job "$MIGRATE_JOB" --image "$JOBS_IMAGE" --dry-run)
+          [ "$SIMULATE_FAILURE" != true ] || args+=(--simulate-failure)
+          bash scripts/cd/azure_jobs.sh "${args[@]}"
+      - name: 3. Apps (backend, frontend by digest)
+        if: steps.plan.outputs.go == 'true'
+        env:
+          BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
+          FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
+        run: |
+          echo "Would record a deployment and update by digest: $BACKEND_APP, $FRONTEND_APP (rg $RESOURCE_GROUP)"
+      - name: 4. Purge and backup Job images (digest; schedules never touched)
+        if: steps.plan.outputs.go == 'true'
+        env:
+          PURGE_JOB: ${{ vars.AZURE_PURGE_JOB || '<AZURE_PURGE_JOB>' }}
+          BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB || '<AZURE_BACKUP_JOB>' }}
+        run: |
+          for job in "$PURGE_JOB" "$BACKUP_JOB"; do
+            bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE" --dry-run
+          done
+          echo "Schedules are never enabled by CD (manual switch, runbook)."
 
   images:
     name: Build & push images (GHCR)
@@ -224,6 +275,7 @@ jobs:
     outputs:
       backend_digest: ${{ steps.backend.outputs.digest }}
       frontend_digest: ${{ steps.frontend.outputs.digest }}
+      jobs_digest: ${{ steps.jobs.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -260,17 +312,72 @@ jobs:
             ghcr.io/${{ github.repository }}-frontend:latest
             ghcr.io/${{ github.repository }}-frontend:${{ needs.plan.outputs.sha }}
 
+      # Slim jobs image (T11.2.12): migration, purge and backup Jobs.
+      - name: Build & push jobs image
+        id: jobs
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.jobs
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-jobs:latest
+            ghcr.io/${{ github.repository }}-jobs:${{ needs.plan.outputs.sha }}
+
       - name: Digests
         env:
           BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
           FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+          JOBS_DIGEST: ${{ steps.jobs.outputs.digest }}
         run: |
           echo "backend  $BACKEND_DIGEST"
           echo "frontend $FRONTEND_DIGEST"
+          echo "jobs     $JOBS_DIGEST"
+
+  # T11.2.6: migrations run as an Azure Container Apps Job from the jobs image, BEFORE the apps.
+  # A failed or timed-out execution fails this job, so `deploy` (apps + Job images) never runs.
+  migrate:
+    name: Migration Job (before the apps)
+    needs: [plan, images]
+    if: needs.plan.outputs.real == 'true' && needs.plan.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC
+      contents: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      JOBS_IMAGE: ghcr.io/${{ github.repository }}-jobs@${{ needs.images.outputs.jobs_digest }}
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      MIGRATE_JOB: ${{ vars.AZURE_MIGRATE_JOB }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/cd
+
+      # Defence in depth: nothing reaches Azure without a local --full PASS for the SHA.
+      - name: Refuse a SHA without secrag/gate-full (D-2026-09-27-7 b)
+        env:
+          CREATOR: ${{ vars.GATE_STATUS_CREATOR || github.repository_owner }}
+        run: bash scripts/cd/gate_status.sh verify "$SHA" --creator "$CREATOR"
+
+      - name: Azure login (OIDC federated credentials)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update the migration Job to the jobs image, start it, wait (stop on failure)
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+          bash scripts/cd/azure_jobs.sh migrate --rg "$RESOURCE_GROUP" --job "$MIGRATE_JOB" --image "$JOBS_IMAGE"
 
   deploy:
     name: Deploy to Azure Container Apps
-    needs: [plan, images]
+    needs: [plan, images, migrate]
     if: needs.plan.outputs.real == 'true' && needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -335,6 +442,20 @@ jobs:
               --name "${{ vars.AZURE_FRONTEND_APP }}" \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --image "ghcr.io/${{ github.repository }}-frontend@${{ needs.images.outputs.frontend_digest }}"
+
+      # X1 / T11.2.11: the purge and backup Jobs follow the deployed digest (jobs image), after
+      # the apps. `job update --image` only — never per-execution overrides, never schedules.
+      - name: Update the purge and backup Job images (by digest)
+        env:
+          JOBS_IMAGE: ghcr.io/${{ github.repository }}-jobs@${{ needs.images.outputs.jobs_digest }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PURGE_JOB: ${{ vars.AZURE_PURGE_JOB }}
+          BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB }}
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+          for job in "$PURGE_JOB" "$BACKUP_JOB"; do
+            bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE"
+          done
 
       - name: Record deployment status
         if: always() && steps.record.outputs.id != ''

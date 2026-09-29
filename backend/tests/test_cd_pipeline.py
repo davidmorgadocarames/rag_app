@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CD_YML = REPO_ROOT / ".github" / "workflows" / "cd.yml"
 GATE_STATUS = REPO_ROOT / "scripts" / "cd" / "gate_status.sh"
 PLAN = REPO_ROOT / "scripts" / "cd" / "plan.sh"
+AZURE_JOBS = REPO_ROOT / "scripts" / "cd" / "azure_jobs.sh"
 SHA = "a" * 40
 
 needs_tools = pytest.mark.skipif(
@@ -145,15 +146,58 @@ def test_plan_uses_the_workflow_scripts_not_the_planned_commit(cd: dict) -> None
 
 def test_real_jobs_need_the_plan_and_the_gate_status(cd: dict) -> None:
     jobs = cd["jobs"]
-    assert set(jobs) == {"plan", "gate-status", "dry-run", "images", "deploy"}
+    assert set(jobs) == {"plan", "gate-status", "dry-run", "images", "migrate", "deploy"}
     assert jobs["gate-status"]["needs"] == ["plan"]
     assert "deploy == 'true'" in jobs["gate-status"]["if"]
     assert jobs["images"]["needs"] == ["plan", "gate-status"]
-    assert jobs["deploy"]["needs"] == ["plan", "images"]
-    for name in ("images", "deploy"):
+    # T11.2.6 order: images → migrate Job → apps (+ Job images); a failed migration skips deploy
+    assert jobs["migrate"]["needs"] == ["plan", "images"]
+    assert jobs["deploy"]["needs"] == ["plan", "images", "migrate"]
+    for name in ("images", "migrate", "deploy"):
         assert "real == 'true'" in jobs[name]["if"] and "deploy == 'true'" in jobs[name]["if"]
         assert "always()" not in jobs[name]["if"]  # a refused gate status stops them
     assert "real != 'true'" in jobs["dry-run"]["if"]
+
+
+def test_the_migrate_job_checks_the_gate_then_runs_the_migration_job_by_digest(cd: dict) -> None:
+    job = cd["jobs"]["migrate"]
+    runs = [step.get("run", "") for step in job["steps"]]
+    verify = [i for i, run in enumerate(runs) if "gate_status.sh verify" in run]
+    migrate = [i for i, run in enumerate(runs) if "azure_jobs.sh migrate" in run]
+    assert verify and migrate and verify[0] < migrate[0]
+    assert job["env"]["JOBS_IMAGE"].endswith("-jobs@${{ needs.images.outputs.jobs_digest }}")
+    assert job["env"]["MIGRATE_JOB"] == "${{ vars.AZURE_MIGRATE_JOB }}"
+    assert job["permissions"]["id-token"] == "write"
+
+
+def test_the_deploy_job_updates_the_job_images_after_the_apps(cd: dict) -> None:
+    steps = cd["jobs"]["deploy"]["steps"]
+    apps = next(i for i, s in enumerate(steps) if "inlineScript" in s.get("with", {}))
+    jobs = next(i for i, s in enumerate(steps) if "azure_jobs.sh update-image" in s.get("run", ""))
+    assert apps < jobs
+    env = steps[jobs]["env"]
+    assert env["PURGE_JOB"] == "${{ vars.AZURE_PURGE_JOB }}"
+    assert env["BACKUP_JOB"] == "${{ vars.AZURE_BACKUP_JOB }}"
+    assert env["JOBS_IMAGE"].endswith("-jobs@${{ needs.images.outputs.jobs_digest }}")
+
+
+def test_images_build_the_jobs_image(cd: dict) -> None:
+    step = next(s for s in cd["jobs"]["images"]["steps"] if s.get("id") == "jobs")
+    assert step["with"]["file"] == "./backend/Dockerfile.jobs"
+    assert cd["jobs"]["images"]["outputs"]["jobs_digest"] == "${{ steps.jobs.outputs.digest }}"
+
+
+def test_the_dry_run_shows_the_real_order_and_can_simulate_a_migrate_failure(cd: dict) -> None:
+    inputs = _triggers(cd)["workflow_dispatch"]["inputs"]
+    assert inputs["simulate_failure"]["default"] is False
+    names = [s.get("name", "") for s in cd["jobs"]["dry-run"]["steps"] if "name" in s]
+    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4"]
+    assert "Images" in names[1] and "Migration Job" in names[2] and "Apps" in names[3]
+    migrate = cd["jobs"]["dry-run"]["steps"][3]
+    assert "azure_jobs.sh" in migrate["run"] and "--simulate-failure" in migrate["run"]
+    # simulate_failure is refused in real runs, like base_sha/head_sha
+    mode = cd["jobs"]["plan"]["steps"][0]["run"]
+    assert "SIMULATE_FAILURE" in mode and "dry runs only" in mode
 
 
 def test_deploy_job_refuses_without_gate_status_and_deploys_by_digest(cd: dict) -> None:
@@ -173,12 +217,210 @@ def test_deploy_job_refuses_without_gate_status_and_deploys_by_digest(cd: dict) 
     assert deploy["permissions"]["id-token"] == "write"
 
 
+def _commands(path: Path) -> str:
+    # Comments may mention the rules; commands may not break them (X1).
+    text = path.read_text(encoding="utf-8")
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
 def test_cd_never_touches_job_schedules_or_job_yaml() -> None:
-    text = CD_YML.read_text(encoding="utf-8")
-    # Comments may mention the rule; commands may not exist (X1).
-    commands = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-    for forbidden in ("containerapp job", "--trigger-type", "--cron-expression", "--yaml"):
-        assert forbidden not in commands
+    # cd.yml reaches the Jobs only through scripts/cd/azure_jobs.sh.
+    assert "containerapp job" not in _commands(CD_YML)
+    for path in (CD_YML, AZURE_JOBS):
+        commands = _commands(path)
+        for forbidden in ("--trigger-type", "--cron-expression", "--yaml", "job create"):
+            assert forbidden not in commands, (path.name, forbidden)
+    # `job start` never carries per-execution overrides (image/command/env/args).
+    starts = [line for line in _commands(AZURE_JOBS).splitlines() if "job start" in line]
+    assert starts
+    for line in starts:
+        for override in ("--image", "--command", "--env-vars", "--args", "--yaml"):
+            assert override not in line, line
+
+
+JOB_YAMLS = sorted((REPO_ROOT / "deploy" / "azure" / "jobs").glob("*.yaml"))
+
+
+def test_job_definitions_are_manual_single_placeholder_image_and_secretless() -> None:
+    """T11.2.6 / X1: versioned Job YAML, applied by hand with a Manual trigger, placeholder
+    image (CD sets the digest), parallelism 1, timeout + retry limit, no secret values and no
+    API secrets (JobSettings)."""
+    assert [p.stem for p in JOB_YAMLS] == ["backup", "migrate", "purge"]
+    for path in JOB_YAMLS:
+        job = yaml.safe_load(path.read_text(encoding="utf-8"))
+        config = job["properties"]["configuration"]
+        assert config["triggerType"] == "Manual", path.name
+        assert config["manualTriggerConfig"]["parallelism"] == 1
+        assert config["replicaTimeout"] > 0 and "replicaRetryLimit" in config
+        for secret in config.get("secrets", []):
+            assert secret["value"].startswith("<") and secret["value"].endswith(">"), path.name
+        (container,) = job["properties"]["template"]["containers"]
+        assert "@sha256:" not in container["image"] and "placeholder" in path.read_text()
+        env = {e["name"] for e in container["env"]}
+        assert "DATABASE_URL" in env and not {"JWT_SECRET", "DATA_MASTER_KEY"} & env
+        assert container["resources"]["cpu"] and container["resources"]["memory"]
+    migrate = yaml.safe_load((REPO_ROOT / "deploy/azure/jobs/migrate.yaml").read_text())
+    assert migrate["properties"]["template"]["containers"][0]["command"] == [
+        "alembic",
+        "upgrade",
+        "head",
+    ]
+
+
+# --- azure_jobs.sh (fake az) ------------------------------------------------------------
+
+FAKE_AZ = """\
+import json, os, sys
+state_path = os.environ["FAKE_AZ_STATE"]
+state = json.load(open(state_path)) if os.path.exists(state_path) else {"image": "old", "polls": 0}
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_LOG"], "a") as log:
+    log.write(" ".join(args) + "\\n")
+def val(flag):
+    return args[args.index(flag) + 1]
+cmd = " ".join(a for a in args if not a.startswith("-"))[:40]
+if args[:3] == ["containerapp", "job", "update"]:
+    if os.environ.get("FAKE_AZ_UPDATE_IGNORED") != "1":
+        state["image"] = val("--image")
+elif args[:3] == ["containerapp", "job", "show"]:
+    print(state["image"])
+elif args[:3] == ["containerapp", "job", "start"]:
+    print("exec-1")
+elif args[:4] == ["containerapp", "job", "execution", "show"]:
+    state["polls"] += 1
+    seq = os.environ.get("FAKE_AZ_STATUSES", "Running,Succeeded").split(",")
+    print(seq[min(state["polls"] - 1, len(seq) - 1)])
+else:
+    sys.exit(3)
+json.dump(state, open(state_path, "w"))
+"""
+
+IMAGE = "ghcr.io/o/r-jobs@sha256:" + "b" * 64
+
+
+def _fake_az(tmp_path: Path, **extra: str) -> dict[str, str]:
+    bin_dir = tmp_path / "azbin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "fake_az.py").write_text(FAKE_AZ, encoding="utf-8")
+    az = bin_dir / "az"
+    az.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{bin_dir / "fake_az.py"}" "$@"\n')
+    az.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_AZ_STATE": str(tmp_path / "az.json"),
+        "FAKE_AZ_LOG": str(tmp_path / "az.log"),
+        "AZURE_JOBS_POLL_SECONDS": "0",
+        **extra,
+    }
+
+
+def _az_log(tmp_path: Path) -> list[str]:
+    log = tmp_path / "az.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+@needs_tools
+def test_migrate_updates_by_digest_starts_without_overrides_and_waits(tmp_path: Path) -> None:
+    env = _fake_az(tmp_path, FAKE_AZ_STATUSES="Running,Running,Succeeded")
+    proc = _run(AZURE_JOBS, "migrate", "--rg", "rg", "--job", "mig", "--image", IMAGE, env=env)
+    assert proc.returncode == 0, proc.stderr
+    log = _az_log(tmp_path)
+    assert log[0].startswith("containerapp job update -n mig -g rg --image " + IMAGE)
+    assert log[1].startswith("containerapp job show")
+    assert log[2] == "containerapp job start -n mig -g rg --query name -o tsv"
+    assert sum("execution show" in line for line in log) == 3
+    assert "Succeeded" in proc.stdout
+
+
+@needs_tools
+@pytest.mark.parametrize("status", ["Failed", "Stopped", "Degraded"])
+def test_a_failed_migration_stops_the_pipeline(tmp_path: Path, status: str) -> None:
+    env = _fake_az(tmp_path, FAKE_AZ_STATUSES=f"Running,{status}")
+    proc = _run(AZURE_JOBS, "migrate", "--rg", "rg", "--job", "mig", "--image", IMAGE, env=env)
+    assert proc.returncode == 1
+    assert status in proc.stderr and "apps are NOT updated" in proc.stderr
+
+
+@needs_tools
+def test_a_migration_that_never_finishes_times_out(tmp_path: Path) -> None:
+    env = _fake_az(tmp_path, FAKE_AZ_STATUSES="Running")
+    proc = _run(
+        AZURE_JOBS,
+        "migrate",
+        "--rg",
+        "rg",
+        "--job",
+        "mig",
+        "--image",
+        IMAGE,
+        "--timeout",
+        "0",
+        env=env,
+    )
+    assert proc.returncode == 1 and "did not finish" in proc.stderr
+
+
+@needs_tools
+def test_an_image_that_did_not_change_fails_before_start(tmp_path: Path) -> None:
+    env = _fake_az(tmp_path, FAKE_AZ_UPDATE_IGNORED="1")
+    proc = _run(AZURE_JOBS, "migrate", "--rg", "rg", "--job", "mig", "--image", IMAGE, env=env)
+    assert proc.returncode == 1 and "expected" in proc.stderr
+    assert not any("job start" in line for line in _az_log(tmp_path))
+
+
+@needs_tools
+@pytest.mark.parametrize("image", ["ghcr.io/o/r-jobs:latest", "ghcr.io/o/r-jobs:abc", ""])
+def test_an_image_without_a_digest_is_refused(tmp_path: Path, image: str) -> None:
+    env = _fake_az(tmp_path)
+    proc = _run(AZURE_JOBS, "update-image", "--rg", "rg", "--job", "p", "--image", image, env=env)
+    assert proc.returncode != 0 and _az_log(tmp_path) == []
+
+
+@needs_tools
+def test_update_image_never_starts_the_job(tmp_path: Path) -> None:
+    env = _fake_az(tmp_path)
+    proc = _run(AZURE_JOBS, "update-image", "--rg", "rg", "--job", "p", "--image", IMAGE, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert [line.split()[2] for line in _az_log(tmp_path)] == ["update", "show"]
+
+
+@needs_tools
+def test_dry_run_prints_the_order_and_simulates_a_failure(tmp_path: Path) -> None:
+    env = _fake_az(tmp_path)
+    args = ("migrate", "--rg", "rg", "--job", "m", "--image", IMAGE)
+    ok = _run(AZURE_JOBS, *args, "--dry-run", env=env)
+    assert ok.returncode == 0
+    lines = [line for line in ok.stdout.splitlines() if "would run" in line]
+    assert "job update" in lines[0] and "job start" in lines[1]
+    bad = _run(
+        AZURE_JOBS,
+        "migrate",
+        "--rg",
+        "rg",
+        "--job",
+        "m",
+        "--image",
+        IMAGE,
+        "--dry-run",
+        "--simulate-failure",
+        env=env,
+    )
+    assert bad.returncode == 1 and "simulated" in bad.stderr
+    assert _az_log(tmp_path) == []  # a dry run never calls az
+    real = _run(
+        AZURE_JOBS,
+        "migrate",
+        "--rg",
+        "rg",
+        "--job",
+        "m",
+        "--image",
+        IMAGE,
+        "--simulate-failure",
+        env=env,
+    )
+    assert real.returncode == 1 and "dry runs only" in real.stderr
 
 
 # --- gate_status.sh ---------------------------------------------------------------------

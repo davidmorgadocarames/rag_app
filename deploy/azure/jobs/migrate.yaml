@@ -1,0 +1,41 @@
+# Azure Container Apps Job: database migrations (T11.2.6). AUTHORED HERE, APPLIED BY HAND
+# (runbook, PHASE_TASKS row 40) — CD never applies Job YAML and never changes triggers (X1).
+#
+#   az containerapp job create -g rg-secrag -n <AZURE_MIGRATE_JOB> --yaml deploy/azure/jobs/migrate.yaml
+#   az containerapp job secret set -g rg-secrag -n <AZURE_MIGRATE_JOB> --secrets database-url=<owner URL>
+#   az containerapp job update -g rg-secrag -n <AZURE_MIGRATE_JOB> --image <deployed jobs digest>
+#
+# - The image is a PLACEHOLDER: CD sets the jobs image by digest (`job update --image`) before
+#   every start; a Job re-created from this file must immediately get the deployed digest
+#   (X1, plan B) and be re-checked.
+# - The secret value is a placeholder and is set with `job secret set` right after the create:
+#   never put a real value here, and never re-apply this file to an existing Job (it would
+#   overwrite the secret). DATABASE_URL = the OWNER role (it runs DDL).
+# - JobSettings: only DATABASE_URL and ENV — no JWT_SECRET / DATA_MASTER_KEY (T11.2.2).
+# - Placeholders in <angle brackets> are filled from the runbook when the Job is created.
+location: <region-of-the-container-apps-environment>
+properties:
+  environmentId: /subscriptions/<subscription-id>/resourceGroups/rg-secrag/providers/Microsoft.App/managedEnvironments/<environment-name>
+  configuration:
+    triggerType: Manual
+    manualTriggerConfig:
+      parallelism: 1
+      replicaCompletionCount: 1
+    replicaTimeout: 900
+    replicaRetryLimit: 0          # a failed migration is investigated, not retried blindly
+    secrets:
+      - name: database-url
+        value: <set-with-az-containerapp-job-secret-set>
+  template:
+    containers:
+      - name: migrate
+        image: mcr.microsoft.com/k8se/quickstart-jobs:latest   # placeholder; CD sets the digest
+        command: ["alembic", "upgrade", "head"]
+        env:
+          - name: DATABASE_URL
+            secretRef: database-url
+          - name: ENV
+            value: prod
+        resources:
+          cpu: 0.25
+          memory: 0.5Gi

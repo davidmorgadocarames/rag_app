@@ -1,0 +1,47 @@
+# Azure Container Apps Job: batched erasure purger (11.2b, T11.2b.4/6). AUTHORED HERE, APPLIED
+# BY HAND (runbook, row 40) with a MANUAL trigger; switched to an hourly Schedule by hand after
+# the promotion (row 41) — CD never applies Job YAML and never changes triggers (X1).
+#
+#   az containerapp job create -g rg-secrag -n <AZURE_PURGE_JOB> --yaml deploy/azure/jobs/purge.yaml
+#   az containerapp job secret set -g rg-secrag -n <AZURE_PURGE_JOB> --secrets database-url=<secrag_purger URL>
+#   az containerapp job update -g rg-secrag -n <AZURE_PURGE_JOB> --image <deployed jobs digest>
+#
+# - Image: PLACEHOLDER (CD updates it to the deployed jobs digest after the apps, X1).
+# - Runs as the least-privilege role `secrag_purger` (grants from migration 0005), never the
+#   owner. The CLI `python -m rag_app.erasure purge` arrives with 11.2b (block G).
+# - The user-assigned identity writes the tombstone export to Blob `tombstones/` (R5-2).
+# - Secret value: placeholder, set with `job secret set`; never re-apply to an existing Job.
+location: <region-of-the-container-apps-environment>
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    /subscriptions/<subscription-id>/resourceGroups/rg-secrag/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<jobs-identity>: {}
+properties:
+  environmentId: /subscriptions/<subscription-id>/resourceGroups/rg-secrag/providers/Microsoft.App/managedEnvironments/<environment-name>
+  configuration:
+    triggerType: Manual
+    manualTriggerConfig:
+      parallelism: 1
+      replicaCompletionCount: 1
+    replicaTimeout: 1800
+    replicaRetryLimit: 1          # resumable: the next run completes what a killed one left
+    secrets:
+      - name: database-url
+        value: <set-with-az-containerapp-job-secret-set>
+  template:
+    containers:
+      - name: purge
+        image: mcr.microsoft.com/k8se/quickstart-jobs:latest   # placeholder; CD sets the digest
+        command: ["python", "-m", "rag_app.erasure", "purge"]
+        env:
+          - name: DATABASE_URL
+            secretRef: database-url
+          - name: ENV
+            value: prod
+          - name: AZURE_CLIENT_ID
+            value: <client-id-of-the-jobs-identity>
+          - name: TOMBSTONE_STORAGE_ACCOUNT
+            value: <storage-account-name>
+        resources:
+          cpu: 0.25
+          memory: 0.5Gi

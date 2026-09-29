@@ -1,0 +1,49 @@
+# Azure Container Apps Job: encrypted database backup to Blob (T11.2.10, block F). AUTHORED
+# HERE, APPLIED BY HAND (runbook, row 40) with a MANUAL trigger; switched to a daily Schedule by
+# hand after the promotion (row 41) — CD never applies Job YAML and never changes triggers (X1).
+#
+#   az containerapp job create -g rg-secrag -n <AZURE_BACKUP_JOB> --yaml deploy/azure/jobs/backup.yaml
+#   az containerapp job secret set -g rg-secrag -n <AZURE_BACKUP_JOB> --secrets database-url=<secrag_backup URL>
+#   az containerapp job update -g rg-secrag -n <AZURE_BACKUP_JOB> --image <deployed jobs digest>
+#
+# - Image: PLACEHOLDER (CD updates it to the deployed jobs digest after the apps, X1).
+# - Runs as the read-only role `secrag_backup`; `pg_dump` 16 → `age` (PUBLIC key only; the
+#   private key never reaches Azure, R4-1) → Blob `backups/` with the user-assigned identity
+#   (Storage Blob Data Contributor; shared-key access disabled). The script comes with row 28.
+# - Secret value: placeholder, set with `job secret set`; never re-apply to an existing Job.
+location: <region-of-the-container-apps-environment>
+identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    /subscriptions/<subscription-id>/resourceGroups/rg-secrag/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<jobs-identity>: {}
+properties:
+  environmentId: /subscriptions/<subscription-id>/resourceGroups/rg-secrag/providers/Microsoft.App/managedEnvironments/<environment-name>
+  configuration:
+    triggerType: Manual
+    manualTriggerConfig:
+      parallelism: 1
+      replicaCompletionCount: 1
+    replicaTimeout: 1800
+    replicaRetryLimit: 1
+    secrets:
+      - name: database-url
+        value: <set-with-az-containerapp-job-secret-set>
+  template:
+    containers:
+      - name: backup
+        image: mcr.microsoft.com/k8se/quickstart-jobs:latest   # placeholder; CD sets the digest
+        command: ["bash", "/app/scripts/db/backup.sh", "--blob"]
+        env:
+          - name: DATABASE_URL
+            secretRef: database-url
+          - name: ENV
+            value: prod
+          - name: AZURE_CLIENT_ID
+            value: <client-id-of-the-jobs-identity>
+          - name: BACKUP_STORAGE_ACCOUNT
+            value: <storage-account-name>
+          - name: BACKUP_AGE_RECIPIENT
+            value: <age-public-key>
+        resources:
+          cpu: 0.5
+          memory: 1Gi
