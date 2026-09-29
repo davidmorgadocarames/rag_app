@@ -37,6 +37,7 @@ MAIN_VENV="$MAIN_ROOT/backend/.venv"
 VENV="${GATE_VENV:-$MAIN_VENV}"   # final choice: resolve_venv
 PY="$VENV/bin/python"
 GATE_STATE="$MAIN_ROOT/.gate"
+ROLES_ENV="$GATE_STATE/roles.env"   # local role passwords (git-ignored, 0600; T11.0.13)
 SEED="$GATE_STATE/seed.dump"
 SEED_META="$GATE_STATE/seed.meta"
 CHUNKS="$MAIN_ROOT/data/chunks/chunks.jsonl"
@@ -75,6 +76,7 @@ adr-links        - 30
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
+migrations-roundtrip db 180
 eval             seed 1200
 "
 STACK_BUDGET=300   # up + migrate + seed restore
@@ -252,6 +254,92 @@ step_db-tests() {
   (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m db -p no:cacheprovider -rs)
 }
 
+# Fresh database → roles.sql twice (catalog identical) → the roles log in with the gate
+# passwords → upgrade head → pg_dump as secrag_backup (default privileges, W16) →
+# downgrade -1 → upgrade head. Roles are cluster-wide: stack_up already created them.
+ROLES_SNAPSHOT_SQL="
+SELECT 'role', rolname, rolcanlogin::text, rolsuper::text, rolinherit::text, rolcreaterole::text,
+       rolcreatedb::text, rolreplication::text, rolbypassrls::text, rolconnlimit::text
+  FROM pg_roles WHERE rolname LIKE 'secrag\\_%' AND rolname <> current_user
+UNION ALL SELECT 'db', datname, coalesce(datacl::text, ''), '', '', '', '', '', '', ''
+  FROM pg_database WHERE datname = current_database()
+UNION ALL SELECT 'schema', nspname, coalesce(nspacl::text, ''), '', '', '', '', '', '', ''
+  FROM pg_namespace WHERE nspname = 'public'
+UNION ALL SELECT 'default', defaclobjtype::text, coalesce(defaclacl::text, ''), '', '', '', '', '', '', ''
+  FROM pg_default_acl
+UNION ALL SELECT 'rel', relname, coalesce(relacl::text, ''), '', '', '', '', '', '', ''
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind IN ('r', 'S', 'v', 'm', 'p')
+ORDER BY 1, 2, 3"
+
+# rt_alembic <database> <alembic args…>: Alembic against one database of the gate server.
+rt_alembic() {
+  local db="$1"
+  shift
+  (cd backend && DATABASE_URL="postgresql+psycopg://$GATE_DB_USER:$GATE_DB_PASSWORD@127.0.0.1:$GATE_DB_PORT/$db" \
+    "$VENV/bin/alembic" "$@" 2>&1 | sed 's/^/  /'; exit "${PIPESTATUS[0]}")
+}
+
+step_migrations-roundtrip() {
+  need_venv || return 1
+  if ! command -v psql >/dev/null || ! command -v pg_dump >/dev/null; then
+    missing_tool "psql/pg_dump 16 (scripts/prereqs/install.sh pg)"
+    return
+  fi
+  [ -f "$ROLES_ENV" ] || { echo "  FAIL: $ROLES_ENV missing (created by the gate stack)"; return 1; }
+  set -a
+  # shellcheck source=/dev/null
+  . "$ROLES_ENV"
+  set +a
+  local db rc=0 before after role var
+  db="secrag_rt_$(openssl rand -hex 4)"
+  local base="postgresql://$GATE_DB_USER@127.0.0.1:$GATE_DB_PORT"
+  export PGPASSWORD="$GATE_DB_PASSWORD"
+  psql "$base/postgres" -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db" || return 1
+  # shellcheck disable=SC2064
+  trap "PGPASSWORD='$GATE_DB_PASSWORD' psql '$base/postgres' -X -q -c 'DROP DATABASE IF EXISTS $db WITH (FORCE)' >/dev/null 2>&1" EXIT
+  local url="$base/$db"
+  echo "  fresh database $db"
+  bash "$REPO_ROOT/scripts/db/apply_roles.sh" "$url" | sed 's/^/  /' || return 1
+  rt_alembic "$db" upgrade head || { echo "  FAIL: alembic upgrade head on a fresh database"; return 1; }
+  rt_alembic "$db" current
+  # Before any second roles.sql run: only the default privileges can make the tables the
+  # migrations just created readable (W16).
+  if PGPASSWORD="$SECRAG_BACKUP_PASSWORD" pg_dump \
+       "postgresql://secrag_backup@127.0.0.1:$GATE_DB_PORT/$db" -Fc >/dev/null; then
+    echo "  pg_dump as secrag_backup: OK (tables created after roles.sql are readable)"
+  else
+    echo "  FAIL: pg_dump as secrag_backup (default privileges missing?)"
+    rc=1
+  fi
+  # Second run on the migrated database: roles, grants, default privileges and every
+  # table/sequence ACL must be identical.
+  before="$(psql "$url" -X -tA -F'|' -c "$ROLES_SNAPSHOT_SQL")" || return 1
+  bash "$REPO_ROOT/scripts/db/apply_roles.sh" "$url" >/dev/null || return 1
+  after="$(psql "$url" -X -tA -F'|' -c "$ROLES_SNAPSHOT_SQL")" || return 1
+  if [ "$before" = "$after" ]; then
+    echo "  roles.sql twice: catalog unchanged ($(wc -l <<<"$after") entries: roles, grants, default privileges, ACLs)"
+  else
+    echo "  FAIL: running roles.sql again changed the catalog:"
+    diff <(echo "$before") <(echo "$after") | sed 's/^/    /'
+    rc=1
+  fi
+  for role in purger backup; do
+    var="SECRAG_${role^^}_PASSWORD"
+    if PGPASSWORD="${!var}" psql "postgresql://secrag_$role@127.0.0.1:$GATE_DB_PORT/$db" \
+         -X -tA -c 'SELECT current_user' >/dev/null; then
+      echo "  secrag_$role logs in with the gate password"
+    else
+      echo "  FAIL: secrag_$role cannot log in with the gate password"
+      rc=1
+    fi
+  done
+  { rt_alembic "$db" downgrade -1 && rt_alembic "$db" upgrade head; } \
+    || { echo "  FAIL: downgrade -1 / upgrade head round trip"; return 1; }
+  echo "  downgrade -1 → upgrade head: OK"
+  return "$rc"
+}
+
 step_eval() {
   need_venv || return 1
   (cd backend && "$PY" -m rag_app.eval.gate --require-stack)
@@ -372,6 +460,21 @@ db_alembic_head() {
   compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT version_num FROM alembic_version'
 }
 
+# Local passwords of the database roles (git-ignored gate state, never printed). Created once;
+# the gate cluster is thrown away after every run, so they only need to be stable per clone.
+ensure_roles_env() {
+  [ -f "$ROLES_ENV" ] && return 0
+  mkdir -p "$GATE_STATE" && chmod 700 "$GATE_STATE" || return 1
+  (
+    umask 077
+    {
+      echo "# Local passwords for db/roles.sql roles (scripts/db/apply_roles.sh). Git-ignored."
+      echo "SECRAG_PURGER_PASSWORD=$(openssl rand -hex 24)"
+      echo "SECRAG_BACKUP_PASSWORD=$(openssl rand -hex 24)"
+    } >"$ROLES_ENV.tmp" && mv -f "$ROLES_ENV.tmp" "$ROLES_ENV"
+  )
+}
+
 stack_down() {
   [ "$STACK_STARTED" = 1 ] || return 0
   echo ""
@@ -410,6 +513,20 @@ stack_up() {
   if [ "${PIPESTATUS[0]}" -ne 0 ]; then STACK_ERROR="gate DB did not become healthy"; return 1; fi
   gate_urls "$GATE_DB_PASSWORD"
   echo "  gate DB up on 127.0.0.1:$GATE_DB_PORT (project $COMPOSE_PROJECT, volume secrag_gate_pgdata)"
+  # Roles before migrate, as in compose, CI and Azure (T11.0.13).
+  ensure_roles_env || { STACK_ERROR="could not create $ROLES_ENV"; return 1; }
+  if ! command -v psql >/dev/null; then
+    STACK_ERROR="psql not found (scripts/prereqs/install.sh pg) — needed to apply db/roles.sql"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  if ! (set -a; . "$ROLES_ENV"; set +a
+        PGPASSWORD="$GATE_DB_PASSWORD" bash "$REPO_ROOT/scripts/db/apply_roles.sh" \
+          "postgresql://$GATE_DB_USER@127.0.0.1:$GATE_DB_PORT/$GATE_DB_NAME" 2>&1 | sed 's/^/  /'
+        exit "${PIPESTATUS[0]}"); then
+    STACK_ERROR="db/roles.sql failed on the gate DB"
+    return 1
+  fi
   if ! (cd backend && "$VENV/bin/alembic" upgrade head 2>&1 | sed 's/^/  /'; exit "${PIPESTATUS[0]}"); then
     STACK_ERROR="alembic upgrade head failed on the gate DB"
     return 1
@@ -525,7 +642,7 @@ run_step() {
   esac
   [ "$status" = FAIL ] && fail=1
   echo "  $status (${elapsed}s)"
-  RESULTS+=("$(printf '%-17s %-5s %5ss / %ss' "$name" "$status" "$elapsed" "$budget")")
+  RESULTS+=("$(printf '%-20s %-5s %5ss / %ss' "$name" "$status" "$elapsed" "$budget")")
 }
 
 usage() { sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; }
@@ -581,7 +698,7 @@ main() {
     echo "  FAIL: $VENV_ERROR"
     fail=1
   fi
-  RESULTS+=("$(printf '%-17s %-5s %5ss' venv-resolve "$([ -z "$VENV_ERROR" ] && echo PASS || echo FAIL)" "$((SECONDS - v0))")")
+  RESULTS+=("$(printf '%-20s %-5s %5ss' venv-resolve "$([ -z "$VENV_ERROR" ] && echo PASS || echo FAIL)" "$((SECONDS - v0))")")
 
   if [ "$mode" = seed ]; then
     [ -z "$VENV_ERROR" ] || return 1
@@ -614,7 +731,7 @@ main() {
     fi
     local stack_status=PASS
     [ -n "$STACK_ERROR$SEED_ERROR" ] && { stack_status=FAIL; fail=1; }
-    RESULTS+=("$(printf '%-17s %-5s %5ss / %ss' stack "$stack_status" "$((SECONDS - s0))" "$STACK_BUDGET")")
+    RESULTS+=("$(printf '%-20s %-5s %5ss / %ss' stack "$stack_status" "$((SECONDS - s0))" "$STACK_BUDGET")")
   fi
 
   for name in "${steps[@]}"; do

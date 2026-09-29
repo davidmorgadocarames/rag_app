@@ -47,6 +47,19 @@ jobs:
         run: ruff format --check .
       - name: Mypy
         run: mypy src
+      # Roles before migrate, as in compose, the gate and Azure (T11.0.13). Applied twice
+      # (idempotent); throwaway CI passwords; each role must then log in.
+      - name: Database roles (db/roles.sql, twice) + role logins
+        env:
+          DATABASE_URL: postgresql://secrag_ci:ci-throwaway@localhost:15432/secrag_ci
+          SECRAG_PURGER_PASSWORD: ci-throwaway-purger
+          SECRAG_BACKUP_PASSWORD: ci-throwaway-backup
+        run: |
+          psql --version
+          bash ../scripts/db/apply_roles.sh
+          bash ../scripts/db/apply_roles.sh
+          PGPASSWORD="$SECRAG_PURGER_PASSWORD" psql -X -tA "postgresql://secrag_purger@localhost:15432/secrag_ci" -c 'SELECT current_user'
+          PGPASSWORD="$SECRAG_BACKUP_PASSWORD" psql -X -tA "postgresql://secrag_backup@localhost:15432/secrag_ci" -c 'SELECT current_user'
       - name: Alembic upgrade head (CI Postgres)
         env:
           DATABASE_URL: postgresql+psycopg://secrag_ci:ci-throwaway@localhost:15432/secrag_ci

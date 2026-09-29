@@ -8,8 +8,9 @@ project's Postgres on 127.0.0.1:15432 by default, or the CI service). The harnes
    (so never an Azure server);
 2. creates a fresh database ``secrag_test_<random>`` and marks it with a comment;
 3. refuses to hand out any database that does not carry that marker;
-4. migrates it (``alembic upgrade head``), applies ``db/roles.sql`` when that file exists,
-   and drops it at the end of the session.
+4. applies ``db/roles.sql`` when that file exists, then migrates it (``alembic upgrade
+   head``) — roles before migrate, as everywhere else — and drops it at the end of the
+   session.
 
 5. points the **app's own configuration** at that database for every ``db`` test:
    ``DATABASE_URL`` (the only setting the app builds its engine from) is set to the harness
@@ -132,7 +133,7 @@ def migrate(test_url: URL) -> None:
 
 
 def apply_roles(engine: Engine) -> bool:
-    """Apply ``db/roles.sql`` when it exists (row 12 adds it); True when applied."""
+    """Apply ``db/roles.sql`` when it exists (T11.0.13); True when applied."""
     if not ROLES_SQL.is_file():
         return False
     raw = engine.raw_connection()

@@ -89,8 +89,8 @@ def db_url(admin_url: URL) -> Iterator[URL]:
         engine = create_engine(url, future=True)
         try:
             assert_harness_database(engine)
+            apply_roles(engine)  # before migrate, as everywhere else (T11.0.13)
             migrate(url)
-            apply_roles(engine)
         finally:
             engine.dispose()
         os.environ["DATABASE_URL"] = url.render_as_string(hide_password=False)
