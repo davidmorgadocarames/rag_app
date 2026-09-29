@@ -4,7 +4,8 @@
 #
 #   ollama serve                                   # native, bound to 127.0.0.1:11434 (WSL)
 #   ollama pull bge-m3 && ollama pull qwen2.5:7b-instruct-q4_K_M
-#   docker compose up -d --build                   # db → db-roles → backend → frontend
+#   scripts/dev/create_dev_volume.sh               # once: the external dev volume
+#   docker compose up -d --build                   # db → db-roles → migrate → backend → frontend
 #
 #   docker compose --profile ci up -d ...          # containerised Ollama instead; then set
 #                                                  # CONTAINER_OLLAMA_HOST=http://ollama:11434
@@ -54,6 +55,24 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # One-shot: migrations, once per `up`, after the roles and before the backend (T11.2.5).
+  # Runs from the slim jobs image, like the Azure migration Job; the backend image never
+  # migrates. Needs only DATABASE_URL (JobSettings) — no JWT_SECRET / DATA_MASTER_KEY.
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.jobs
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
+      ENV: ${ENV:-prod}
+    depends_on:
+      db:
+        condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
+    restart: "no"
+
   ollama:
     image: ollama/ollama:latest
     profiles: ["ci"]
@@ -92,6 +111,8 @@ services:
         condition: service_healthy
       db-roles:
         condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
       ollama:
         condition: service_started
         required: false
@@ -107,5 +128,13 @@ services:
       - backend
 
 volumes:
+  # The development database lives in ONE fixed, external volume (T11.2.1). Before, `pgdata`
+  # had no name, so Docker prefixed it with the compose project (the checkout folder) and a
+  # checkout under another folder silently started on an empty database (ADR phase 11,
+  # Diagnosis). `external: true`: compose never creates, recreates or removes it (`down -v`
+  # included) — create it once with scripts/dev/create_dev_volume.sh; `up` fails clearly if
+  # it is missing. The gate never references it (compose.gate.yml, restart_check.sh).
   pgdata:
+    name: rag_ia_pgdata
+    external: true
   ollama:

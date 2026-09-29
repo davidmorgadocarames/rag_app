@@ -60,10 +60,15 @@ jobs:
           bash ../scripts/db/apply_roles.sh
           PGPASSWORD="$SECRAG_PURGER_PASSWORD" psql -X -tA "postgresql://secrag_purger@localhost:15432/secrag_ci" -c 'SELECT current_user'
           PGPASSWORD="$SECRAG_BACKUP_PASSWORD" psql -X -tA "postgresql://secrag_backup@localhost:15432/secrag_ci" -c 'SELECT current_user'
-      - name: Alembic upgrade head (CI Postgres)
+      # migrations-roundtrip (T11.2.9): fresh DB → roles.sql (above) → upgrade head →
+      # downgrade -1 → upgrade head, as the gate step does; a broken downgrade fails here.
+      - name: Alembic round trip (upgrade head → downgrade -1 → upgrade head)
         env:
           DATABASE_URL: postgresql+psycopg://secrag_ci:ci-throwaway@localhost:15432/secrag_ci
-        run: alembic upgrade head && alembic current
+        run: |
+          alembic upgrade head && alembic current
+          alembic downgrade -1 && alembic current
+          alembic upgrade head && alembic current
       - name: Pytest (unit)
         run: pytest -rs -m "not db"
       - name: Pytest (DB tests through the harness — must run, never skip)
@@ -98,6 +103,34 @@ jobs:
         run: npm run typecheck
       - name: Build
         run: npm run build
+
+  # Slim jobs image (T11.2.12): the migration/purge/backup Jobs run it. rag_app must import
+  # without torch, which must not be importable at all.
+  jobs-image:
+    name: Jobs image (build, no torch, pg_dump 16, audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend/Dockerfile.jobs
+        run: docker build -f backend/Dockerfile.jobs -t secrag-jobs:ci backend
+      - name: rag_app.erasure imports; torch is not importable
+        run: |
+          docker run --rm secrag-jobs:ci python -c 'import rag_app.erasure, rag_app.keycheck, azure.storage.blob, azure.identity; print("imports ok")'
+          if docker run --rm secrag-jobs:ci python -c 'import torch' 2>/dev/null; then
+            echo "::error::torch is importable in the jobs image"
+            exit 1
+          fi
+          echo "torch not importable: ok"
+      - name: Tools (pg_dump 16, age, alembic, non-root)
+        run: |
+          docker run --rm secrag-jobs:ci sh -c 'pg_dump --version | grep -q "(PostgreSQL) 16\." && age --version && alembic --help >/dev/null && test "$(id -u)" = 10001'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit the jobs pins (pip-audit, pinned version from requirements-dev.txt)
+        run: |
+          pip install "$(grep -E '^pip-audit==' backend/requirements-dev.txt)"
+          pip-audit --no-deps --disable-pip -r backend/requirements-jobs.txt
 
   gitleaks:
     name: Secret scan

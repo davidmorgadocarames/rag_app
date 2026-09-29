@@ -1,0 +1,30 @@
+alembic==1.14.0           # via -c requirements.txt, -r requirements-jobs.in
+annotated-types==0.8.0    # via pydantic
+azure-core==1.41.0        # via azure-identity, azure-storage-blob
+azure-identity==1.25.3    # via -r requirements-jobs.in
+azure-storage-blob==12.30.3  # via -r requirements-jobs.in
+certifi==2026.7.22        # via requests
+cffi==2.1.1               # via cryptography
+charset-normalizer==3.5.1  # via requests
+cryptography==50.0.1      # via azure-identity, azure-storage-blob, msal, pyjwt, -c requirements.txt, -r requirements-jobs.in
+greenlet==3.5.6           # via sqlalchemy
+idna==3.20                # via requests
+isodate==0.7.2            # via azure-storage-blob
+mako==1.4.3               # via alembic
+markupsafe==3.0.3         # via mako
+msal==1.39.0              # via azure-identity, msal-extensions
+msal-extensions==1.3.1    # via azure-identity
+numpy==2.5.3              # via pgvector
+pgvector==0.3.6           # via -c requirements.txt, -r requirements-jobs.in
+psycopg==3.2.3            # via -c requirements.txt, -r requirements-jobs.in
+psycopg-binary==3.2.3     # via psycopg
+pycparser==3.0            # via cffi
+pydantic==2.10.4          # via pydantic-settings, -c requirements.txt, -r requirements-jobs.in
+pydantic-core==2.27.2     # via pydantic
+pydantic-settings==2.7.1  # via -c requirements.txt, -r requirements-jobs.in
+pyjwt==2.15.0             # via msal, -c requirements.txt
+python-dotenv==1.2.3      # via pydantic-settings
+requests==2.34.2          # via azure-core, msal
+sqlalchemy==2.0.36        # via alembic, -c requirements.txt, -r requirements-jobs.in
+typing-extensions==4.16.0  # via alembic, azure-core, azure-identity, azure-storage-blob, psycopg, pydantic, pydantic-core, sqlalchemy
+urllib3==2.8.0            # via requests

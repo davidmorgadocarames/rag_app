@@ -1,0 +1,15 @@
+# Direct dependencies of the slim `jobs` image (Dockerfile.jobs, T11.2.12): migrations,
+# purge and backup Jobs. No torch, no sentence-transformers, no models, no web server.
+# Resolved into requirements-jobs.txt with the SAME versions as requirements.txt:
+#   uv pip compile requirements-jobs.in -c requirements.txt --python-version 3.12 \
+#     --no-header --annotation-style line -o requirements-jobs.txt
+pydantic
+pydantic-settings
+SQLAlchemy
+alembic
+psycopg[binary]
+pgvector
+cryptography
+# Blob upload (backup Job, managed identity)
+azure-storage-blob
+azure-identity
