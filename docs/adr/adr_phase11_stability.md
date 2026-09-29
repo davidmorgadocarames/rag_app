@@ -23,10 +23,136 @@
 
 ## Diagnosis
 
-*To be completed in 11.1:* local reproduction (volume names, row counts, exact commands);
-Azure key check via `az containerapp exec` (OK/KO counts only) and its classification —
-(a) data gone, (b) unreadable because the key changed, (c) session only; in-memory state
-inventory (rate-limit buckets, signup tracker, singletons); the red `restart_check`.
+Classes (PHASE_PLANNING 11.1): **(a)** data gone, **(b)** unreadable because the master key
+changed, **(c)** session only (the data is there and readable; only the login/JWT broke).
+Evidence is counts only — no row contents, emails, hashes or keys.
+
+### Local (11.1, T11.1.1) — 2026-09-29
+
+**Method (the development volumes were never mounted by a database).** Both dev DB containers
+were already stopped (`rag_ia-db-1` exited 2026-09-24, `rag_app-db-1` exited 2026-09-27), so a
+file-level copy is consistent. Each volume was copied read-only into a git-ignored, mode-700
+directory outside the repository, the copy restored into a new throw-away volume, and a
+throw-away `pgvector/pgvector:pg16` (the image the dev compose uses; data directory
+`PG_VERSION` 16) started on it on a loopback port:
+
+```bash
+docker run --rm --network none -v rag_ia_pgdata:/src:ro -v ~/secrag-backups:/dst alpine \
+  tar -C /src -czf /dst/rag_ia_pgdata-20260929T202333Z.tgz .          # same for rag_app_pgdata
+docker volume create secrag-diag-rag_ia_pgdata
+docker run --rm --network none -v secrag-diag-rag_ia_pgdata:/dst -v ~/secrag-backups:/src:ro alpine \
+  tar -C /dst -xzf /src/rag_ia_pgdata-20260929T202333Z.tgz
+docker run -d --name secrag-diag-rag_ia_pgdata-db -p 127.0.0.1:15441:5432 \
+  -v secrag-diag-rag_ia_pgdata:/var/lib/postgresql/data pgvector/pgvector:pg16   # rag_app → 15442
+psql -h 127.0.0.1 -p 15441 -U rag -d rag -X -At -F'|' -f scripts/azure/sql/diag_counts.sql
+```
+
+The snapshots (sha256 `96989e30…eafcf37` rag_ia, `34db794e…e836291a` rag_app) are kept as a
+backup; the throw-away containers and volumes were removed afterwards. Before and after, the
+dev volumes' `CreatedAt` were unchanged (`rag_ia_pgdata` 2026-09-19T02:27:17Z,
+`rag_app_pgdata` 2026-09-20T14:34:58Z) and no new container referenced them.
+
+**Volumes.** `docker-compose.yml` declares `pgdata` without `name:`, so Docker prefixes it with
+the compose project, i.e. the checkout folder: two volumes exist, each labelled with its
+project (`com.docker.compose.project` = `rag_ia` / `rag_app`).
+
+| Item (counts) | `rag_ia_pgdata` | `rag_app_pgdata` |
+|---|---:|---:|
+| PostgreSQL / `alembic_version` | 16.15 / `0004_conv_titles_tokens` | 16.15 / `0004_conv_titles_tokens` |
+| `users` / `user_keys` / users without a key | 5 / 5 / 0 | 0 / 0 / 0 |
+| `conversations` / `messages` | 4 / 13 | 0 / 0 |
+| `deletion_requests` / `email_verification_tokens` | 4 / 9 | 0 / 0 |
+| `documents` / `chunks` (corpus) | 9 / 322 | 9 / 322 |
+| users / messages created after `rag_app_pgdata` appeared | 2 / 10 | 0 / 0 |
+
+**Key check** (the T11.1.3 snippet `scripts/azure/diag_keys.py`, run with the local
+`backend/.env` settings against each copy): `rag_ia` copy — N 5, **OK 4, KO 1**, `JWT_SECRET`
+length ≥ 32 OK, `DATA_MASTER_KEY` valid Fernet OK; `rag_app` copy — N 0.
+
+**Local classification.**
+1. **Not (a):** nothing was deleted. Every account and conversation is in `rag_ia_pgdata`;
+   `rag_app_pgdata` holds the schema and a re-ingested corpus only (no user rows). The "loss"
+   is a **volume split**: whenever the stack ran as project `rag_app` it used the other,
+   user-less database. Both projects were used after 2026-09-20 (2 users and 10 messages were
+   written to `rag_ia_pgdata` after `rag_app_pgdata` appeared), so the data seemed to come and
+   go with the folder the stack was started from.
+2. **Also (b) for one account:** 1 of 5 wrapped keys does not unwrap with today's local
+   `DATA_MASTER_KEY`, so that account's content is unreadable locally. The counts cannot show
+   which key wrapped it. Likely cause: two key sources in local development — the compose
+   backend reads `DATA_MASTER_KEY` from the shell or a root `.env`, native runs read
+   `backend/.env` — or a regenerated key. The fingerprint check (T11.2.4) turns this into a
+   refusal at start-up instead of silent `InvalidToken`s.
+3. `rag_app_pgdata` is **not empty** (planned: "empty"): it holds the corpus, which can be
+   re-ingested, and no personal data. T11.2.1 may remove it after the user confirms. The
+   snapshot is kept.
+
+### Tools for the Azure diagnosis (T11.1.2, T11.1.3)
+
+- **`scripts/azure/db-tunnel.sh`** — temporary access to the Flexible Server. Every call first
+  sweeps stale `secrag-tunnel-*` firewall rules. It detects the public IPv4 from two services,
+  which must agree and be public (fail closed), creates one `/32` rule, and runs `psql` or
+  `pg_dump` only. The connection is `sslmode=require` and read-only by default
+  (`default_transaction_read_only=on`; `--read-write` is explicit). The password comes from
+  the backend's `database-url` secret into a 0600 `PGPASSFILE`; it never reaches argv or the
+  output. The rule is **always** removed (EXIT trap, including SIGINT/SIGTERM/SIGHUP, with
+  signals ignored during the removal), and then verified gone; otherwise the script prints the
+  manual command and fails. Tested against a stateful fake `az`/`curl`/`psql`
+  (`backend/tests/test_db_tunnel.py`, 22 cases: rule present only during the call; removed on
+  success, error, SIGINT and SIGTERM; sweep; `--sweep`; seven unknown-IP cases; read-only;
+  password never printed; the delete-failure path). Mutations (INT trap, sweep, read-only
+  removed) fail the tests.
+- **`scripts/azure/sql/diag_counts.sql`** — the counts above, as `name|value` lines.
+- **`scripts/azure/diag_keys.py`** — runs inside the backend and reads settings and the DB as
+  the app does, in a read-only transaction. It prints exactly five lines (`N`, `OK`, `KO`,
+  `JWT_SECRET length >= 32: OK|KO`, `DATA_MASTER_KEY valid Fernet: OK|KO`); a failure prints
+  the exception class only. `scripts/azure/exec_oneliner.py` wraps it into one
+  whitespace-free `python -c …` argument for `az containerapp exec --command`. It was verified
+  in the backend image `rag_app-backend:bc7c661` (same Dockerfile as the deployed `dee9cbc`)
+  in four ways: as argv, through `sh -c` (`--for shell`), over stdin (`python -`), and with a
+  wrong key (KO = N).
+
+### Azure (T11.1.3) — *to be filled in by the orchestrator*
+
+| Item | Result |
+|---|---|
+| Spike: stdin (`python -`) through `exec` / `--command` split on whitespace or by a shell | *pending* |
+| db-tunnel counts: `users` / `user_keys` / users without a key / `conversations` / `messages` / `alembic_version` | *pending* |
+| Key snippet: N / OK / KO | *pending* |
+| `JWT_SECRET` length ≥ 32 / `DATA_MASTER_KEY` valid Fernet | *pending* |
+| Firewall: no `secrag-tunnel-*` rule left after the runs | *pending* |
+| **Classification** (a / b / c) and consequence (R5-5 in row 40 if b) | *pending* |
+
+### In-memory state (T11.1.4)
+
+Everything below lives in the API process. It is lost on every restart (and on every
+scale-to-zero on Azure), and with more than one replica each replica has its own copy.
+
+| State | Where | Lost on restart | Diverges across replicas | Fix |
+|---|---|---|---|---|
+| Rate-limit token buckets (`chat:<ip>`, `login:<ip>`) | `api/deps.py` `_rate_limiter` (`ratelimit.RateLimiter`) | yes: a restart refills every bucket (the login brute-force budget resets) | yes: each replica allows the full budget | Phase 16.3 (shared store, Valkey) |
+| Signup velocity per IP (1 h window, risk score) | `api/deps.py` `_signup_tracker` (`risk.SignupTracker`) | yes: the anti-Sybil window restarts empty | yes | 16.3 |
+| Engine and session factories (connection pools) | `api/deps.py` `_session_factory`, `api/conversations.py` `_stream_sessions` | rebuilt (no user state) | one pool per replica: DB connections × replicas | none; watch `max_connections` from 16.3 |
+| Reranker model (`CrossEncoder`, ~2.2 GB) | built **per question** (`generation.py`); files in the container's Hugging Face cache (ephemeral disk) | re-downloaded after a restart/new replica | per replica | 11b (one shared instance, baked into the image) |
+| `bge-m3` in `secrag-ollama` (Azure) | Ollama's ephemeral storage | yes: scale-to-zero loses it (F-2026-09-27-5) | per replica | T11.4.3 (baked image) |
+| Login sessions (JWT) | stateless tokens signed with `JWT_SECRET` | survive restarts **only if `JWT_SECRET` is unchanged**; a new secret logs everyone out (class c) | no (same secret) | fail-fast length check T11.2.2; server-side sessions 12a |
+| Settings, password hasher | `config.get_settings()` (read on every call), `security._hasher` | no state | no | — |
+
+User data (users, keys, conversations, messages, verification tokens, deletion requests) is
+only in PostgreSQL.
+
+### Red restart check (T11.1.5)
+
+`scripts/restart_check.sh` does: register a throw-away account → one chat turn → `compose down`
+(volumes kept) → `up` → login → decrypted read. It refuses the development projects, any
+project that resolves to a development volume, and any project whose `pgdata` already exists;
+it removes both projects (`down -v --rmi local`) at the end. It uses throw-away projects in
+place of `-p rag_ia` / `-p rag_app`, with the same mechanism (2026-09-29):
+
+- `--project secrag-rc-same` (same project before and after): **PASS** (41 s).
+- `--project secrag-rc-ia --restart-project secrag-rc-app`: **FAIL (rc 1)** at "login after
+  restart" — `HTTP 401 … the restarted stack runs on volume secrag-rc-app_pgdata, the data
+  was written to secrag-rc-ia_pgdata`. This is the diagnosed cause. It turns green once the
+  dev volume has a fixed name (T11.2.1); T11.2.8 makes it the gate's `restart-check` step.
 
 ## Decisions
 
