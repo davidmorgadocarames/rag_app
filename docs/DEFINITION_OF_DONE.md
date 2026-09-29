@@ -37,8 +37,9 @@ are a human/agent checklist.
   Enforced by the gate step `eval` (in `--full`).
 - **Phase 10 (cloud)** — the deployed Azure URL responds to a health check; the eval gate
   ran and passed **before** the Azure deploy step (not just before the GHCR push) — the
-  pre-push gate blocks the very push that triggers CD, and the deploy job is
-  `needs: [images]`; Azure credentials/secrets are supplied via OIDC federated credentials
+  pre-push gate blocks the very push that triggers CD, and (from Phase 11a) CD runs only
+  after CI succeeded on `main` and deploys only a SHA carrying `secrag/gate-full` (below);
+  Azure credentials/secrets are supplied via OIDC federated credentials
   and Container Apps secrets, never committed (this extends norm #2, it is not a new
   mechanism). Note: norm #1 (**WSL2**) governs where the code is *written and tested* — it
   does **not** conflict with a container that *runs in production* on Azure.
@@ -49,15 +50,25 @@ are a human/agent checklist.
   (PHASE_TASKS rows 40/41) needs the **`--full` PASS log for the exact SHA pushed**: the
   gate's summary prints `total … @ <full SHA>` and `GATE: PASS`; the log is attached to the
   phase report / PR. CI's `cheap-checks` job is the server-side backstop for the cheap steps
-  (git modes, shellcheck, venv, dependency-audit, adr-links). A GitHub commit status that CD
-  requires before deploying (D-7 b) is added with the CD rework (row 9).
+  (git modes, shellcheck, venv, dependency-audit, adr-links).
+- **Gate status enforced by CD (Phase 11+, D-2026-09-27-7 b)** — a `--full` PASS on a clean
+  tree publishes the GitHub commit status **`secrag/gate-full` = success for exactly that
+  SHA** (`scripts/cd/gate_status.sh`, via `gh`). CD's `gate-status` job and the `deploy` job
+  itself refuse a SHA whose newest `secrag/gate-full` status is missing, not `success`, or
+  not posted by the repository owner (`vars.GATE_STATUS_CREATOR` overrides). Under the
+  pre-push hook the commit is not on GitHub yet, so a detached publisher posts the status
+  once the push lands (log: `.git/secrag-gate/publish-status.log`); CD waits up to 10 min
+  for it. A dirty tree, a missing `gh` or `SECRAG_GATE_PUBLISH=0` → no status (said in the
+  gate output) → CD refuses. By hand, after a `--full` PASS on a pushed SHA:
+  `bash scripts/cd/gate_status.sh publish <sha>`. A status can still be posted without
+  running the gate — that is a deliberate act, not an accident (accepted in D-7).
 
 ## Gate modes
 
 | Mode | When | What |
 |---|---|---|
 | `--fast` (default) | pre-push on phase branches | every step marked `-` below; no stack needed |
-| `--full` | pre-push to `main` (promotion), before a PR is ready | fast + stack steps in the gate project: up → migrate → seed → steps → `down -v`. A missing tool or an unreachable stack **fails** (never skips) |
+| `--full` | pre-push to `main` (promotion), before a PR is ready | fast + stack steps in the gate project: up → roles → migrate → seed → steps → `down -v`. A missing tool or an unreachable stack **fails** (never skips). A PASS on a clean tree publishes `secrag/gate-full` for the SHA (see above) |
 | `--only a,b` | closing a sub-phase, debugging, CI `cheap-checks` | just the named steps (the gate project is started only if one needs it). A missing tool **fails**, as in `--full` — a step that was asked for never passes without running |
 | `--make-seed` | once, and whenever the corpus (`data/chunks/chunks.jsonl`), the embedding model build (Ollama digest) or the migrations head changes | builds the git-ignored seed `.gate/seed.dump` (documents + chunks, embedded with Ollama) in the gate project; `seed.meta` records corpus hash, `embed_model` digest and `alembic_head`, and `eval` fails on any mismatch |
 | `--list` | — | step names, stack needs and budgets |
@@ -74,9 +85,17 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `ruff-lint` | - | 60 s | `dependency-audit` | - | 240 s |
 | `ruff-format` | - | 60 s | `db-tests` | gate DB | 300 s |
 | `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
-| `pytest` | - | 300 s | | | |
+| `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
 
-Gate-project setup (up + migrate + seed restore) has its own 300 s budget; building a
+`migrations-roundtrip` (T11.0.13; the CI leg and the broken-downgrade test come with
+T11.2.9): a fresh database on the gate server → `db/roles.sql` → `alembic upgrade head` →
+`pg_dump` as `secrag_backup` (only the default privileges can make the new tables readable)
+→ `roles.sql` again with the catalog compared (roles, grants, default privileges, every
+table/sequence ACL: identical) → `secrag_purger` / `secrag_backup` log in with the gate
+passwords → `downgrade -1` → `upgrade head`. The local role passwords live in the
+git-ignored `.gate/roles.env` (0600, generated once).
+
+Gate-project setup (up + roles + migrate + seed restore) has its own 300 s budget; building a
 cached venv (below) has 900 s. Measured on the development machine (2026-09-27): `--fast`
 ≈ 26 s, `--full` ≈ 3 min (eval ≈ 2.5 min).
 
@@ -85,8 +104,9 @@ main tree's `backend/.venv` when the checked tree's requirements hash equals the
 and the installed versions equal the pins; otherwise (a pushed commit that changes the pins)
 a venv cached per requirements hash under `$(git rev-parse --git-common-dir)/secrag-gate/venvs/`
 (built once with `uv`: same Python and CPU torch as the main venv, then
-`requirements-dev.txt`; the three most recent are kept). In the main tree a drifted venv is
-never rebuilt behind the developer's back: the `venv` step fails with the install command.
+`requirements-dev.txt`; the two most recent are kept). In the main tree a drifted venv is
+never rebuilt behind the developer's back: the gate fails (every mode, also `--only <step>`
+without the `venv` step — DA-B2-2) with the install command.
 `GATE_VENV=<dir>` overrides the choice (CI); the `venv` step still checks it.
 
 **Isolation.** `compose.gate.yml` is self-contained: project `secrag-gate`, volume
@@ -103,8 +123,8 @@ Teardown is `docker compose -p secrag-gate down -v` — it only removes that pro
 **Test DB harness** (`backend/tests/db_harness.py`, marker `db`). `TEST_DATABASE_URL` is a
 maintenance connection on a local test server; the harness refuses port 5432, database
 `rag` and any non-loopback host before connecting, creates `secrag_test_<random>` with a
-marker comment, refuses any database without that marker, migrates it (`alembic upgrade
-head`), applies `db/roles.sql` when present and drops it at the end. Without
+marker comment, refuses any database without that marker, applies `db/roles.sql` when
+present, migrates it (`alembic upgrade head`) and drops it at the end. Without
 `TEST_DATABASE_URL` the `db` tests are skipped — unless `SECRAG_REQUIRE_DB_TESTS=1`
 (`--full`, CI), where that is an error. While the harness database exists, the app's own
 `DATABASE_URL` points at it (whatever the shell or `backend/.env` say), the app's cached

@@ -38,7 +38,31 @@ inventory (rate-limit buckets, signup tracker, singletons); the red `restart_che
    development machine), seeded from a git-ignored dump (`gate.sh --make-seed`) and removed
    with `down -v` after every `--full`; a test DB harness that refuses the development
    database; see [Definition of Done — Gate modes](../DEFINITION_OF_DONE.md#gate-modes).
-2. Fail-fast settings validation in the API lifespan; master-key fingerprint.
+   *Landed in 11.0 (CD part):* CD runs on `workflow_run` of CI on `main` (success only),
+   uses the CI run's `head_sha` everywhere, compares the changed files with the last
+   deployed SHA (GitHub Deployments; only `docs/**`, `**/*.md`, `deploy/k8s/**` → skip),
+   deploys images by digest, and refuses any SHA without the commit status
+   `secrag/gate-full` = success that a local `gate.sh --full` PASS publishes for exactly that
+   SHA (D-2026-09-27-7 b) — a skipped pre-push hook can no longer reach Azure. No
+   `environment:` key (OIDC subject unchanged); dry runs stay echo-only.
+   *Compose ↔ native Ollama (T11.0.11/12, input for 16.0):* the backend container calls
+   `host.docker.internal:11434`; Docker Desktop forwards it to Windows' loopback and WSL2's
+   default localhost forwarding (NAT mode, no `.wslconfig`) relays it to Ollama bound to
+   `127.0.0.1` inside WSL. Measured on the development machine: Windows listens only on
+   `127.0.0.1:11434` (`wslrelay`), so there is no LAN exposure, no firewall rule, no mirrored
+   networking and no distro-IP script (the planned options; not needed). Verified with a
+   throw-away compose project: the backend container listed `bge-m3` and `qwen2.5` at
+   `/api/tags` and answered one grounded chat question (4 citations); `ss -ltn` showed only
+   `127.0.0.1` listeners. Dependencies: Docker Desktop and `localhostForwarding` (default on);
+   for k3d (Phase 16) the same path is `host.docker.internal` / `host.k3d.internal`. The
+   containerised Ollama moved to the `ci` profile; every published port is on `127.0.0.1`.
+   *Roles (T11.0.13):* idempotent `db/roles.sql` (`secrag_purger`, `secrag_backup`, NOLOGIN;
+   default privileges so every future table stays dumpable), applied before every migrate
+   (compose `db-roles`, CI, gate, test harness); LOGIN + passwords outside Alembic
+   (`scripts/db/apply_roles.sh` via `\getenv`). Gate step `migrations-roundtrip`.
+2. Fail-fast settings validation in the API lifespan; master-key fingerprint. *Landed in 11.0:*
+   `ENV` (`dev`/`prod`, default `prod`) and a lifespan guard that refuses any development-only
+   flag with `ENV=prod` (registry `DEV_ONLY_FLAGS`, empty until Phases 13/16/19/20).
 3. Migrations out of the container command: compose one-shot service and an Azure
    migration Job run by CD before the apps; expand/contract rule.
 4. Slim `jobs` image for the migration, purge and backup Jobs.

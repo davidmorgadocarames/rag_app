@@ -1,87 +1,172 @@
 name: CD
 
-# On every push to main: build the app images, publish them to the GitHub Container
-# Registry, then deploy to Azure Container Apps. The cloud path uses a hosted LLM
-# (Azure OpenAI via LLM_PROVIDER) instead of GPU/Ollama; see
-# docs/adr/adr_phase10_azure.md. The eval gate that guards a bad deploy runs
-# in the pre-push hook (scripts/gate.sh), which blocks the very push that triggers this.
+# Deploys `main` to Azure Container Apps after CI has succeeded on it (T11.0.9, PHASE_PLANNING
+# §1 rule 2). The cloud path uses a hosted LLM (Azure OpenAI via LLM_PROVIDER); see
+# docs/adr/adr_phase10_azure.md and docs/adr/adr_phase11_stability.md.
 #
-# Manual runs (workflow_dispatch) default to dry_run=true and only echo what they would
-# do. A real manual deploy needs dry_run=false AND the main branch. The workflow_run job
-# is echo-only for now: it exercises the "after CI succeeded" path before Phase 11a moves
-# deploys onto it. No job uses `environment:`, so the OIDC subject stays
-# repo:<owner>/<repo>:ref:refs/heads/main (see the runbook, gotcha 8).
+#   plan         changed files vs the LAST DEPLOYED SHA (GitHub Deployments); only docs/**,
+#                **/*.md or deploy/k8s/** changed → build and deploy are skipped
+#   gate-status  the SHA must carry the commit status `secrag/gate-full` = success, posted by
+#                `scripts/gate.sh --full` for exactly that SHA (D-2026-09-27-7 b); otherwise
+#                the deploy is REFUSED (a skipped pre-push hook can no longer reach Azure)
+#   images       build + push, tagged with the SHA; deployed BY DIGEST
+#   deploy       re-checks the gate status, records a deployment, updates the apps
+#
+# One SHA everywhere: head_sha of the CI run (workflow_run) or the dispatched commit.
+# Manual runs (workflow_dispatch) default to dry_run=true: plan + gate-status run (read-only)
+# and an echo job prints what a real run would do. A real manual deploy needs dry_run=false
+# AND the main branch. base_sha/head_sha inputs exist to test the plan in dry runs only.
+# No job uses `environment:`, so the OIDC subject stays repo:<owner>/<repo>:ref:refs/heads/main
+# (runbook, gotcha 8). CD never enables Job schedules and never applies Job YAML (X1); the
+# migration Job and Job image updates come with T11.2.6.
 on:
-  push:
-    branches: ["main"]
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Only echo what would be built and deployed"
-        type: boolean
-        default: true
   workflow_run:
     workflows: ["CI"]
     types: [completed]
     branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only plan and echo what would be built and deployed"
+        type: boolean
+        default: true
+      base_sha:
+        description: "Dry runs only: compare with this SHA instead of the last deployed one"
+        type: string
+        default: ""
+      head_sha:
+        description: "Dry runs only: plan this SHA instead of the dispatched ref's head"
+        type: string
+        default: ""
 
 # Real deploys are serialised in one group and never cancelled mid-flight; dry runs and
 # echo runs get their own group so they can never replace a pending real deploy.
 concurrency:
-  group: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)) && 'cd-main' || format('cd-noop-{0}', github.run_id) }}
+  group: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)) && 'cd-main' || format('cd-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Plan (changed files vs last deployed SHA)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: read
+    outputs:
+      real: ${{ steps.mode.outputs.real }}
+      sha: ${{ steps.plan.outputs.sha }}
+      deploy: ${{ steps.plan.outputs.deploy }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - name: Mode and SHA
+        id: mode
+        env:
+          REAL: ${{ github.event_name == 'workflow_run' || (github.ref == 'refs/heads/main' && inputs.dry_run == false) }}
+          SHA: ${{ inputs.head_sha || github.event.workflow_run.head_sha || github.sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          echo "event=${{ github.event_name }} ref=${{ github.ref }} dry_run=${{ inputs.dry_run }} real=$REAL sha=$SHA"
+          if [ "${{ github.event_name }}" = workflow_run ]; then
+            echo "CI succeeded for ${{ github.event.workflow_run.head_branch }}@${{ github.event.workflow_run.head_sha }}"
+          fi
+          if [ "$REAL" = true ] && [ -n "$BASE_SHA$HEAD_SHA" ]; then
+            echo "::error::base_sha/head_sha are for dry runs only; a real deploy uses the dispatched commit"
+            exit 1
+          fi
+          echo "real=$REAL" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.mode.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Changed files vs the last deployed SHA
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.mode.outputs.sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: bash scripts/cd/plan.sh --sha "$SHA" ${BASE_SHA:+--base "$BASE_SHA"}
+
+  gate-status:
+    name: Gate status (secrag/gate-full on the SHA)
+    needs: [plan]
+    if: needs.plan.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/cd
+      - name: Refuse a SHA without a local --full PASS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          # A real run waits for a background publisher (the pre-push hook gates before the
+          # push lands); a dry run answers immediately.
+          WAIT: ${{ needs.plan.outputs.real == 'true' && '600' || '0' }}
+          CREATOR: ${{ vars.GATE_STATUS_CREATOR || github.repository_owner }}
+        run: bash scripts/cd/gate_status.sh verify "$SHA" --wait "$WAIT" --creator "$CREATOR"
+
   dry-run:
     name: Dry run (echo only)
-    if: github.event_name == 'workflow_dispatch' && !(github.ref == 'refs/heads/main' && inputs.dry_run == false)
+    needs: [plan, gate-status]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.real != 'true'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
       - name: Echo what a real deploy would do
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+          DEPLOY: ${{ needs.plan.outputs.deploy }}
+          REASON: ${{ needs.plan.outputs.reason }}
+          GATE: ${{ needs.gate-status.result }}
         run: |
-          echo "ref=${{ github.ref }} sha=${{ github.sha }} dry_run=${{ inputs.dry_run }}"
+          echo "ref=${{ github.ref }} sha=$SHA dry_run=${{ inputs.dry_run }}"
           if [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "Not main: a real deploy is never run from this ref."
           fi
-          echo "Would build and push:"
-          echo "  ghcr.io/${{ github.repository }}-backend:${{ github.sha }}"
-          echo "  ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}"
-          echo "Would deploy to: ${{ vars.AZURE_BACKEND_APP }}, ${{ vars.AZURE_FRONTEND_APP }} (rg ${{ vars.AZURE_RESOURCE_GROUP }})"
-
-  after-ci:
-    name: After CI on main (echo only)
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      deployments: read
-    steps:
-      - name: Echo the CI run and the last deployed SHA
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "CI succeeded for ${{ github.event.workflow_run.head_branch }}@${{ github.event.workflow_run.head_sha }}"
-          # Last deployed SHA = the newest deployment whose latest status is success.
-          last=""
-          for row in $(gh api "repos/$REPO/deployments?environment=azure&per_page=30" --jq '.[] | "\(.id):\(.sha)"'); do
-            state=$(gh api "repos/$REPO/deployments/${row%%:*}/statuses?per_page=1" --jq '.[0].state // ""')
-            if [ "$state" = "success" ]; then last="${row#*:}"; break; fi
-          done
-          echo "Last deployed SHA: ${last:-none recorded yet}"
+          echo "Plan: deploy=$DEPLOY — $REASON"
+          if [ "$DEPLOY" != true ]; then
+            echo "Would skip build and deploy."
+            exit 0
+          fi
+          case "$GATE" in
+            success) echo "Gate status: secrag/gate-full=success — deploy allowed." ;;
+            *) echo "Gate status: DEPLOY REFUSED (no successful secrag/gate-full for $SHA; job result: $GATE)." ;;
+          esac
+          echo "Would build and push (order: images → apps; tags = SHA, deploy by digest):"
+          echo "  ghcr.io/${{ github.repository }}-backend:$SHA"
+          echo "  ghcr.io/${{ github.repository }}-frontend:$SHA"
+          echo "Would deploy by digest to: ${{ vars.AZURE_BACKEND_APP }}, ${{ vars.AZURE_FRONTEND_APP }} (rg ${{ vars.AZURE_RESOURCE_GROUP }})"
+          echo "Jobs: none updated yet (migration Job + Job digests come with T11.2.6); schedules are never enabled by CD."
 
   images:
     name: Build & push images (GHCR)
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)
+    needs: [plan, gate-status]
+    if: needs.plan.outputs.real == 'true' && needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      backend_digest: ${{ steps.backend.outputs.digest }}
+      frontend_digest: ${{ steps.frontend.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
 
       - uses: docker/login-action@v3
         with:
@@ -90,15 +175,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push backend
+        id: backend
         uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-backend:latest
-            ghcr.io/${{ github.repository }}-backend:${{ github.sha }}
+            ghcr.io/${{ github.repository }}-backend:${{ needs.plan.outputs.sha }}
 
       - name: Build & push frontend
+        id: frontend
         uses: docker/build-push-action@v6
         with:
           context: ./frontend
@@ -110,27 +197,54 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-frontend:latest
-            ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}
+            ghcr.io/${{ github.repository }}-frontend:${{ needs.plan.outputs.sha }}
+
+      - name: Digests
+        run: |
+          echo "backend  ${{ steps.backend.outputs.digest }}"
+          echo "frontend ${{ steps.frontend.outputs.digest }}"
 
   deploy:
     name: Deploy to Azure Container Apps
-    needs: [images]
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.dry_run == false)
+    needs: [plan, images]
+    if: needs.plan.outputs.real == 'true' && needs.plan.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # OIDC: mint a short-lived token, no long-lived secrets stored
       contents: read
       deployments: write
+      statuses: read
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       REPO: ${{ github.repository }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      BACKEND_IMAGE: ghcr.io/${{ github.repository }}-backend@${{ needs.images.outputs.backend_digest }}
+      FRONTEND_IMAGE: ghcr.io/${{ github.repository }}-frontend@${{ needs.images.outputs.frontend_digest }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/cd
+
+      # Defence in depth: the deploy job itself refuses a SHA without a local --full PASS.
+      - name: Refuse a SHA without secrag/gate-full (D-2026-09-27-7 b)
+        env:
+          CREATOR: ${{ vars.GATE_STATUS_CREATOR || github.repository_owner }}
+        run: bash scripts/cd/gate_status.sh verify "$SHA" --creator "$CREATOR"
+
+      - name: Images must be pinned by digest
+        run: |
+          case "$BACKEND_IMAGE $FRONTEND_IMAGE" in
+            *@sha256:*@sha256:*) echo "backend  $BACKEND_IMAGE"; echo "frontend $FRONTEND_IMAGE" ;;
+            *) echo "::error::missing image digest"; exit 1 ;;
+          esac
+
       # Recorded through the REST API rather than a job `environment:` key, which would
       # change the OIDC subject and break the federated credential.
       - name: Record deployment (GitHub Deployments API)
         id: record
         run: |
-          id=$(jq -n --arg ref "$GITHUB_SHA" \
+          id=$(jq -n --arg ref "$SHA" \
                  '{ref: $ref, environment: "azure", auto_merge: false, required_contexts: [],
                    description: "CD deploy to Azure Container Apps"}' \
                | gh api -X POST "repos/$REPO/deployments" --input - --jq .id)
@@ -144,7 +258,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy new images to the Container Apps
+      - name: Deploy new images to the Container Apps (by digest)
         uses: azure/cli@v2
         with:
           azcliversion: latest
@@ -152,11 +266,11 @@ jobs:
             az containerapp update \
               --name "${{ vars.AZURE_BACKEND_APP }}" \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-              --image "ghcr.io/${{ github.repository }}-backend:${{ github.sha }}"
+              --image "ghcr.io/${{ github.repository }}-backend@${{ needs.images.outputs.backend_digest }}"
             az containerapp update \
               --name "${{ vars.AZURE_FRONTEND_APP }}" \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-              --image "ghcr.io/${{ github.repository }}-frontend:${{ github.sha }}"
+              --image "ghcr.io/${{ github.repository }}-frontend@${{ needs.images.outputs.frontend_digest }}"
 
       - name: Record deployment status
         if: always() && steps.record.outputs.id != ''
