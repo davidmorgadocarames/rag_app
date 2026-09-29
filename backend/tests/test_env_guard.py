@@ -3,9 +3,11 @@ the registry is derived from field metadata, with a name-based backstop (DA-C-5)
 
 from __future__ import annotations
 
+from typing import Annotated, Optional
+
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import StrictBool, ValidationError
 
 from rag_app.api.app import create_app
 from rag_app.config import (
@@ -35,7 +37,7 @@ class _SettingsWithUndeclaredFlag(Settings):
 @pytest.fixture(autouse=True)
 def _no_env_from_outside(monkeypatch: pytest.MonkeyPatch) -> None:
     # Tests decide ENV themselves; the developer's shell or .env must not leak in.
-    for name in ("ENV", "SANDBOX_FEATURE", "FAKE_LLM"):
+    for name in ("ENV", "SANDBOX_FEATURE", "FAKE_LLM", "DEFENCE_LAB"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -85,6 +87,29 @@ def test_an_undeclared_flag_with_a_dev_only_name_is_still_refused_in_prod(
     assert dev_only_flags(_SettingsWithUndeclaredFlag) == ["fake_llm"]
     with pytest.raises(DevOnlyFlagInProdError, match="fake_llm"):
         check_dev_only_flags(_SettingsWithUndeclaredFlag(_env_file=None))
+
+
+class _SettingsWithWrappedBools(Settings):
+    """DA-C2-4: undeclared dev-named flags typed as bool wrappers, plus non-bool look-alikes."""
+
+    fake_llm: bool | None = None
+    defence_lab: Optional[bool] = None  # noqa: UP007 - the typing spelling is the point
+    data_explorer: StrictBool = False
+    debug_endpoints: Annotated[bool | None, "doc"] = None
+    demo_label: str = "x"  # dev-looking name, but not a switch
+    mock_count: int | None = None
+
+
+def test_bool_wrappers_with_a_dev_only_name_are_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert dev_only_flags(_SettingsWithWrappedBools) == [
+        "data_explorer",
+        "debug_endpoints",
+        "defence_lab",
+        "fake_llm",
+    ]
+    monkeypatch.setenv("DEFENCE_LAB", "true")
+    with pytest.raises(DevOnlyFlagInProdError, match="defence_lab"):
+        check_dev_only_flags(_SettingsWithWrappedBools(_env_file=None))
 
 
 @pytest.mark.parametrize(
