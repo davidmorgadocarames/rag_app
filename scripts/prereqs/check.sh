@@ -109,6 +109,12 @@ else
   report KO "shellcheck" "missing — run scripts/prereqs/install.sh shellcheck"
 fi
 
+if command -v jq >/dev/null; then
+  report OK "jq" "$(jq --version)"
+else
+  report KO "jq" "missing — run scripts/prereqs/install.sh jq"
+fi
+
 if [ "$docker_ok" = 1 ]; then
   v="$(docker compose version --short 2>/dev/null | tr -d v)"
   if version_ge "$v" 2.20.0; then

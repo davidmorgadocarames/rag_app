@@ -80,10 +80,17 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
           SKIP_TIP_CHECK: ${{ inputs.skip_tip_check }}
+          # DA-C2-3: every expression reaches the shell through env, never pasted into
+          # `run:` (a ref name may contain `$(`, `;` or backticks).
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CI_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          echo "event=${{ github.event_name }} ref=${{ github.ref }} dry_run=${{ inputs.dry_run }} real=$REAL sha=$SHA"
-          if [ "${{ github.event_name }}" = workflow_run ]; then
-            echo "CI succeeded for ${{ github.event.workflow_run.head_branch }}@${{ github.event.workflow_run.head_sha }}"
+          echo "event=$EVENT ref=$REF dry_run=$DRY_RUN real=$REAL sha=$SHA"
+          if [ "$EVENT" = workflow_run ]; then
+            echo "CI succeeded for $CI_BRANCH@$CI_SHA"
           fi
           if [ "$REAL" = true ] && { [ -n "$BASE_SHA$HEAD_SHA" ] || [ "$SKIP_TIP_CHECK" = true ]; }; then
             echo "::error::base_sha/head_sha/skip_tip_check are for dry runs only; a real deploy uses the dispatched commit"
@@ -180,9 +187,15 @@ jobs:
           DEPLOY: ${{ needs.plan.outputs.deploy }}
           REASON: ${{ needs.plan.outputs.reason }}
           GATE: ${{ needs.gate-status.result }}
+          REF: ${{ github.ref }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO: ${{ github.repository }}
+          BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
+          FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
         run: |
-          echo "ref=${{ github.ref }} sha=$SHA dry_run=${{ inputs.dry_run }}"
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+          echo "ref=$REF sha=$SHA dry_run=$DRY_RUN"
+          if [ "$REF" != "refs/heads/main" ]; then
             echo "Not main: a real deploy is never run from this ref."
           fi
           echo "Plan: deploy=$DEPLOY — $REASON"
@@ -195,9 +208,9 @@ jobs:
             *) echo "Gate status: DEPLOY REFUSED (no successful secrag/gate-full for $SHA; job result: $GATE)." ;;
           esac
           echo "Would build and push (order: images → apps; tags = SHA, deploy by digest):"
-          echo "  ghcr.io/${{ github.repository }}-backend:$SHA"
-          echo "  ghcr.io/${{ github.repository }}-frontend:$SHA"
-          echo "Would deploy by digest to: ${{ vars.AZURE_BACKEND_APP }}, ${{ vars.AZURE_FRONTEND_APP }} (rg ${{ vars.AZURE_RESOURCE_GROUP }})"
+          echo "  ghcr.io/$REPO-backend:$SHA"
+          echo "  ghcr.io/$REPO-frontend:$SHA"
+          echo "Would deploy by digest to: $BACKEND_APP, $FRONTEND_APP (rg $RESOURCE_GROUP)"
           echo "Jobs: none updated yet (migration Job + Job digests come with T11.2.6); schedules are never enabled by CD."
 
   images:
@@ -248,9 +261,12 @@ jobs:
             ghcr.io/${{ github.repository }}-frontend:${{ needs.plan.outputs.sha }}
 
       - name: Digests
+        env:
+          BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
         run: |
-          echo "backend  ${{ steps.backend.outputs.digest }}"
-          echo "frontend ${{ steps.frontend.outputs.digest }}"
+          echo "backend  $BACKEND_DIGEST"
+          echo "frontend $FRONTEND_DIGEST"
 
   deploy:
     name: Deploy to Azure Container Apps
@@ -322,6 +338,9 @@ jobs:
 
       - name: Record deployment status
         if: always() && steps.record.outputs.id != ''
+        env:
+          DEPLOYMENT_ID: ${{ steps.record.outputs.id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
         run: |
-          gh api -X POST "repos/$REPO/deployments/${{ steps.record.outputs.id }}/statuses" \
-            -f state="${{ job.status == 'success' && 'success' || 'failure' }}" > /dev/null
+          gh api -X POST "repos/$REPO/deployments/$DEPLOYMENT_ID/statuses" \
+            -f state="$STATE" > /dev/null

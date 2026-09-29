@@ -15,7 +15,8 @@
 #      (`workflow_run` cannot use `paths-ignore`).
 #
 # Needs a full clone (fetch-depth: 0) and, without --base, `gh` + GH_REPO. Writes
-# sha/base/deploy/reason to $GITHUB_OUTPUT when set. Exit 0 whatever the verdict.
+# sha/base/deploy/reason to $GITHUB_OUTPUT when set. Exit 0 whatever the verdict; exit 1 when
+# the deployments cannot be read (fail-closed, DA-C2-1) or --tip is malformed.
 set -euo pipefail
 
 sha="" base="" base_source="input" tip="" tip_given=0
@@ -35,12 +36,18 @@ if [ "$tip_given" = 1 ] && ! [[ "$tip" =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 
+# Prints the newest successfully deployed SHA (nothing when none is recorded). Returns 1 on
+# any API error (DA-C2-1): a failing `gh` inside a `for` word list or a `$(…)` does not trip
+# `set -e`, and "no deployment" would silently mean "deploy everything" — fail closed.
 last_deployed_sha() {
-  local row id state
-  for row in $(gh api "repos/$GH_REPO/deployments?environment=azure&per_page=30" \
-                 --jq '.[] | "\(.id):\(.sha)"'); do
+  local rows row id state
+  rows="$(gh api "repos/$GH_REPO/deployments?environment=azure&per_page=30" \
+            --jq '.[] | "\(.id):\(.sha)"')" || return 1
+  for row in $rows; do
+    [[ "$row" =~ ^[0-9]+:[0-9a-f]{40}$ ]] || return 1
     id="${row%%:*}"
-    state="$(gh api "repos/$GH_REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')"
+    state="$(gh api "repos/$GH_REPO/deployments/$id/statuses?per_page=1" \
+               --jq '.[0].state // ""')" || return 1
     if [ "$state" = success ]; then
       echo "${row#*:}"
       return 0
@@ -50,7 +57,10 @@ last_deployed_sha() {
 
 if [ -z "$base" ]; then
   base_source="last deployed (GitHub Deployments, environment azure)"
-  base="$(last_deployed_sha)"
+  if ! base="$(last_deployed_sha)"; then
+    echo "plan: cannot read the GitHub deployments (API error or unexpected output) — refusing to plan" >&2
+    exit 1
+  fi
 fi
 
 # skippable <path>: changes that never need a new image.

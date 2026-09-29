@@ -1,9 +1,10 @@
 """CD pipeline (T11.0.9 + D-2026-09-27-7 b): cd.yml invariants, the changed-files plan and the
 `secrag/gate-full` status check.
 
-`gh` is replaced by a fake that answers per endpoint with canned (already jq-filtered)
-output, so no test talks to GitHub. The jq filters themselves are exercised by the real
-dry-run dispatches recorded in PHASE_STATUS.md.
+`gh` is replaced by a fake that answers per endpoint, so no test talks to GitHub. A route
+gives either canned (already filtered) `stdout`, or `json` — a realistic API response to
+which the fake applies the script's own `--jq` expression with the real `jq` (DA-C2-2), so
+the filters are tested too.
 """
 
 from __future__ import annotations
@@ -29,16 +30,31 @@ needs_tools = pytest.mark.skipif(
 )
 
 FAKE_GH = """\
-import json, os, sys
-args = " ".join(sys.argv[1:])
+import json, os, subprocess, sys
+argv = sys.argv[1:]
+args = " ".join(argv)
 with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
     log.write(args + "\\n")
 for route in json.load(open(os.environ["FAKE_GH_ROUTES"], encoding="utf-8")):
     if route["match"] in args:
+        if "json" in route:
+            # Like `gh api --jq`: the expression runs on the response, strings print raw.
+            expr = argv[argv.index("--jq") + 1] if "--jq" in argv else "."
+            proc = subprocess.run(["jq", "-r", expr], input=json.dumps(route["json"]),
+                                  capture_output=True, text=True)
+            sys.stdout.write(proc.stdout)
+            sys.stderr.write(proc.stderr)
+            sys.exit(proc.returncode or route.get("rc", 0))
         sys.stdout.write(route.get("stdout", ""))
         sys.exit(route.get("rc", 0))
 sys.exit(1)
 """
+
+# Never skipped in CI (the runner image ships jq): the filter tests must run there.
+needs_jq = pytest.mark.skipif(
+    shutil.which("jq") is None and not os.environ.get("GITHUB_ACTIONS"),
+    reason="needs jq (scripts/prereqs/install.sh jq)",
+)
 
 
 def _fake_gh(tmp_path: Path, routes: list[dict[str, object]]) -> dict[str, str]:
@@ -93,6 +109,20 @@ def test_cd_runs_after_ci_on_main_and_never_on_a_raw_push(cd: dict) -> None:
     inputs = triggers["workflow_dispatch"]["inputs"]
     assert inputs["dry_run"]["default"] is True
     assert {"base_sha", "head_sha", "skip_tip_check"} <= set(inputs)
+
+
+@pytest.mark.parametrize("workflow", ["cd.yml", "ci.yml"])
+def test_no_expression_is_pasted_into_a_run_script(workflow: str) -> None:
+    """DA-C2-3: `${{ … }}` in `run:` is template-injected into the shell (a ref name may
+    contain `$(…)`); values reach scripts through `env:` instead."""
+    wf = yaml.safe_load((CD_YML.parent / workflow).read_text(encoding="utf-8"))
+    offenders = [
+        f"{job_id}/{step.get('name', step.get('id', '?'))}"
+        for job_id, job in wf["jobs"].items()
+        for step in job.get("steps", [])
+        if "${{" in step.get("run", "")
+    ]
+    assert offenders == []
 
 
 def test_no_job_uses_environment_so_the_oidc_subject_stays_main(cd: dict) -> None:
@@ -316,6 +346,55 @@ def test_base_is_the_newest_successful_deployment(tmp_path: Path, history) -> No
     assert out["deploy"] == "false"
 
 
+# DA-C2-1: an unreadable Deployments API must never turn into "nothing deployed yet →
+# deploy everything" (that would skip the ancestor/equal and docs-only checks).
+@needs_tools
+@pytest.mark.parametrize(
+    "routes",
+    [
+        [{"match": "deployments?environment=azure", "stdout": "", "rc": 1}],
+        [{"match": "deployments?environment=azure", "stdout": "HTTP 502 Bad Gateway\n"}],
+        [
+            {"match": "deployments/7/statuses", "stdout": "", "rc": 1},
+            {"match": "deployments?environment=azure", "stdout": f"7:{'b' * 40}\n"},
+        ],
+    ],
+    ids=["list-fails", "list-garbage", "statuses-fail"],
+)
+def test_a_deployments_api_error_refuses_to_plan(tmp_path: Path, history, routes) -> None:
+    repo, shas = history
+    proc, out = _plan(tmp_path, repo, "--sha", shas["code"], routes=routes)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "cannot read the GitHub deployments" in proc.stderr
+    assert "deploy" not in out
+
+
+@needs_tools
+@needs_jq
+def test_the_deployments_jq_filters_pick_the_newest_success(tmp_path: Path, history) -> None:
+    repo, shas = history
+    routes = [
+        {"match": "deployments/9/statuses", "json": [{"state": "failure", "id": 91}]},
+        {"match": "deployments/8/statuses", "json": []},
+        {
+            "match": "deployments/7/statuses",
+            "json": [{"state": "success", "id": 71}, {"state": "in_progress", "id": 70}],
+        },
+        {
+            "match": "deployments?environment=azure",
+            "json": [
+                {"id": 9, "sha": shas["code"], "environment": "azure", "ref": "main"},
+                {"id": 8, "sha": shas["docs"], "environment": "azure", "ref": "main"},
+                {"id": 7, "sha": shas["base"], "environment": "azure", "ref": "main"},
+            ],
+        },
+    ]
+    proc, out = _plan(tmp_path, repo, "--sha", shas["code"], routes=routes)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert out["base"] == shas["base"]
+    assert out["deploy"] == "true"
+
+
 @needs_tools
 def test_same_sha_as_deployed_skips(tmp_path: Path, history) -> None:
     repo, shas = history
@@ -453,6 +532,64 @@ def test_ci_status(tmp_path: Path, stdout: str, rc: int, expected: str) -> None:
         '.conclusion == "success"',
     ):
         assert field in call
+
+
+def _run_json(**overrides: object) -> dict[str, object]:
+    """A workflow run as the Actions API returns it (trimmed to the fields that matter)."""
+    run: dict[str, object] = {
+        "id": 36617249764,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "head_branch": "main",
+        "head_sha": SHA,
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+        "run_attempt": 1,
+    }
+    run.update(overrides)
+    return run
+
+
+# DA-C2-2: the jq filter itself, on realistic API JSON. The API's query parameters are
+# assumed to be IGNORED here (every run is returned), so only the filter decides.
+@needs_tools
+@needs_jq
+@pytest.mark.parametrize(
+    ("runs", "rc", "expected"),
+    [
+        ([_run_json()], 0, "(1 run(s)) — CI requirement met"),
+        ([_run_json(), _run_json(id=2, run_attempt=2)], 0, "(2 run(s))"),
+        ([_run_json(head_sha="b" * 40)], 1, "REFUSED"),
+        ([_run_json(event="pull_request")], 1, "REFUSED"),
+        ([_run_json(head_branch="phase-11a-persistence")], 1, "REFUSED"),
+        ([_run_json(conclusion="failure")], 1, "REFUSED"),
+        ([_run_json(conclusion=None, status="in_progress")], 1, "REFUSED"),
+        (
+            [_run_json(event="pull_request"), _run_json(conclusion="failure"), _run_json()],
+            0,
+            "(1 run(s))",
+        ),
+        ([], 1, "REFUSED"),
+    ],
+    ids=[
+        "success",
+        "two-attempts",
+        "other-sha",
+        "pull-request",
+        "other-branch",
+        "failure",
+        "in-progress",
+        "mixed",
+        "none",
+    ],
+)
+def test_ci_status_filter_on_api_json(tmp_path: Path, runs: list, rc: int, expected: str) -> None:
+    body = {"total_count": len(runs), "workflow_runs": runs}
+    env = _fake_gh(tmp_path, [{"match": "actions/workflows/ci.yml/runs", "json": body}])
+    proc = _run(CI_STATUS, "verify", SHA, env=env)
+    assert proc.returncode == rc, proc.stdout + proc.stderr
+    assert expected in proc.stdout
 
 
 @needs_tools

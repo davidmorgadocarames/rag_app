@@ -57,6 +57,10 @@ AGE_SHA256="cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"
 SHELLCHECK_VERSION="0.11.0"
 SHELLCHECK_SHA256="8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
 
+# jq: the CD tests run the real `gh --jq` filters against fixture JSON (DA-C2-2).
+JQ_VERSION="1.7.1"
+JQ_SHA256="5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5"
+
 GH_VERSION="2.101.0"
 GH_SHA256="9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8"
 
@@ -202,6 +206,20 @@ install_shellcheck() {
   ln -sfn "$dir/shellcheck" "$BIN/shellcheck"
 }
 
+install_jq() {
+  local dir="$OPT/jq-$JQ_VERSION"
+  if [ ! -x "$dir/jq" ]; then
+    local st
+    log "jq $JQ_VERSION"
+    fetch "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/jq-linux-amd64" \
+      "$JQ_SHA256" "$TMP/jq"
+    st="$(stage jq)"
+    install -m 755 "$TMP/jq" "$st/jq"
+    commit "$st" "$dir"
+  fi
+  ln -sfn "$dir/jq" "$BIN/jq"
+}
+
 install_gh() {
   local dir="$OPT/gh-$GH_VERSION"
   if [ ! -x "$dir/bin/gh" ]; then
@@ -299,7 +317,7 @@ main() {
     --lock-az) lock_az; return ;;
   esac
   local tools=("$@")
-  [ ${#tools[@]} -eq 0 ] && tools=(node pg age shellcheck gh az)
+  [ ${#tools[@]} -eq 0 ] && tools=(node pg age shellcheck jq gh az)
   local t
   for t in "${tools[@]}"; do
     case "$t" in
@@ -307,9 +325,10 @@ main() {
       pg) install_pg ;;
       age) install_age ;;
       shellcheck) install_shellcheck ;;
+      jq) install_jq ;;
       gh) install_gh ;;
       az) install_az ;;
-      *) echo "unknown tool: $t (node pg age shellcheck gh az)" >&2; exit 2 ;;
+      *) echo "unknown tool: $t (node pg age shellcheck jq gh az)" >&2; exit 2 ;;
     esac
   done
   log "done — run scripts/prereqs/check.sh"

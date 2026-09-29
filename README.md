@@ -123,7 +123,7 @@ wheels are not yet available for it), **Node 22 (≥ 22.13) with npm 11** and
 [Ollama](https://ollama.com). An NVIDIA GPU is strongly recommended for the local LLM.
 
 **Contributor toolchain (WSL2).** The gate and the operations scripts also need the
-PostgreSQL 16 client (`psql`/`pg_dump`), `age`, `shellcheck`, the GitHub CLI and the Linux
+PostgreSQL 16 client (`psql`/`pg_dump`), `age`, `shellcheck`, `jq`, the GitHub CLI and the Linux
 Azure CLI. One script installs all of them as user binaries (no `sudo`) under
 `~/.local/opt`, with entry points in `~/.local/bin`; another prints every prerequisite as
 OK / KO / PENDING (PENDING = a login or a repository/Azure setting that only the owner can do):
