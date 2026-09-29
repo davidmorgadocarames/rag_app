@@ -30,9 +30,12 @@ Evidence is counts only — no row contents, emails, hashes or keys.
 ### Local (11.1, T11.1.1) — 2026-09-29
 
 **Method (the development volumes were never mounted by a database).** Both dev DB containers
-were already stopped (`rag_ia-db-1` exited 2026-09-24, `rag_app-db-1` exited 2026-09-27), so a
-file-level copy is consistent. Each volume was copied read-only into a git-ignored, mode-700
-directory outside the repository, the copy restored into a new throw-away volume, and a
+were already stopped (`rag_ia-db-1` exited 2026-09-24, `rag_app-db-1` exited 2026-09-27), so
+the files did not change during the copy. Both had exited with code 255 (an unclean stop), so
+the copies are **crash-consistent**, not cleanly shut down: the restore below replayed the
+write-ahead log on its first start, exactly as after a power cut. Each volume was copied
+read-only into a mode-700 directory outside the repository (`~/secrag-backups`), the copy
+restored into a new throw-away volume, and a
 throw-away `pgvector/pgvector:pg16` (the image the dev compose uses; data directory
 `PG_VERSION` 16) started on it on a loopback port:
 
@@ -92,7 +95,11 @@ length ≥ 32 OK, `DATA_MASTER_KEY` valid Fernet OK; `rag_app` copy — N 0.
   sweeps stale `secrag-tunnel-*` firewall rules. It detects the public IPv4 from two services,
   which must agree and be public (fail closed), creates one `/32` rule, and runs `psql` or
   `pg_dump` only. The connection is `sslmode=require` and read-only by default
-  (`default_transaction_read_only=on`; `--read-write` is explicit). The password comes from
+  (`default_transaction_read_only=on`; `--read-write` is explicit). The read-only default is a
+  **guard against accidents, not a security control**: it is a session default that `SET` or
+  `BEGIN READ WRITE` override, and with `--password-from-app` the session runs as the app's
+  role (today the database owner). Once row 40's least-privilege roles exist, read-only
+  sessions use a role that has only `SELECT`. The password comes from
   the backend's `database-url` secret into a 0600 `PGPASSFILE`; it never reaches argv or the
   output. The rule is **always** removed (EXIT trap, including SIGINT/SIGTERM/SIGHUP, with
   signals ignored during the removal), and then verified gone; otherwise the script prints the
@@ -111,16 +118,16 @@ length ≥ 32 OK, `DATA_MASTER_KEY` valid Fernet OK; `rag_app` copy — N 0.
   in four ways: as argv, through `sh -c` (`--for shell`), over stdin (`python -`), and with a
   wrong key (KO = N).
 
-### Azure (T11.1.3) — *to be filled in by the orchestrator*
+### Azure (T11.1.3) — 2026-09-29/30 (run by the orchestrator, read-only)
 
 | Item | Result |
 |---|---|
-| Spike: stdin (`python -`) through `exec` / `--command` split on whitespace or by a shell | *pending* |
-| db-tunnel counts: `users` / `user_keys` / users without a key / `conversations` / `messages` / `alembic_version` | *pending* |
-| Key snippet: N / OK / KO | *pending* |
-| `JWT_SECRET` length ≥ 32 / `DATA_MASTER_KEY` valid Fernet | *pending* |
-| Firewall: no `secrag-tunnel-*` rule left after the runs | *pending* |
-| **Classification** (a / b / c) and consequence (R5-5 in row 40 if b) | *pending* |
+| Spike: stdin (`python -`) through `exec` / `--command` split on whitespace or by a shell | **stdin is not possible** with the Linux `az` (`containerapp exec` needs a TTY: `termios.error` 25). **Split mode works** with the Windows CLI: `--command "python -c print(12345)"` printed `12345` (split on whitespace, no shell). The snippet ran as one whitespace-free argument built by `exec_oneliner.py` (1733 characters) |
+| db-tunnel counts: `users` / `user_keys` / users without a key / `conversations` / `messages` / `alembic_version` | 2 / 2 / 0 / 9 / 17 / `0004_conv_titles_tokens` (PostgreSQL 16.15; also `deletion_requests` 0, `email_verification_tokens` 9, `documents` 9, `chunks` 322) |
+| Key snippet: N / OK / KO | **2 / 1 / 1** |
+| `JWT_SECRET` length ≥ 32 / `DATA_MASTER_KEY` valid Fernet | OK / OK |
+| Firewall: no `secrag-tunnel-*` rule left after the runs | Yes: the tunnel's rule was created and removed on every call, including a SIGINT drill during `psql` (rc 130, removal confirmed). The standing single-IP rule `AllowMyIP` (stale, not the current IP) was **deleted on 2026-09-30**; only `AllowAllAzureServicesAndResourcesWithinAzureIps_…` remains (needed by Container Apps without a VNet; accepted risk, D-2026-09-29-3) |
+| **Classification** (a / b / c) and consequence (R5-5 in row 40 if b) | **(b) unreadable — key changed, for 1 of 2 accounts** (the older one; the fresh test account unwraps). Nothing is gone (not (a)). Consequence: before the first fingerprint write on Azure (row 40), a time-boxed key recovery with candidate keys (D-2026-09-29-2 (b)), then R5-5 — purge with a tombstone — for whatever still fails |
 
 ### In-memory state (T11.1.4)
 
