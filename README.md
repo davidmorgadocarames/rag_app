@@ -283,15 +283,25 @@ so it never touches the development database. It needs Docker and Ollama (native
 harness that creates a throw-away database and **refuses** the development one (port 5432 or
 database `rag`). Pushing a phase branch runs `--fast`, pushing `main` runs `--full`, both
 from a temporary worktree at the pushed commit; deleting a remote branch runs nothing.
+A `--full` PASS on a clean tree publishes the commit status `secrag/gate-full` for that
+commit; CD deploys `main` only after CI succeeded **and** that status is present.
 
 ### Run everything with Docker
 
+The containers use a **native** Ollama (GPU, `ollama serve` in WSL2) by default:
+
 ```bash
-docker compose up -d db ollama
-docker compose exec ollama ollama pull bge-m3
-docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
-JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # backend :8000 + frontend :3000
+ollama serve &                                   # listens on 127.0.0.1:11434 only
+ollama pull bge-m3 && ollama pull qwen2.5:7b-instruct-q4_K_M
+JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # db, roles, backend :8000, frontend :3000
 ```
+
+The backend container reaches it as `host.docker.internal:11434`: Docker Desktop forwards
+that to Windows' loopback, and WSL2's localhost forwarding relays it to Ollama's loopback
+port inside WSL, so Ollama (which has no authentication) is never exposed on the network.
+Every published port is bound to `127.0.0.1`. To use the containerised Ollama instead:
+`docker compose --profile ci up -d` with `CONTAINER_OLLAMA_HOST=http://ollama:11434`.
+A one-shot `db-roles` service applies `db/roles.sql` before the backend starts.
 
 The backend container applies its migrations on startup. To build the index, run the
 ingestion and indexing steps from [step 4](#4-build-the-corpus-and-the-index) against the

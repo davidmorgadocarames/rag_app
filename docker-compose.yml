@@ -1,11 +1,22 @@
-# Full local stack: PostgreSQL (pgvector), Ollama, backend (FastAPI), frontend (Next.js).
+# Full local stack: PostgreSQL (pgvector), backend (FastAPI), frontend (Next.js). The LLM and
+# embeddings come from a NATIVE Ollama (WSL2: `ollama serve`, GPU) by default; the containerised
+# Ollama is only in the `ci` profile (T11.0.11/T11.0.12, ADR phase 11).
 #
-#   docker compose up -d db ollama         # infra only
-#   docker compose exec ollama ollama pull qwen2.5:7b-instruct-q4_K_M
-#   docker compose exec ollama ollama pull bge-m3
-#   JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # whole app
+#   ollama serve                                   # native, bound to 127.0.0.1:11434 (WSL)
+#   ollama pull bge-m3 && ollama pull qwen2.5:7b-instruct-q4_K_M
+#   docker compose up -d --build                   # db → db-roles → backend → frontend
 #
-# JWT_SECRET and DATA_MASTER_KEY must be provided (env or a root .env; see .env.example).
+#   docker compose --profile ci up -d ...          # containerised Ollama instead; then set
+#                                                  # CONTAINER_OLLAMA_HOST=http://ollama:11434
+#
+# How the backend container reaches the native Ollama without exposing it: the container calls
+# host.docker.internal:11434 (Docker Desktop → Windows loopback); WSL2's localhost forwarding
+# relays Windows 127.0.0.1:11434 to Ollama's 127.0.0.1:11434 inside WSL. Ollama stays on
+# loopback (no LAN exposure, no firewall rule, no .wslconfig change).
+#
+# Every published port is bound to 127.0.0.1 only. JWT_SECRET and DATA_MASTER_KEY must be
+# provided (env or a root .env; see .env.example). ENV defaults to prod (fail-closed); the root
+# .env sets ENV=dev.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -14,7 +25,7 @@ services:
       POSTGRES_PASSWORD: rag
       POSTGRES_DB: rag
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -23,10 +34,28 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot: database roles before any migration (db/roles.sql, T11.0.13). Idempotent.
+  # A role gets LOGIN only when its password is set (root .env, git-ignored).
+  db-roles:
+    image: pgvector/pgvector:pg16
+    entrypoint: ["bash", "/secrag/scripts/db/apply_roles.sh"]
+    environment:
+      DATABASE_URL: postgresql://rag:rag@db:5432/rag
+      SECRAG_PURGER_PASSWORD: ${SECRAG_PURGER_PASSWORD:-}
+      SECRAG_BACKUP_PASSWORD: ${SECRAG_BACKUP_PASSWORD:-}
+    volumes:
+      - ./db:/secrag/db:ro
+      - ./scripts/db:/secrag/scripts/db:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   ollama:
     image: ollama/ollama:latest
+    profiles: ["ci"]
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama:/root/.ollama
     # GPU passthrough (NVIDIA). Requires nvidia-container-toolkit on the host.
@@ -42,18 +71,26 @@ services:
   backend:
     build: ./backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
-      OLLAMA_HOST: http://ollama:11434
+      # Native Ollama through host.docker.internal (see the header); override in the root .env.
+      OLLAMA_HOST: ${CONTAINER_OLLAMA_HOST:-http://host.docker.internal:11434}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
       DATA_MASTER_KEY: ${DATA_MASTER_KEY:?set DATA_MASTER_KEY}
+      ENV: ${ENV:-prod}
       FRONTEND_ORIGIN: http://localhost:3000
+    # Built in on Docker Desktop; needed on a plain Linux engine.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
       ollama:
         condition: service_started
+        required: false
 
   frontend:
     build:
@@ -61,7 +98,7 @@ services:
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - backend
 
