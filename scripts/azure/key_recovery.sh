@@ -10,7 +10,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
-PY="$ROOT/backend/.venv/bin/python"
-[ -x "$PY" ] || { echo "key_recovery: backend venv missing at $PY" >&2; exit 2; }
+# The backend venv of this checkout (it has cryptography + psycopg); KEY_RECOVERY_PYTHON
+# overrides it where there is none (the gate's pre-push worktree, CI).
+PY="${KEY_RECOVERY_PYTHON:-$ROOT/backend/.venv/bin/python}"
+[ -x "$PY" ] || { echo "key_recovery: no Python at $PY (backend venv missing?)" >&2; exit 2; }
 ulimit -c 0
 exec "$PY" -I -B "$ROOT/scripts/azure/key_recovery.py" "$@"

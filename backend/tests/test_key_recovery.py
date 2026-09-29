@@ -33,6 +33,9 @@ TOOL_PY = REPO_ROOT / "scripts" / "azure" / "key_recovery.py"
 TUNNEL = REPO_ROOT / "scripts" / "azure" / "db-tunnel.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+# The interpreter running the tests has the tool's dependencies (the pre-push worktree and CI
+# have no backend/.venv of their own).
+PYTHON_ENV = {"KEY_RECOVERY_PYTHON": sys.executable}
 
 
 def _module():
@@ -82,7 +85,7 @@ def secrets() -> Secrets:
 
 def _run(home: Path, *args: str, env: dict[str, str] | None = None, **kw):
     base = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
-    base.update({"HOME": str(home), "TMPDIR": str(home.parent)})
+    base.update({"HOME": str(home), "TMPDIR": str(home.parent), **PYTHON_ENV})
     return subprocess.run(
         ["bash", str(TOOL_SH), *args],
         env={**base, **(env or {})},
@@ -259,6 +262,7 @@ def test_a_tunnel_failure_leaks_nothing(home: Path, tmp_path: Path, secrets: Sec
         **{k: v for k, v in os.environ.items() if not k.startswith("PG")},
         "HOME": str(home),
         "TMPDIR": str(tmp_path),
+        **PYTHON_ENV,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_AZ_STATE": str(state),
         "FAKE_AZ_LOG": str(tmp_path / "az.log"),
