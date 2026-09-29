@@ -107,7 +107,14 @@ length ≥ 32 OK, `DATA_MASTER_KEY` valid Fernet OK; `rag_app` copy — N 0.
   (`backend/tests/test_db_tunnel.py`, 22 cases: rule present only during the call; removed on
   success, error, SIGINT and SIGTERM; sweep; `--sweep`; seven unknown-IP cases; read-only;
   password never printed; the delete-failure path). Mutations (INT trap, sweep, read-only
-  removed) fail the tests.
+  removed) fail the tests. *Hardened in 11.2 (DA-D-4, DA-D-5):* the command runs as a
+  waited-for child (default SIGINT and the caller's stdin restored), so a SIGINT/SIGTERM/SIGHUP
+  sent only to the script's PID is forwarded at once and the command gets 5 s before
+  SIGTERM/SIGKILL — the rule never outlives a signal, even for an interactive `psql`; a signal
+  during `create` makes the cleanup watch 60 s for a late rule; a URI or password anywhere in
+  an argument (`--dbname=postgresql://…`, `-d "… password=…"`) is refused. Tests cover SIGHUP,
+  signals to the script's PID only, a `psql` that ignores SIGINT and the late rule; the
+  foreground-child, no-watch and prefix-only-guard mutations fail them.
 - **`scripts/azure/sql/diag_counts.sql`** — the counts above, as `name|value` lines.
 - **`scripts/azure/diag_keys.py`** — runs inside the backend and reads settings and the DB as
   the app does, in a read-only transaction. It prints exactly five lines (`N`, `OK`, `KO`,
@@ -161,6 +168,17 @@ place of `-p rag_ia` / `-p rag_app`, with the same mechanism (2026-09-29):
   was written to secrag-rc-ia_pgdata`. This is the diagnosed cause. It turns green once the
   dev volume has a fixed name (T11.2.1); T11.2.8 makes it the gate's `restart-check` step.
 
+**Green (T11.2.1 + T11.2.8, 2026-09-30).** The same cross-project run
+(`--project secrag-rc-ia --restart-project secrag-rc-app`) re-run at `f5f15e2` (compose before
+T11.2.1) still FAILS with the 401 above; with the fixed external volume it **PASSES** (57 s,
+including the master-key variant below). The final check runs the real `docker-compose.yml`
+plus `scripts/restart_check.compose.yml` (a throwaway external volume, API on
+`127.0.0.1:18000`, no DB port) and also proves that the backend image alone never migrates,
+that the `migrate` one-shot exits 0, and — `--restart-master-key` (DA-D-2) — that a restart
+with a new random `DATA_MASTER_KEY` is **refused** ("does not match the master-key
+fingerprint"). With the fingerprint check mutated away, that step FAILS with
+`login 200, read 500` — exactly the class (b) symptom of 11.1.
+
 ## Decisions
 
 *To be completed as 11a/11b land.* Planned sections:
@@ -201,20 +219,126 @@ place of `-p rag_ia` / `-p rag_app`, with the same mechanism (2026-09-29):
    verifier computed client-side (`scripts/db/scram_verifier.pl`, RFC 5802/7677), never the
    plaintext, so no server log setting (`log_statement`, failing-statement logging) can leak
    a role password. Gate step `migrations-roundtrip`.
+   *Landed in 11.2 (T11.2.1):* `docker-compose.yml` declares `pgdata` as the **external**
+   volume `rag_ia_pgdata` — the one that held the data (the 11.1 diagnosis) — so its name no
+   longer depends on the compose project, and compose never creates, recreates or removes it
+   (`down -v` included). `scripts/dev/create_dev_volume.sh` creates it once on a new machine
+   and never touches an existing one. The gate never references it: `compose.gate.yml` has
+   its own volume, and `restart_check.sh` swaps it for a throwaway volume and refuses any
+   development volume. The stray `rag_app_pgdata` (schema + corpus only, no user rows) is no
+   longer used; removing it is a manual, verified step.
 2. Fail-fast settings validation in the API lifespan; master-key fingerprint. *Landed in 11.0:*
    `ENV` (`dev`/`prod`, default `prod`) and a lifespan guard that refuses any development-only
    flag with `ENV=prod`. The registry is derived from the fields declared with
    `dev_only_flag(...)` (none until Phases 13/16/19/20), so there is no list to forget; a
    boolean field *named* like a dev feature (`fake_`, `_lab`, `explorer`, `code_fix`, `debug`,
    …) counts as dev-only even if undeclared, and a unit test fails until it is declared.
+   *Landed in 11.2 (T11.2.2, T11.2.4):* the API lifespan (never import time, never a Job)
+   runs, in order: `validate_api_settings` — `DATABASE_URL` is a PostgreSQL URL and, with
+   `ENV=prod`, explicitly set; `JWT_SECRET` ≥ 32 characters; `DATA_MASTER_KEY` a valid Fernet
+   key; `ENV` — reporting every problem by name, never a value; the dev-flag guard; and the
+   **master-key fingerprint** (`rag_app/keycheck.py`): the one-row table
+   `master_key_fingerprint` (0005) holds `HMAC-SHA256(key, context)`; a mismatch refuses to
+   start. The **first** write is guarded by R5-5: while any stored user key does not unwrap
+   with the running key, the API refuses to start and stores nothing, so a fingerprint can
+   never bless a key that cannot read existing data (the first start after 0005 on the
+   developer's DB and on Azure therefore happens only after the key recovery below). Jobs
+   use `JobSettings` (`ENV`, `DATABASE_URL` only): Alembic's `env.py` and `make_engine` read
+   it, so a Job starts without `JWT_SECRET`/`DATA_MASTER_KEY`.
 3. Migrations out of the container command: compose one-shot service and an Azure
-   migration Job run by CD before the apps; expand/contract rule.
-4. Slim `jobs` image for the migration, purge and backup Jobs.
+   migration Job run by CD before the apps; expand/contract rule. *Landed in 11.2
+   (T11.2.3, T11.2.5–7, T11.2.9, T11.2.11):* the backend `CMD` is uvicorn only; compose runs
+   the one-shot `migrate` (jobs image) after `db-roles`, and the backend waits for it. CD's
+   order is images (backend, frontend, jobs) → `migrate` job (re-checks `secrag/gate-full`;
+   `scripts/cd/azure_jobs.sh`: `job update --image <jobs digest>` verified, `job start` with
+   no overrides, wait; Failed/Stopped/Degraded or a timeout stop the pipeline) → apps → purge
+   and backup Job images (digest). Job names come from repo variables; the Jobs are
+   versioned YAML (`deploy/azure/jobs/*.yaml`: Manual trigger, placeholder image and
+   secrets, parallelism 1, timeout, retry limit) applied by hand — CD never applies YAML or
+   touches schedules. A dry run prints the same order step by step, and the dispatch input
+   `simulate_failure` (dry runs only) stops it at the migration step. **Migration 0005**
+   (expand): `master_key_fingerprint`, `users.deleted_at`, nullable `email`/`password_hash`,
+   tombstone status/progress/attempts/last error (old tombstones = `done`), `purger_runs`,
+   `usage_daily`, and the migration map's grants (`secrag_purger` may lock by `UPDATE (id)`
+   and delete leaf rows but never write content or touch the corpus; `secrag_backup` reads
+   everything); it fails clearly without its roles, and its downgrade refuses while erased
+   users exist. It is authored once and extended in place by 11.2b before any shared apply
+   (TF7). The expand/contract rule is in the
+   [Definition of Done](../DEFINITION_OF_DONE.md#phase-specific-norms); `migrations-roundtrip`
+   runs locally and in CI, and a broken downgrade fails it.
+4. Slim `jobs` image for the migration, purge and backup Jobs. *Landed in 11.2 (T11.2.12):*
+   `backend/Dockerfile.jobs` — `python:3.12-slim` pinned by digest, PGDG
+   `postgresql-client-16` (signing key checked by fingerprint), `age`, `rag_app` without
+   torch (`requirements-jobs.txt`, resolved with `requirements.txt` as constraints), Azure
+   Blob client, non-root (uid 10001), ≈ 490 MB. CI job `jobs-image`: `import rag_app.erasure`
+   works, `import torch` fails, `pg_dump` 16 + `age` present, jobs pins audited.
 5. Encrypted backups (14-day retention) with tombstones exported outside the database.
 6. Asynchronous erasure: short request transaction (crypto-shred + PII scrub) → 202, then a
    batched, resumable purger.
 7. Global daily answer cap.
 8. (11b) One shared reranker, baked model images, latency gate.
+
+## Key recovery (D-2026-09-29-2)
+
+Class (b) accounts (1 of 5 locally, 1 of 2 on Azure) get a time-boxed recovery before R5-5
+erases them: the user supplies candidate old master keys, a local tool tests them, a match is
+re-wrapped under the **current** key (the master key is never switched back — newer accounts
+depend on it), and whatever still fails is purged with a tombstone before the first
+fingerprint write.
+
+**Tool.** `scripts/azure/key_recovery.sh` (backend venv, `python -I -B`, core dumps off) →
+`key_recovery.py`:
+
+- `init` creates `~/.secrag-recovery/candidates` (directory 0700, empty file 0600) and prints
+  how to fill it **without the shell history** (`nano …`, or `cat > …`, paste, Ctrl-D). One
+  key per line; `#` comments and blank lines are ignored; `DATA_MASTER_KEY=<key>` lines are
+  accepted.
+- Every run refuses a file or directory with wider permissions, not owned by the user, a
+  symlink anywhere on the path, a path inside any git work tree, or one on a Windows drive
+  (`/mnt`, 9p/drvfs). `.gitignore` also ignores `**/.secrag-recovery/` and `**/candidates`
+  (defensive; the gitleaks allowlist is unchanged).
+- `check --accounts all|1,2 [--current-key-from-app APP | --current-key-from-env-file PATH]`
+  reads the wrapped keys through libpq in a READ ONLY transaction (only the requested
+  accounts) and prints only `account #i: current key OK|KO` and
+  `account #i: candidate #j OK|KO`, plus a summary. Accounts are numbered by
+  `users.created_at, users.id`, never identified.
+- `rewrap --account N --candidate J --current-key-from-… [--apply --i-have-a-pg-dump]`: one
+  transaction; refuses unless the current key cannot unwrap the account and candidate J can;
+  unwraps, wraps the same data key under the current master key, verifies; without `--apply`
+  it prints `dry run: would update 1 row` and rolls back (works in a read-only session); with
+  `--apply` (only together with `--i-have-a-pg-dump`) it locks and updates exactly that row.
+- `shred` overwrites every file in `~/.secrag-recovery` with random bytes, then zeros
+  (fsync each), deletes them and the directory.
+
+**What never leaks.** Keys (candidates, current, wrapped, unwrapped) are never on argv or in
+the environment, never printed or logged, never written to any file: errors print an
+exception **class** only (no message, no traceback); a malformed candidate prints
+`candidate #j: not a valid Fernet key`. On Azure the tool runs **inside**
+`scripts/azure/db-tunnel.sh` (which allows exactly this script besides `psql`/`pg_dump`), so
+the wrapped keys go from the server into the process' memory only, and candidates never go
+to Azure. The current Azure key is read by the tool itself from the Container App secret into
+memory. Tests (`backend/tests/test_key_recovery.py`, fake keys) scan stdout, stderr and every
+file written under `$HOME`, `/tmp` and the repository during a run — also with a malformed
+candidate and with a failing database or tunnel — for any fragment of any key, and check the
+refusals (modes, symlinks, git work tree, Windows drive) and `shred`. Limits: Python cannot
+wipe immutable strings from memory, and an overwrite on a journaling/SSD disk is best effort;
+the WSL disk image is not encrypted, so the lasting copy of old keys belongs in the password
+manager only.
+
+**Local evidence (2026-09-30, throwaway restore of the `rag_ia` snapshot, FAKE candidates):**
+`check --accounts all --current-key-from-env-file backend/.env` → accounts #2–#5 current key
+OK, **account #1 current key KO**, fake candidates KO; `rewrap` dry run in a read-only session
+→ `candidate #1 KO — nothing changed`. The throwaway container and volume were removed; the
+development volumes were not touched.
+
+**Procedure** (the user's real candidates; nothing is run on the developer's database before
+it): local — restore the snapshot into a throwaway container, `check`; on a match, `rewrap
+--apply --i-have-a-pg-dump` on the developer's database only after a `pg_dump` of it, then
+`diag_keys.py` → KO 0; Azure (row 40, orchestrator) — after the row-40 `pg_dump`,
+`db-tunnel.sh --password-from-app -- scripts/azure/key_recovery.sh check --accounts all
+--current-key-from-app secrag-backend`; on a match, the same `rewrap` with `--read-write` on
+the tunnel; re-run the row-15 snippet → KO 0; then `shred`. Accounts without a match are
+erased with a tombstone (R5-5) before the first start of the 0005 image.
 
 ## Rollback
 

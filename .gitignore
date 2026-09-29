@@ -2,6 +2,10 @@
 .env
 .env.*
 !.env.example
+# Master-key recovery candidates (D-2026-09-29-2): they live in ~/.secrag-recovery, never in
+# a work tree (the tool refuses one); ignored defensively anyway.
+**/.secrag-recovery/
+**/candidates
 
 # --- Python ---
 __pycache__/

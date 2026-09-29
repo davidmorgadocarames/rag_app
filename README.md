@@ -160,11 +160,16 @@ cd rag_app
 ### 2. Start the infrastructure and pull the models
 
 ```bash
-docker compose up -d db                        # PostgreSQL 16 + pgvector on :5432
+scripts/dev/create_dev_volume.sh               # once: the database volume (never recreated)
+docker compose up -d db db-roles               # PostgreSQL 16 + pgvector on :5432, DB roles
 ollama serve &                                 # or run Ollama as a desktop app / service
 ollama pull bge-m3                             # embeddings
 ollama pull qwen2.5:7b-instruct-q4_K_M         # chat model
 ```
+
+The development database lives in one fixed Docker volume, `rag_ia_pgdata`, declared
+`external` in `docker-compose.yml`: compose never creates or deletes it (not even with
+`down -v`), and the data no longer depends on the folder you start compose from.
 
 If you don't want to install Ollama on the host, `docker compose up -d db ollama` runs it
 in a container instead (GPU passthrough needs `nvidia-container-toolkit`). Pull the models
@@ -200,7 +205,15 @@ Fill in two required secrets in `backend/.env` (it is git-ignored and must never
 ```bash
 python -c "import secrets; print('JWT_SECRET=' + secrets.token_urlsafe(64))"
 python -c "from cryptography.fernet import Fernet; print('DATA_MASTER_KEY=' + Fernet.generate_key().decode())"
+chmod 600 .env                                 # secrets: owner-only (scripts/prereqs/check.sh checks it)
 ```
+
+Keep **one** `DATA_MASTER_KEY` per database, and keep a copy in your password manager: every
+user's data key is wrapped with it. Native runs read `backend/.env`; compose reads the shell or
+a root `.env` — use the same key in both. The API checks this at start-up: it validates
+`DATABASE_URL`, `JWT_SECRET` (≥ 32 characters) and `DATA_MASTER_KEY` (a Fernet key), and it
+refuses to start when the key is not the one the database was initialised with (a stored
+key fingerprint) — see [Recovering from a changed master key](#recovering-from-a-changed-master-key).
 
 SMTP is optional. Without it, email-verification links are written to the backend log.
 
@@ -214,7 +227,7 @@ All commands below run from `backend/` with the virtual environment active.
 ```bash
 python ../scripts/fetch_corpus.py              # download the official OWASP documents → data/
 python -m rag_app.ingestion --data-dir ../data # PDF/MD → normalized Markdown → chunks.jsonl
-alembic upgrade head                           # schema: pgvector, HNSW, full-text, auth tables
+alembic upgrade head                           # schema (needs the db-roles step above)
 python -m rag_app.indexing                     # embed chunks with bge-m3 → pgvector
 ```
 
@@ -272,7 +285,8 @@ git config core.hooksPath .githooks            # phase gate on every push (WSL2/
 bash scripts/gate.sh --fast          # default: lint, types, unit tests, gitleaks, shellcheck,
                                      # schema-check, adr-links, frontend, dependency-audit
 bash scripts/gate.sh --make-seed     # once (and when the corpus changes): build the gate seed
-bash scripts/gate.sh --full          # fast + DB tests + eval in an isolated gate project
+bash scripts/gate.sh --full          # fast + DB tests, migrations round trip, restart check
+                                     # and eval, in isolated throwaway projects
 bash scripts/gate.sh --only eval     # one or more steps (comma-separated); --list shows them
 ```
 
@@ -293,7 +307,8 @@ The containers use a **native** Ollama (GPU, `ollama serve` in WSL2) by default:
 ```bash
 ollama serve &                                   # listens on 127.0.0.1:11434 only
 ollama pull bge-m3 && ollama pull qwen2.5:7b-instruct-q4_K_M
-JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # db, roles, backend :8000, frontend :3000
+scripts/dev/create_dev_volume.sh                 # once
+JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # db → roles → migrate → backend :8000, frontend :3000
 ```
 
 The backend container reaches it as `host.docker.internal:11434`: Docker Desktop forwards
@@ -307,9 +322,33 @@ Compose reads its variables from the shell or from an optional repository-root `
 runs with `ENV=prod` unless `ENV=dev` is set there, so development-only features stay off
 by default.
 
-The backend container applies its migrations on startup. To build the index, run the
+Migrations run **once per `up`** in the one-shot `migrate` service (the slim `jobs` image,
+`backend/Dockerfile.jobs`: no torch, PostgreSQL 16 client, `age`), after `db-roles` and before
+the backend; the backend image itself never migrates (on Azure the same image runs as a
+migration Job that CD starts before updating the apps). To build the index, run the
 ingestion and indexing steps from [step 4](#4-build-the-corpus-and-the-index) against the
 same database.
+
+### Recovering from a changed master key
+
+If the API refuses to start because stored user keys do not unwrap with `DATA_MASTER_KEY`
+(or `diag_keys.py` reports `KO > 0`), an older key may still exist (password manager, an old
+`.env`, shell history). `scripts/azure/key_recovery.sh` tests candidate keys **without ever
+printing, logging or storing them**:
+
+```bash
+scripts/azure/key_recovery.sh init             # ~/.secrag-recovery/candidates (dir 0700, file 0600)
+nano ~/.secrag-recovery/candidates             # one key per line — never on the command line
+# locally, against a throwaway copy of the database (PG* variables), or on Azure inside
+# scripts/azure/db-tunnel.sh (read-only):
+scripts/azure/key_recovery.sh check --accounts all --current-key-from-env-file backend/.env
+scripts/azure/key_recovery.sh shred            # overwrite + delete the candidates afterwards
+```
+
+It prints only `account #i: candidate #j OK|KO`. A match is re-wrapped under the current key
+with `rewrap` (dry run by default; `--apply` only after a `pg_dump`); accounts without a
+match are erased. The full procedure is in
+[ADR phase 11 — Key recovery](docs/adr/adr_phase11_stability.md#key-recovery-d-2026-09-29-2).
 
 ## API at a glance
 
