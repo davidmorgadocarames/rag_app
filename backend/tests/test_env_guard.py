@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Annotated, Optional
 
 import pytest
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from pydantic import StrictBool, ValidationError
 
@@ -142,19 +143,38 @@ def test_every_settings_field_that_looks_dev_only_is_declared_dev_only() -> None
             assert field.annotation is bool and field.default is False, name
 
 
+def _valid(settings_cls: type[Settings]) -> Settings:
+    """Settings that pass the fail-fast validation (T11.2.2), so the dev-flag guard is what
+    the lifespan tests exercise."""
+    return settings_cls(
+        _env_file=None,
+        database_url="postgresql+psycopg://u:p@127.0.0.1:15432/lifespan_unit",
+        jwt_secret="j" * 40,
+        data_master_key=Fernet.generate_key().decode(),
+    )
+
+
+@pytest.fixture()
+def _no_fingerprint_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Unit tests: the fingerprint check needs a database (tested in test_startup_db.py).
+    monkeypatch.setattr("rag_app.api.app.check_master_key_fingerprint", lambda *_a: "match")
+
+
+@pytest.mark.usefixtures("_no_fingerprint_db")
 def test_api_lifespan_refuses_to_start_with_a_dev_flag_in_prod(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The guard runs at API start-up: the app never serves with a dev-only flag in prod."""
     monkeypatch.setenv("SANDBOX_FEATURE", "true")
-    monkeypatch.setattr(
-        "rag_app.api.app.get_settings",
-        lambda: _SettingsWithDummyFlag(_env_file=None),
-    )
+    settings = _valid(_SettingsWithDummyFlag)
+    monkeypatch.setattr("rag_app.api.app.get_settings", lambda: settings)
     with pytest.raises(DevOnlyFlagInProdError), TestClient(create_app()):
         pass
 
 
-def test_api_lifespan_starts_with_the_real_registry() -> None:
+@pytest.mark.usefixtures("_no_fingerprint_db")
+def test_api_lifespan_starts_with_the_real_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _valid(Settings)
+    monkeypatch.setattr("rag_app.api.app.get_settings", lambda: settings)
     with TestClient(create_app()) as client:
         assert client.get("/health").status_code == 200

@@ -14,15 +14,34 @@ from rag_app.api import auth, conversations
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
-from rag_app.config import check_dev_only_flags, get_settings
+from rag_app.config import Settings, check_dev_only_flags, get_settings, validate_api_settings
+from rag_app.db.session import make_engine
+from rag_app.keycheck import check_master_key_fingerprint
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 
 
+def startup_checks(settings: Settings) -> None:
+    """Fail closed before serving anything, in this order (API only — never a Job):
+
+    1. settings: DATABASE_URL, JWT_SECRET length, DATA_MASTER_KEY is Fernet, ENV (T11.2.2);
+    2. no development-only flag with ENV=prod (T11.0.10);
+    3. the master key matches the database's fingerprint, stored on the first start only
+       when every existing user key unwraps (T11.2.4, R5-5).
+    """
+    validate_api_settings(settings)
+    check_dev_only_flags(settings)
+    engine = make_engine(settings.database_url)
+    try:
+        check_master_key_fingerprint(engine, settings.data_master_key)
+    finally:
+        engine.dispose()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Start-up checks: fail closed before serving anything (T11.0.10; 11.2 adds more)."""
-    check_dev_only_flags(get_settings())
+    """Start-up checks (``startup_checks``): any failure aborts the start."""
+    startup_checks(get_settings())
     yield
 
 

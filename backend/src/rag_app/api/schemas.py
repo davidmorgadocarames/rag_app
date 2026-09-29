@@ -48,7 +48,7 @@ class TokenResponse(BaseModel):
 
 class UserOut(BaseModel):
     id: str
-    email: str
+    email: str | None  # None once erasure scrubbed it (0005)
     email_verified: bool
 
 

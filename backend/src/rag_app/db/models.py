@@ -12,17 +12,19 @@ import uuid
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Date,
     DateTime,
     ForeignKey,
     Integer,
     LargeBinary,
+    SmallInteger,
     String,
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 EMBEDDING_DIM = 1024  # bge-m3 dense embedding dimension
@@ -73,12 +75,16 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    email: Mapped[str] = mapped_column(String, unique=True, index=True)
-    password_hash: Mapped[str] = mapped_column(String)
+    # Nullable since 0005: the erasure request path scrubs them (PII) before the batched
+    # purge removes the row (11.2b). A live account always has both.
+    email: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # Set by the erasure request path (0005); login and token checks ignore such users.
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     key: Mapped[UserKey | None] = relationship(
         back_populates="user", cascade="all, delete-orphan", uselist=False
@@ -142,14 +148,69 @@ class Message(Base):
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
 
+TOMBSTONE_STATUSES = ("pending", "running", "done", "failed")
+
+
 class DeletionRequest(Base):
-    """Tombstone for a GDPR erasure. Contains no personal data; kept for replay."""
+    """Tombstone for a GDPR erasure. Contains no personal data; kept for replay.
+
+    0005 adds the purge bookkeeping (status, per-step progress, attempts, last error class)
+    used by the batched purger (11.2b)."""
 
     __tablename__ = "deletion_requests"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True, index=True)
     requested_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    status: Mapped[str] = mapped_column(String, server_default="pending")
+    progress: Mapped[dict[str, int]] = mapped_column(JSONB, server_default="{}")
+    attempts: Mapped[int] = mapped_column(Integer, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PurgerRun(Base):
+    """One run of the batched purger (0005; written by 11.2b). No personal data."""
+
+    __tablename__ = "purger_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    started_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    requests_processed: Mapped[int] = mapped_column(Integer, server_default="0")
+    errors: Mapped[int] = mapped_column(Integer, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class UsageDaily(Base):
+    """Global daily answer counter for the daily cap (R6-1, 0005). No personal data."""
+
+    __tablename__ = "usage_daily"
+
+    day: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    answers: Mapped[int] = mapped_column(Integer, server_default="0")
+    tokens: Mapped[int] = mapped_column(BigInteger, server_default="0")
+
+
+class MasterKeyFingerprint(Base):
+    """The one row identifying the DATA_MASTER_KEY this database was initialised with
+    (0005; see rag_app.keycheck)."""
+
+    __tablename__ = "master_key_fingerprint"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String)
+    algorithm: Mapped[str] = mapped_column(String)
+    created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 

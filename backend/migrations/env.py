@@ -12,13 +12,14 @@ from sqlalchemy import engine_from_config, pool
 # Make the application package importable (backend/src).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from rag_app.config import get_settings  # noqa: E402
+from rag_app.config import get_job_settings  # noqa: E402
 from rag_app.db.models import Base  # noqa: E402
 
 config = context.config
-# A URL set programmatically (the test DB harness) wins; otherwise the app settings.
+# A URL set programmatically (the test DB harness) wins; otherwise the Jobs' minimal settings
+# (only DATABASE_URL: the migration Job runs without JWT_SECRET / DATA_MASTER_KEY, T11.2.2).
 if not config.get_main_option("sqlalchemy.url"):
-    config.set_main_option("sqlalchemy.url", get_settings().database_url)
+    config.set_main_option("sqlalchemy.url", get_job_settings().database_url.replace("%", "%%"))
 
 # Callers embedding Alembic (the test harness) keep their own logging configuration.
 if config.config_file_name is not None and config.attributes.get("configure_logger", True):

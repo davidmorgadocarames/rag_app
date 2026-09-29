@@ -90,7 +90,7 @@ def register(
     )
     session.commit()
 
-    send_verification_email(user.email, raw_token)
+    send_verification_email(request.email, raw_token)
     tracker.record(ip)
     return TokenResponse(access_token=create_token(str(user.id)))
 
@@ -117,6 +117,8 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
     """Issue a fresh verification token. In dev (no SMTP) return the link to the UI."""
     if user.email_verified:
         return ResendVerificationResponse(detail="Email already verified.")
+    if user.email is None:  # scrubbed by erasure (0005); nothing to send to
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "account has no email address")
     raw_token = generate_verification_token()
     session.add(
         EmailVerificationToken(
@@ -134,7 +136,11 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
 @router.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_login)])
 def login(request: LoginRequest, session: SessionDep) -> TokenResponse:
     user = session.scalar(select(User).where(User.email == request.email))
-    if user is None or not verify_password(request.password, user.password_hash):
+    if (
+        user is None
+        or user.password_hash is None  # scrubbed by erasure (0005)
+        or not verify_password(request.password, user.password_hash)
+    ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
     if get_settings().require_email_verification and not user.email_verified:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "email not verified")

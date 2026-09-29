@@ -124,7 +124,7 @@ def test_backup_role_reads_tables_created_after_roles_sql(db_engine: Engine) -> 
         conn.rollback()
 
 
-def test_roles_are_not_superusers_and_have_no_write_rights_yet(db_engine: Engine) -> None:
+def test_roles_are_not_superusers_and_have_only_their_mapped_rights(db_engine: Engine) -> None:
     with db_engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -137,7 +137,15 @@ def test_roles_are_not_superusers_and_have_no_write_rights_yet(db_engine: Engine
         assert not conn.execute(
             text("SELECT has_table_privilege('secrag_backup', 'public.users', 'DELETE')")
         ).scalar_one()
-        # The purger's table rights come with migration 0005 (row 20), not with roles.sql.
-        assert not conn.execute(
+        # The purger's table rights come with migration 0005 (row 20; the harness migrates to
+        # head), never from roles.sql: it may delete users but never create them or touch
+        # the corpus (full map: test_startup_db.py).
+        assert conn.execute(
             text("SELECT has_table_privilege('secrag_purger', 'public.users', 'DELETE')")
+        ).scalar_one()
+        assert not conn.execute(
+            text("SELECT has_table_privilege('secrag_purger', 'public.users', 'INSERT')")
+        ).scalar_one()
+        assert not conn.execute(
+            text("SELECT has_table_privilege('secrag_purger', 'public.chunks', 'SELECT')")
         ).scalar_one()

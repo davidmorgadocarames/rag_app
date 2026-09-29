@@ -38,8 +38,25 @@ class DevOnlyFlagInProdError(RuntimeError):
     """A development-only feature is enabled while ENV=prod."""
 
 
-class Settings(BaseSettings):
-    """Application settings, populated from the environment / `.env`."""
+class SettingsValidationError(RuntimeError):
+    """The API refuses to start: a required setting is missing or invalid (T11.2.2).
+
+    The message names the settings and the rule, never a value."""
+
+
+# Development default of DATABASE_URL (the local compose database). With ENV=prod the API
+# refuses to start on it: production must say where its database is.
+DEV_DATABASE_URL = "postgresql+psycopg://rag:rag@localhost:5432/rag"
+JWT_SECRET_MIN_LENGTH = 32
+
+
+class JobSettings(BaseSettings):
+    """The minimal settings of the Jobs (migrations, purge, backup — T11.2.2).
+
+    A Job only needs to know where the database is. It never reads, needs or validates
+    ``JWT_SECRET`` or ``DATA_MASTER_KEY``, so the Jobs' Container Apps definitions do not
+    carry those secrets, and a Job starts without them.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -53,7 +70,7 @@ class Settings(BaseSettings):
     env: Literal["dev", "prod"] = "prod"
 
     # --- Database (PostgreSQL + pgvector) ---
-    database_url: str = "postgresql+psycopg://rag:rag@localhost:5432/rag"
+    database_url: str = DEV_DATABASE_URL
 
     @field_validator("database_url")
     @classmethod
@@ -70,6 +87,14 @@ class Settings(BaseSettings):
             if v.startswith(scheme):
                 return "postgresql+psycopg://" + v[len(scheme) :]
         return v
+
+
+class Settings(JobSettings):
+    """Application (API) settings, populated from the environment / `.env`.
+
+    Constructing them never fails on a missing secret; the API validates them in its
+    lifespan (``validate_api_settings``) and refuses to start. Jobs use ``JobSettings``.
+    """
 
     # --- Ollama / models (only 3 models across the whole system) ---
     ollama_host: str = "http://localhost:11434"
@@ -131,6 +156,60 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the application settings loaded from the environment."""
     return Settings()
+
+
+def get_job_settings() -> JobSettings:
+    """Return the Jobs' minimal settings (no secrets besides the database URL)."""
+    return JobSettings()
+
+
+def _database_url_problem(settings: JobSettings) -> str | None:
+    from sqlalchemy.engine import make_url
+
+    raw = settings.database_url.strip()
+    if not raw:
+        return "DATABASE_URL is empty"
+    try:
+        url = make_url(raw)
+    except Exception:  # noqa: BLE001 - the message could echo the URL (password)
+        return "DATABASE_URL is not a database URL"
+    if not url.drivername.startswith("postgresql"):
+        return "DATABASE_URL must be a PostgreSQL URL"
+    if not url.database:
+        return "DATABASE_URL names no database"
+    if settings.env == "prod" and "database_url" not in settings.model_fields_set:
+        return "DATABASE_URL is not set (ENV=prod refuses the local development default)"
+    return None
+
+
+def validate_api_settings(settings: Settings) -> None:
+    """Fail-fast validation of the API's settings (T11.2.2), called from the API lifespan
+    only — never at import time and never by a Job.
+
+    Checks ``DATABASE_URL`` (a PostgreSQL URL; explicitly set when ``ENV=prod``),
+    ``JWT_SECRET`` (at least 32 characters), ``DATA_MASTER_KEY`` (a valid Fernet key) and
+    ``ENV`` (``dev``/``prod``). Every problem is reported at once, by setting name only.
+    """
+    from cryptography.fernet import Fernet
+
+    problems: list[str] = []
+    if settings.env not in ("dev", "prod"):  # also enforced by the Literal type
+        problems.append("ENV must be 'dev' or 'prod'")
+    db_problem = _database_url_problem(settings)
+    if db_problem:
+        problems.append(db_problem)
+    if len(settings.jwt_secret) < JWT_SECRET_MIN_LENGTH:
+        problems.append(f"JWT_SECRET must be at least {JWT_SECRET_MIN_LENGTH} characters")
+    try:
+        Fernet(settings.data_master_key.encode())
+    except Exception:  # noqa: BLE001 - never echo the key
+        problems.append(
+            "DATA_MASTER_KEY is not a valid Fernet key (32 url-safe base64-encoded bytes)"
+        )
+    if problems:
+        raise SettingsValidationError(
+            "refusing to start — invalid settings: " + "; ".join(problems)
+        )
 
 
 def _is_marked_dev_only(extra: object) -> bool:

@@ -7,6 +7,7 @@ in one step. A tombstone is retained so deletions can be replayed after a restor
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from typing import Any
 
@@ -21,11 +22,15 @@ def _rowcount(result: Result[Any]) -> int:
 
 
 def erase_user(session: Session, user_id: uuid.UUID) -> None:
-    """Hard-delete the user (cascades to key/conversations/messages) and tombstone it."""
+    """Hard-delete the user (cascades to key/conversations/messages) and tombstone it.
+
+    Still synchronous (11.2b makes it a short request transaction + batched purge), so the
+    tombstone is written as already ``done``."""
     session.execute(delete(User).where(User.id == user_id))
     already = session.scalar(select(DeletionRequest).where(DeletionRequest.user_id == user_id))
     if already is None:
-        session.add(DeletionRequest(user_id=user_id))
+        now = dt.datetime.now(dt.UTC)
+        session.add(DeletionRequest(user_id=user_id, status="done", completed_at=now))
     session.commit()
 
 
