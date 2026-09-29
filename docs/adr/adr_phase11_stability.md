@@ -43,7 +43,12 @@ inventory (rate-limit buckets, signup tracker, singletons); the red `restart_che
    deployed SHA (GitHub Deployments; only `docs/**`, `**/*.md`, `deploy/k8s/**` → skip),
    deploys images by digest, and refuses any SHA without the commit status
    `secrag/gate-full` = success that a local `gate.sh --full` PASS publishes for exactly that
-   SHA (D-2026-09-27-7 b) — a skipped pre-push hook can no longer reach Azure. No
+   SHA (D-2026-09-27-7 b) — a skipped pre-push hook can no longer reach Azure. CI runs can
+   finish out of order (a re-run of an old commit), so the plan also skips a SHA that is no
+   longer the tip of `main` at plan time (its successor's run deploys) and a SHA that equals
+   or is an ancestor of the last deployed one — CD never rolls back. A real manual dispatch
+   (`dry_run=false` on `main`) additionally needs a successful CI `push` run for exactly that
+   SHA on `main` (`scripts/cd/ci_status.sh`, D-2026-09-29-1 a). No
    `environment:` key (OIDC subject unchanged); dry runs stay echo-only.
    *Compose ↔ native Ollama (T11.0.11/12, input for 16.0):* the backend container calls
    `host.docker.internal:11434`; Docker Desktop forwards it to Windows' loopback and WSL2's

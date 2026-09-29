@@ -4,8 +4,12 @@ name: CD
 # §1 rule 2). The cloud path uses a hosted LLM (Azure OpenAI via LLM_PROVIDER); see
 # docs/adr/adr_phase10_azure.md and docs/adr/adr_phase11_stability.md.
 #
-#   plan         changed files vs the LAST DEPLOYED SHA (GitHub Deployments); only docs/**,
-#                **/*.md or deploy/k8s/** changed → build and deploy are skipped
+#   plan         skip a SHA that is no longer the branch tip at plan time or that is not newer
+#                than the LAST DEPLOYED SHA (equal to it or an ancestor: CD never rolls back,
+#                DA-C-1); then changed files vs that SHA (GitHub Deployments): only docs/**,
+#                **/*.md or deploy/k8s/** changed → build and deploy are skipped. A real
+#                manual deploy also needs a successful CI push run for the SHA on main
+#                (DA-C-2, D-2026-09-29-1 a); dry runs only report that check.
 #   gate-status  the SHA must carry the commit status `secrag/gate-full` = success, posted by
 #                `scripts/gate.sh --full` for exactly that SHA (D-2026-09-27-7 b); otherwise
 #                the deploy is REFUSED (a skipped pre-push hook can no longer reach Azure)
@@ -15,7 +19,7 @@ name: CD
 # One SHA everywhere: head_sha of the CI run (workflow_run) or the dispatched commit.
 # Manual runs (workflow_dispatch) default to dry_run=true: plan + gate-status run (read-only)
 # and an echo job prints what a real run would do. A real manual deploy needs dry_run=false
-# AND the main branch. base_sha/head_sha inputs exist to test the plan in dry runs only.
+# AND the main branch. base_sha/head_sha/skip_tip_check exist to test the plan in dry runs only.
 # No job uses `environment:`, so the OIDC subject stays repo:<owner>/<repo>:ref:refs/heads/main
 # (runbook, gotcha 8). CD never enables Job schedules and never applies Job YAML (X1); the
 # migration Job and Job image updates come with T11.2.6.
@@ -38,6 +42,10 @@ on:
         description: "Dry runs only: plan this SHA instead of the dispatched ref's head"
         type: string
         default: ""
+      skip_tip_check:
+        description: "Dry runs only: plan head_sha even if it is not the ref's tip"
+        type: boolean
+        default: false
 
 # Real deploys are serialised in one group and never cancelled mid-flight; dry runs and
 # echo runs get their own group so they can never replace a pending real deploy.
@@ -55,6 +63,7 @@ jobs:
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     permissions:
+      actions: read       # ci_status.sh: CI runs of the SHA
       contents: read
       deployments: read
     outputs:
@@ -70,13 +79,14 @@ jobs:
           SHA: ${{ inputs.head_sha || github.event.workflow_run.head_sha || github.sha }}
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          SKIP_TIP_CHECK: ${{ inputs.skip_tip_check }}
         run: |
           echo "event=${{ github.event_name }} ref=${{ github.ref }} dry_run=${{ inputs.dry_run }} real=$REAL sha=$SHA"
           if [ "${{ github.event_name }}" = workflow_run ]; then
             echo "CI succeeded for ${{ github.event.workflow_run.head_branch }}@${{ github.event.workflow_run.head_sha }}"
           fi
-          if [ "$REAL" = true ] && [ -n "$BASE_SHA$HEAD_SHA" ]; then
-            echo "::error::base_sha/head_sha are for dry runs only; a real deploy uses the dispatched commit"
+          if [ "$REAL" = true ] && { [ -n "$BASE_SHA$HEAD_SHA" ] || [ "$SKIP_TIP_CHECK" = true ]; }; then
+            echo "::error::base_sha/head_sha/skip_tip_check are for dry runs only; a real deploy uses the dispatched commit"
             exit 1
           fi
           echo "real=$REAL" >> "$GITHUB_OUTPUT"
@@ -88,14 +98,51 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Changed files vs the last deployed SHA
+      # DA-C-2 / D-2026-09-29-1 (a): a real manual deploy needs CI to have passed on a push of
+      # exactly this SHA to main (workflow_run runs start only after that). Dry runs report.
+      - name: CI must have passed on this SHA (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.mode.outputs.sha }}
+          REAL: ${{ steps.mode.outputs.real }}
+        run: |
+          if bash scripts/cd/ci_status.sh verify "$SHA" --branch main; then
+            exit 0
+          fi
+          if [ "$REAL" = true ]; then
+            echo "::error::DEPLOY REFUSED — no successful CI push run for $SHA on main"
+            exit 1
+          fi
+          echo "Dry run: a real manual deploy of $SHA would be REFUSED (CI check above)."
+
+      # DA-C-1: the branch head NOW. A SHA that is no longer the tip is skipped (the newer
+      # commit's own run deploys it). Empty/unreadable → plan.sh refuses (fail-closed).
+      - name: Branch tip at plan time
+        id: tip
+        if: inputs.skip_tip_check != true
+        env:
+          REF: ${{ github.event_name == 'workflow_run' && 'refs/heads/main' || github.ref }}
+        run: |
+          tip="$(git ls-remote --exit-code origin "$REF" | cut -f1)" || tip=""
+          echo "tip of $REF: ${tip:-unknown}"
+          echo "tip=$tip" >> "$GITHUB_OUTPUT"
+
+      - name: Plan (tip, last deployed SHA, changed files)
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ steps.mode.outputs.sha }}
           BASE_SHA: ${{ inputs.base_sha }}
-        run: bash scripts/cd/plan.sh --sha "$SHA" ${BASE_SHA:+--base "$BASE_SHA"}
+          CHECK_TIP: ${{ steps.tip.conclusion == 'success' }}
+          TIP: ${{ steps.tip.outputs.tip }}
+        run: |
+          args=(--sha "$SHA")
+          [ -z "$BASE_SHA" ] || args+=(--base "$BASE_SHA")
+          [ "$CHECK_TIP" != true ] || args+=(--tip "$TIP")
+          bash scripts/cd/plan.sh "${args[@]}"
 
   gate-status:
     name: Gate status (secrag/gate-full on the SHA)

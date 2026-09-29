@@ -92,7 +92,7 @@ def test_cd_runs_after_ci_on_main_and_never_on_a_raw_push(cd: dict) -> None:
     }
     inputs = triggers["workflow_dispatch"]["inputs"]
     assert inputs["dry_run"]["default"] is True
-    assert {"base_sha", "head_sha"} <= set(inputs)
+    assert {"base_sha", "head_sha", "skip_tip_check"} <= set(inputs)
 
 
 def test_no_job_uses_environment_so_the_oidc_subject_stays_main(cd: dict) -> None:
@@ -329,3 +329,153 @@ def test_unknown_base_deploys_everything(tmp_path: Path, history) -> None:
     proc, out = _plan(tmp_path, repo, "--sha", shas["docs"], "--base", "b" * 40)
     assert out["deploy"] == "true", proc.stdout
     assert "not in this clone" in out["reason"]
+
+
+# --- plan.sh: never roll back, never deploy a superseded commit (DA-C-1) ----------------
+
+
+@needs_tools
+def test_an_ancestor_of_the_deployed_sha_is_never_deployed(tmp_path: Path, history) -> None:
+    """CI of an OLD commit re-run after a newer one was deployed: the diff is non-empty,
+    but deploying it would roll back (older code on a newer schema)."""
+    repo, shas = history
+    for older in ("base", "docs"):
+        proc, out = _plan(tmp_path, repo, "--sha", shas[older], "--base", shas["code"])
+        assert proc.returncode == 0, proc.stderr
+        assert out["deploy"] == "false", proc.stdout
+        assert "older than the deployed" in out["reason"]
+        assert "never rolls back" in out["reason"]
+
+
+@needs_tools
+def test_an_ancestor_of_the_last_deployment_from_the_api_is_skipped(
+    tmp_path: Path, history
+) -> None:
+    repo, shas = history
+    routes = [
+        {"match": "deployments/5/statuses", "stdout": "success\n"},
+        {"match": "deployments?environment=azure", "stdout": f"5:{shas['code']}\n"},
+    ]
+    proc, out = _plan(tmp_path, repo, "--sha", shas["base"], routes=routes)
+    assert out["base"] == shas["code"] and out["deploy"] == "false", proc.stdout
+
+
+@needs_tools
+def test_a_sha_that_is_no_longer_the_tip_is_skipped(tmp_path: Path, history) -> None:
+    """A newer commit landed after this CI run: its own CD run deploys it."""
+    repo, shas = history
+    proc, out = _plan(
+        tmp_path, repo, "--sha", shas["docs"], "--base", shas["base"], "--tip", shas["code"]
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert out["deploy"] == "false"
+    assert "no longer the branch tip" in out["reason"]
+
+
+@needs_tools
+def test_the_tip_itself_is_planned_normally(tmp_path: Path, history) -> None:
+    repo, shas = history
+    proc, out = _plan(
+        tmp_path, repo, "--sha", shas["code"], "--base", shas["docs"], "--tip", shas["code"]
+    )
+    assert out["deploy"] == "true", proc.stdout
+    # Tip given, nothing deployed yet: the tip check passes, then "deploy everything".
+    routes = [{"match": "deployments?environment=azure", "stdout": ""}]
+    proc, out = _plan(tmp_path, repo, "--sha", shas["code"], "--tip", shas["code"], routes=routes)
+    assert out["deploy"] == "true" and "no successful deployment" in out["reason"], proc.stdout
+
+
+@needs_tools
+@pytest.mark.parametrize("tip", ["", "main", "abc"])
+def test_an_unknown_tip_refuses_to_plan(tmp_path: Path, history, tip: str) -> None:
+    """ls-remote failed → empty tip → the plan job fails (fail-closed), no deploy output."""
+    repo, shas = history
+    proc, out = _plan(tmp_path, repo, "--sha", shas["code"], "--base", shas["docs"], "--tip", tip)
+    assert proc.returncode == 1
+    assert "deploy" not in out
+
+
+@needs_tools
+def test_a_diverged_sha_is_planned_by_its_diff(tmp_path: Path, history) -> None:
+    """Neither ancestor nor descendant (e.g. history rewritten): the diff decides."""
+    repo, shas = history
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", shas["base"]], check=True)
+    side = _commit(repo, {"backend/other.py": "x"}, "side")
+    proc, out = _plan(tmp_path, repo, "--sha", side, "--base", shas["code"], "--tip", side)
+    assert out["deploy"] == "true", proc.stdout
+
+
+def test_cd_passes_the_live_tip_to_the_plan(cd: dict) -> None:
+    steps = cd["jobs"]["plan"]["steps"]
+    tip = next(s for s in steps if s.get("id") == "tip")
+    assert "git ls-remote --exit-code origin" in tip["run"]
+    assert "refs/heads/main" in tip["env"]["REF"]  # workflow_run: always main's head
+    assert tip["if"] == "inputs.skip_tip_check != true"
+    plan = next(s for s in steps if s.get("id") == "plan")
+    assert "--tip" in plan["run"]
+    assert plan["env"]["CHECK_TIP"] == "${{ steps.tip.conclusion == 'success' }}"
+    mode = next(s for s in steps if s.get("id") == "mode")
+    # A real run can never switch the tip check off.
+    assert '[ "$SKIP_TIP_CHECK" = true ]' in mode["run"] and "exit 1" in mode["run"]
+    inputs = _triggers(cd)["workflow_dispatch"]["inputs"]
+    assert inputs["skip_tip_check"]["default"] is False
+
+
+# --- ci_status.sh + manual deploys need CI (DA-C-2, D-2026-09-29-1 a) -------------------
+
+CI_STATUS = REPO_ROOT / "scripts" / "cd" / "ci_status.sh"
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    ("stdout", "rc", "expected"),
+    [
+        ("1\n", 0, "CI requirement met"),
+        ("2\n", 0, "CI requirement met"),
+        ("0\n", 1, "REFUSED — no successful ci.yml push run"),
+        ("\n", 1, "REFUSED"),
+        ("null\n", 1, "REFUSED"),
+    ],
+)
+def test_ci_status(tmp_path: Path, stdout: str, rc: int, expected: str) -> None:
+    env = _fake_gh(tmp_path, [{"match": "actions/workflows/ci.yml/runs", "stdout": stdout}])
+    proc = _run(CI_STATUS, "verify", SHA, env=env)
+    assert proc.returncode == rc, proc.stdout + proc.stderr
+    assert expected in proc.stdout
+    call = (tmp_path / "gh.log").read_text(encoding="utf-8")
+    for part in (f"head_sha={SHA}", "branch=main", "event=push", "status=success"):
+        assert part in call
+    # The jq filter re-checks every field (a query parameter the API ignored cannot widen it).
+    for field in (
+        f'.head_sha == "{SHA}"',
+        '.head_branch == "main"',
+        '.event == "push"',
+        '.conclusion == "success"',
+    ):
+        assert field in call
+
+
+@needs_tools
+def test_ci_status_refuses_on_an_api_error(tmp_path: Path) -> None:
+    env = _fake_gh(tmp_path, [{"match": "actions/workflows", "stdout": "", "rc": 1}])
+    proc = _run(CI_STATUS, "verify", SHA, "--branch", "main", env=env)
+    assert proc.returncode == 1 and "API error" in proc.stdout
+
+
+@needs_tools
+@pytest.mark.parametrize("args", [["verify", "abc"], ["check", SHA], ["verify"]])
+def test_ci_status_usage_errors(tmp_path: Path, args: list[str]) -> None:
+    assert _run(CI_STATUS, *args, env=_fake_gh(tmp_path, [])).returncode == 2
+
+
+def test_a_real_manual_deploy_requires_ci_success(cd: dict) -> None:
+    plan = cd["jobs"]["plan"]
+    assert plan["permissions"]["actions"] == "read"
+    steps = plan["steps"]
+    ci = next(s for s in steps if "ci_status.sh verify" in s.get("run", ""))
+    assert ci["if"] == "github.event_name == 'workflow_dispatch'"
+    assert "--branch main" in ci["run"]
+    # Real → the step (so the plan job, so every later job) fails.
+    assert 'if [ "$REAL" = true ]; then' in ci["run"] and "exit 1" in ci["run"]
+    plan_step = next(s for s in steps if s.get("id") == "plan")
+    assert steps.index(ci) < steps.index(plan_step)
