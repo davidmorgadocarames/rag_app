@@ -14,9 +14,12 @@
 # relays Windows 127.0.0.1:11434 to Ollama's 127.0.0.1:11434 inside WSL. Ollama stays on
 # loopback (no LAN exposure, no firewall rule, no .wslconfig change).
 #
-# Every published port is bound to 127.0.0.1 only. JWT_SECRET and DATA_MASTER_KEY must be
-# provided (env or a root .env; see .env.example). ENV defaults to prod (fail-closed); the root
-# .env sets ENV=dev.
+# Every published port is bound to 127.0.0.1 only. Compose reads its variables from the shell
+# or from an OPTIONAL repository-root .env (git-ignored; not created by the setup steps, and
+# not the same file as backend/.env, which compose does not read; keys: .env.example).
+# JWT_SECRET and DATA_MASTER_KEY must be set. ENV defaults to prod (fail-closed): with no
+# ENV in the shell or a root .env, dev-only features stay off — export ENV=dev (or add it
+# to a root .env) for local development.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -35,7 +38,7 @@ services:
       retries: 5
 
   # One-shot: database roles before any migration (db/roles.sql, T11.0.13). Idempotent.
-  # A role gets LOGIN only when its password is set (root .env, git-ignored).
+  # A role gets LOGIN only when its password is set (shell or optional root .env).
   db-roles:
     image: pgvector/pgvector:pg16
     entrypoint: ["bash", "/secrag/scripts/db/apply_roles.sh"]
@@ -58,7 +61,8 @@ services:
       - "127.0.0.1:11434:11434"
     volumes:
       - ollama:/root/.ollama
-    # GPU passthrough (NVIDIA). Requires nvidia-container-toolkit on the host.
+    # GPU passthrough (NVIDIA). Requires nvidia-container-toolkit on the host, so this
+    # service does not start on a GPU-less host (e.g. a GitHub runner) as is.
     # Comment this block out if running CPU-only.
     deploy:
       resources:
@@ -74,7 +78,7 @@ services:
       - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
-      # Native Ollama through host.docker.internal (see the header); override in the root .env.
+      # Native Ollama through host.docker.internal (see the header); override with CONTAINER_OLLAMA_HOST.
       OLLAMA_HOST: ${CONTAINER_OLLAMA_HOST:-http://host.docker.internal:11434}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
       DATA_MASTER_KEY: ${DATA_MASTER_KEY:?set DATA_MASTER_KEY}

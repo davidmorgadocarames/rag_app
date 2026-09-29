@@ -302,6 +302,10 @@ port inside WSL, so Ollama (which has no authentication) is never exposed on the
 Every published port is bound to `127.0.0.1`. To use the containerised Ollama instead:
 `docker compose --profile ci up -d` with `CONTAINER_OLLAMA_HOST=http://ollama:11434`.
 A one-shot `db-roles` service applies `db/roles.sql` before the backend starts.
+Compose reads its variables from the shell or from an optional repository-root `.env` (not
+`backend/.env`, which compose does not read; keys in `.env.example`). The backend container
+runs with `ENV=prod` unless `ENV=dev` is set there, so development-only features stay off
+by default.
 
 The backend container applies its migrations on startup. To build the index, run the
 ingestion and indexing steps from [step 4](#4-build-the-corpus-and-the-index) against the
