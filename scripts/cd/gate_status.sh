@@ -23,7 +23,10 @@ usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 cmd="${1:-}"
 sha="${2:-}"
-[ -n "$cmd" ] && [ -n "$sha" ] || { usage >&2; exit 2; }
+if [ -z "$cmd" ] || [ -z "$sha" ]; then
+  usage >&2
+  exit 2
+fi
 shift 2
 wait_s=0 description="scripts/gate.sh --full PASS" creator=""
 while [ $# -gt 0 ]; do

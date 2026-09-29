@@ -464,7 +464,8 @@ db_alembic_head() {
 # the gate cluster is thrown away after every run, so they only need to be stable per clone.
 ensure_roles_env() {
   [ -f "$ROLES_ENV" ] && return 0
-  mkdir -p "$GATE_STATE" && chmod 700 "$GATE_STATE" || return 1
+  mkdir -p "$GATE_STATE" || return 1
+  chmod 700 "$GATE_STATE" || return 1
   (
     umask 077
     {
@@ -649,7 +650,8 @@ publish_gate_status() {
     return 0
   fi
   dir="$GIT_COMMON/secrag-gate"
-  mkdir -p "$dir" && cp -f "$REPO_ROOT/scripts/cd/gate_status.sh" "$dir/gate_status.sh" || return 0
+  mkdir -p "$dir" || return 0
+  cp -f "$REPO_ROOT/scripts/cd/gate_status.sh" "$dir/gate_status.sh" || return 0
   (
     cd "$MAIN_ROOT" || exit 0
     # Detached (own session, no inherited stdio) so git does not wait for it.
