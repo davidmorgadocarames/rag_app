@@ -70,7 +70,10 @@ inventory (rate-limit buckets, signup tracker, singletons); the red `restart_che
    a role password. Gate step `migrations-roundtrip`.
 2. Fail-fast settings validation in the API lifespan; master-key fingerprint. *Landed in 11.0:*
    `ENV` (`dev`/`prod`, default `prod`) and a lifespan guard that refuses any development-only
-   flag with `ENV=prod` (registry `DEV_ONLY_FLAGS`, empty until Phases 13/16/19/20).
+   flag with `ENV=prod`. The registry is derived from the fields declared with
+   `dev_only_flag(...)` (none until Phases 13/16/19/20), so there is no list to forget; a
+   boolean field *named* like a dev feature (`fake_`, `_lab`, `explorer`, `code_fix`, `debug`,
+   …) counts as dev-only even if undeclared, and a unit test fails until it is declared.
 3. Migrations out of the container command: compose one-shot service and an Azure
    migration Job run by CD before the apps; expand/contract rule.
 4. Slim `jobs` image for the migration, purge and backup Jobs.

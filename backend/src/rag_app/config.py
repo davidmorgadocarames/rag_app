@@ -6,17 +6,30 @@ Nothing sensitive is hardcoded; see `.env.example` for the full list of keys.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Settings fields that enable a feature which must never run in production (PHASE_PLANNING
-# §1 rule 2, "fail-closed flags"). Each such feature adds its boolean field name here when it
-# lands: fake LLM provider (Phase 16), defence lab (13), data explorer (19), code-fix (20).
-# With ENV=prod (the default) the API refuses to start while any of them is enabled.
-DEV_ONLY_FLAGS: list[str] = []
+# Development-only features (PHASE_PLANNING §1 rule 2, "fail-closed flags"): fake LLM
+# provider (Phase 16), defence lab (13), data explorer (19), code-fix (20). Each one is a
+# boolean Settings field declared with `dev_only_flag(...)`; the registry is DERIVED from that
+# field metadata (DA-C-5), so there is no separate list to forget. With ENV=prod (the
+# default) the API refuses to start while any of them is on. As a backstop, a boolean field
+# whose NAME looks development-only (DEV_ONLY_NAME) counts as dev-only even when it was not
+# declared that way, and a unit test fails on it. A development-only VALUE of a non-boolean
+# field (e.g. a future LLM_PROVIDER=fake) needs its own validator in that phase.
+DEV_ONLY_MARK = "dev_only"
+DEV_ONLY_NAME = re.compile(
+    r"(^|_)(fake|mock|stub|lab|labs|explorer|code_fix|codefix|dev|debug|demo|unsafe|insecure)(_|$)"
+)
+
+
+def dev_only_flag(description: str) -> Any:
+    """A development-only boolean Settings field: off by default, refused with ENV=prod."""
+    return Field(default=False, description=description, json_schema_extra={DEV_ONLY_MARK: True})
 
 
 class DevOnlyFlagInProdError(RuntimeError):
@@ -118,9 +131,25 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def _is_marked_dev_only(extra: object) -> bool:
+    return isinstance(extra, dict) and extra.get(DEV_ONLY_MARK) is True
+
+
+def dev_only_flags(settings_cls: type[BaseSettings] = Settings) -> list[str]:
+    """The development-only fields of ``settings_cls``: every field declared with
+    ``dev_only_flag`` plus every boolean field whose name matches ``DEV_ONLY_NAME``."""
+    names = []
+    for name, field in settings_cls.model_fields.items():
+        marked = _is_marked_dev_only(field.json_schema_extra)
+        looks_dev_only = field.annotation is bool and DEV_ONLY_NAME.search(name) is not None
+        if marked or looks_dev_only:
+            names.append(name)
+    return sorted(names)
+
+
 def enabled_dev_only_flags(settings: Settings, flags: Iterable[str] | None = None) -> list[str]:
     """Names of the development-only flags that are switched on in ``settings``."""
-    names = DEV_ONLY_FLAGS if flags is None else flags
+    names = dev_only_flags(type(settings)) if flags is None else flags
     return [name for name in names if bool(getattr(settings, name, False))]
 
 
