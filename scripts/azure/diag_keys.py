@@ -9,11 +9,12 @@ exception message:
     N: <user_keys rows>
     OK: <unwrapped with DATA_MASTER_KEY>
     KO: <InvalidToken or any other unwrap failure>
-    JWT_SECRET length >= 32: OK|KO
-    DATA_MASTER_KEY valid Fernet: OK|KO
+    JWT_SECRET length >= 32: OK|KO|unknown
+    DATA_MASTER_KEY valid Fernet: OK|KO|unknown
 
 A failure prints "error (<exception class>)" in place of a value (never the message, which
-may echo a setting). Classification (PHASE_PLANNING 11.1), with the db-tunnel counts:
+may echo a setting); when the settings cannot even be loaded, the two checks print
+"unknown" (not evaluated), never KO. Classification (PHASE_PLANNING 11.1), with the db-tunnel counts:
 users gone → (a) data gone; KO > 0 → (b) unreadable, key changed; N > 0 and KO = 0 →
 (c) session only.
 
@@ -36,12 +37,13 @@ def _diag() -> list[str]:
 
         settings = get_settings()
     except Exception as exc:  # noqa: BLE001 - only the class name is printed
+        # Nothing could be evaluated: "unknown", not KO (a KO means a checked failure, DA-D-9).
         return [
             f"N: {err(exc)}",
             "OK: -",
             "KO: -",
-            "JWT_SECRET length >= 32: KO",
-            "DATA_MASTER_KEY valid Fernet: KO",
+            "JWT_SECRET length >= 32: unknown",
+            "DATA_MASTER_KEY valid Fernet: unknown",
         ]
 
     try:

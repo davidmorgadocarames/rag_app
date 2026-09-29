@@ -81,6 +81,27 @@ def test_snippet_prints_only_the_verdicts_when_the_db_is_unreachable(tmp_path: P
     ]
 
 
+def test_snippet_says_unknown_when_the_settings_cannot_be_loaded(tmp_path: Path) -> None:
+    """DA-D-9: nothing evaluated → "unknown", never a KO that looks like a checked failure."""
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "-I", str(SNIPPET)],  # isolated: rag_app is not importable
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == [
+        "N: error (ModuleNotFoundError)",
+        "OK: -",
+        "KO: -",
+        "JWT_SECRET length >= 32: unknown",
+        "DATA_MASTER_KEY valid Fernet: unknown",
+    ]
+
+
 @pytest.mark.db
 @pytest.mark.parametrize("oneliner", [False, True], ids=["file", "oneliner"])
 def test_snippet_counts_unwrappable_keys(db_engine, tmp_path: Path, oneliner: bool) -> None:
@@ -137,3 +158,61 @@ def test_restart_check_refuses_the_development_projects(args: list[str]) -> None
     )
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "REFUSED" in proc.stderr
+    assert "project" in proc.stderr  # refused for the project, before touching docker
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("port", ["8000", "5432", "3000", "11434", "x"])
+def test_restart_check_refuses_development_ports(port: str) -> None:
+    proc = subprocess.run(
+        ["bash", str(RESTART_CHECK), "--project", "secrag-rc-unit"],
+        env={**os.environ, "RESTART_CHECK_API_PORT": port},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 2 and "REFUSED" in proc.stderr and "port" in proc.stderr.lower()
+
+
+def _docker_ready() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    return subprocess.run(["docker", "info"], capture_output=True, timeout=30).returncode == 0
+
+
+@pytest.mark.skipif(not _docker_ready(), reason="needs a reachable docker")
+def test_restart_check_refuses_a_busy_api_port(tmp_path: Path) -> None:
+    """DA-D-7: something already answering on the API port (e.g. a native uvicorn on WSL's
+    127.0.0.1) must stop the check before any container starts."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(50):
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            import time
+
+            time.sleep(0.1)
+        proc = subprocess.run(
+            ["bash", str(RESTART_CHECK), "--project", "secrag-rc-unit"],
+            env={**os.environ, "RESTART_CHECK_API_PORT": str(port)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        server.terminate()
+        server.wait(timeout=10)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "already listens/answers" in proc.stderr
+    assert "throwaway volume" not in proc.stdout  # refused before creating anything

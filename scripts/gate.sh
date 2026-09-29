@@ -58,7 +58,8 @@ GATE_DB_USER="secrag_gate"
 GATE_DB_NAME="secrag_gate"
 FULL_TARGET_SECONDS=1800   # X5: --full target in Phase 11
 
-# name | needs the gate stack: - (no) / db (gate DB) / seed (DB + seed + Ollama) | budget (s)
+# name | needs the gate stack: - (no) / db (gate DB) / seed (DB + seed + Ollama) /
+#        docker (own throwaway compose projects, not in --fast) | budget (s)
 STEP_TABLE="
 environment      - 10
 secrets          - 10
@@ -77,6 +78,7 @@ frontend         - 600
 dependency-audit - 240
 db-tests         db 300
 migrations-roundtrip db 180
+restart-check    docker 900
 eval             seed 1200
 "
 STACK_BUDGET=300   # up + migrate + seed restore
@@ -338,6 +340,20 @@ step_migrations-roundtrip() {
     || { echo "  FAIL: downgrade -1 / upgrade head round trip"; return 1; }
   echo "  downgrade -1 → upgrade head: OK"
   return "$rc"
+}
+
+# T11.2.8: data survives down/up (no -v) even across compose project names (fixed external
+# volume, T11.2.1); the backend image never migrates (T11.2.5); a changed master key refuses
+# to start (T11.2.4, DA-D-2); the dedicated account is erased at the end. Throwaway projects
+# `secrag-gate-rc*` and a throwaway external volume, API on 127.0.0.1:18000 (no DB port) —
+# never the development volume, and it can run with the development stack up.
+step_restart-check() {
+  docker info >/dev/null 2>&1 \
+    || { echo "  FAIL: docker is not reachable from WSL — start Docker Desktop"; return 1; }
+  env -u JWT_SECRET -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
+    --project secrag-gate-rc --restart-project secrag-gate-rc2 --restart-master-key 2>&1 \
+    | sed 's/^/  /'
+  return "${PIPESTATUS[0]}"
 }
 
 step_eval() {
@@ -638,7 +654,7 @@ run_step() {
   t0=$SECONDS
   local need
   need="$(step_field "$name" 2)"
-  if [ "$need" != - ] && [ -n "$STACK_ERROR" ]; then
+  if { [ "$need" = db ] || [ "$need" = seed ]; } && [ -n "$STACK_ERROR" ]; then
     echo "  FAIL: stack not available — $STACK_ERROR"
     rc=1
   elif [ "$need" = seed ] && [ -n "$SEED_ERROR" ]; then

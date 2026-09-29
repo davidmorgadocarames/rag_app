@@ -1,0 +1,22 @@
+# Override of docker-compose.yml used ONLY by scripts/restart_check.sh (T11.2.8).
+#
+# It keeps the real development compose file (services, dependencies, the migrate one-shot,
+# the fixed EXTERNAL volume) and changes only what must differ for a throwaway run:
+#   - the external volume is a throwaway one created and removed by the script (never
+#     rag_ia_pgdata — the script refuses that);
+#   - no database port is published and the API is on a high loopback port, so the check can
+#     run while the development stack is up (no 5432/8000/3000 collision).
+# Needs Docker Compose >= 2.24 (!reset / !override).
+services:
+  db:
+    ports: !reset []
+  backend:
+    ports: !override
+      - "127.0.0.1:${RESTART_CHECK_API_PORT:?restart_check.sh sets RESTART_CHECK_API_PORT}:8000"
+  frontend:
+    ports: !reset []
+
+volumes:
+  pgdata: !override
+    name: ${RESTART_CHECK_VOLUME:?restart_check.sh sets RESTART_CHECK_VOLUME}
+    external: true
