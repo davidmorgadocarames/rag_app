@@ -1,13 +1,72 @@
-"""db/roles.sql (T11.0.13): idempotent roles, default privileges for secrag_backup."""
+"""db/roles.sql (T11.0.13): idempotent roles, default privileges for secrag_backup;
+scripts/db/apply_roles.sh sends passwords only as SCRAM verifiers (DA-C-3)."""
 
 from __future__ import annotations
 
+import os
+import secrets
+import shutil
+import subprocess
+from pathlib import Path
+
 import pytest
-from sqlalchemy import Engine, text
+from sqlalchemy import URL, Engine, create_engine, text
 
 from db_harness import ROLES_SQL, apply_roles
 
 pytestmark = pytest.mark.db
+
+APPLY_ROLES = Path(__file__).resolve().parents[2] / "scripts" / "db" / "apply_roles.sh"
+
+
+def test_apply_roles_sends_a_scram_verifier_and_the_password_logs_in(
+    db_url: URL, tmp_path: Path
+) -> None:
+    """Real psql against the harness database, wrapped with --echo-queries: psql prints each
+    query exactly as sent to the server (after variable interpolation). The password must
+    not be in it — only a SCRAM verifier — and the role must then log in with the password."""
+    real_psql = shutil.which("psql")
+    assert real_psql, "psql is required for this test (CI and the gate have it)"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / "psql"
+    wrapper.write_text(f'#!/bin/sh\nexec "{real_psql}" --echo-queries "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    password = "t-" + secrets.token_hex(12)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"SECRAG_PURGER_PASSWORD", "SECRAG_BACKUP_PASSWORD", "PGPASSWORD"}
+    }
+    env |= {"PATH": f"{bin_dir}:{env['PATH']}", "SECRAG_PURGER_PASSWORD": password}
+    proc = subprocess.run(
+        ["bash", str(APPLY_ROLES), db_url.render_as_string(hide_password=False)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    sent = proc.stdout + proc.stderr
+    assert "ALTER ROLE secrag_purger LOGIN PASSWORD 'SCRAM-SHA-256$4096:" in sent
+    assert password not in sent
+    assert "secrag_backup stays NOLOGIN" in sent
+
+    role_url = db_url.set(username="secrag_purger", password=password)
+    engine = create_engine(role_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT current_user")).scalar_one() == "secrag_purger"
+    finally:
+        engine.dispose()
+    wrong = create_engine(db_url.set(username="secrag_purger", password="wrong"), future=True)
+    try:
+        with pytest.raises(Exception, match="password authentication failed"):
+            wrong.connect().close()
+    finally:
+        wrong.dispose()
+
 
 SNAPSHOT = """
 SELECT 'role:' || rolname || ':' || rolcanlogin || ':' || rolsuper || ':' || rolcreaterole

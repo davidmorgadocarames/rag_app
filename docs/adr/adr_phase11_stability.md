@@ -64,7 +64,10 @@ inventory (rate-limit buckets, signup tracker, singletons); the red `restart_che
    *Roles (T11.0.13):* idempotent `db/roles.sql` (`secrag_purger`, `secrag_backup`, NOLOGIN;
    default privileges so every future table stays dumpable), applied before every migrate
    (compose `db-roles`, CI, gate, test harness); LOGIN + passwords outside Alembic
-   (`scripts/db/apply_roles.sh` via `\getenv`). Gate step `migrations-roundtrip`.
+   (`scripts/db/apply_roles.sh` via `\getenv`). The server only ever receives a SCRAM-SHA-256
+   verifier computed client-side (`scripts/db/scram_verifier.pl`, RFC 5802/7677), never the
+   plaintext, so no server log setting (`log_statement`, failing-statement logging) can leak
+   a role password. Gate step `migrations-roundtrip`.
 2. Fail-fast settings validation in the API lifespan; master-key fingerprint. *Landed in 11.0:*
    `ENV` (`dev`/`prod`, default `prod`) and a lifespan guard that refuses any development-only
    flag with `ENV=prod` (registry `DEV_ONLY_FLAGS`, empty until Phases 13/16/19/20).
