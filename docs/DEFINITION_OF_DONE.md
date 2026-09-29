@@ -50,7 +50,13 @@ are a human/agent checklist.
   (PHASE_TASKS rows 40/41) needs the **`--full` PASS log for the exact SHA pushed**: the
   gate's summary prints `total … @ <full SHA>` and `GATE: PASS`; the log is attached to the
   phase report / PR. CI's `cheap-checks` job is the server-side backstop for the cheap steps
-  (git modes, shellcheck, venv, dependency-audit, adr-links).
+  (git modes, shellcheck, venv, dependency-audit, adr-links). **Right after the promotion
+  push** (DA-C-4), check locally that the status really exists for the pushed SHA:
+  `bash scripts/cd/gate_status.sh verify <sha> --wait 300 --creator <owner>` → `deploy
+  allowed`. **Recovery** when it is missing (the background publisher died, e.g. WSL shut
+  down; see `.git/secrag-gate/publish-status.log`): after a `--full` PASS for that SHA,
+  `bash scripts/cd/gate_status.sh publish <sha>`, then **"Re-run failed jobs"** on the CD
+  run whose `gate-status` job timed out.
 - **Gate status enforced by CD (Phase 11+, D-2026-09-27-7 b)** — a `--full` PASS on a clean
   tree publishes the GitHub commit status **`secrag/gate-full` = success for exactly that
   SHA** (`scripts/cd/gate_status.sh`, via `gh`). CD's `gate-status` job and the `deploy` job

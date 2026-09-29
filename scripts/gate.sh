@@ -613,52 +613,16 @@ make_seed() {
 
 # --- secrag/gate-full commit status (D-2026-09-27-7 b) ---------------------------------
 
-# publish_gate_status <seconds>: after a --full PASS, post `secrag/gate-full` = success for
-# exactly the checked SHA; CD refuses to deploy a SHA without it. Only a clean tree counts
-# (uncommitted or untracked changes mean the PASS does not describe the commit). Under the
-# pre-push hook the commit is not on GitHub yet (the gate runs before the push lands), so a
-# background publisher — a copy of scripts/cd/gate_status.sh outside the temporary
-# worktree — posts it once the push arrives. Never changes the gate result.
+# publish_gate_status <mode> <fail> <seconds>: every gate run ends here; only a --full PASS
+# on a clean, unmoved tree posts `secrag/gate-full` = success for exactly the checked SHA
+# (CD refuses a SHA without it). The decision and the detached publisher for the pre-push
+# case live in scripts/cd/gate_publish.sh (tested, DA-C-4). Never changes the gate result.
 publish_gate_status() {
-  local total="$1" sha="$GATE_START_SHA" dirty desc repo rc dir
-  if [ "$(git rev-parse HEAD 2>/dev/null)" != "$sha" ]; then
-    echo "gate status: NOT published — HEAD moved during the run (started at $sha), so this PASS describes no single commit"
-    return 0
-  fi
-  if [ "$GATE_START_DIRTY" != 0 ]; then
-    echo "gate status: NOT published — the tree had uncommitted or untracked changes when the gate started"
-    return 0
-  fi
-  if [ "${SECRAG_GATE_PUBLISH:-1}" != 1 ]; then
-    echo "gate status: not published (SECRAG_GATE_PUBLISH=${SECRAG_GATE_PUBLISH})"
-    return 0
-  fi
-  dirty="$(git status --porcelain 2>/dev/null)"
-  if [ -n "$dirty" ]; then
-    echo "gate status: NOT published — the tree has uncommitted or untracked changes, so this PASS does not describe $sha"
-    return 0
-  fi
-  command -v gh >/dev/null || { echo "gate status: NOT published — gh not found (CD will refuse $sha)"; return 0; }
-  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)"
-  [ -n "$repo" ] || { echo "gate status: NOT published — gh cannot resolve the GitHub repository (CD will refuse $sha)"; return 0; }
-  desc="scripts/gate.sh --full PASS in ${total}s"
-  GH_REPO="$repo" bash "$REPO_ROOT/scripts/cd/gate_status.sh" publish "$sha" --description "$desc"
-  rc=$?
-  [ "$rc" -eq 0 ] && return 0
-  if [ "$rc" -ne 3 ]; then
-    echo "gate status: NOT published (gh error) — publish by hand: GH_REPO=$repo bash scripts/cd/gate_status.sh publish $sha"
-    return 0
-  fi
-  dir="$GIT_COMMON/secrag-gate"
-  mkdir -p "$dir" || return 0
-  cp -f "$REPO_ROOT/scripts/cd/gate_status.sh" "$dir/gate_status.sh" || return 0
-  (
-    cd "$MAIN_ROOT" || exit 0
-    # Detached (own session, no inherited stdio) so git does not wait for it.
-    GH_REPO="$repo" setsid nohup bash "$dir/gate_status.sh" publish "$sha" --wait 900 \
-      --description "$desc" </dev/null >>"$dir/publish-status.log" 2>&1 &
-  )
-  echo "gate status: $sha is not on GitHub yet — a background publisher posts secrag/gate-full once the push lands (up to 15 min; log: $dir/publish-status.log)"
+  local mode="$1" fail="$2" total="$3" result=FAIL
+  [ "$fail" -eq 0 ] && result=PASS
+  bash "$REPO_ROOT/scripts/cd/gate_publish.sh" --mode "$mode" --result "$result" \
+    --start-sha "$GATE_START_SHA" --start-dirty "$GATE_START_DIRTY" --total "$total" \
+    --state-dir "$GIT_COMMON/secrag-gate" || true
 }
 
 # --- runner -----------------------------------------------------------------------------
@@ -809,9 +773,7 @@ main() {
     echo "GATE: FAIL — see failures above (docs/DEFINITION_OF_DONE.md)"
   fi
   echo "============================================"
-  if [ "$mode" = full ] && [ "$fail" -eq 0 ]; then
-    publish_gate_status "$total"
-  fi
+  publish_gate_status "$mode" "$fail" "$total"
   return "$fail"
 }
 
