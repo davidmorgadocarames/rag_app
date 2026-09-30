@@ -6,10 +6,13 @@ stored ``user_keys.wrapped_key`` of the accounts, and prints only OK/KO lines:
 
     key_recovery.sh init                 create ~/.secrag-recovery/candidates (dir 0700, file
                                          0600, empty) and print how to fill it
-    key_recovery.sh check --accounts all|1,2 [--current-key-from-app APP |
-                                              --current-key-from-env-file PATH]
-    key_recovery.sh rewrap --account N --candidate J (--current-key-from-app APP |
-                           --current-key-from-env-file PATH) [--apply --i-have-a-pg-dump]
+    key_recovery.sh check --accounts all|1,2 [--expect-total N]
+                          [--current-key-from-app APP | --current-key-from-env-file PATH]
+    key_recovery.sh rewrap --account I --candidate J [--expect-total N]
+                           (--current-key-from-app APP | --current-key-from-env-file PATH)
+                           [--apply --i-have-a-pg-dump]
+    key_recovery.sh erase --account I --expect-total N --current-key-from-env-file PATH
+                          [--apply --i-have-a-snapshot]          (LOCAL development DB only)
     key_recovery.sh shred                overwrite (random, then zeros) and delete the
                                          candidate file and its directory
 
@@ -17,27 +20,52 @@ Database: libpq environment only (``PGHOST``/``PGPORT``/``PGUSER``/``PGDATABASE`
 password from ``PGPASSFILE``/``PGPASSWORD``). On Azure the tool runs INSIDE
 ``scripts/azure/db-tunnel.sh`` (read-only by default; ``--read-write`` only for
 ``rewrap --apply``), so wrapped keys travel only from the server into this process' memory.
-Locally it points at a throwaway database restored from a snapshot.
+Locally it points at a throwaway database restored from a snapshot, or at the development DB.
 
-Accounts are labelled ``account #i`` = position by ``users.created_at, users.id`` — never an
-id, email or hash. The candidate keys, the current master key, the wrapped keys and the
-unwrapped data keys are NEVER printed, logged, written to a file, put on argv or in the
+Accounts are labelled ``account #i`` = position by ``users.created_at, users.id`` among the
+accounts that have a key, and every command prints the total ``N`` first (``accounts: N in
+total``). A new account is appended at the end (its ``created_at`` is the latest); an erased
+account shifts the labels after it — so ``--expect-total N`` (optional for check/rewrap,
+mandatory for erase) refuses when the total differs from what ``check`` printed. Never an id,
+email or hash is printed. The candidate keys, the current master key, the wrapped keys and
+the unwrapped data keys are NEVER printed, logged, written to a file, put on argv or in the
 environment: every error prints only an exception CLASS name; a malformed candidate prints
-"candidate #j: not a valid Fernet key". ``check`` runs in a READ ONLY transaction.
+"candidate #j: not a valid Fernet key", a line that is not UTF-8 "candidate #j: unreadable".
+``check`` runs in a READ ONLY transaction.
 
 ``rewrap`` (PHASE_TASKS row 40, after the row-40 ``pg_dump``): in ONE transaction, locks
-account N's key row, refuses unless the current key cannot unwrap it and candidate J can,
+account I's key row, refuses unless the current key cannot unwrap it and candidate J can,
 unwraps with J, wraps the same data key under the CURRENT master key, verifies, and — only
 with ``--apply --i-have-a-pg-dump`` — updates exactly that one row. Without ``--apply`` it
 prints "dry run: would update 1 row" and rolls back. The master key is never switched back.
 
+``erase`` (D-2026-09-30-2, local only — on Azure the owner deletes the account in the app):
+for an account that NO key can unwrap. In ONE transaction it checks the total against
+``--expect-total``, locks the account, and refuses unless the current key AND every
+candidate fail on that very blob (it also refuses while any candidate line is unreadable or
+malformed); then it erases the account through the app's own erasure path
+(``rag_app.erasure.erase_user``: user row deleted with its key, conversations and messages by
+cascade, tombstone ``done`` written, one commit). Without ``--apply`` it is a read-only dry
+run. It refuses a non-local ``PGHOST``/``PGHOSTADDR``, ``PGSERVICE``, a run inside the tunnel,
+and a schema older than migration 0005 (the app's tombstone columns).
+
+If an error happens after COMMIT was sent (``--apply``), the tool cannot know whether the
+change was committed: it prints "state unknown — run check again" instead of "nothing
+changed".
+
 Candidate file format: one key per line (url-safe base64 of 32 bytes); blank lines and
 lines starting with ``#`` are ignored; a line like ``DATA_MASTER_KEY=<key>`` or
-``data-master-key=<key>`` (as pasted from an .env file or a shell history) is accepted.
-The file must be a regular file, mode 0600, in a directory of mode 0700, both owned by you,
-no symlink anywhere on the path, NOT inside any git work tree and NOT on a Windows drive
-(/mnt, 9p/drvfs). Fill it without the shell history: ``nano ~/.secrag-recovery/candidates``
-or ``cat > ~/.secrag-recovery/candidates``, paste, then Ctrl-D.
+``data-master-key=<key>`` (as pasted from an .env file or a shell history) is accepted. Each
+line is decoded on its own as UTF-8 (a leading BOM and CR line ends are removed, so a file
+saved by a Windows editor works). The file must be a regular file, mode 0600, in a directory
+of mode 0700, both owned by you, no symlink anywhere on the path, NOT inside any git work
+tree and NOT on a Windows drive (/mnt, 9p/drvfs). Fill it without the shell history:
+``nano ~/.secrag-recovery/candidates`` or ``cat > ~/.secrag-recovery/candidates``, paste,
+then Ctrl-D. ``--candidates PATH`` (before the subcommand) uses another file.
+
+The process makes itself non-dumpable (``prctl(PR_SET_DUMPABLE, 0)``: no core dump even with
+a pipe ``core_pattern``, no same-user ptrace or ``/proc/<pid>/mem``) and sets
+``RLIMIT_CORE`` to 0 before it reads any key.
 """
 
 from __future__ import annotations
@@ -51,6 +79,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.dont_write_bytecode = True
 
@@ -58,6 +87,13 @@ DEFAULT_DIR = Path.home() / ".secrag-recovery"
 DEFAULT_FILE = DEFAULT_DIR / "candidates"
 WINDOWS_FS = {"9p", "v9fs", "drvfs"}
 PREFIXES = ("DATA_MASTER_KEY=", "data-master-key=", "export DATA_MASTER_KEY=")
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+TUNNEL_APPNAME = "secrag-db-tunnel"  # scripts/azure/db-tunnel.sh sets PGAPPNAME to this
+
+PR_GET_DUMPABLE = 3
+PR_SET_DUMPABLE = 4
+
+TOTAL_SQL = "SELECT count(*) FROM user_keys uk JOIN users u ON u.id = uk.user_id"
 
 ACCOUNTS_SQL = """
 SELECT n, user_id, wrapped_key FROM (
@@ -68,6 +104,9 @@ WHERE %(all)s OR n = ANY(%(wanted)s::bigint[])
 ORDER BY n
 """
 
+# True once COMMIT of a write may have been sent: from then on an error means "state unknown".
+_STATE = {"write_sent": False}
+
 
 class Refusal(Exception):
     """A safety rule refused the run; the message never contains key material."""
@@ -76,6 +115,26 @@ class Refusal(Exception):
 def out(line: str) -> None:
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+
+
+# --- process hardening ----------------------------------------------------------------------
+
+
+def _harden() -> None:
+    """No core dump, no ptrace, no /proc/<pid>/mem for this process (DA-E-2)."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        if (
+            libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+            or libc.prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0
+        ):
+            raise Refusal("cannot make the process non-dumpable (prctl PR_SET_DUMPABLE)")
 
 
 # --- candidate file -----------------------------------------------------------------------
@@ -166,22 +225,30 @@ def _parse_line(line: str) -> str:
 
 
 def load_candidates(path: Path) -> list[object | None]:
-    """The candidates as Fernet objects (None = malformed, reported by index only)."""
+    """The candidates as Fernet objects (None = unreadable or malformed, reported by index
+    only). Each line is decoded on its own (DA-E-3): one bad line never hides the others."""
     _check_file(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "r", encoding="utf-8", errors="strict") as handle:
-        lines = handle.read().splitlines()
+    with os.fdopen(fd, "rb") as handle:
+        raw_lines = handle.read().split(b"\n")
     candidates: list[object | None] = []
-    for line in lines:
+    problems: list[tuple[int, str]] = []
+    for raw in raw_lines:
+        try:
+            line = raw.decode("utf-8-sig").replace("\r", "")
+        except UnicodeDecodeError:
+            candidates.append(None)
+            problems.append((len(candidates), "unreadable (not UTF-8)"))
+            continue
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         try:
             candidates.append(_fernet(_parse_line(line)))
         except (ValueError, binascii.Error, UnicodeError):
             candidates.append(None)
-    for j, candidate in enumerate(candidates, start=1):
-        if candidate is None:
-            out(f"candidate #{j}: not a valid Fernet key (skipped)")
+            problems.append((len(candidates), "not a valid Fernet key"))
+    for j, why in problems:
+        out(f"candidate #{j}: {why} (skipped)")
     if not candidates:
         raise Refusal("the candidate file has no candidates")
     return candidates
@@ -245,7 +312,7 @@ def shred(path: Path) -> None:
 
 
 def current_key(args: argparse.Namespace):  # type: ignore[no-untyped-def]
-    if args.current_key_from_app:
+    if getattr(args, "current_key_from_app", None):
         rg = args.rg or os.environ.get("DB_TUNNEL_RG") or "rg-secrag"
         proc = subprocess.run(
             [
@@ -278,7 +345,7 @@ def current_key(args: argparse.Namespace):  # type: ignore[no-untyped-def]
         if mode & 0o077:
             raise Refusal(f"the env file has mode {mode:o}; chmod 600 it first")
         value = ""
-        for line in env_path.read_text(encoding="utf-8").splitlines():
+        for line in env_path.read_text(encoding="utf-8-sig").splitlines():
             if line.strip().startswith("DATA_MASTER_KEY="):
                 value = _parse_line(line)
         if not value:
@@ -294,7 +361,7 @@ def current_key(args: argparse.Namespace):  # type: ignore[no-untyped-def]
 # --- database (libpq environment; the tunnel sets it on Azure) -------------------------------
 
 
-def _connect():  # type: ignore[no-untyped-def]
+def _connect() -> Any:
     import psycopg
 
     return psycopg.connect("", connect_timeout=20, application_name="secrag-key-recovery")
@@ -303,6 +370,21 @@ def _connect():  # type: ignore[no-untyped-def]
 def _accounts(conn, wanted: list[int] | None):  # type: ignore[no-untyped-def]
     rows = conn.execute(ACCOUNTS_SQL, {"all": wanted is None, "wanted": wanted or []}).fetchall()
     return [(int(n), user_id, bytes(blob)) for n, user_id, blob in rows]
+
+
+def _total(conn) -> int:  # type: ignore[no-untyped-def]
+    return int(conn.execute(TOTAL_SQL).fetchone()[0])
+
+
+def _expect_total(total: int, expected: int | None) -> None:
+    """Labels are positions: refuse when accounts were added or erased since `check`."""
+    out(f"accounts: {total} in total (#1…#{total} by creation time, then id)")
+    if expected is not None and total != expected:
+        raise Refusal(
+            f"the database has {total} account(s) with a key, --expect-total says {expected}"
+            " — accounts were added or erased since the check, so the labels may have"
+            " shifted; run check again"
+        )
 
 
 def _unwraps(fernet, blob: bytes) -> bool:  # type: ignore[no-untyped-def]
@@ -319,8 +401,10 @@ def check(args: argparse.Namespace) -> int:
     wanted = None if args.accounts == "all" else _parse_accounts(args.accounts)
     with _connect() as conn:
         conn.execute("SET TRANSACTION READ ONLY")
+        total = _total(conn)
         accounts = _accounts(conn, wanted)
         conn.rollback()
+    _expect_total(total, args.expect_total)
     readable = matched = unmatched = 0
     for n, _user_id, blob in accounts:
         if current is not None and _unwraps(current, blob):
@@ -339,7 +423,7 @@ def check(args: argparse.Namespace) -> int:
         matched += hit
         unmatched += not hit
     out(
-        f"summary: {len(accounts)} account(s) checked; "
+        f"summary: {len(accounts)} account(s) checked of {total}; "
         + (f"{readable} readable with the current key; " if current is not None else "")
         + f"{matched} matched a candidate; {unmatched} without a match"
     )
@@ -358,6 +442,7 @@ def rewrap(args: argparse.Namespace) -> int:
         raise Refusal("rewrap needs the current master key (--current-key-from-…)")
     with _connect() as conn:
         with conn.transaction(force_rollback=not args.apply):
+            _expect_total(_total(conn), args.expect_total)
             rows = conn.execute(
                 ACCOUNTS_SQL,
                 {"all": False, "wanted": [args.account]},
@@ -376,11 +461,12 @@ def rewrap(args: argparse.Namespace) -> int:
             blob = bytes(locked[0])
             if _unwraps(current, blob):
                 out(
-                    f"account #{args.account}: already readable with the current key — nothing to do"
+                    f"account #{args.account}: already readable with the current key"
+                    " — nothing to do"
                 )
                 return 0
             try:
-                data_key = bytearray(old.decrypt(blob))  # type: ignore[attr-defined]
+                data_key = bytearray(old.decrypt(blob))
             except Exception:  # noqa: BLE001
                 out(f"account #{args.account}: candidate #{args.candidate} KO — nothing changed")
                 return 1
@@ -397,10 +483,144 @@ def rewrap(args: argparse.Namespace) -> int:
                 ).rowcount
                 if updated != 1:
                     raise Refusal(f"expected to update 1 row, would update {updated} — rolled back")
+                # Leaving the transaction block sends COMMIT: from here an error cannot tell
+                # whether the row was changed (DA-E-4).
+                _STATE["write_sent"] = True
             finally:
                 for i in range(len(data_key)):
                     data_key[i] = 0
     out(f"account #{args.account}: re-wrapped under the current master key (1 row updated)")
+    return 0
+
+
+# --- erase (local development DB only; D-2026-09-30-2) ----------------------------------------
+
+
+def _local_only() -> None:
+    """erase never runs against Azure: the owner deletes that account in the app instead."""
+    if os.environ.get("PGAPPNAME") == TUNNEL_APPNAME:
+        raise Refusal("erase is local-only; it does not run inside db-tunnel.sh (D-2026-09-30-2)")
+    if os.environ.get("PGSERVICE") or os.environ.get("PGSERVICEFILE"):
+        raise Refusal("erase is local-only; unset PGSERVICE/PGSERVICEFILE and use PGHOST")
+    for var in ("PGHOST", "PGHOSTADDR"):
+        for host in filter(None, os.environ.get(var, "").split(",")):
+            if host not in LOCAL_HOSTS and not host.startswith("/"):
+                raise Refusal(
+                    f"erase is local-only; {var} must be 127.0.0.1, localhost, ::1 or a socket"
+                    " directory (on Azure the owner deletes the account in the app)"
+                )
+
+
+def _app_erasure() -> tuple[Any, Any]:
+    """The app's own erasure path and tombstone model, from this checkout's backend."""
+    src = Path(os.path.abspath(__file__)).parents[2] / "backend" / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from rag_app.db.models import DeletionRequest
+    from rag_app.erasure import erase_user
+
+    return erase_user, DeletionRequest
+
+
+def erase(args: argparse.Namespace) -> int:
+    if args.apply and not args.i_have_a_snapshot:
+        raise Refusal("--apply needs --i-have-a-snapshot (pg_dump or volume snapshot first)")
+    _local_only()
+    candidates = load_candidates(args.candidates)
+    bad = [j for j, c in enumerate(candidates, start=1) if c is None]
+    if bad:
+        raise Refusal(
+            "candidate(s) " + ", ".join(f"#{j}" for j in bad) + " could not be read — erase"
+            " needs every candidate tried; fix or remove those lines first"
+        )
+    current = current_key(args)
+    erase_user, deletion_request = _app_erasure()
+
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import NullPool
+
+    engine = create_engine("postgresql+psycopg://", creator=_connect, poolclass=NullPool)
+    try:
+        with Session(engine) as session:
+            conn = session.connection()
+            if not args.apply:
+                conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+            columns = {
+                row[0]
+                for row in conn.exec_driver_sql(
+                    "SELECT column_name FROM information_schema.columns"
+                    " WHERE table_schema = current_schema() AND table_name = 'deletion_requests'"
+                )
+            }
+            if not set(deletion_request.__table__.columns.keys()) <= columns:
+                raise Refusal(
+                    "the schema is older than the app's erasure path (migration 0005) — run"
+                    " db-roles and migrate first"
+                )
+            total = int(conn.exec_driver_sql(TOTAL_SQL).scalar_one())
+            _expect_total(total, args.expect_total)
+            rows = conn.exec_driver_sql(
+                ACCOUNTS_SQL, {"all": False, "wanted": [args.account]}
+            ).fetchall()
+            if len(rows) != 1:
+                raise Refusal(f"account #{args.account} does not exist")
+            _n, user_id, blob = rows[0]
+            lock = " FOR UPDATE" if args.apply else ""
+            locked = conn.exec_driver_sql(
+                "SELECT uk.wrapped_key FROM user_keys uk JOIN users u ON u.id = uk.user_id"
+                " WHERE uk.user_id = %(id)s" + lock,
+                {"id": user_id},
+            ).fetchone()
+            if locked is None or bytes(locked[0]) != bytes(blob):
+                raise Refusal(f"account #{args.account} changed while reading — run it again")
+            blob = bytes(locked[0])
+            if _unwraps(current, blob):
+                raise Refusal(
+                    f"account #{args.account} is readable with the current key — erase never"
+                    " touches a readable account"
+                )
+            for j, candidate in enumerate(candidates, start=1):
+                if _unwraps(candidate, blob):
+                    raise Refusal(
+                        f"candidate #{j} unwraps account #{args.account} — recover it with"
+                        " rewrap instead of erasing it"
+                    )
+            out(
+                f"account #{args.account}: current key KO, every candidate"
+                f" ({len(candidates)}) KO"
+            )
+            if not args.apply:
+                session.rollback()
+                out(
+                    f"dry run: would erase account #{args.account} through the app's erasure"
+                    " path (user row, key, conversations, messages; tombstone); nothing changed"
+                )
+                return 0
+
+            def _commit_sent(_session: Session) -> None:
+                _STATE["write_sent"] = True
+
+            event.listen(session, "before_commit", _commit_sent)
+            erase_user(session, user_id)  # deletes + writes the tombstone + commits
+        with Session(engine) as session:
+            conn = session.connection()
+            still = conn.exec_driver_sql(
+                "SELECT count(*) FROM users WHERE id = %(id)s", {"id": user_id}
+            ).scalar_one()
+            tombstones = conn.exec_driver_sql(
+                "SELECT count(*) FROM deletion_requests WHERE user_id = %(id)s", {"id": user_id}
+            ).scalar_one()
+            remaining = int(conn.exec_driver_sql(TOTAL_SQL).scalar_one())
+            session.rollback()
+        if still or tombstones != 1:
+            raise RuntimeError("erase not visible after commit")
+    finally:
+        engine.dispose()
+    out(
+        f"account #{args.account}: erased through the app's erasure path (tombstone written);"
+        f" {remaining} account(s) remain — labels after #{args.account} moved down by one"
+    )
     return 0
 
 
@@ -416,7 +636,12 @@ def _parse_accounts(raw: str) -> list[int]:
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="key_recovery.sh", add_help=True)
-    p.add_argument("--candidates", type=Path, default=DEFAULT_FILE, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--candidates",
+        type=Path,
+        default=DEFAULT_FILE,
+        help="candidate file (default: %(default)s)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
     sub.add_parser("shred")
@@ -426,6 +651,9 @@ def _parser() -> argparse.ArgumentParser:
         src.add_argument("--current-key-from-app", metavar="APP")
         src.add_argument("--current-key-from-env-file", metavar="PATH")
         s.add_argument("--rg", help="resource group for --current-key-from-app")
+        s.add_argument(
+            "--expect-total", type=int, metavar="N", help="refuse unless N accounts exist"
+        )
         if name == "check":
             s.add_argument("--accounts", required=True, help="'all' or e.g. 1,3")
         else:
@@ -433,37 +661,53 @@ def _parser() -> argparse.ArgumentParser:
             s.add_argument("--candidate", type=int, required=True)
             s.add_argument("--apply", action="store_true")
             s.add_argument("--i-have-a-pg-dump", action="store_true")
+    e = sub.add_parser("erase", help="local development DB only (D-2026-09-30-2)")
+    e.add_argument("--account", type=int, required=True)
+    e.add_argument("--expect-total", type=int, required=True, metavar="N")
+    e.add_argument("--current-key-from-env-file", metavar="PATH", required=True)
+    e.add_argument("--apply", action="store_true")
+    e.add_argument("--i-have-a-snapshot", action="store_true")
     return p
 
 
+def run(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    args.candidates = Path(os.path.abspath(os.path.expanduser(str(args.candidates))))
+    if args.cmd == "init":
+        init(args.candidates)
+        return 0
+    if args.cmd == "shred":
+        shred(args.candidates)
+        return 0
+    if args.cmd == "check":
+        return check(args)
+    if args.cmd == "erase":
+        return erase(args)
+    return rewrap(args)
+
+
 def main(argv: list[str] | None = None) -> int:
+    _STATE["write_sent"] = False
     try:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # no core dump with key material
-    except (ValueError, OSError):
-        pass
-    try:
-        args = _parser().parse_args(argv)
-        args.candidates = Path(os.path.abspath(os.path.expanduser(str(args.candidates))))
-        if args.cmd == "init":
-            init(args.candidates)
-            return 0
-        if args.cmd == "shred":
-            shred(args.candidates)
-            return 0
-        if args.cmd == "check":
-            return check(args)
-        return rewrap(args)
+        _harden()  # before any key is read
+        return run(argv)
     except SystemExit as exc:  # argparse (usage errors carry no key material)
         return int(exc.code or 0)
     except Refusal as exc:
         sys.stderr.write(f"key_recovery: REFUSED — {exc}\n")
         return 2
-    except KeyboardInterrupt:
-        sys.stderr.write("key_recovery: interrupted — nothing changed\n")
-        return 130
     except BaseException as exc:  # noqa: BLE001 - never a traceback or a message
-        sys.stderr.write(f"key_recovery: error ({type(exc).__name__}) — nothing changed\n")
-        return 1
+        what = (
+            "interrupted" if isinstance(exc, KeyboardInterrupt) else f"error ({type(exc).__name__})"
+        )
+        if _STATE["write_sent"]:
+            sys.stderr.write(
+                f"key_recovery: {what} after COMMIT was sent — state unknown: the change may"
+                " or may not be committed; run check again\n"
+            )
+        else:
+            sys.stderr.write(f"key_recovery: {what} — nothing changed\n")
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
 
 
 if __name__ == "__main__":

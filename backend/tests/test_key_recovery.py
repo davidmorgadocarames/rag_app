@@ -1,20 +1,29 @@
-"""scripts/azure/key_recovery.{sh,py} (D-2026-09-29-2) with FAKE keys only.
+"""scripts/azure/key_recovery.{sh,py} (D-2026-09-29-2, D-2026-09-30-2) with FAKE keys only.
 
 Hard requirements proven here: the candidate keys (and the current key, the wrapped keys and
-the data keys) never appear in stdout, stderr or any file written during a run under $HOME,
-/tmp or the repository — also with a malformed candidate and when the database or the
-tunnel fails; the candidate file must be a private regular file (0600 in a 0700 directory,
-owned by the user, no symlink, not in a git work tree, not on a Windows drive); `shred`
-overwrites before deleting; `rewrap` changes exactly one row, only with --apply and
---i-have-a-pg-dump, and never in a read-only session.
+the data keys) never appear — as text, as raw bytes, or base64/url-safe base64/hex encoded —
+in stdout, stderr or any file written during a run under the test's $HOME, /tmp, /var/tmp,
+/dev/shm or the repository — also with a malformed or non-UTF-8 candidate and when the
+database or the tunnel fails; the process is non-dumpable; the candidate file must be a
+private regular file (0600 in a 0700 directory, owned by the user, no symlink, not in a git
+work tree, not on a Windows drive); `shred` overwrites before deleting; `rewrap` changes
+exactly one row, only with --apply and --i-have-a-pg-dump, and never in a read-only session;
+`erase` is local-only, needs the expected total and a snapshot, refuses an account any key
+can unwrap and uses the app's erasure path; an error after COMMIT reports "state unknown".
+
+Every run uses `--candidates` in a temporary directory (never the default location).
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import ctypes
 import datetime as dt
 import importlib.util
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -31,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOL_SH = REPO_ROOT / "scripts" / "azure" / "key_recovery.sh"
 TOOL_PY = REPO_ROOT / "scripts" / "azure" / "key_recovery.py"
 TUNNEL = REPO_ROOT / "scripts" / "azure" / "db-tunnel.sh"
+CAND_DIR = "kr-test"  # the candidate directory inside the test's $HOME
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 # The interpreter running the tests has the tool's dependencies (the pre-push worktree and CI
@@ -51,6 +61,22 @@ def _module():
         sys.dont_write_bytecode = previous
 
 
+def _encodings(value: str) -> set[bytes]:
+    """A key's text, its fragments, its raw bytes and their base64 / url-safe / hex forms."""
+    forms = {value.encode(), value[:16].encode(), value[-20:].encode()}
+    try:
+        raw = base64.urlsafe_b64decode(value.encode())
+    except (binascii.Error, ValueError):
+        return forms
+    if len(raw) < 16:
+        return forms
+    std = base64.b64encode(raw)
+    hexed = raw.hex().encode()
+    forms |= {raw, raw[:16], raw[-16:], std, std[:16], std[-20:]}
+    forms |= {base64.urlsafe_b64encode(raw)[:16], hexed, hexed.upper(), hexed[:32], hexed[-32:]}
+    return forms
+
+
 class Secrets:
     """Every key of a test, to scan for afterwards."""
 
@@ -62,12 +88,10 @@ class Secrets:
         self.values.append(value)
         return value
 
-    def fragments(self) -> set[str]:
-        out: set[str] = set()
+    def patterns(self) -> set[bytes]:
+        out: set[bytes] = set()
         for value in self.values:
-            out.add(value)
-            out.add(value[:16])
-            out.add(value[-20:])
+            out |= _encodings(value)
         return out
 
 
@@ -83,9 +107,15 @@ def secrets() -> Secrets:
     return Secrets()
 
 
+def _cand_path(home: Path) -> Path:
+    return home / CAND_DIR / "candidates"
+
+
 def _run(home: Path, *args: str, env: dict[str, str] | None = None, **kw):
     base = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
     base.update({"HOME": str(home), "TMPDIR": str(home.parent), **PYTHON_ENV})
+    if "--candidates" not in args:
+        args = ("--candidates", str(_cand_path(home)), *args)
     return subprocess.run(
         ["bash", str(TOOL_SH), *args],
         env={**base, **(env or {})},
@@ -96,32 +126,48 @@ def _run(home: Path, *args: str, env: dict[str, str] | None = None, **kw):
     )
 
 
-def _candidate_file(home: Path, lines: list[str]) -> Path:
-    directory = home / ".secrag-recovery"
-    directory.mkdir(mode=0o700, exist_ok=True)
-    directory.chmod(0o700)
-    path = directory / "candidates"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def _candidate_file(home: Path, lines: list[str] | bytes) -> Path:
+    path = _cand_path(home)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.parent.chmod(0o700)
+    data = lines if isinstance(lines, bytes) else ("\n".join(lines) + "\n").encode()
+    path.write_bytes(data)
     path.chmod(0o600)
     return path
 
 
+def _scan_roots(home: Path | None) -> list[Path]:
+    roots = [Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"), REPO_ROOT]
+    if home is not None:
+        roots.append(home)
+    return [r for r in roots if r.is_dir()]
+
+
 def _scan_for_leaks(
-    secrets: Secrets, since: float, outputs: list[str], allowed: set[Path]
+    secrets: Secrets,
+    since: float,
+    outputs: list[str],
+    allowed: set[Path],
+    home: Path | None = None,
 ) -> list[str]:
-    """Every fragment of every key in the outputs and in any file (re)written since `since`
-    under $HOME (the test's), /tmp and the repository — except the input files."""
-    found = [f"output #{i}" for i, o in enumerate(outputs) for s in secrets.fragments() if s in o]
-    roots = [Path("/tmp"), REPO_ROOT]
+    """Every encoding of every key in the outputs and in any file (re)written since `since`
+    under the test's $HOME, /tmp, /var/tmp, /dev/shm and the repository — except the inputs."""
+    patterns = secrets.patterns()
+    found = [
+        f"output #{i}"
+        for i, o in enumerate(outputs)
+        if any(p in o.encode("utf-8") for p in patterns)
+    ]
     skip_dirs = {".git", "node_modules", ".next"}
-    fragments = [s.encode() for s in secrets.fragments()]
-    for root in roots:
+    seen: set[Path] = set()
+    for root in _scan_roots(home):
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
             dirnames[:] = [d for d in dirnames if d not in skip_dirs]
             for name in filenames:
                 path = Path(dirpath) / name
-                if path in allowed:
+                if path in allowed or path in seen:
                     continue
+                seen.add(path)
                 try:
                     info = path.lstat()
                     if not path.is_file() or info.st_mtime < since or info.st_size > 20_000_000:
@@ -129,28 +175,125 @@ def _scan_for_leaks(
                     data = path.read_bytes()
                 except OSError:
                     continue
-                found += [f"{path}" for frag in fragments if frag in data]
+                if any(p in data for p in patterns):
+                    found.append(str(path))
     return found
 
 
 def test_the_leak_scan_itself_finds_a_leak(tmp_path: Path, secrets: Secrets) -> None:
-    """The scanner must be able to fail: a key written to a file under /tmp is found."""
+    """The scanner must be able to fail: text, raw bytes, hex and standard base64 of a key
+    are found under /tmp, /var/tmp and /dev/shm, and in the outputs."""
     key = secrets.key()
+    raw = base64.urlsafe_b64decode(key)
     since = time.time() - 1
     leaked = tmp_path / "leak.txt"
     leaked.write_text(f"oops {key[:16]}\n")
-    assert _scan_for_leaks(secrets, since, ["clean"], set()) == [str(leaked)]
+    assert _scan_for_leaks(secrets, since, ["clean"], set(), tmp_path) == [str(leaked)]
     assert set(_scan_for_leaks(secrets, since, [f"x{key}x"], {leaked})) == {"output #0"}
+    assert _scan_for_leaks(secrets, since, [f"hex {raw.hex()}"], {leaked}) == ["output #0"]
+    probes: list[Path] = []
+    try:
+        for root, data in (
+            (Path("/var/tmp"), b"raw " + raw),
+            (Path("/dev/shm"), raw.hex().upper().encode()),
+            (tmp_path, base64.b64encode(raw)),
+        ):
+            if not root.is_dir() or not os.access(root, os.W_OK):
+                continue
+            probe = root / f"kr-scan-probe-{uuid.uuid4().hex}"
+            probe.write_bytes(data)
+            probes.append(probe)
+        found = set(_scan_for_leaks(secrets, since, [], {leaked}, tmp_path))
+        assert found == {str(p) for p in probes} and probes
+    finally:
+        for probe in probes:
+            probe.unlink(missing_ok=True)
+
+
+# --- process hardening (DA-E-2) ---------------------------------------------------------------
+
+
+def test_harden_makes_the_process_non_dumpable() -> None:
+    """In a child interpreter: after _harden(), PR_GET_DUMPABLE is 0 and RLIMIT_CORE 0."""
+    code = (
+        "import ctypes, importlib.util, resource, sys\n"
+        f"spec = importlib.util.spec_from_file_location('kr', {str(TOOL_PY)!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "libc = ctypes.CDLL(None)\n"
+        "before = libc.prctl(3, 0, 0, 0, 0)\n"
+        "m._harden()\n"
+        "print(before, libc.prctl(3, 0, 0, 0, 0), resource.getrlimit(resource.RLIMIT_CORE))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["1", "0", "(0,", "0)"]
+    assert "PR_SET_DUMPABLE" in TOOL_PY.read_text(encoding="utf-8")
+    assert ctypes.CDLL(None).prctl(3, 0, 0, 0, 0) == 1  # this test process is untouched
+
+
+def test_the_running_tool_is_non_dumpable(home: Path) -> None:
+    """Black box: while the tool waits for a silent database, its /proc entry belongs to root
+    (the kernel's sign of a non-dumpable process) and its core limit is 0."""
+    _candidate_file(home, [Fernet.generate_key().decode()])
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(1)  # the handshake completes in the backlog; nothing ever answers
+    port = silent.getsockname()[1]
+    base = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env = {
+        **base,
+        "HOME": str(home),
+        **PYTHON_ENV,
+        "PGHOST": "127.0.0.1",
+        "PGPORT": str(port),
+        "PGUSER": "x",
+        "PGDATABASE": "x",
+        "PGPASSWORD": "x",
+    }
+    proc = subprocess.Popen(
+        ["bash", str(TOOL_SH), "--candidates", str(_cand_path(home)), "check", "--accounts", "all"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        owner, limits = None, ""
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                cmdline = Path(f"/proc/{proc.pid}/cmdline").read_bytes()
+                if b"key_recovery.py" in cmdline:
+                    limits = Path(f"/proc/{proc.pid}/limits").read_text()
+                    owner = os.stat(f"/proc/{proc.pid}/status").st_uid
+                    if owner == 0:
+                        break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        assert owner == 0, "the tool's /proc entry is not root-owned: still dumpable"
+        core = next(line for line in limits.splitlines() if line.startswith("Max core file size"))
+        assert core.split()[4:6] == ["0", "0"]
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+        silent.close()
 
 
 # --- candidate file rules -------------------------------------------------------------------
 
 
+def test_the_default_candidate_location_is_private_to_home() -> None:
+    module = _module()
+    assert module.DEFAULT_FILE == Path.home() / ".secrag-recovery" / "candidates"
+
+
 def test_init_creates_a_private_empty_file_and_never_truncates(home: Path) -> None:
     proc = _run(home, "init")
     assert proc.returncode == 0, proc.stderr
-    directory, path = home / ".secrag-recovery", home / ".secrag-recovery" / "candidates"
-    assert oct(directory.stat().st_mode & 0o777) == "0o700"
+    path = _cand_path(home)
+    assert oct(path.parent.stat().st_mode & 0o777) == "0o700"
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert path.read_text() == ""
     assert "nano" in proc.stdout and "Ctrl-D" in proc.stdout and "cat >" in proc.stdout
@@ -180,11 +323,11 @@ def test_a_symlinked_file_or_directory_is_refused(home: Path, tmp_path: Path) ->
     real.mkdir(mode=0o700)
     (real / "candidates").write_text("x\n")
     (real / "candidates").chmod(0o600)
-    (home / ".secrag-recovery").symlink_to(real)
+    (home / CAND_DIR).symlink_to(real)
     proc = _run(home, "check", "--accounts", "all")
     assert proc.returncode == 2 and "symlink" in proc.stderr
-    (home / ".secrag-recovery").unlink()
-    directory = home / ".secrag-recovery"
+    (home / CAND_DIR).unlink()
+    directory = home / CAND_DIR
     directory.mkdir(mode=0o700)
     (directory / "candidates").symlink_to(real / "candidates")
     proc = _run(home, "check", "--accounts", "all")
@@ -205,7 +348,7 @@ def test_windows_drives_are_refused(home: Path, monkeypatch: pytest.MonkeyPatch)
     proc = _run(home, "--candidates", "/mnt/c/secrag-never-created/candidates", "init")
     assert proc.returncode == 2 and "Windows drive" in proc.stderr
     module = _module()
-    path = home / ".secrag-recovery" / "candidates"
+    path = _cand_path(home)
     monkeypatch.setattr(module, "_mounts", lambda: [("/", "ext4"), (str(home), "9p")])
     with pytest.raises(module.Refusal, match="Windows drive"):
         module._check_location(path)
@@ -225,6 +368,40 @@ def test_gitleaks_allowlist_is_not_widened_for_recovery() -> None:
     assert "recovery" not in config and "candidates" not in config
 
 
+# --- candidate parsing (DA-E-3) ---------------------------------------------------------------
+
+
+def test_a_bom_and_crlf_file_from_a_windows_editor_still_matches(home: Path) -> None:
+    module = _module()
+    first, second = Fernet.generate_key(), Fernet.generate_key()
+    token = Fernet(first).encrypt(b"data key")
+    path = _candidate_file(
+        home, b"\xef\xbb\xbf" + first + b"\r\n# note\r\nDATA_MASTER_KEY=" + second + b"\r\n"
+    )
+    candidates = module.load_candidates(path)
+    assert len(candidates) == 2 and None not in candidates
+    assert candidates[0].decrypt(token) == b"data key"
+    assert candidates[1].decrypt(Fernet(second).encrypt(b"x")) == b"x"
+
+
+def test_a_non_utf8_line_is_unreadable_and_the_others_still_run(
+    home: Path, secrets: Secrets
+) -> None:
+    good1, good2 = secrets.key(), secrets.key()
+    bad = b"\xff\xfe" + secrets.key().encode()[:20] + b"\x80"
+    path = _candidate_file(home, good1.encode() + b"\n" + bad + b"\n" + good2.encode() + b"\n")
+    since = time.time() - 1
+    proc = _run(home, "check", "--accounts", "all", env={"PGHOST": "127.0.0.1", "PGPORT": "1"})
+    assert "candidate #2: unreadable (not UTF-8) (skipped)" in proc.stdout
+    assert "candidate #1" not in proc.stdout and "candidate #3" not in proc.stdout
+    assert proc.returncode == 1 and "error (OperationalError) — nothing changed" in proc.stderr
+    assert "UnicodeDecodeError" not in proc.stderr
+    module = _module()
+    loaded = module.load_candidates(path)
+    assert [c is None for c in loaded] == [False, True, False]
+    assert _scan_for_leaks(secrets, since, [proc.stdout, proc.stderr], {path}, home) == []
+
+
 # --- no leak: malformed candidates, database failure, tunnel failure ---------------------------
 
 
@@ -240,7 +417,7 @@ def test_malformed_candidates_are_reported_by_index_only(home: Path, secrets: Se
     assert "candidate #2: not a valid Fernet key (skipped)" in proc.stdout
     assert proc.returncode == 1 and "error (OperationalError)" in proc.stderr
     assert "Traceback" not in proc.stderr
-    assert _scan_for_leaks(secrets, since, [proc.stdout, proc.stderr], {path}) == []
+    assert _scan_for_leaks(secrets, since, [proc.stdout, proc.stderr], {path}, home) == []
 
 
 def test_a_tunnel_failure_leaks_nothing(home: Path, tmp_path: Path, secrets: Secrets) -> None:
@@ -271,7 +448,7 @@ def test_a_tunnel_failure_leaks_nothing(home: Path, tmp_path: Path, secrets: Sec
         "FAKE_DB_URL": "postgresql://secragadmin:pw@127.0.0.2/rag",
     }
     since = time.time() - 1
-    tool = [str(TOOL_SH), "check", "--accounts", "1"]
+    tool = [str(TOOL_SH), "--candidates", str(path), "check", "--accounts", "1"]
     proc = subprocess.run(
         ["bash", str(TUNNEL), "--password-from-app", "--", *tool],
         env=env,
@@ -282,7 +459,22 @@ def test_a_tunnel_failure_leaks_nothing(home: Path, tmp_path: Path, secrets: Sec
     assert proc.returncode == 1, proc.stderr
     assert "error (OperationalError)" in proc.stderr and "removed" in proc.stderr
     assert '"rules": []' in state.read_text()
-    assert _scan_for_leaks(secrets, since, [proc.stdout, proc.stderr], {path}) == []
+    assert _scan_for_leaks(secrets, since, [proc.stdout, proc.stderr], {path}, home) == []
+    # erase never runs through the tunnel (Azure: the owner deletes the account in the app)
+    env_file = tmp_path / "current.env"
+    env_file.write_text(f"DATA_MASTER_KEY={secrets.key()}\n")
+    env_file.chmod(0o600)
+    erase = [str(TOOL_SH), "--candidates", str(path), "erase", "--account", "1"]
+    erase += ["--expect-total", "1", "--current-key-from-env-file", str(env_file)]
+    refused = subprocess.run(
+        ["bash", str(TUNNEL), "--password-from-app", "--read-write", "--", *erase],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert refused.returncode != 0 and "erase is local-only" in refused.stderr
+    assert '"rules": []' in state.read_text()
     # only this repository's key_recovery.sh may run through the tunnel
     copy = tmp_path / "key_recovery.sh"
     shutil.copy(TOOL_SH, copy)
@@ -294,6 +486,31 @@ def test_a_tunnel_failure_leaks_nothing(home: Path, tmp_path: Path, secrets: Sec
         timeout=60,
     )
     assert refused.returncode == 1 and "only this repository" in refused.stderr
+
+
+def test_erase_refuses_non_local_targets_and_bad_candidates(home: Path, tmp_path: Path) -> None:
+    env_file = tmp_path / "current.env"
+    env_file.write_text(f"DATA_MASTER_KEY={Fernet.generate_key().decode()}\n")
+    env_file.chmod(0o600)
+    _candidate_file(home, [Fernet.generate_key().decode()])
+    cmd = ["erase", "--account", "1", "--expect-total", "3"]
+    cmd += ["--current-key-from-env-file", str(env_file)]
+    for env, expected in (
+        ({"PGHOST": "db.example.test"}, "PGHOST must be 127.0.0.1"),
+        ({"PGHOST": "127.0.0.1,10.0.0.5"}, "PGHOST must be 127.0.0.1"),
+        ({"PGHOSTADDR": "192.0.2.10"}, "PGHOSTADDR must be"),
+        ({"PGSERVICE": "prod"}, "unset PGSERVICE"),
+        ({"PGHOST": "127.0.0.1", "PGAPPNAME": "secrag-db-tunnel"}, "inside db-tunnel.sh"),
+    ):
+        proc = _run(home, *cmd, env=env)
+        assert proc.returncode == 2 and expected in proc.stderr, (env, proc.stderr)
+    no_snapshot = _run(home, *cmd, "--apply", env={"PGHOST": "127.0.0.1"})
+    assert no_snapshot.returncode == 2 and "--i-have-a-snapshot" in no_snapshot.stderr
+    no_total = _run(home, "erase", "--account", "1", "--current-key-from-env-file", str(env_file))
+    assert no_total.returncode == 2 and "--expect-total" in no_total.stderr
+    _candidate_file(home, [Fernet.generate_key().decode(), "garbage"])
+    bad = _run(home, *cmd, env={"PGHOST": "127.0.0.1", "PGPORT": "1"})
+    assert bad.returncode == 2 and "candidate(s) #2 could not be read" in bad.stderr
 
 
 def test_shred_overwrites_then_removes_the_file_and_directory(home: Path, tmp_path: Path) -> None:
@@ -325,7 +542,7 @@ def test_the_tool_leaves_no_bytecode_and_disables_core_dumps() -> None:
     assert not (TOOL_PY.parent / "__pycache__" / "key_recovery.cpython-312.pyc").exists()
 
 
-# --- database: check and rewrap on a throwaway harness database -----------------------------
+# --- database: check, rewrap and erase on a throwaway harness database ------------------------
 
 
 @pytest.fixture()
@@ -356,11 +573,11 @@ def _pg_env(url: URL, **extra: str) -> dict[str, str]:
     }
 
 
-def _seed(url: URL, masters: list[str]) -> list[bytes]:
-    """One account per master key, in this order (created_at ascending); returns the data
-    keys."""
+def _seed(url: URL, masters: list[str]) -> tuple[list[bytes], list[uuid.UUID]]:
+    """One account per master key, in this order (created_at ascending), each with one
+    conversation; returns the data keys and the user ids."""
     engine = create_engine(url, future=True)
-    data_keys = []
+    data_keys, ids = [], []
     base = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
     try:
         with engine.begin() as conn:
@@ -368,6 +585,7 @@ def _seed(url: URL, masters: list[str]) -> list[bytes]:
                 user_id = uuid.uuid4()
                 data_key = Fernet.generate_key()
                 data_keys.append(data_key)
+                ids.append(user_id)
                 conn.execute(
                     text(
                         "INSERT INTO users (id, email, password_hash, created_at)"
@@ -383,26 +601,33 @@ def _seed(url: URL, masters: list[str]) -> list[bytes]:
                     text("INSERT INTO user_keys (user_id, wrapped_key) VALUES (:id, :w)"),
                     {"id": user_id, "w": Fernet(master.encode()).encrypt(data_key)},
                 )
+                conn.execute(
+                    text("INSERT INTO conversations (id, user_id) VALUES (:c, :id)"),
+                    {"c": uuid.uuid4(), "id": user_id},
+                )
     finally:
         engine.dispose()
-    return data_keys
+    return data_keys, ids
 
 
-def _wrapped(url: URL) -> list[bytes]:
+def _query(url: URL, sql: str, **params) -> list:
     engine = create_engine(url, future=True)
     try:
         with engine.connect() as conn:
-            return [
-                bytes(r[0])
-                for r in conn.execute(
-                    text(
-                        "SELECT uk.wrapped_key FROM user_keys uk JOIN users u ON u.id = uk.user_id"
-                        " ORDER BY u.created_at, u.id"
-                    )
-                )
-            ]
+            return [tuple(r) for r in conn.execute(text(sql), params)]
     finally:
         engine.dispose()
+
+
+def _wrapped(url: URL) -> list[bytes]:
+    return [
+        bytes(r[0])
+        for r in _query(
+            url,
+            "SELECT uk.wrapped_key FROM user_keys uk JOIN users u ON u.id = uk.user_id"
+            " ORDER BY u.created_at, u.id",
+        )
+    ]
 
 
 @pytest.mark.db
@@ -410,7 +635,7 @@ def test_check_and_rewrap_end_to_end(
     recovery_db: URL, home: Path, tmp_path: Path, secrets: Secrets
 ) -> None:
     old1, current, old2, wrong = (secrets.key() for _ in range(4))
-    data_keys = _seed(recovery_db, [old1, current, old2])
+    data_keys, _ids = _seed(recovery_db, [old1, current, old2])
     for key in data_keys:
         secrets.values.append(key.decode())
     cand = _candidate_file(home, [wrong, "garbage-line", old2, old1])
@@ -428,17 +653,22 @@ def test_check_and_rewrap_end_to_end(
     assert proc.returncode == 0, proc.stderr
     lines = proc.stdout.splitlines()
     assert "candidate #2: not a valid Fernet key (skipped)" in lines
+    assert "accounts: 3 in total (#1…#3 by creation time, then id)" in lines
     assert "account #1: current key KO" in lines
     assert "account #1: candidate #1 KO" in lines and "account #1: candidate #4 OK" in lines
     assert "account #2: current key OK" in lines
     assert not any(line.startswith("account #2: candidate") for line in lines)
     assert "account #3: candidate #3 OK" in lines
-    assert lines[-1].startswith("summary: 3 account(s) checked; 1 readable")
+    assert lines[-1].startswith("summary: 3 account(s) checked of 3; 1 readable")
 
-    only = _run(home, "check", "--accounts", "3", env=pg)  # only the needed account is fetched
+    only = _run(home, "check", "--accounts", "3", "--expect-total", "3", env=pg)
     outputs += [only.stdout, only.stderr]
+    assert only.returncode == 0, only.stderr
     labels = {line.split(":")[0] for line in only.stdout.splitlines() if line.startswith("acc")}
-    assert labels == {"account #3"}
+    assert labels == {"accounts", "account #3"}  # only the needed account is fetched
+    shifted = _run(home, "check", "--accounts", "3", "--expect-total", "4", env=pg)
+    assert shifted.returncode == 2 and "--expect-total says 4" in shifted.stderr
+    assert "account #3:" not in shifted.stdout
 
     before = _wrapped(recovery_db)
     read_only_pg = {**pg, "PGOPTIONS": "-c default_transaction_read_only=on"}  # tunnel default
@@ -447,48 +677,27 @@ def test_check_and_rewrap_end_to_end(
     assert dry.returncode == 0 and "dry run: would update 1 row (account #1)" in dry.stdout
     no_dump = _run(home, "rewrap", "--account", "1", "--candidate", "4", *cur, "--apply", env=pg)
     assert no_dump.returncode == 2 and "--i-have-a-pg-dump" in no_dump.stderr
-    wrong_cand = _run(
-        home,
-        "rewrap",
-        "--account",
-        "1",
-        "--candidate",
-        "1",
-        *cur,
-        "--apply",
-        "--i-have-a-pg-dump",
+    apply = ("--apply", "--i-have-a-pg-dump")
+    wrong_total = _run(
+        home, "rewrap", "--account", "1", "--candidate", "4", "--expect-total", "2", *cur, *apply,
         env=pg,
-    )
+    )  # fmt: skip
+    assert wrong_total.returncode == 2 and "labels may have shifted" in wrong_total.stderr
+    wrong_cand = _run(home, "rewrap", "--account", "1", "--candidate", "1", *cur, *apply, env=pg)
     outputs += [wrong_cand.stdout, wrong_cand.stderr]
     assert wrong_cand.returncode == 1 and "candidate #1 KO — nothing changed" in wrong_cand.stdout
     read_only = _run(
-        home,
-        "rewrap",
-        "--account",
-        "1",
-        "--candidate",
-        "4",
-        *cur,
-        "--apply",
-        "--i-have-a-pg-dump",
-        env={**pg, "PGOPTIONS": "-c default_transaction_read_only=on"},
+        home, "rewrap", "--account", "1", "--candidate", "4", *cur, *apply, env=read_only_pg
     )
     outputs += [read_only.stdout, read_only.stderr]
-    assert read_only.returncode == 1 and "error (ReadOnlySqlTransaction)" in read_only.stderr
+    assert read_only.returncode == 1
+    assert "error (ReadOnlySqlTransaction) — nothing changed" in read_only.stderr
     assert _wrapped(recovery_db) == before  # nothing changed so far
 
     applied = _run(
-        home,
-        "rewrap",
-        "--account",
-        "1",
-        "--candidate",
-        "4",
-        *cur,
-        "--apply",
-        "--i-have-a-pg-dump",
+        home, "rewrap", "--account", "1", "--candidate", "4", "--expect-total", "3", *cur, *apply,
         env=pg,
-    )
+    )  # fmt: skip
     outputs += [applied.stdout, applied.stderr]
     assert applied.returncode == 0, applied.stderr
     assert "account #1: re-wrapped under the current master key (1 row updated)" in applied.stdout
@@ -498,4 +707,169 @@ def test_check_and_rewrap_end_to_end(
     again = _run(home, "rewrap", "--account", "1", "--candidate", "4", *cur, env=pg)
     assert "already readable with the current key" in again.stdout
 
-    assert _scan_for_leaks(secrets, since, outputs, allowed) == []
+    assert _scan_for_leaks(secrets, since, outputs, allowed, home) == []
+
+
+class _FaultAfterExit:
+    """A psycopg connection whose `with` exit (after the COMMIT) raises: the fault a dropped
+    connection causes once COMMIT was sent."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        import psycopg
+
+        self._real.__exit__(*exc)
+        raise psycopg.OperationalError("injected after commit")
+
+
+@pytest.mark.db
+def test_a_fault_after_commit_reports_state_unknown(
+    recovery_db: URL,
+    home: Path,
+    tmp_path: Path,
+    secrets: Secrets,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DA-E-4: rewrap --apply and erase --apply with a fault injected after COMMIT print
+    "state unknown — run check again", never "nothing changed" — and the change did land."""
+    old, current, lost = secrets.key(), secrets.key(), secrets.key()
+    data_keys, ids = _seed(recovery_db, [old, current, lost])
+    cand = _candidate_file(home, [old])
+    env_file = tmp_path / "current.env"
+    env_file.write_text(f"DATA_MASTER_KEY={current}\n")
+    env_file.chmod(0o600)
+    for name, value in _pg_env(recovery_db).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("PGAPPNAME", raising=False)
+    module = _module()
+    monkeypatch.setattr(module, "_harden", lambda: None)  # keep the pytest process dumpable
+    real_connect = module._connect
+    monkeypatch.setattr(module, "_connect", lambda: _FaultAfterExit(real_connect()))
+    cur = ["--current-key-from-env-file", str(env_file)]
+
+    rc = module.main(
+        ["--candidates", str(cand), "rewrap", "--account", "1", "--candidate", "1", *cur,
+         "--apply", "--i-have-a-pg-dump"]
+    )  # fmt: skip
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "error (OperationalError) after COMMIT was sent — state unknown" in captured.err
+    assert "run check again" in captured.err and "nothing changed" not in captured.err
+    assert Fernet(current.encode()).decrypt(_wrapped(recovery_db)[0]) == data_keys[0]
+
+    monkeypatch.setattr(module, "_connect", real_connect)
+    erase_user, model = module._app_erasure()
+
+    def faulty_erase(session, user_id) -> None:
+        import psycopg
+
+        erase_user(session, user_id)
+        raise psycopg.OperationalError("injected after commit")
+
+    monkeypatch.setattr(module, "_app_erasure", lambda: (faulty_erase, model))
+    rc = module.main(
+        ["--candidates", str(cand), "erase", "--account", "3", "--expect-total", "3", *cur,
+         "--apply", "--i-have-a-snapshot"]
+    )  # fmt: skip
+    captured = capsys.readouterr()
+    assert rc == 1 and "state unknown" in captured.err and "nothing changed" not in captured.err
+    assert _query(recovery_db, "SELECT count(*) FROM users WHERE id = :i", i=ids[2]) == [(0,)]
+
+    # a failure BEFORE the commit is still "nothing changed"
+    monkeypatch.setattr(module, "_app_erasure", lambda: (erase_user, model))
+    rc = module.main(
+        ["--candidates", str(cand), "erase", "--account", "9", "--expect-total", "2", *cur,
+         "--apply", "--i-have-a-snapshot"]
+    )  # fmt: skip
+    captured = capsys.readouterr()
+    assert rc == 2 and "account #9 does not exist" in captured.err
+    for output in (captured.out, captured.err):
+        assert not any(p in output.encode() for p in secrets.patterns())
+
+
+@pytest.mark.db
+def test_erase_end_to_end_through_the_app_erasure_path(
+    recovery_db: URL, home: Path, tmp_path: Path, secrets: Secrets
+) -> None:
+    """D-2026-09-30-2 / DA-E-9: erase refuses a wrong total, a readable account and an account
+    a candidate unwraps; a dry run changes nothing; --apply erases exactly the unrecoverable
+    account with the app's tombstone; a pre-0005 schema is refused."""
+    current, lost, old = secrets.key(), secrets.key(), secrets.key()
+    data_keys, ids = _seed(recovery_db, [current, lost, old])
+    for key in data_keys:
+        secrets.values.append(key.decode())
+    cand = _candidate_file(home, [secrets.key(), old])
+    env_file = tmp_path / "current.env"
+    env_file.write_text(f"DATA_MASTER_KEY={current}\n")
+    env_file.chmod(0o600)
+    pg = _pg_env(recovery_db)
+    cur = ("--current-key-from-env-file", str(env_file))
+    snap = ("--apply", "--i-have-a-snapshot")
+    since = time.time() - 1
+    outputs: list[str] = []
+    before = _wrapped(recovery_db)
+
+    def erase(account: str, total: str, *extra: str):
+        proc = _run(home, "erase", "--account", account, "--expect-total", total, *cur, *extra,
+                    env=pg)  # fmt: skip
+        outputs.extend([proc.stdout, proc.stderr])
+        return proc
+
+    shifted = erase("2", "4", *snap)
+    assert shifted.returncode == 2 and "labels may have shifted" in shifted.stderr
+    readable = erase("1", "3", *snap)
+    assert readable.returncode == 2 and "readable with the current key" in readable.stderr
+    recoverable = erase("3", "3", *snap)
+    assert recoverable.returncode == 2
+    assert "candidate #2 unwraps account #3 — recover it with rewrap" in recoverable.stderr
+    missing = erase("7", "3")
+    assert missing.returncode == 2 and "account #7 does not exist" in missing.stderr
+    dry = erase("2", "3")
+    assert dry.returncode == 0, dry.stderr
+    assert "account #2: current key KO, every candidate (2) KO" in dry.stdout
+    assert "dry run: would erase account #2" in dry.stdout
+    assert _wrapped(recovery_db) == before
+    assert _query(recovery_db, "SELECT count(*) FROM deletion_requests") == [(0,)]
+
+    applied = erase("2", "3", *snap)
+    assert applied.returncode == 0, applied.stderr
+    assert "account #2: erased through the app's erasure path (tombstone written);" in (
+        applied.stdout
+    )
+    assert "2 account(s) remain" in applied.stdout
+    assert _query(recovery_db, "SELECT id FROM users ORDER BY created_at") == [
+        (ids[0],),
+        (ids[2],),
+    ]
+    assert _query(
+        recovery_db, "SELECT user_id, status, completed_at IS NOT NULL FROM deletion_requests"
+    ) == [(ids[1], "done", True)]
+    assert _query(recovery_db, "SELECT count(*) FROM user_keys WHERE user_id = :i", i=ids[1]) == [
+        (0,)
+    ]
+    assert _query(recovery_db, "SELECT user_id FROM conversations ORDER BY user_id") == sorted(
+        [(ids[0],), (ids[2],)]
+    )
+    assert _wrapped(recovery_db) == [before[0], before[2]]  # other keys untouched
+    relabelled = erase("2", "3", *snap)  # the old "#3" is now #2, and the total changed
+    assert relabelled.returncode == 2 and "labels may have shifted" in relabelled.stderr
+
+    engine = create_engine(recovery_db, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE deletion_requests DROP COLUMN progress"))
+    finally:
+        engine.dispose()
+    old_schema = erase("2", "2", *snap)
+    assert old_schema.returncode == 2 and "migration 0005" in old_schema.stderr
+    assert _scan_for_leaks(secrets, since, outputs, {cand, env_file}, home) == []

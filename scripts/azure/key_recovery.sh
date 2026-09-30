@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Entry point of the master-key recovery tool (D-2026-09-29-2; scripts/azure/key_recovery.py).
 #
-#   scripts/azure/key_recovery.sh init | check … | rewrap … | shred     (--help for details)
+#   scripts/azure/key_recovery.sh init | check … | rewrap … | erase … | shred   (--help)
 #
 # Runs the tool with the backend venv's Python in isolated mode (-I: no PYTHON* variables, no
 # user site, no current directory on sys.path; -B: no bytecode written) and with core dumps
-# disabled, so candidate keys can reach neither a dump nor a cache file. On Azure it runs
-# INSIDE scripts/azure/db-tunnel.sh (which allows exactly this script besides psql/pg_dump).
+# disabled (here, and in the tool itself: RLIMIT_CORE 0 + prctl PR_SET_DUMPABLE 0), so
+# candidate keys can reach neither a dump nor a cache file. On Azure it runs INSIDE
+# scripts/azure/db-tunnel.sh (which allows exactly this script besides psql/pg_dump); `erase`
+# is local-only and refuses to run there.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
