@@ -19,7 +19,11 @@ import re
 import sys
 from pathlib import Path
 
-REQUIREMENTS = ("backend/requirements.txt", "backend/requirements-dev.txt")
+REQUIREMENTS = (
+    "backend/requirements-torch.txt",  # torch==<version>+cpu, local label included (DA-B2-3)
+    "backend/requirements.txt",
+    "backend/requirements-dev.txt",
+)
 _PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?==([^\s;#]+)")
 
 

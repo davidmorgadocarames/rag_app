@@ -104,7 +104,7 @@ flowchart LR
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, pydantic-settings |
 | Database | PostgreSQL 16 + pgvector (HNSW) + full-text search |
 | LLM | Ollama `qwen2.5:7b-instruct` (local) · Azure OpenAI `gpt-4.1-mini` (cloud) |
-| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder) |
+| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, loaded offline from the cache when present) |
 | Security | argon2, JWT, Fernet envelope encryption (crypto-shred), token bucket |
 | Evaluation | Separate retrieval and generation metrics, LLM judge, regression gate |
 | Quality | ruff, mypy `--strict`, pytest, ESLint, `tsc`, pre-commit, gitleaks |
@@ -186,7 +186,8 @@ since both listen on port 11434.
 cd backend
 python3.12 -m venv .venv                       # or: uv venv --python 3.12 .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt            # includes torch for the reranker
+pip install -r requirements-torch.txt          # pinned CPU torch (own index) first
+pip install -r requirements-dev.txt
 export PYTHONPATH=src
 cp ../.env.example .env                        # the backend reads backend/.env
 ```
@@ -197,6 +198,7 @@ cp ../.env.example .env                        # the backend reads backend/.env
 cd backend
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r requirements-torch.txt
 pip install -r requirements-dev.txt
 $env:PYTHONPATH = "src"
 Copy-Item ..\.env.example .env

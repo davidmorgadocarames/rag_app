@@ -3,9 +3,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps kept minimal; torch is installed CPU-only to keep the image small.
-COPY requirements.txt ./
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+# System deps kept minimal; torch is installed CPU-only (pinned, from its own index) to keep
+# the image small, then the runtime pins from PyPI.
+COPY requirements-torch.txt requirements.txt ./
+RUN pip install --no-cache-dir -r requirements-torch.txt \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src

@@ -44,8 +44,7 @@ CHUNKS="$MAIN_ROOT/data/chunks/chunks.jsonl"
 
 # Venvs for trees whose pins differ from the main venv (DA-B-4).
 VENV_CACHE="$GIT_COMMON/secrag-gate/venvs"
-VENV_RECIPE=1                     # bump when build_venv changes
-TORCH_INDEX="https://download.pytorch.org/whl/cpu"   # as in backend/Dockerfile
+VENV_RECIPE=2                     # bump when build_venv changes (2: torch from requirements-torch.txt)
 VENV_BUILD_BUDGET=900
 VENV_CACHE_KEEP=2                 # ~1.5 GB each (torch)
 
@@ -193,7 +192,7 @@ step_venv() {
   need_venv || return 1
   echo "  $("$PY" --version 2>&1) at $VENV"
   "$PY" -m rag_app.devtools.venv_sync --root "$REPO_ROOT" 2>&1 | sed 's/^/  /'
-  [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "  FAIL: fix with: $VENV/bin/pip install -r backend/requirements-dev.txt"; return 1; }
+  [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "  FAIL: fix with: $VENV/bin/pip install -r backend/requirements-torch.txt, then -r backend/requirements-dev.txt"; return 1; }
 }
 
 step_ruff-lint() { need_venv && (cd backend && "$VENV/bin/ruff" check .); }
@@ -399,15 +398,17 @@ step_restart-check() {
 
 step_eval() {
   need_venv || return 1
-  (cd backend && "$PY" -m rag_app.eval.gate --require-stack)
+  # The reranker must come from the local cache at its pinned revision (row 37d): offline.
+  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.gate --require-stack)
 }
 
 # --- backend venv matching the pins (DA-B-4) --------------------------------------------
 
-req_hash() { # req_hash <tree>: build recipe + both requirement files
+req_hash() { # req_hash <tree>: build recipe + the requirement files (torch pin included)
   {
-    echo "recipe=$VENV_RECIPE torch-index=$TORCH_INDEX"
-    cat "$1/backend/requirements.txt" "$1/backend/requirements-dev.txt" 2>/dev/null
+    echo "recipe=$VENV_RECIPE"
+    cat "$1/backend/requirements-torch.txt" "$1/backend/requirements.txt" \
+      "$1/backend/requirements-dev.txt" 2>/dev/null
   } | sha256sum | cut -c1-16
 }
 
@@ -418,7 +419,7 @@ venv_in_sync() { # venv_in_sync <venv dir>: installed == REPO_ROOT's pins
 
 # build_venv <dir>: runs in its own process under timeout (--build-venv).
 build_venv() {
-  local dir="$1" torch_pin="" py_version="3.12"
+  local dir="$1" py_version="3.12"
   command -v uv >/dev/null || { echo "FAIL: uv not found (needed to build the gate venv)"; return 1; }
   mkdir -p "$VENV_CACHE" || return 1
   exec 9>"$VENV_CACHE/.lock"
@@ -426,13 +427,12 @@ build_venv() {
   [ -f "$dir/.secrag-complete" ] && return 0   # a concurrent run built it
   rm -rf "$dir"
   if [ -x "$MAIN_VENV/bin/python" ]; then
-    # Same interpreter and torch build as the main venv (torch is not in the pins).
+    # Same interpreter as the main venv; torch is pinned in requirements-torch.txt (DA-B2-3).
     py_version="$("$MAIN_VENV/bin/python" -c 'import platform; print(platform.python_version())')"
-    torch_pin="$("$MAIN_VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("torch"))' 2>/dev/null)"
   fi
   uv venv --quiet --seed --python "$py_version" "$dir" || return 1
-  uv pip install --quiet --python "$dir/bin/python" --index-url "$TORCH_INDEX" \
-    "torch${torch_pin:+==$torch_pin}" || return 1
+  uv pip install --quiet --python "$dir/bin/python" -r "$REPO_ROOT/backend/requirements-torch.txt" \
+    || return 1
   uv pip install --quiet --python "$dir/bin/python" -r "$REPO_ROOT/backend/requirements-dev.txt" \
     || return 1
   "$dir/bin/python" -m rag_app.devtools.venv_sync --root "$REPO_ROOT" || return 1
@@ -464,7 +464,7 @@ resolve_venv() {
     # Never rebuilt behind the developer's back. Every step fails (VENV_ERROR), not only the
     # venv step: `--only pytest` must not pass against drifted packages (DA-B2-2).
     VENV="$MAIN_VENV"
-    VENV_ERROR="the main venv ($MAIN_VENV) does not match this tree's pins — fix with: $MAIN_VENV/bin/pip install -r backend/requirements-dev.txt"
+    VENV_ERROR="the main venv ($MAIN_VENV) does not match this tree's pins — fix with: $MAIN_VENV/bin/pip install -r backend/requirements-torch.txt, then -r backend/requirements-dev.txt"
     echo "venv: main venv is out of sync with the pins"
   else
     dir="$VENV_CACHE/$want"

@@ -1,0 +1,6 @@
+# CPU-only torch from the PyTorch index, installed BEFORE requirements.txt (backend/Dockerfile,
+# CI, gate.sh venvs). Kept in its own file so only torch resolves against that index; pinned
+# with its local label so the venv check and the gate venv cache key see the exact build
+# (DA-B2-3, PHASE_TASKS row 37d). The runtime pins in requirements.txt resolve from PyPI.
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu

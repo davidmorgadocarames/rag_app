@@ -10,14 +10,13 @@
 # Keep entries sorted by ecosystem/package.
 #
 # Expiry policy (D-2026-09-27-6):
-# - INTERIM entries expire with the block that fixes them. starlette (via FastAPI) and
-#   transformers (via sentence-transformers) are fixed by PHASE_TASKS row 37d (deps block,
-#   before row 38). 2026-10-31 is the expected 11a promotion window: row 37d precedes the
-#   full gate (row 38) and the promotion (rows 40/41). If 11a slips past it, every push fails
-#   and the entries must be re-decided, not silently carried over.
+# - INTERIM entries expire with the block that fixes them. None are left: cryptography, PyJWT,
+#   pytest and setuptools were bumped in the block B fix block (D-6 a1); FastAPI/starlette
+#   (0.142.2 / 1.7.0) and sentence-transformers/transformers (6.1.0 / 5.17.0) in the deps
+#   block, PHASE_TASKS row 37d (D-6 a2). The two formerly PERMANENT transformers entries
+#   (PYSEC-2025-217, PYSEC-2026-2290) are no longer reported for 5.17.0 and were removed.
 # - PERMANENT entries (no fixed version, or no fixed version in every record) carry a
-#   re-review date six months out.
-# - cryptography, PyJWT, pytest and setuptools were bumped in the block B fix block (D-6 a1).
+#   reachability reason and a re-review date six months out.
 
 [[exception]]
 advisory = "GHSA-6g55-p6wh-862q"
@@ -46,87 +45,3 @@ package = "postcss"
 ecosystem = "npm"
 reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
 expires = 2027-06-30
-
-[[exception]]
-advisory = "PYSEC-2026-161"  # CVE-2026-48710, GHSA-86qp-5c8j-p5mr, X41-2026-002
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). Host header not validated when request.url is rebuilt. Low reachability: no SecRAG code reads request.url for authorization (auth is a bearer JWT, routing uses the raw path); residual exposure is only redirect_slashes redirects built from request.url, behind the Azure ingress host."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-1941"  # CVE-2025-54121, GHSA-2c2j-9gv5-cj73
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). Multipart upload spooling blocks the event loop. Not reachable: no Form/UploadFile endpoint, and python-multipart is not installed, so multipart bodies are never parsed."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-1942"  # CVE-2025-62727, GHSA-7f5h-v6xp-fcq8
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). Quadratic Range-header parsing in FileResponse. Not reachable: the API serves no files (no FileResponse/StaticFiles; the frontend is a separate Next container)."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-2280"  # CVE-2026-48817, GHSA-x746-7m8f-x49c
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). HTTPEndpoint dispatches arbitrary methods via getattr. Not reachable: no HTTPEndpoint subclasses; all routes are FastAPI path operations with explicit methods."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-2281"  # CVE-2026-48818, GHSA-wqp7-x3pw-xc5r
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). StaticFiles UNC-path SSRF on Windows. Not reachable: no StaticFiles, and the API only runs on Linux (WSL2, Linux containers on Azure)."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-248"  # CVE-2026-54282, GHSA-jp82-jpqv-5vv3
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). A path without a leading slash moves request.url's authority. Low reachability: no SecRAG code reads request.url.hostname/netloc; residual exposure is redirect_slashes redirects built from request.url."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-249"  # CVE-2026-54283, GHSA-82w8-qh3p-5jfq
-package = "starlette"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: FastAPI/starlette upgrade). Form limits ignored for urlencoded bodies. Not reachable: no Form endpoint and no request.form() call (JSON bodies only, validated by pydantic)."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2025-217"  # CVE-2025-14929
-package = "transformers"
-ecosystem = "pypi"
-reason = "PERMANENT (no fixed version published). Unsafe deserialization in the X-CLIP checkpoint conversion script. Not reachable: SecRAG never runs transformers' conversion scripts; it only loads one cross-encoder (bge-reranker) through sentence-transformers. Re-review at the date or when a fix is published."
-expires = 2027-03-31
-
-[[exception]]
-advisory = "PYSEC-2026-2288"  # CVE-2026-1839, GHSA-69w3-r845-3855
-package = "transformers"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: sentence-transformers/transformers 5.x). torch.load without weights_only in Trainer RNG-state loading. Not reachable: no training or Trainer checkpoint resume; torch is >= 2.6 anyway."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-2289"  # CVE-2026-4372, GHSA-29pf-2h5f-8g72
-package = "transformers"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: sentence-transformers/transformers 5.x). A crafted config.json makes from_pretrained fetch and run code. REACHABLE via the supply chain: CrossEncoder downloads BAAI/bge-reranker-v2-m3 from the Hugging Face Hub by name at runtime (no revision pin, no offline mode), so a changed or compromised repo would execute code in the API. Row 37d pins the model revision and bakes/offlines it."
-expires = 2026-10-31
-
-[[exception]]
-advisory = "PYSEC-2026-2290"  # CVE-2026-5241, GHSA-fgcw-684q-jj6r
-package = "transformers"
-ecosystem = "pypi"
-reason = "PERMANENT (one record has no fixed version; the GHSA gives 5.5.0). LightGlue config overrides trust_remote_code. Not reachable: SecRAG loads no LightGlue (vision) model, only an XLM-RoBERTa cross-encoder; the Hub supply-chain risk is covered by PYSEC-2026-2289 and row 37d's revision pin. Re-review at the date or after row 37d (drop it if no longer reported)."
-expires = 2027-03-31
-
-[[exception]]
-advisory = "PYSEC-2026-3929"  # CVE-2026-9856, GHSA-xrqw-3rrv-vx5w
-package = "transformers"
-ecosystem = "pypi"
-reason = "INTERIM (D-6 a2, row 37d: sentence-transformers/transformers 5.x). Path traversal in tokenizer/processor save_pretrained via chat_template keys. Not reachable: SecRAG never calls save_pretrained; the reranker is only loaded."
-expires = 2026-10-31

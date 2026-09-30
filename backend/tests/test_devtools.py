@@ -231,9 +231,12 @@ def test_the_repository_exceptions_file_is_valid() -> None:
     postcss = [e for e in entries if e.package == "postcss"]
     assert postcss and all(e.ecosystem == "npm" for e in postcss)
     assert all(e.expires > dt.date(2026, 9, 27) for e in entries)
-    # D-6 a1: these were bumped; no exception may come back for them silently.
+    # D-6 a1 + a2 (row 37d): these were bumped; no exception may come back for them silently.
     bumped = {"cryptography", "pyjwt", "pytest", "setuptools"}
+    bumped |= {"fastapi", "starlette", "sentence-transformers", "transformers"}
     assert not [e for e in entries if e.package.lower() in bumped]
+    # Row 37d: no INTERIM entry is left; only PERMANENT ones with a reachability reason.
+    assert not [e for e in entries if e.reason.startswith("INTERIM")]
     # DA-B-7: every entry states its class and a reason longer than a boilerplate line.
     python = [e for e in entries if e.ecosystem == "pypi"]
     assert all(e.reason.startswith(("INTERIM", "PERMANENT")) for e in python)

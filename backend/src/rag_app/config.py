@@ -101,6 +101,10 @@ class Settings(JobSettings):
     llm_model: str = "qwen2.5:7b-instruct-q4_K_M"
     embed_model: str = "bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    # Hugging Face commit of reranker_model (a full 40-hex commit hash, never a branch/tag):
+    # the loader reads exactly this snapshot — from the local cache first, offline — so a
+    # changed or compromised Hub repo cannot change the code/config that runs (DA-B-7).
+    reranker_revision: str = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
     # Keep the model resident in VRAM between requests (avoids a cold ~5 GB reload
     # per idle window). Ollama accepts a duration ("30m") or -1 to keep forever.
     ollama_keep_alive: str = "30m"

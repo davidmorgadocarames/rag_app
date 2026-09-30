@@ -39,8 +39,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install dependencies (pinned CPU torch first, as in backend/Dockerfile)
+        run: |
+          pip install -r requirements-torch.txt
+          pip install -r requirements-dev.txt
       - name: Ruff (lint)
         run: ruff check .
       - name: Ruff (format check)
@@ -177,7 +179,7 @@ jobs:
       - name: Backend venv (CPU torch as in backend/Dockerfile, then the pins)
         run: |
           python -m venv backend/.venv
-          backend/.venv/bin/pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          backend/.venv/bin/pip install --quiet -r backend/requirements-torch.txt
           backend/.venv/bin/pip install --quiet -r backend/requirements-dev.txt
       - name: Frontend dependencies (npm audit needs the lock tree)
         working-directory: frontend
