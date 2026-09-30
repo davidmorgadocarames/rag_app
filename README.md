@@ -428,10 +428,10 @@ DATABASE_URL=postgresql+psycopg://secrag_purger:…@127.0.0.1:5432/rag \
 python -m rag_app.erasure purge-now <request-id> --export-dir .tombstones
 ```
 
-The gate step `erasure-scale` erases a synthetic user with 100,000 messages under
-concurrent login and listing load and checks the request stays under 200 ms, the connection
-pool is never exhausted, no lock error reaches another request and a purger killed mid-way
-is completed by the next run.
+The gate step `erasure-scale` erases synthetic users with 100,000 messages each under
+concurrent login and listing load and checks the request stays under 200 ms (measured:
+35-74 ms), the connection pool is never exhausted, no lock error reaches another request and
+a purger killed mid-way is completed by the next run.
 
 ## API at a glance
 

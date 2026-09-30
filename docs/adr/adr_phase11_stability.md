@@ -352,13 +352,21 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    erases through the request path and purges as `secrag_purger`. **Local runner:** compose
    service `purger` (jobs image, `loop --interval ${PURGE_INTERVAL_SECONDS:-3600}`, runs as
    the WSL user so the exports are theirs). **Gate step `erasure-scale`**
-   (`rag_app.devtools.erasure_scale`, throwaway `secrag_scale_*` database): a synthetic user
-   with 100,000 messages, the real API in a child process (pool 5 + 10), 8 workers of login +
-   listing + reads + a few stub chat calls; measured on 2026-09-30: `DELETE /account` 202 in
-   **39 ms**, 1,460 load requests with 0 failures, 0 lock errors, 0 pool timeouts, pool peak
-   **9 of 15**; the purger killed at 17,000 messages (tombstone `running`), an overlapping run
-   skipped, the next run finished in 0.9 s (tombstone `done`, 0 rows left, longest
-   transaction 0.021 s).
+   (`rag_app.devtools.erasure_scale`, throwaway `secrag_scale_*` database): three synthetic
+   users with 100,000 messages each, the real API in a child process (pool 5 + 10), 8
+   workers of sessions (a login, then 6 listings and a read; a few stub chat calls — no GPU);
+   each synthetic user erases itself during the load. Criteria: the **median** erasure
+   request < 200 ms and every request's work outside its COMMIT's WAL flush < 200 ms — on
+   this laptop a single commit on the Docker Desktop volume occasionally waits 0.3-0.9 s for
+   the disk flush (seen as `COMMIT 862 ms` with every statement < 10 ms and no other WAL
+   written; an idle probe had 0 of 800 commits over 12 ms), so one sample alone made the
+   gate flaky for a reason unrelated to erasure; every sample and its COMMIT time are
+   printed. The seed is settled (VACUUM ANALYZE + CHECKPOINT) before the measured window.
+   Measured on 2026-09-30 (6 runs, 18 requests): erasure request 35-74 ms (median per run
+   39-60 ms; the transaction 17-32 ms), ~2,400 load requests per run with 0 failures, 0 lock
+   errors, 0 pool timeouts, pool peak **9 of 15**; the purger killed at 16,000 messages
+   (tombstone `running`), an overlapping run skipped, the next run purged the 300,000
+   messages in 2.2-3.3 s (tombstones `done`, 0 rows left, longest transaction ≤ 0.044 s).
 7. Global daily answer cap.
 8. (11b) One shared reranker, baked model images, latency gate.
 

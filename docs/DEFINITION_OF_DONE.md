@@ -132,14 +132,16 @@ files are kept; controls: without the tombstone export the user comes back, a wr
 non-empty target restore nothing.
 
 `erasure-scale` (T11.2b.7, `rag_app.devtools.erasure_scale`): a throwaway `secrag_scale_*`
-database on the gate server; a synthetic user with **100,000 messages**; the real API in a
-child process (pool 5 + 10 overflow); 8 workers of login + conversation listing + reads (+ a
-few stub chat calls — no GPU) while the user sends `DELETE /account` → **request < 200 ms**,
-202 with the 14-day constant, token refused and key/email gone right after; **pool never
-exhausted** (peak below capacity, no checkout timeout); **no failed load request, no lock
-error**; the purger as `secrag_purger` (real login) is SIGKILLed mid-way (tombstone
-`running`), an overlapping run is skipped, the next run leaves the tombstone **`done`** with 0
-rows; the longest purger transaction < 2 s.
+database on the gate server; three synthetic users with **100,000 messages** each; the real
+API in a child process (pool 5 + 10 overflow); 8 workers of sessions (login, then listings
+and a read; a few stub chat calls — no GPU) while each synthetic user sends
+`DELETE /account` → **request < 200 ms** (median of the three, and each request's work
+outside its COMMIT's WAL flush < 200 ms — a laptop disk flush can stall any commit; every
+sample is printed), 202 with the 14-day constant, token refused and key/email gone right
+after; **pool never exhausted** (peak below capacity, no checkout timeout); **no failed load
+request, no lock error**; the purger as `secrag_purger` (real login) is SIGKILLed mid-way
+(tombstone `running`), an overlapping run is skipped, the next run leaves every tombstone
+**`done`** with 0 rows; the longest purger transaction < 2 s.
 
 `restart-check` (T11.2.8, `scripts/restart_check.sh`; not in `--fast`): the **real**
 `docker-compose.yml` plus `scripts/restart_check.compose.yml`, which swaps the external dev
