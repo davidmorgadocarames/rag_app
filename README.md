@@ -345,9 +345,16 @@ scripts/azure/key_recovery.sh check --accounts all --current-key-from-env-file b
 scripts/azure/key_recovery.sh shred            # overwrite + delete the candidates afterwards
 ```
 
-It prints only `account #i: candidate #j OK|KO`. A match is re-wrapped under the current key
-with `rewrap` (dry run by default; `--apply` only after a `pg_dump`); accounts without a
-match are erased. The full procedure is in
+It prints the total (`accounts: N in total`) and only `account #i: candidate #j OK|KO`
+lines; pass that `N` back as `--expect-total N` so a later command refuses if accounts were
+added or erased in between. A match is re-wrapped under the current key with `rewrap` (dry
+run by default; `--apply` only after a `pg_dump`). On the local development DB, an account
+that no key unwraps is erased with
+`key_recovery.sh erase --account I --expect-total N --current-key-from-env-file backend/.env`
+(dry run; then `--apply --i-have-a-snapshot`): it re-checks the current key and every
+candidate in the same transaction and uses the app's own erasure path (tombstone). It needs
+migration 0005 and never runs against Azure — there the owner deletes the account in the app.
+The full procedure is in
 [ADR phase 11 — Key recovery](docs/adr/adr_phase11_stability.md#key-recovery-d-2026-09-29-2).
 
 ## API at a glance

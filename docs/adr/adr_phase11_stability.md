@@ -287,12 +287,22 @@ depend on it), and whatever still fails is purged with a tombstone before the fi
 fingerprint write.
 
 **Tool.** `scripts/azure/key_recovery.sh` (backend venv, `python -I -B`, core dumps off) →
-`key_recovery.py`:
+`key_recovery.py`. Before it reads any key, the process sets `RLIMIT_CORE` to 0 **and**
+`prctl(PR_SET_DUMPABLE, 0)` (no core dump even with a pipe `core_pattern` such as
+systemd-coredump or a WSL crash collector; no same-user ptrace or `/proc/<pid>/mem`); it
+refuses to run if that fails.
 
 - `init` creates `~/.secrag-recovery/candidates` (directory 0700, empty file 0600) and prints
   how to fill it **without the shell history** (`nano …`, or `cat > …`, paste, Ctrl-D). One
   key per line; `#` comments and blank lines are ignored; `DATA_MASTER_KEY=<key>` lines are
-  accepted.
+  accepted. Each line is decoded on its own as UTF-8 with a leading BOM and CR removed (a file
+  saved by a Windows editor works); a line that is not UTF-8 prints `candidate #j: unreadable`
+  and the others still run. `--candidates PATH` (before the subcommand) uses another file.
+- **Labels.** `account #i` = position by `users.created_at, users.id` among the accounts with
+  a key; every command first prints `accounts: N in total`. A new account is appended at the
+  end, but an erased one shifts the labels after it, so `--expect-total N` (optional for
+  `check`/`rewrap`, mandatory for `erase`) refuses when the total is no longer what `check`
+  printed.
 - Every run refuses a file or directory with wider permissions, not owned by the user, a
   symlink anywhere on the path, a path inside any git work tree, or one on a Windows drive
   (`/mnt`, 9p/drvfs). `.gitignore` also ignores `**/.secrag-recovery/` and `**/candidates`
@@ -307,6 +317,20 @@ fingerprint write.
   unwraps, wraps the same data key under the current master key, verifies; without `--apply`
   it prints `dry run: would update 1 row` and rolls back (works in a read-only session); with
   `--apply` (only together with `--i-have-a-pg-dump`) it locks and updates exactly that row.
+- `erase --account I --expect-total N --current-key-from-env-file PATH [--apply
+  --i-have-a-snapshot]` (**local development DB only**, D-2026-09-30-2 / DA-E-9): for an
+  account that **no** key can unwrap. One transaction: checks the total, locks the account,
+  refuses unless the current key **and every candidate** fail on that very blob (and while
+  any candidate line is unreadable or malformed), then erases it through the app's own
+  erasure path (`rag_app.erasure.erase_user`: the user row is deleted with its key,
+  conversations and messages by cascade, and a `done` tombstone is written, one commit).
+  Without `--apply` it is a read-only dry run. It needs the 0005 schema (the app's tombstone
+  columns) and refuses a non-local `PGHOST`/`PGHOSTADDR`, `PGSERVICE`, or a run inside
+  `db-tunnel.sh`: on Azure the owner deletes that account in the running app instead
+  (`DELETE /account`).
+- **Unknown outcome.** With `--apply`, an error after COMMIT was sent prints `… state unknown
+  — run check again` instead of `nothing changed` (DA-E-4); re-running `check` shows the
+  real state (`rewrap` then says "already readable").
 - `shred` overwrites every file in `~/.secrag-recovery` with random bytes, then zeros
   (fsync each), deletes them and the directory.
 
@@ -318,9 +342,13 @@ exception **class** only (no message, no traceback); a malformed candidate print
 the wrapped keys go from the server into the process' memory only, and candidates never go
 to Azure. The current Azure key is read by the tool itself from the Container App secret into
 memory. Tests (`backend/tests/test_key_recovery.py`, fake keys) scan stdout, stderr and every
-file written under `$HOME`, `/tmp` and the repository during a run — also with a malformed
-candidate and with a failing database or tunnel — for any fragment of any key, and check the
-refusals (modes, symlinks, git work tree, Windows drive) and `shred`. Limits: Python cannot
+file written under the test's `$HOME`, `/tmp`, `/var/tmp`, `/dev/shm` and the repository
+during a run — also with a malformed or non-UTF-8 candidate and with a failing database or
+tunnel — for any key as text or fragment, as raw bytes, and base64 / url-safe base64 / hex
+encoded (a self-test proves the scan can fail); they check the refusals (modes, symlinks, git
+work tree, Windows drive, `erase` targets), `shred`, the non-dumpable process
+(`PR_GET_DUMPABLE`, and a root-owned `/proc/<pid>` while the tool runs), `erase` end to end,
+and "state unknown" with a fault injected after COMMIT. Limits: Python cannot
 wipe immutable strings from memory, and an overwrite on a journaling/SSD disk is best effort;
 the WSL disk image is not encrypted, so the lasting copy of old keys belongs in the password
 manager only.
@@ -328,17 +356,30 @@ manager only.
 **Local evidence (2026-09-30, throwaway restore of the `rag_ia` snapshot, FAKE candidates):**
 `check --accounts all --current-key-from-env-file backend/.env` → accounts #2–#5 current key
 OK, **account #1 current key KO**, fake candidates KO; `rewrap` dry run in a read-only session
-→ `candidate #1 KO — nothing changed`. The throwaway container and volume were removed; the
-development volumes were not touched.
+→ `candidate #1 KO — nothing changed`. `erase` (same snapshot, second throwaway restore, FAKE
+candidates): on 0004 → refused ("migration 0005"); after `roles.sql` + `alembic upgrade head`
+on the throwaway: wrong total and readable account #2 refused, dry run changed nothing,
+`--apply` → users/keys 5 → 4, tombstones 4 → 5 (`done`), `check --expect-total 4` → 4 of 4
+readable. The throwaway containers and volumes were removed; the development volumes were
+not touched.
 
 **Procedure** (the user's real candidates; nothing is run on the developer's database before
-it): local — restore the snapshot into a throwaway container, `check`; on a match, `rewrap
---apply --i-have-a-pg-dump` on the developer's database only after a `pg_dump` of it, then
-`diag_keys.py` → KO 0; Azure (row 40, orchestrator) — after the row-40 `pg_dump`,
-`db-tunnel.sh --password-from-app -- scripts/azure/key_recovery.sh check --accounts all
---current-key-from-app secrag-backend`; on a match, the same `rewrap` with `--read-write` on
-the tunnel; re-run the row-15 snippet → KO 0; then `shred`. Accounts without a match are
-erased with a tombstone (R5-5) before the first start of the 0005 image.
+it; note the total `N` that `check` prints):
+
+- Local — restore the snapshot into a throwaway container and `check --accounts all
+  --current-key-from-env-file backend/.env`. On a match: `pg_dump` of the developer's
+  database, then `rewrap --account I --candidate J --expect-total N … --apply
+  --i-have-a-pg-dump` on it, then `diag_keys.py` → KO 0. No match: `pg_dump`, `roles.sql` +
+  migration 0005 (compose `db-roles`, `migrate`; they read no user key), `erase --account I
+  --expect-total N --current-key-from-env-file backend/.env` (dry run), then the same with
+  `--apply --i-have-a-snapshot`, then `check --accounts all --expect-total N-1` → all OK —
+  before the first API start (which writes the fingerprint only when every key unwraps).
+- Azure (row 40, orchestrator) — `db-tunnel.sh --password-from-app --
+  scripts/azure/key_recovery.sh check --accounts all --current-key-from-app secrag-backend`
+  (read-only, any time); on a match, after the row-40 `pg_dump`, the same `rewrap` with
+  `--read-write` on the tunnel; re-run the row-15 snippet → KO 0. No match: the owner deletes
+  the account in the running pre-11a app before the promotion (`erase` refuses the tunnel).
+- Then `shred`.
 
 ## Rollback
 
