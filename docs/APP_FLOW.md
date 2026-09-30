@@ -26,9 +26,11 @@ Chat (/chat)              [authenticated]
    - Client validates format; server enforces password policy.
    - Server runs **risk scoring** (IP velocity, disposable-email check, account-age heuristics). High
      risk → challenge (CAPTCHA) or block.
-   - On success: user row created (`email_verified = false`), a verification token is emailed.
+   - On success: user row created (`email_verified = false`), a verification token is emailed
+     (the address and the link are never written to a log; the cloud deployment has no SMTP
+     yet, so it does not require verification).
    - Redirect to **`/verify`** ("Check your email").
-3. If email already exists → inline error, stay on page.
+3. If email already exists → inline error (409, also when two sign-ups race), stay on page.
 
 ### 2.2 Verify email
 
@@ -55,6 +57,14 @@ Chat (/chat)              [authenticated]
    presses **Send** (Enter; Shift+Enter for a newline). Requires auth → redirects to `/login` otherwise.
 2. Client → `POST /chat/stream` (Bearer token). Server:
    - Applies the **per-user rate limit / quota** (cost-aware). Over limit → 429.
+   - Checks the **global daily answer cap** (`DAILY_ANSWER_CAP` answers per UTC day for all
+     users together — a cost guard for the public demo; 300 by default). The answer is
+     counted **before** any LLM call, after the user's data key is known to unwrap. Once the
+     cap is reached the stream sends the `conversation` event and one `error` event
+     (`daily_cap_reached`, "SecRAG has reached its daily answer limit … come back after
+     midnight UTC") and stores nothing; the one-shot `POST /chat` answers **429** with
+     `Retry-After` (seconds to UTC midnight). A greeting (fast path, no LLM call) is never
+     counted or refused.
    - **Classifies intent.** Small talk / greetings ("hello", "thanks", "who are you") take a **fast-path**:
      an instant, honest, non-sourced reply — no retrieval, no citations, no abstention.
    - Security questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
@@ -131,10 +141,12 @@ Chat (/chat)              [authenticated]
 | `/` | no | Landing |
 | `/signup`, `/login`, `/verify` | no | Redirect to `/chat` if already authenticated |
 | `/chat`, `/account` | yes | Redirect to `/login` if not authenticated |
-| `POST /chat/stream`, `GET/PATCH/DELETE /conversations…` | yes | Chat is rate-limited (cost-aware) |
+| `POST /chat/stream`, `POST /chat`, `GET/PATCH/DELETE /conversations…` | yes | Chat is rate-limited (cost-aware) and counted against the global daily answer cap |
 | `POST /auth/resend-verification`, `DELETE /account` | yes | |
 
 ## 4. Key states to design for
 
 - Loading (retrieval/generation in progress), empty (no history yet), abstention, rate-limited (429),
-  unverified-email, and error states — each screen must handle these explicitly.
+  daily answer cap reached (`daily_cap_reached` / 429 — the bubble shows the server's message),
+  unverified-email, erasure accepted (202) or busy (503 + `Retry-After`), unreadable
+  conversation (409), and error states — each screen must handle these explicitly.

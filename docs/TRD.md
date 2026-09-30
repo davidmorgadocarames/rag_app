@@ -137,7 +137,7 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
 
 - **Web/data tier**: two **Azure Container Apps** (backend, frontend) pull the existing GHCR images;
   **Azure Database for PostgreSQL Flexible Server** with the `pgvector` extension enabled holds the
-  data (run `alembic upgrade head` against it).
+  data (migrated by the migration Job since Phase 11a).
 - **Model tier**: the Container Apps consumption plan has no practical GPU, so `qwen`/Ollama is **not**
   deployed there — **Azure OpenAI** replaces it for the cloud path only, selected via `LLM_PROVIDER`
   (Ollama stays the local default). See [ADR phase 10](adr/adr_phase10_azure.md).
@@ -145,4 +145,8 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
   `DATA_MASTER_KEY`, `AZURE_OPENAI_*`); escalate to Key Vault only if a real need shows up.
 - **CD**: after the GHCR push, `cd.yml` authenticates to Azure with **OIDC federated credentials**
   (no stored secrets) and rolls both apps to the new image tag; the pre-push eval gate still guards
-  the deploy.
+  the deploy. *From Phase 11a:* CD runs on a successful CI run on `main`, refuses a commit without
+  the `secrag/gate-full` status, deploys images **by digest**, starts the **migration Job** (slim
+  `jobs` image) before the apps and updates the **purge** (hourly) and **backup** (daily, encrypted
+  to Blob Storage) Jobs to the same digest; it never rolls back
+  ([ADR phase 11](adr/adr_phase11_stability.md)).

@@ -90,13 +90,22 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    DEV[git push] --> GATE[Pre-push gate<br/>lint · mypy · tests · gitleaks · eval]
-    GATE --> GH[GitHub Actions]
-    GH --> GHCR[GHCR images]
-    GHCR -->|OIDC, no stored secrets| ACA[Azure Container Apps<br/>frontend · backend · embeddings]
+    DEV[git push main] --> GATE["Pre-push gate (full mode)<br/>lint · mypy · tests · DB tests · eval<br/>then commit status secrag/gate-full"]
+    GATE --> CI[CI on GitHub Actions]
+    CI -->|success on main| CD[CD: images by digest]
+    CD -->|OIDC, no stored secrets| MIG[Migration Job<br/>alembic upgrade head]
+    MIG -->|only if it succeeded| ACA[Azure Container Apps<br/>frontend · backend · embeddings]
+    CD --> JOBS[Purge + backup Jobs<br/>slim jobs image]
     ACA --> PG[(Azure PostgreSQL<br/>Flexible Server + pgvector)]
+    JOBS --> PG
+    JOBS --> BLOB[(Blob Storage<br/>age-encrypted dumps · tombstone exports)]
     ACA --> AOAI[Azure OpenAI]
 ```
+
+CD runs only after CI succeeded on `main`, refuses a commit without the `secrag/gate-full`
+status that a local `gate.sh --full` PASS publishes, skips docs-only changes and never rolls
+back; migrations run as a Job before the apps are updated, never at container start
+([ADR phase 11](docs/adr/adr_phase11_stability.md), decisions 1 and 3).
 
 ## Tech stack
 
@@ -459,16 +468,20 @@ a purger killed mid-way is completed by the next run.
 | `GET /auth/verify` · `POST /auth/resend-verification` | Email verification |
 | `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage; once the daily answer cap is reached, an `error` event (`daily_cap_reached`) |
 | `POST /chat` | Authenticated one-shot, non-persisting answer with citations and `abstained`/`grounded` flags; `429` + `Retry-After` (until UTC midnight) once the daily answer cap is reached |
+| `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |
+| `DELETE /account` | GDPR erasure, **202 Accepted**: crypto-shred + PII scrub at once; the rows are purged within 24 h, backup copies expire within 14 days |
 
 **Daily answer cap.** Registration is open and the cloud chat sits behind one shared proxy
 IP, so the per-IP rate limit cannot bound total spend on its own. Every answer that needs
 the LLM is counted in `usage_daily` (one row per UTC day: answers and tokens, no personal
-data) at the **start** of the request, in one race-safe `INSERT … ON CONFLICT … WHERE
-answers < cap` statement. Failed and interrupted turns count too, because they spend tokens;
-the canned greeting reply makes no LLM call and does not count. Set `DAILY_ANSWER_CAP`
+data) at the **start** of the request, before any LLM call, in one race-safe `INSERT … ON
+CONFLICT … WHERE answers < cap` statement. Turns that fail or are interrupted inside the
+pipeline count too, because they may have spent tokens; a turn refused before the pipeline
+(the data key does not unwrap, the message cannot be stored) does not, and the canned
+greeting reply makes no LLM call and does not count. Every LLM call has a `max_tokens`
+bound, so the worst-case cost of a day at the cap is known in advance
+([ADR phase 11 — Costs](docs/adr/adr_phase11_stability.md#costs)). Set `DAILY_ANSWER_CAP`
 (default 300; `0` switches it off, `ENV=dev` only).
-| `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |
-| `DELETE /account` | GDPR erasure, **202 Accepted**: crypto-shred + PII scrub at once; the rows are purged within 24 h, backup copies expire within 14 days |
 
 ## Architecture decision records
 
@@ -476,7 +489,7 @@ the canned greeting reply makes no LLM call and does not count. Set `DAILY_ANSWE
 - [ADR phase 6 — Data erasure (GDPR): crypto-shred + tombstones](docs/adr/adr_phase06_gdpr_erasure.md)
 - [ADR phase 9 — Containerization and delivery](docs/adr/adr_phase09_deployment.md)
 - [ADR phase 10 — Cloud deployment on Azure](docs/adr/adr_phase10_azure.md)
-- [ADR phase 11 — Stability: data persistence and rerank latency](docs/adr/adr_phase11_stability.md) (in progress)
+- [ADR phase 11 — Stability: data persistence and rerank latency](docs/adr/adr_phase11_stability.md) (11a landed: persistence, migrations Job, asynchronous erasure, backups, daily cap; 11b open)
 
 ## License
 

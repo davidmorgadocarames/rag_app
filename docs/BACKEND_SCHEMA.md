@@ -3,6 +3,11 @@
 How user and corpus data is stored and organised, including the authentication flow and every table
 with its columns and relationships. Target store: **PostgreSQL 16 + pgvector**.
 
+Sections 1–3 are the **target design** from the planning phase (some tables — sessions,
+password resets, login attempts, query logs — arrive in later phases). What the migrations
+create **today** (head `0005_persistence_erasure`), including the database roles and their
+grants, is in [section 5](#5-as-implemented-migrations-0001-0005).
+
 ## 1. Authentication flow
 
 ```
@@ -171,8 +176,10 @@ Migration 0005 columns used here: `users.deleted_at`, nullable `users.email`/`pa
 `deletion_requests.status` (`pending`/`running`/`done`/`failed`), `progress` (jsonb, rows
 deleted per step), `attempts`, `last_error` (error class only), `updated_at`,
 `completed_at`; `purger_runs` (`started_at`, `finished_at`, `requests_processed`, `errors`,
-`last_error`). Tombstones stay in the database; the exports leave out those `done` for more
-than 15 days.
+`last_error`). Tombstones stay in the database — a minimal record that an erased account
+existed (random id, dates, status, counts; no email, no content), disclosed in the privacy
+text; deleting `done` tombstones older than ~60 days is planned with the `retention` role.
+The exports leave out those `done` for more than 15 days.
 
 **Target list (planning):**
 
@@ -180,3 +187,38 @@ Deleting a user removes/renders-unrecoverable, at minimum:
 `users`, `user_keys`, `*_tokens`, `sessions`, `login_attempts` (for that user), `conversations`,
 `messages`, `citations`, `query_logs` — **plus** any per-user cache entries and external trace records.
 Corpus tables (`documents`, `chunks`) are shared and not user-owned.
+
+## 5. As implemented (migrations 0001-0005)
+
+Source of truth: `backend/src/rag_app/db/models.py` and `backend/migrations/versions/`. Head:
+**`0005_persistence_erasure`** (Phase 11a, expand-only — see the
+[Definition of Done](DEFINITION_OF_DONE.md#phase-specific-norms), expand/contract).
+
+| Table | Columns (type; nullable = null) | Notes |
+|---|---|---|
+| `users` | `id` uuid PK · `email` varchar unique, **null since 0005** · `password_hash` varchar, **null since 0005** · `email_verified` bool · `created_at` · **`deleted_at`** timestamptz null (0005) | an erased account has `email`/`password_hash` NULL and `deleted_at` set until the purger removes the row; login and token checks ignore it |
+| `user_keys` | `user_id` uuid PK → `users` (cascade) · `wrapped_key` bytea · `created_at` | the per-user Fernet key wrapped by `DATA_MASTER_KEY`; deleted in the erasure request (crypto-shred) |
+| `conversations` | `id` · `user_id` → `users` (cascade) · `title_encrypted` bytea null · `created_at` | |
+| `messages` | `id` · `conversation_id` → `conversations` (cascade) · `role` · `content_encrypted` bytea · `prompt_tokens`, `completion_tokens` int null · `created_at` | citations inside the encrypted JSON; failed/interrupted turns are stored as assistant error markers |
+| `email_verification_tokens` | `id` · `user_id` → `users` (cascade) · `token_hash` unique · `expires_at` · `used_at` null · `created_at` | only the hash is stored |
+| `deletion_requests` (tombstones) | `id` · `user_id` uuid **unique, no FK** · `requested_at` · **0005:** `status` (`pending`/`running`/`done`/`failed`, default `pending`; rows from before 0005 = `done`) · `progress` jsonb (rows deleted per purge step) · `attempts` int · `last_error` text null (error class only) · `updated_at` · `completed_at` null | partial index `ix_deletion_requests_open` on `requested_at` where the status is open; no personal data; exported to Blob `tombstones/` (local `.tombstones/`) for restores |
+| `purger_runs` (0005) | `id` uuid PK (`gen_random_uuid()`) · `started_at` · `finished_at` null · `requests_processed` · `errors` · `last_error` null | one row per purger run; no personal data |
+| `usage_daily` (0005) | `day` date PK · `answers` int ≥ 0 · `tokens` bigint ≥ 0 | global daily answer cap (R6-1); no user id |
+| `master_key_fingerprint` (0005) | `id` smallint PK, `CHECK (id = 1)` · `fingerprint` · `algorithm` · `created_at` | HMAC-SHA256 of `DATA_MASTER_KEY`; the API refuses to start on a mismatch, and writes the first row only when every stored user key unwraps (R5-5) |
+| `documents` | `id` · `slug` unique · `source`, `title` null · `version` · `effective_date` null · `category_rank` null · `created_at` | corpus, shared |
+| `chunks` | `id` · `document_id` → `documents` (cascade) · `chunk_uid` unique · `heading` · `ordinal` · `text` · `embedding` vector(1024) · `version` · `effective_date` null | corpus, shared |
+
+**Roles and grants.** The application and the migrations run as the database **owner**
+(a restricted app role is planned for a later phase). `db/roles.sql` (idempotent, run as
+the owner before every migrate) creates two `NOLOGIN` roles; LOGIN and passwords are set
+outside Alembic by `scripts/db/apply_roles.sh` (it sends only a client-side SCRAM verifier):
+
+| Role | Grants | Used by |
+|---|---|---|
+| `secrag_backup` | `CONNECT`, `USAGE` on `public`; `SELECT` on every table and sequence, and **default privileges** so every future table is readable too (0005 also grants its new tables explicitly) | `scripts/db/backup.sh` (`pg_dump` → `age`), the backup Job |
+| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`: `SELECT, DELETE, UPDATE (id)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` | `rag_app.purger` (purge Job, compose `purger`) |
+
+0005 checks that both roles exist (a missing role fails the upgrade with a clear message)
+and its downgrade revokes the purger's grants. The **downgrade refuses** while any user has
+`email`/`password_hash` NULL or `deleted_at` set: it is never a rollback path (roll images
+back instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback)).

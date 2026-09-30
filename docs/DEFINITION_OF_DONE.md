@@ -71,6 +71,12 @@ are a human/agent checklist.
   down; see `.git/secrag-gate/publish-status.log`): after a `--full` PASS for that SHA,
   `bash scripts/cd/gate_status.sh publish <sha>`, then **"Re-run failed jobs"** on the CD
   run whose `gate-status` job timed out.
+- **Rollback block before the merge (Phase 11+)** — every promotion that changes Azure has a
+  written rollback block, reviewed by the owner **before** the merge: the previous image
+  digests and the exact commands, the trigger, what is kept and what is deleted, and the
+  accepted short-window effects. CD never rolls back; a migration's downgrade is never the
+  rollback path. 11a's is in the
+  [ADR phase 11 — Rollback](adr/adr_phase11_stability.md#rollback).
 - **Gate status enforced by CD (Phase 11+, D-2026-09-27-7 b)** — a `--full` PASS on a clean
   tree publishes the GitHub commit status **`secrag/gate-full` = success for exactly that
   SHA** (`scripts/cd/gate_status.sh`, via `gh`). CD's `gate-status` job and the `deploy` job
@@ -155,8 +161,10 @@ existing throwaway volume and a busy API port, and removes everything it created
 while the development stack is up.
 
 Gate-project setup (up + roles + migrate + seed restore) has its own 300 s budget; building a
-cached venv (below) has 900 s. Measured on the development machine (2026-09-27): `--fast`
-≈ 26 s, `--full` ≈ 3 min (eval ≈ 2.5 min).
+cached venv (below) has 900 s. Measured on the development machine (2026-10-01, end of
+11a): `--fast` ≈ 1 min in the main tree (≈ 2 min from the pre-push worktree), `--full`
+≈ 6 min (eval ≈ 2.5 min, restart-check ≈ 1 min, db-tests ≈ 40 s, erasure-scale ≈ 17 s,
+backup-drill ≈ 10 s) — well inside the 30-minute target.
 
 **Venv matching the pins** (DA-B-4). The gate resolves the backend venv before any step: the
 main tree's `backend/.venv` when the checked tree's requirements hash equals the main tree's
