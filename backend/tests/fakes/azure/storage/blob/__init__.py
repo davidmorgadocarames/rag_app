@@ -46,6 +46,9 @@ class ContainerClient:
     def get_blob_client(self, blob: str) -> _BlobClient:
         return _BlobClient(self.root / blob)
 
+    def delete_blob(self, blob: str) -> None:
+        (self.root / blob).unlink()
+
     def list_blobs(self, name_starts_with: str | None = None) -> Iterator[Any]:
         for path in sorted(p for p in self.root.rglob("*") if p.is_file()):
             name = path.relative_to(self.root).as_posix()

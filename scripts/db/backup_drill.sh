@@ -3,7 +3,8 @@
 # the user stays erased; decrypt with the OFFLINE copy of the key; files older than the retention (X9) removed.
 #
 #   DRILL_ADMIN_URL=postgresql://<superuser>:<pw>@127.0.0.1:<port>/postgres \
-#   SECRAG_BACKUP_PASSWORD=<secrag_backup password> scripts/db/backup_drill.sh
+#   SECRAG_BACKUP_PASSWORD=<secrag_backup password> SECRAG_PURGER_PASSWORD=<secrag_purger password> \
+#   scripts/db/backup_drill.sh
 #
 # Runs ONLY on a local throwaway server (the gate project): the admin URL must be loopback and
 # not port 5432 (the development database). Everything it creates is thrown away: databases
@@ -16,9 +17,11 @@
 #      manager / offline copy of R4-1) and the working copy is shredded
 #   3. backup.sh --file as secrag_backup into a folder that already holds a 15-day-old dump,
 #      a 13-day-old dump and an unrelated file → only the 15-day-old one is removed
-#   4. erase the test account (the app's path) and export the tombstones (the purger's export)
-#   5. restore.sh with the OFFLINE key into a new empty database → the erased account stays
-#      erased (tombstone "done", no key/conversation/message), the kept one is intact
+#   4. erase the test account with the API's request path (key gone, tombstone pending), then
+#      one purger run AS secrag_purger (11.2b): rows removed, tombstone done, export written
+#   5. restore.sh with the OFFLINE key into a new empty database (union → replay_deletions →
+#      purger) → the erased account stays erased (tombstone "done", no key/conversation/
+#      message), the kept one is intact
 #   6. controls: without the tombstone export the erased account comes back (the export is
 #      what keeps it erased); a wrong key restores nothing; a non-empty target is refused
 set -euo pipefail
@@ -28,6 +31,7 @@ set -euo pipefail
 
 [ -n "${DRILL_ADMIN_URL:-}" ] || die "DRILL_ADMIN_URL is not set"
 [ -n "${SECRAG_BACKUP_PASSWORD:-}" ] || die "SECRAG_BACKUP_PASSWORD is not set"
+[ -n "${SECRAG_PURGER_PASSWORD:-}" ] || die "SECRAG_PURGER_PASSWORD is not set"
 for tool in age age-keygen pg_dump pg_restore psql jq shred; do
   command -v "$tool" >/dev/null || die "$tool not found"
 done
@@ -97,12 +101,16 @@ dump="$(find "$work/backups" -maxdepth 1 -name 'secrag-*.dump.age' ! -name "$old
 if age -d -i "$work/keys/wrong.key" "$dump" >/dev/null 2>&1; then fail "a wrong key decrypts the dump"; fi
 ok "backup as secrag_backup: $(basename "$dump") (age); > $days days removed, $((days - 1)) days kept, other files untouched"
 
-# --- 4. erase the test user + export the tombstones ---------------------------------------
-DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$src")" "$py" -m rag_app.devtools.backup_drill erase --user "$erase" >/dev/null
-DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$src")" "$py" -m rag_app.tombstones export --dir "$work/tombstones" | sed 's/^/  /'
-ok "erased the test account after the backup; tombstones exported"
-
 state() { DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$1")" "$py" -m rag_app.devtools.backup_drill state --user "$keep" --user "$erase"; }
+
+# --- 4. erase the test user (request path) + one purger run as secrag_purger ---------------
+DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$src")" "$py" -m rag_app.devtools.backup_drill erase --user "$erase" >/dev/null
+jq -e --arg e "$erase" '.[$e] | .user and (.key | not) and .conversations == 1 and .tombstone == "pending"' <<<"$(state "$src")" >/dev/null   || fail "request path: expected key gone, rows still there, tombstone pending: $(jq -c --arg e "$erase" '.[$e]' <<<"$(state "$src")")"
+DATABASE_URL="$(url_for secrag_purger "$SECRAG_PURGER_PASSWORD" "$src")"   "$py" -m rag_app.erasure purge --export-dir "$work/tombstones" | sed 's/^/  /'
+[ "${PIPESTATUS[0]}" = 0 ] || fail "the purger run failed"
+jq -e --arg e "$erase" '.[$e] | (.user | not) and (.key | not) and .conversations == 0 and .messages == 0 and .tombstone == "done"' <<<"$(state "$src")" >/dev/null   || fail "purger: the erased account was not purged: $(jq -c --arg e "$erase" '.[$e]' <<<"$(state "$src")")"
+ls "$work/tombstones"/tombstones-*.jsonl >/dev/null 2>&1 || fail "the purger wrote no tombstone export"
+ok "erased the test account after the backup (request path → purger as secrag_purger: done); tombstones exported"
 restore_into() { # restore_into <db> <tombstone dir> <identity>
   RESTORE_DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$1")" \
     bash "$SECRAG_DB_DIR/restore.sh" --dump "$dump" --identity "$3" --tombstones-dir "$2"

@@ -10,6 +10,10 @@
 - ``check`` is the daily oldest-blob check (X9): it fails when there is no backup blob or the
   oldest one under ``backups/`` is older than ``BACKUP_RETENTION_DAYS`` (the Storage lifecycle
   rule deletes them after 12 days, so an older blob means the rule is broken).
+- ``upload_tombstone_export`` / ``prune_tombstone_exports``: the purger's side (11.2b): each
+  run uploads its tombstone export to a new blob ``tombstones/tombstones-<ts>.jsonl`` and
+  prunes exports older than ``TOMBSTONE_EXPORT_RETENTION_DAYS`` (30; the lifecycle rule
+  covers ``backups/`` only), always keeping the newest valid one (DA-F-8, DA-F2-1).
 
 Credentials: the Job's user-assigned managed identity (``AZURE_CLIENT_ID``; Storage Blob Data
 Contributor on the account; shared-key access is disabled). Settings: ``BACKUP_STORAGE_ACCOUNT``
@@ -25,6 +29,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable, Iterator
+from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
 from rag_app.retention import BACKUP_RETENTION_DAYS
@@ -50,13 +55,17 @@ class ContainerClient(Protocol):
 
     def list_blobs(self, name_starts_with: str | None = ...) -> Iterable[Any]: ...
 
+    def delete_blob(self, blob: str) -> Any: ...
 
-def container_client() -> ContainerClient:
-    """The real client: managed identity → Blob service → container (jobs image only)."""
-    account = os.environ.get("BACKUP_STORAGE_ACCOUNT", "")
+
+def container_client(account_env: str = "BACKUP_STORAGE_ACCOUNT") -> ContainerClient:
+    """The real client: managed identity → Blob service → container (jobs image only).
+    ``account_env`` names the variable holding the storage account (the purger uses
+    ``TOMBSTONE_STORAGE_ACCOUNT``)."""
+    account = os.environ.get(account_env, "")
     client_id = os.environ.get("AZURE_CLIENT_ID", "")
     if not re.fullmatch(r"[a-z0-9]{3,24}", account):
-        raise BackupError("BACKUP_STORAGE_ACCOUNT is missing or not a storage account name")
+        raise BackupError(f"{account_env} is missing or not a storage account name")
     if not client_id:
         raise BackupError("AZURE_CLIENT_ID (the Jobs' user-assigned identity) is not set")
     from azure.identity import ManagedIdentityCredential
@@ -114,6 +123,43 @@ def check(
             " retention promise — check the Storage lifecycle rule (12 days, backups/)"
         )
     return len(ages), oldest, newest
+
+
+TOMBSTONE_BLOB_RE = re.compile(r"^tombstones/(tombstones-\d{8}T\d{6}Z\.jsonl)$")
+
+
+def upload_tombstone_export(client: ContainerClient, path: Path) -> str:
+    """Upload a local tombstone export (``rag_app.tombstones`` format) to a NEW blob
+    ``tombstones/<file name>`` (never overwrites); returns the blob name. Opaque ids only;
+    the file is not encrypted (the container is private, shared-key access disabled)."""
+    name = TOMBSTONE_PREFIX + path.name
+    if not TOMBSTONE_BLOB_RE.match(name):
+        raise BackupError("tombstone export name must be tombstones-<yyyymmddThhmmssZ>.jsonl")
+    with path.open("rb") as handle:
+        client.upload_blob(name, iter(lambda: handle.read(CHUNK), b""), overwrite=False)
+    return name
+
+
+def prune_tombstone_exports(
+    client: ContainerClient, now: dt.datetime | None = None
+) -> tuple[list[str], list[str]]:
+    """DA-F-8: delete exports under ``tombstones/`` older than the tombstone-export retention
+    (by the time in the NAME), always keeping the newest valid one; while any export name
+    cannot be judged, nothing is deleted (DA-F2-1). Returns (deleted blob names, problems)."""
+    from rag_app.tombstones import exports_to_prune
+
+    now = now or dt.datetime.now(dt.UTC)
+    names = [
+        blob.name[len(TOMBSTONE_PREFIX) :]
+        for blob in client.list_blobs(name_starts_with=TOMBSTONE_PREFIX)
+        if blob.name.startswith(TOMBSTONE_PREFIX) and "/" not in blob.name[len(TOMBSTONE_PREFIX) :]
+    ]
+    remove, problems = exports_to_prune(names, now)
+    deleted = []
+    for base in remove:
+        client.delete_blob(TOMBSTONE_PREFIX + base)
+        deleted.append(TOMBSTONE_PREFIX + base)
+    return deleted, problems
 
 
 def main(argv: list[str] | None = None, client: ContainerClient | None = None) -> int:

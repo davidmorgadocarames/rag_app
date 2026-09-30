@@ -16,7 +16,7 @@
 #      backend must REFUSE to start with a master-key fingerprint mismatch (T11.2.4). Before
 #      T11.2.4 it started and every read failed (500) — that is reported as FAIL. Then `up`
 #      again with the original key (must be healthy).
-#   6. erase the account (DELETE /account) → login must then fail (401)
+#   6. erase the account (DELETE /account → 202, asynchronous erasure) → login must then fail (401)
 #   PASS → rc 0; FAIL → rc 1 with the step and the ACTUAL reason; usage/safety errors → rc 2.
 #
 # Before T11.2.1, `--restart-project Q` other than P failed at step 4 (compose derived the
@@ -303,7 +303,7 @@ fi
 
 # --- 6. erase the dedicated account ------------------------------------------------------
 res="$(http DELETE /account "$token")"
-[ "$(status_of "$res")" = 200 ] || fail "erase" "HTTP $(status_of "$res") on DELETE /account"
+[ "$(status_of "$res")" = 202 ] || fail "erase" "HTTP $(status_of "$res") on DELETE /account"
 res="$(http POST /auth/login - "$creds")"
 [ "$(status_of "$res")" = 401 ] || fail "erase" "login still works after DELETE /account (HTTP $(status_of "$res"))"
 say "dedicated account erased (login refused afterwards)"

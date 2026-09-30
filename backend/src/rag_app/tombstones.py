@@ -12,10 +12,20 @@ one JSON object per line, nothing else::
 
     {"user_id": "<uuid>", "requested_at": "<ISO 8601 with offset>"}
 
-The ids are opaque (no email, no name): a tombstone is not personal data on its own. A line
-that does not match the format fails the whole read (a restore never guesses).
+The ids are opaque (no email, no name). They are still pseudonymous personal data (they link
+to the rows of backups up to 14 days old), so exports are private files kept only as long as
+needed. A line that does not match the format fails the whole read (a restore never guesses).
 
-    python -m rag_app.tombstones export --dir DIR          # the purger's export (11.2b)
+What an export holds (PHASE_PLANNING 11.2b): every tombstone EXCEPT those ``done`` for more
+than ``TOMBSTONE_EXPORT_DONE_DAYS`` (no backup copy is old enough to revive them). Which
+exports are kept (DA-F-8): each export is the full list, so exports whose NAME time is older
+than ``TOMBSTONE_EXPORT_RETENTION_DAYS`` are pruned (by the purger: Blob ``tombstones/`` and
+its local folder) and the newest valid one is always kept (``exports_to_prune`` — the same
+rule as ``scripts/db/backup_lib.sh prune_by_name`` with keep-newest; DA-F2-1: while any
+matching name cannot be judged, nothing is deleted).
+
+    python -m rag_app.tombstones export --dir DIR          # an export by hand (the purger
+                                                           # exports on every run, 11.2b)
     python -m rag_app.tombstones validate --dir DIR        # format check, no database
     python -m rag_app.tombstones restore-union --dir DIR   # restore.sh, as the DB OWNER
 
@@ -33,14 +43,18 @@ import sys
 import uuid
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, not_, select
 from sqlalchemy.orm import Session
 
 from rag_app.db.models import DeletionRequest, User
 from rag_app.erasure import replay_deletions
+from rag_app.retention import TOMBSTONE_EXPORT_DONE_DAYS, TOMBSTONE_EXPORT_RETENTION_DAYS
 
 FILE_RE = re.compile(r"^tombstones-(\d{8}T\d{6}Z)\.jsonl$")
 FIELDS = frozenset({"user_id", "requested_at"})
+# A name time more than this far in the future cannot be judged (clock-skew allowance; the
+# shell pruner uses the same value, FUTURE_SKEW_SECONDS in backup_lib.sh).
+FUTURE_SKEW = dt.timedelta(days=1)
 
 
 class TombstoneExportError(ValueError):
@@ -52,12 +66,18 @@ def export_file_name(now: dt.datetime) -> str:
 
 
 def export_tombstones(session: Session, directory: Path, now: dt.datetime | None = None) -> Path:
-    """Write the FULL tombstone list to a new export file (atomic, 0600, directory 0700)."""
+    """Write the tombstone list to a new export file (atomic, 0600, directory 0700): every
+    tombstone except those ``done`` for more than ``TOMBSTONE_EXPORT_DONE_DAYS``."""
     now = now or dt.datetime.now(dt.UTC)
+    long_done = and_(  # never NULL: a `done` row without completed_at stays in the export
+        DeletionRequest.status == "done",
+        DeletionRequest.completed_at.is_not(None),
+        DeletionRequest.completed_at < now - dt.timedelta(days=TOMBSTONE_EXPORT_DONE_DAYS),
+    )
     rows = session.execute(
-        select(DeletionRequest.user_id, DeletionRequest.requested_at).order_by(
-            DeletionRequest.requested_at, DeletionRequest.user_id
-        )
+        select(DeletionRequest.user_id, DeletionRequest.requested_at)
+        .where(not_(long_done))
+        .order_by(DeletionRequest.requested_at, DeletionRequest.user_id)
     ).all()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = directory / export_file_name(now)
@@ -71,6 +91,60 @@ def export_tombstones(session: Session, directory: Path, now: dt.datetime | None
         os.fsync(handle.fileno())
     os.replace(tmp, target)
     return target
+
+
+def export_name_time(name: str) -> dt.datetime | None:
+    """The UTC time in an export file name; None when the name matches the pattern but the
+    date is not a real one (month 13, Feb 31, 24:00). ValueError for a non-matching name."""
+    match = FILE_RE.match(name)
+    if match is None:
+        raise ValueError(f"not a tombstone export name: {name!r}")
+    try:
+        return dt.datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.UTC)
+    except ValueError:
+        return None
+
+
+def exports_to_prune(
+    names: list[str], now: dt.datetime, days: int = TOMBSTONE_EXPORT_RETENTION_DAYS
+) -> tuple[list[str], list[str]]:
+    """(names to delete, problems) among the export names found in ONE place (a folder or
+    the Blob prefix; base names; names that do not match the pattern are ignored).
+
+    - A matching name with an invalid date, or dated more than ``FUTURE_SKEW`` ahead, cannot
+      be judged: it is reported and then NOTHING is deleted (DA-F2-1: a stray future-dated
+      name must never become "the newest" and cost the real newest export its protection;
+      the operator removes it by hand, the next run prunes).
+    - Otherwise every export older than ``days`` is deleted except the newest valid one."""
+    valid: list[tuple[dt.datetime, str]] = []
+    problems: list[str] = []
+    for name in names:
+        if not FILE_RE.match(name):
+            continue
+        when = export_name_time(name)
+        if when is None:
+            problems.append(f"{name}: invalid date in the name")
+        elif when - now > FUTURE_SKEW:
+            problems.append(f"{name}: dated in the future")
+        else:
+            valid.append((when, name))
+    if problems or not valid:
+        return [], problems
+    newest = max(valid)[1]
+    cutoff = now - dt.timedelta(days=days)
+    return sorted(n for when, n in valid if n != newest and when < cutoff), problems
+
+
+def prune_local_exports(
+    directory: Path, now: dt.datetime | None = None
+) -> tuple[list[str], list[str]]:
+    """``exports_to_prune`` applied to a local export folder; returns (removed, problems)."""
+    now = now or dt.datetime.now(dt.UTC)
+    names = [p.name for p in directory.iterdir() if p.is_file() and not p.is_symlink()]
+    remove, problems = exports_to_prune(names, now)
+    for name in remove:
+        (directory / name).unlink()
+    return remove, problems
 
 
 def _parse_line(raw: str, where: str) -> tuple[uuid.UUID, dt.datetime]:
@@ -110,8 +184,8 @@ def read_exports(directory: Path) -> tuple[dict[uuid.UUID, dt.datetime], int]:
 def apply_union(session: Session, exported: dict[uuid.UUID, dt.datetime]) -> tuple[int, int]:
     """Add every exported tombstone the restored database lacks; returns (restored, added).
 
-    Added tombstones are ``done`` like the ones ``erase_user`` writes today (11.2b's
-    ``replay_deletions`` re-queues them as ``pending``)."""
+    Added tombstones are written ``done``; ``replay_deletions`` then re-queues as
+    ``pending`` every one whose account the restore brought back."""
     restored = set(session.scalars(select(DeletionRequest.user_id)))
     now = dt.datetime.now(dt.UTC)
     missing = sorted(set(exported) - restored)
@@ -184,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"tombstones: {c['restored']} restored in the database, {c['exported']} in"
                 f" {c['export_files']} export file(s), {c['added']} added (union ="
-                f" {c['tombstones']}); replay_deletions re-erased {c['reerased']} account(s);"
+                f" {c['tombstones']}); replay_deletions re-erased {c['reerased']} account(s)"
+                " (queued for the purger);"
                 f" users {c['users_before']} -> {c['users_after']}"
             )
             return 0

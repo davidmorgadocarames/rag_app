@@ -10,15 +10,17 @@
 #   git work tree), unless it is already there;
 # - downloads the newest tombstone export tombstones/tombstones-<ts>.jsonl into DIR/tombstones
 #   (restore.sh --tombstones-dir; opaque ids only);
-# - deletes local dumps and tombstone exports older than the retention (X9 constant, read from
-#   backend/src/rag_app/retention.py; the newest tombstone export is always kept).
+# - deletes local dumps older than the retention (X9 constant) and tombstone exports older
+#   than TOMBSTONE_EXPORT_RETENTION_DAYS (30; the newest valid export is always kept, and none
+#   is deleted while a name cannot be judged) — both from backend/src/rag_app/retention.py.
+#   A non-zero exit after the download means: read the WARNING line (a name to check by hand).
 # BACKUP_CONTAINER overrides the container (default secrag-backups).
 set -euo pipefail
 
 # shellcheck source=scripts/db/backup_lib.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/backup_lib.sh"
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
 dir="${BACKUP_PULL_DIR:-$HOME/secrag-db-backups/azure}"
 while [ $# -gt 0 ]; do
@@ -35,6 +37,7 @@ container="${BACKUP_CONTAINER:-secrag-backups}"
 [[ "$account" =~ ^[a-z0-9]{3,24}$ ]] || die "set BACKUP_STORAGE_ACCOUNT (the storage account name)"
 command -v az >/dev/null || die "az (the Linux Azure CLI) not found"
 days="$(retention_days)"
+tdays="$(tombstone_retention_days)"
 if inside_git_work_tree "$dir"; then
   die "refusing $dir: backups never go inside a git work tree"
 fi
@@ -81,9 +84,9 @@ else
   echo "backup-pull: no tombstone export yet under tombstones/ (the purge Job writes it)"
 fi
 
-echo "backup-pull: retention $days days (X9)"
+echo "backup-pull: retention $days days (X9), tombstone exports $tdays days"
 flagged=0
 prune_by_name "$dir" "$DUMP_NAME_RE" "$days" || flagged=1
-prune_by_name "$dir/tombstones" "$TOMBSTONE_NAME_RE" "$days" keep-newest || flagged=1
+prune_by_name "$dir/tombstones" "$TOMBSTONE_NAME_RE" "$tdays" keep-newest || flagged=1
 echo "backup-pull: $(find "$dir" -maxdepth 1 -type f -name 'secrag-*.dump.age' | wc -l) local dump(s) in $dir"
 [ "$flagged" = 0 ] || die "retention found names it cannot judge (WARNING above) — check them"

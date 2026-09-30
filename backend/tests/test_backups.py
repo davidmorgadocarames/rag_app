@@ -228,9 +228,12 @@ class _MemoryContainer:
         )
 
     def list_blobs(self, name_starts_with: str | None = None):
-        for name, (_data, created) in self.blobs.items():
+        for name, (_data, created) in list(self.blobs.items()):
             if name.startswith(name_starts_with or ""):
                 yield types.SimpleNamespace(name=name, creation_time=created)
+
+    def delete_blob(self, blob: str) -> None:
+        del self.blobs[blob]
 
 
 def test_blob_upload_accepts_only_ciphertext_and_never_overwrites() -> None:
@@ -597,6 +600,7 @@ def test_the_union_re_erases_an_account_the_restored_database_still_has(
     from rag_app.db.models import DeletionRequest, User, UserKey
     from rag_app.db.session import make_engine
     from rag_app.devtools import backup_drill
+    from rag_app.purger import Purger
 
     engine = make_engine()
     try:
@@ -609,16 +613,120 @@ def test_the_union_re_erases_an_account_the_restored_database_still_has(
             export = tombstones.export_tombstones(session, tmp_path / "exports")
             assert oct(export.stat().st_mode & 0o777) == "0o600"
             # … while the "restored" database predates the erasure (no tombstone, user alive)
-            session.query(DeletionRequest).delete()
+            session.query(DeletionRequest).filter(DeletionRequest.user_id == erase).delete()
             session.commit()
             assert session.get(User, erase) is not None
             counts = tombstones.restore_union(session, tmp_path / "exports")
-            assert counts["added"] == 1 and counts["restored"] == 0 and counts["reerased"] == 1
-            assert session.get(User, erase) is None and session.get(UserKey, erase) is None
-            assert session.get(User, keep) is not None
-            assert session.scalar(select(DeletionRequest.status)) == "done"
+            assert counts["added"] == 1 and counts["reerased"] >= 1
+            # replay (11.2b): key gone and PII scrubbed at once, rows queued for the purger
+            session.expire_all()
+            erased = session.get(User, erase)
+            assert erased is not None and erased.deleted_at is not None and erased.email is None
+            assert session.get(UserKey, erase) is None
+            status = select(DeletionRequest.status).where(DeletionRequest.user_id == erase)
+            assert session.scalar(status) == "pending"
+            request_id = session.scalar(
+                select(DeletionRequest.id).where(DeletionRequest.user_id == erase)
+            )
+            assert Purger(engine, sleep=lambda _s: None).run(only=request_id).done == 1
+            session.expire_all()
+            assert session.get(User, erase) is None and session.get(User, keep) is not None
+            assert session.scalar(status) == "done"
             again = tombstones.restore_union(session, tmp_path / "exports")
-            assert again["added"] == 0 and again["reerased"] == 0  # idempotent
-            assert session.scalar(select(func.count()).select_from(User)) == 1
+            assert again["added"] == 0  # idempotent: nothing to re-apply for this account
+            assert session.get(User, erase) is None
+            assert session.scalar(select(func.count()).select_from(User).where(User.id == keep))
     finally:
         engine.dispose()
+
+
+# --- DA-F-8 / DA-F2-1: tombstone export retention (30 days, newest kept, no guessing) --------
+
+
+def test_the_tombstone_export_retention_outlives_the_backups() -> None:
+    from rag_app.retention import TOMBSTONE_EXPORT_DONE_DAYS, TOMBSTONE_EXPORT_RETENTION_DAYS
+
+    assert TOMBSTONE_EXPORT_RETENTION_DAYS == 30
+    assert TOMBSTONE_EXPORT_RETENTION_DAYS > BACKUP_RETENTION_DAYS
+    assert TOMBSTONE_EXPORT_DONE_DAYS == BACKUP_RETENTION_DAYS + 1
+
+
+def _tomb(days_ago: float) -> str:
+    return f"tombstones-{_stamp(days_ago)}.jsonl"
+
+
+@needs_bash
+def test_keep_newest_prunes_nothing_while_a_name_cannot_be_judged(tmp_path: Path) -> None:
+    """DA-F2-1 reproduction: exports 20/25/30 days old + a 2099 name, 14-day retention. The
+    old pruner took the 2099 name as "the newest" and deleted all three real exports."""
+    folder = tmp_path / "tombstones"
+    folder.mkdir()
+    real = [_tomb(20), _tomb(25), _tomb(30)]
+    stray = "tombstones-20990101T000000Z.jsonl"
+    for name in [*real, stray]:
+        (folder / name).write_text("")
+    lib = DB_SCRIPTS / "backup_lib.sh"
+
+    def prune() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", f'. "{lib}"; prune_by_name "$1" "$TOMBSTONE_NAME_RE" "$2" keep-newest',
+             "prune", str(folder), str(BACKUP_RETENTION_DAYS)],
+            capture_output=True, text=True, timeout=60,
+        )  # fmt: skip
+
+    proc = prune()
+    assert proc.returncode == 1
+    assert {p.name for p in folder.iterdir()} == {*real, stray}  # nothing deleted
+    assert f"WARNING: {stray} is dated in the future" in proc.stderr
+    assert "nothing pruned" in proc.stderr
+    (folder / stray).unlink()  # the operator removes the stray name by hand
+    again = prune()
+    assert again.returncode == 0, again.stderr
+    assert {p.name for p in folder.iterdir()} == {real[0]}  # newest valid kept, even if old
+
+
+def test_exports_to_prune_keeps_the_newest_and_refuses_to_guess() -> None:
+    now = dt.datetime.now(dt.UTC)
+    names = [_tomb(40), _tomb(35), _tomb(10), _tomb(1), "notes.txt"]
+    remove, problems = tombstones.exports_to_prune(names, now)
+    assert remove == sorted([_tomb(40), _tomb(35)]) and problems == []
+    only_old = [_tomb(40), _tomb(35)]
+    assert tombstones.exports_to_prune(only_old, now)[0] == [_tomb(40)]  # newest always kept
+    for stray in ("tombstones-20990101T000000Z.jsonl", "tombstones-20261399T000000Z.jsonl"):
+        remove, problems = tombstones.exports_to_prune([*names, stray], now)
+        assert remove == [] and len(problems) == 1 and stray in problems[0]
+
+
+def test_local_export_prune(tmp_path: Path) -> None:
+    for name in (_tomb(31), _tomb(29), "other.txt"):
+        (tmp_path / name).write_text("")
+    removed, problems = tombstones.prune_local_exports(tmp_path)
+    assert removed == [_tomb(31)] and problems == []
+    assert {p.name for p in tmp_path.iterdir()} == {_tomb(29), "other.txt"}
+
+
+def test_blob_tombstone_exports_upload_and_prune(tmp_path: Path) -> None:
+    client = _MemoryContainer()
+    now = dt.datetime.now(dt.UTC)
+    for days in (40, 35, 10):
+        client.blobs[f"tombstones/{_tomb(days)}"] = (b"", now)
+    client.blobs[f"backups/secrag-{_stamp(40)}.dump.age"] = (b"", now)  # not ours to touch
+    export = tmp_path / _tomb(0)
+    export.write_text("")
+    assert backup_blob.upload_tombstone_export(client, export) == f"tombstones/{export.name}"
+    with pytest.raises(RuntimeError):
+        backup_blob.upload_tombstone_export(client, export)  # never overwrites
+    with pytest.raises(backup_blob.BackupError):
+        backup_blob.upload_tombstone_export(client, tmp_path / "evil.jsonl")
+    deleted, problems = backup_blob.prune_tombstone_exports(client, now)
+    assert deleted == sorted([f"tombstones/{_tomb(40)}", f"tombstones/{_tomb(35)}"])
+    assert problems == []
+    assert set(client.blobs) == {
+        f"tombstones/{_tomb(10)}",
+        f"tombstones/{export.name}",
+        f"backups/secrag-{_stamp(40)}.dump.age",
+    }
+    client.blobs["tombstones/tombstones-20990101T000000Z.jsonl"] = (b"", now)
+    client.blobs[f"tombstones/{_tomb(45)}"] = (b"", now)
+    deleted, problems = backup_blob.prune_tombstone_exports(client, now)
+    assert deleted == [] and problems and f"tombstones/{_tomb(45)}" in client.blobs

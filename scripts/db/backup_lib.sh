@@ -32,13 +32,17 @@ retention_file() {
   return 1
 }
 
-retention_days() {
+# retention_constant <NAME>: the integer of the `<NAME> = <n>` line in retention.py.
+retention_constant() {
   local f v
   f="$(retention_file)" || { echo "retention.py not found next to $SECRAG_DB_DIR" >&2; return 1; }
-  v="$(sed -n 's/^BACKUP_RETENTION_DAYS = \([0-9][0-9]*\)$/\1/p' "$f")"
-  [ -n "$v" ] || { echo "no 'BACKUP_RETENTION_DAYS = <n>' line in $f" >&2; return 1; }
+  v="$(sed -n "s/^$1 = \([0-9][0-9]*\)\$/\1/p" "$f")"
+  [ -n "$v" ] || { echo "no '$1 = <n>' line in $f" >&2; return 1; }
   echo "$v"
 }
+retention_days() { retention_constant BACKUP_RETENTION_DAYS; }
+# Tombstone exports: kept this many days, the newest valid one always (DA-F-8).
+tombstone_retention_days() { retention_constant TOMBSTONE_EXPORT_RETENTION_DAYS; }
 
 # secrag_python: the interpreter with rag_app (SECRAG_PYTHON, the backend venv, or the jobs
 # image's python) — exports PYTHONPATH for a repository checkout.
@@ -74,18 +78,36 @@ name_epoch() {
 }
 
 # prune_by_name <dir> <regex> <days> [keep-newest]: delete matching files whose name time is
-# more than <days> days old. Prints one line per removed file; with keep-newest the newest
-# match is never removed. Files that do not match the regex are never touched, except
-# leftover partial files: .<matching name>.partial older than PARTIAL_MAX_AGE_SECONDS (by
-# mtime) are removed. A matching name with an invalid date, or a time more than
-# FUTURE_SKEW_SECONDS in the future, is kept but REPORTED on stderr and the function returns
-# 1 after the sweep (it would otherwise be kept forever, silently — DA-F-3).
+# more than <days> days old. Prints one line per removed file. Files that do not match the
+# regex are never touched, except leftover partial files: .<matching name>.partial older than
+# PARTIAL_MAX_AGE_SECONDS (by mtime) are removed. A matching name with an invalid date, or a
+# time more than FUTURE_SKEW_SECONDS in the future, cannot be judged: it is kept but REPORTED
+# on stderr and the function returns 1 (it would otherwise be kept forever, silently — DA-F-3).
+# keep-newest: the newest VALID match is never removed, and while any matching name cannot be
+# judged NOTHING is removed (DA-F2-1: a stray future-dated name must never pass for the newest
+# export and cost the real one its protection) — the rule of rag_app.tombstones.exports_to_prune.
 prune_by_name() {
   local dir="$1" re="$2" days="$3" keep_newest="${4:-}" now f base inner epoch newest="" bad=0
+  local newest_epoch=-1
   now="$(date -u +%s)"
-  if [ -n "$keep_newest" ]; then
-    newest="$(find "$dir" -maxdepth 1 -type f -printf '%f\n' | { grep -E "$re" || true; } \
-      | sort | tail -n 1)"
+  # First pass: judge every matching name and find the newest valid one.
+  for f in "$dir"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    base="$(basename "$f")"
+    [[ "$base" =~ $re ]] || continue
+    if ! epoch="$(name_epoch "$base" "$re")"; then
+      echo "  WARNING: $base has an invalid date in its name — kept; check and remove it by hand" >&2
+      bad=1
+    elif [ $((epoch - now)) -gt "$FUTURE_SKEW_SECONDS" ]; then
+      echo "  WARNING: $base is dated in the future — kept; check the clock / remove it by hand" >&2
+      bad=1
+    elif [ "$epoch" -gt "$newest_epoch" ]; then
+      newest_epoch="$epoch"
+      newest="$base"
+    fi
+  done
+  if [ -n "$keep_newest" ] && [ "$bad" = 1 ]; then
+    echo "  WARNING: nothing pruned in $dir while a name cannot be judged (keep-newest)" >&2
   fi
   for f in "$dir"/* "$dir"/.*.partial; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
@@ -101,17 +123,12 @@ prune_by_name() {
       continue
     fi
     [[ "$base" =~ $re ]] || continue
-    if ! epoch="$(name_epoch "$base" "$re")"; then
-      echo "  WARNING: $base has an invalid date in its name — kept; check and remove it by hand" >&2
-      bad=1
-      continue
+    epoch="$(name_epoch "$base" "$re")" || continue              # reported above
+    [ $((epoch - now)) -gt "$FUTURE_SKEW_SECONDS" ] && continue  # reported above
+    if [ -n "$keep_newest" ]; then
+      [ "$bad" = 0 ] || continue
+      [ "$base" = "$newest" ] && continue
     fi
-    if [ $((epoch - now)) -gt "$FUTURE_SKEW_SECONDS" ]; then
-      echo "  WARNING: $base is dated in the future — kept; check the clock / remove it by hand" >&2
-      bad=1
-      continue
-    fi
-    [ "$base" = "$newest" ] && continue
     if [ $((now - epoch)) -gt $((days * 86400)) ]; then
       rm -f -- "$f"
       echo "  removed $base (older than $days days)"

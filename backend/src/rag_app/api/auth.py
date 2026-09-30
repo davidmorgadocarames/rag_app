@@ -23,7 +23,7 @@ from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.db.models import EmailVerificationToken, User, UserKey
 from rag_app.emailer import send_verification_email, verification_link
-from rag_app.erasure import erase_user
+from rag_app.erasure import ERASURE_ACCEPTED_MESSAGE, request_erasure
 from rag_app.risk import is_high_risk, signup_risk_score
 from rag_app.security import (
     create_token,
@@ -51,7 +51,9 @@ def get_current_user(
         user_id = uuid.UUID(subject)
     except ValueError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
-    user = session.scalar(select(User).where(User.id == user_id))
+    # An erased account (deleted_at set by the request path) is gone for authentication at
+    # once, even while the purger has not removed its row yet: a live token stops working.
+    user = session.scalar(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
     return user
@@ -135,7 +137,9 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
 
 @router.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_login)])
 def login(request: LoginRequest, session: SessionDep) -> TokenResponse:
-    user = session.scalar(select(User).where(User.email == request.email))
+    user = session.scalar(
+        select(User).where(User.email == request.email, User.deleted_at.is_(None))
+    )
     if (
         user is None
         or user.password_hash is None  # scrubbed by erasure (0005)
@@ -152,16 +156,13 @@ def me(user: CurrentUserDep) -> UserOut:
     return UserOut(id=str(user.id), email=user.email, email_verified=user.email_verified)
 
 
-@router.delete("/account", response_model=MessageResponse)
+@router.delete("/account", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
 def delete_account(user: CurrentUserDep, session: SessionDep) -> MessageResponse:
-    """GDPR erasure: hard-delete + crypto-shred + tombstone.
+    """GDPR erasure, asynchronous (D-ER, T11.2b.2): one short transaction deletes the data key
+    (crypto-shred), scrubs the email and password hash, marks the account deleted and queues
+    the tombstone; the batched purger removes the remaining rows within 24 h. 202 Accepted.
 
-    See docs/adr/adr_phase06_gdpr_erasure.md.
+    See docs/adr/adr_phase06_gdpr_erasure.md and docs/adr/adr_phase11_stability.md.
     """
-    erase_user(session, user.id)
-    return MessageResponse(
-        detail=(
-            "Your account and associated data were erased. Encrypted copies in backups "
-            "are put beyond use and deleted within the backup retention window."
-        )
-    )
+    request_erasure(session, user.id)
+    return MessageResponse(detail=ERASURE_ACCEPTED_MESSAGE)

@@ -15,8 +15,10 @@
 #      source owner are skipped; step 3 sets them for this owner)
 #   3. db/roles.sql (default privileges), `alembic upgrade head`
 #   4. the UNION of the restored tombstones and every exported one (Blob `tombstones/` —
-#      pulled by backup-pull.sh — or the local export folder), then `replay_deletions`:
-#      every erased account stays erased (R4-3, R5-2)
+#      pulled by backup-pull.sh — or the local export folder), then `replay_deletions`
+#      (every tombstoned account the dump brought back loses its key again, is scrubbed and
+#      re-queued) and one purger run as the owner (removes their rows; no export here — the
+#      running purge Job exports): every erased account stays erased (R4-3, R5-2)
 #
 # --tombstones-dir is mandatory (an empty directory is valid only if nothing was ever erased).
 # The target URL comes from the environment, never argv (it carries the password).
@@ -27,7 +29,7 @@ set -euo pipefail
 # shellcheck source=scripts/db/backup_lib.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/backup_lib.sh"
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
 
 dump="" identity="" tombstones=""
 while [ $# -gt 0 ]; do
@@ -95,7 +97,8 @@ echo "restore: db/roles.sql applied"
   exit "${PIPESTATUS[0]}"
 )
 
-# --- 4. tombstones: union + replay --------------------------------------------------------
+# --- 4. tombstones: union + replay + purge -------------------------------------------------
 DATABASE_URL="$RESTORE_DATABASE_URL" "$py" -m rag_app.tombstones restore-union --dir "$tombstones"
+DATABASE_URL="$RESTORE_DATABASE_URL" "$py" -m rag_app.erasure purge --no-export   || die "the purger run after the replay failed — do not reopen; run it again (python -m rag_app.erasure purge --no-export)"
 echo "restore: DONE — every tombstoned account is erased again; the app may reopen"
 echo "restore: start the app with the SAME DATA_MASTER_KEY as the source database (escrowed with the age key)"

@@ -4,7 +4,8 @@ Runs against a throwaway drill database on the gate server (``DATABASE_URL``, se
 drill script) — never the development database.
 
     python -m rag_app.devtools.backup_drill seed            → {"keep": "<id>", "erase": "<id>"}
-    python -m rag_app.devtools.backup_drill erase --user ID (the app's erasure path)
+    python -m rag_app.devtools.backup_drill erase --user ID (the API's request path; the drill
+        then runs the purger as secrag_purger, which also writes the tombstone export)
     python -m rag_app.devtools.backup_drill state --user ID [--user ID …]
         → {"<id>": {"user": bool, "key": bool, "conversations": n, "messages": n,
                     "tombstone": "<status>" | null}, …}
@@ -25,7 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from rag_app.db.models import Conversation, DeletionRequest, Message, User, UserKey
-from rag_app.erasure import erase_user
+from rag_app.erasure import request_erasure
 
 
 def seed(session: Session) -> dict[str, str]:
@@ -95,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.cmd == "seed":
                 print(json.dumps(seed(session)))
             elif args.cmd == "erase":
-                erase_user(session, args.user)
+                request_erasure(session, args.user)
                 print(json.dumps({"erased": str(args.user)}))
             else:
                 print(json.dumps(state(session, args.user), sort_keys=True))
