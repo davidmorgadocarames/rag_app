@@ -6,6 +6,7 @@
 #   ollama pull bge-m3 && ollama pull qwen2.5:7b-instruct-q4_K_M
 #   scripts/dev/create_dev_volume.sh               # once: the external dev volume
 #   docker compose up -d --build                   # db → db-roles → migrate → backend → frontend
+#                                                  # (+ purger: hourly erasure loop, T11.2b.6)
 #
 #   docker compose --profile ci up -d ...          # containerised Ollama instead; then set
 #                                                  # CONTAINER_OLLAMA_HOST=http://ollama:11434
@@ -74,6 +75,43 @@ services:
       db-roles:
         condition: service_completed_successfully
     restart: "no"
+
+  # The erasure purger (T11.2b.6): the local runner of the Azure hourly purge Job — same slim
+  # jobs image, same least-privilege role `secrag_purger` (LOGIN only when
+  # SECRAG_PURGER_PASSWORD is set in the shell or root .env, then db-roles gives it; URL-safe
+  # characters only). One run every PURGE_INTERVAL_SECONDS (default 3600): pending erasures
+  # complete without manual action, and each run writes the tombstone export to the
+  # git-ignored ./.tombstones (restore.sh --tombstones-dir .tombstones), pruned after 30 days.
+  # Runs as your WSL user (SECRAG_UID/SECRAG_GID, default 1000) so the export files are yours.
+  purger:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.jobs
+      additional_contexts:
+        dbscripts: ./scripts/db
+    command:
+      - python
+      - -m
+      - rag_app.erasure
+      - loop
+      - --interval
+      - "${PURGE_INTERVAL_SECONDS:-3600}"
+      - --export-dir
+      - /tombstones
+    user: "${SECRAG_UID:-1000}:${SECRAG_GID:-1000}"
+    environment:
+      DATABASE_URL: postgresql+psycopg://secrag_purger:${SECRAG_PURGER_PASSWORD:-}@db:5432/rag
+      ENV: ${ENV:-prod}
+    volumes:
+      - ./.tombstones:/tombstones
+    depends_on:
+      db:
+        condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest

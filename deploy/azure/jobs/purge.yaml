@@ -8,8 +8,12 @@
 #
 # - Image: PLACEHOLDER (CD updates it to the deployed jobs digest after the apps, X1).
 # - Runs as the least-privilege role `secrag_purger` (grants from migration 0005), never the
-#   owner. The CLI `python -m rag_app.erasure purge` arrives with 11.2b (block G).
-# - The user-assigned identity writes the tombstone export to Blob `tombstones/` (R5-2).
+#   owner: `python -m rag_app.erasure purge` (batched, resumable, advisory lock — an
+#   overlapping run is skipped; stops claiming work after 1500 s, below replicaTimeout).
+# - The user-assigned identity writes the tombstone export to Blob `tombstones/` (R5-2) in
+#   the container BACKUP_CONTAINER and prunes exports older than 30 days (newest kept;
+#   DA-F-8) — Storage Blob Data Contributor. Exit 1 = a request failed or an export name needs
+#   a look (the WARNING line in the Job log).
 # - Secret value: placeholder, set with `job secret set`; never re-apply to an existing Job.
 location: <region-of-the-container-apps-environment>
 identity:
@@ -42,6 +46,8 @@ properties:
             value: <client-id-of-the-jobs-identity>
           - name: TOMBSTONE_STORAGE_ACCOUNT
             value: <storage-account-name>
+          - name: BACKUP_CONTAINER
+            value: secrag-backups
         resources:
           cpu: 0.25
           memory: 0.5Gi

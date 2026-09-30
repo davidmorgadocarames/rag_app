@@ -79,6 +79,7 @@ dependency-audit - 240
 db-tests         db 300
 migrations-roundtrip db 180
 backup-drill     db 300
+erasure-scale    db 600
 restart-check    docker 900
 eval             seed 1200
 "
@@ -361,6 +362,25 @@ step_backup-drill() {
   DRILL_ADMIN_URL="postgresql://$GATE_DB_USER:$GATE_DB_PASSWORD@127.0.0.1:$GATE_DB_PORT/postgres" \
     SECRAG_PYTHON="$PY" bash "$REPO_ROOT/scripts/db/backup_drill.sh" 2>&1 | sed 's/^/  /'
   return "${PIPESTATUS[0]}"
+}
+
+# T11.2b.7: a synthetic user with 100,000 messages erased under concurrent login + listing
+# load (the real API in a child process, a throwaway secrag_scale_* database on the gate
+# server): request < 200 ms, pool never exhausted, no lock error reaches other requests; the
+# purger as secrag_purger is killed mid-way, an overlapping run is skipped, the next run
+# leaves the tombstone done (rag_app.devtools.erasure_scale).
+step_erasure-scale() {
+  need_venv || return 1
+  [ -f "$ROLES_ENV" ] || { echo "  FAIL: $ROLES_ENV missing (created by the gate stack)"; return 1; }
+  command -v psql >/dev/null || { missing_tool "psql 16 (scripts/prereqs/install.sh pg)"; return; }
+  set -a
+  # shellcheck source=/dev/null
+  . "$ROLES_ENV"
+  set +a
+  (cd "$REPO_ROOT/backend" \
+    && SCALE_ADMIN_URL="postgresql://$GATE_DB_USER:$GATE_DB_PASSWORD@127.0.0.1:$GATE_DB_PORT/postgres" \
+       env -u DATA_MASTER_KEY -u JWT_SECRET "$PY" -m rag_app.devtools.erasure_scale run 2>&1 \
+    | sed 's/^/  /'; exit "${PIPESTATUS[0]}")
 }
 
 # T11.2.8: data survives down/up (no -v) even across compose project names (fixed external
