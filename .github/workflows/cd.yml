@@ -319,6 +319,8 @@ jobs:
         with:
           context: ./backend
           file: ./backend/Dockerfile.jobs
+          build-contexts: |
+            dbscripts=./scripts/db
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-jobs:latest

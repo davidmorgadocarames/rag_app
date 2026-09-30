@@ -8,8 +8,10 @@
 #
 # - Image: PLACEHOLDER (CD updates it to the deployed jobs digest after the apps, X1).
 # - Runs as the read-only role `secrag_backup`; `pg_dump` 16 → `age` (PUBLIC key only; the
-#   private key never reaches Azure, R4-1) → Blob `backups/` with the user-assigned identity
-#   (Storage Blob Data Contributor; shared-key access disabled). The script comes with row 28.
+#   private key never reaches Azure, R4-1) → Blob `backups/secrag-<ts>.dump.age` with the
+#   user-assigned identity (Storage Blob Data Contributor; shared-key access disabled), then
+#   the oldest-blob check (fails when a backup blob is older than the 14-day promise, X9 —
+#   the lifecycle rule deletes `backups/` after 12 days). Script: scripts/db/backup.sh.
 # - Secret value: placeholder, set with `job secret set`; never re-apply to an existing Job.
 location: <region-of-the-container-apps-environment>
 identity:
@@ -42,6 +44,8 @@ properties:
             value: <client-id-of-the-jobs-identity>
           - name: BACKUP_STORAGE_ACCOUNT
             value: <storage-account-name>
+          - name: BACKUP_CONTAINER
+            value: secrag-backups
           - name: BACKUP_AGE_RECIPIENT
             value: <age-public-key>
         resources:

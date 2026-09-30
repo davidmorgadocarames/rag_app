@@ -1,6 +1,8 @@
 # SecRAG slim `jobs` image (T11.2.12): the migration Job (compose `migrate` locally, the Azure
 # migration Container Apps Job started by CD) and, from 11.2b/11.2.10, the purge and backup
-# Jobs. Build context: ./backend
+# Jobs. Build context: ./backend, plus the named context `dbscripts` = scripts/db (the backup
+# Job's backup.sh): docker build --build-context dbscripts=scripts/db … (compose
+# additional_contexts, CI, CD build-contexts).
 #
 #   rag_app WITHOUT torch/sentence-transformers/models (requirements-jobs.txt, same pins as
 #   requirements.txt) + alembic.ini + migrations/; PostgreSQL 16 client from PGDG (pg_dump
@@ -40,6 +42,8 @@ RUN pip install --no-cache-dir -r requirements-jobs.txt
 COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
+# Backup Job (T11.2.10): backup.sh reads the retention from /app/src/rag_app/retention.py.
+COPY --from=dbscripts --chmod=0755 backup.sh backup_lib.sh /app/scripts/db/
 
 ENV PYTHONPATH=/app/src \
     PYTHONDONTWRITEBYTECODE=1 \

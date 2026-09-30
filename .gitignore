@@ -6,6 +6,11 @@
 # a work tree (the tool refuses one); ignored defensively anyway.
 **/.secrag-recovery/
 **/candidates
+# Backups (T11.2.10): encrypted dumps live outside the repository (backup.sh refuses a work
+# tree); the local tombstone export folder holds opaque ids only. Ignored defensively.
+*.dump.age
+*.dump
+.tombstones/
 
 # --- Python ---
 __pycache__/

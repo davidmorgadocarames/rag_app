@@ -62,6 +62,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile.jobs
+      additional_contexts:
+        dbscripts: ./scripts/db
     command: ["alembic", "upgrade", "head"]
     environment:
       DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag

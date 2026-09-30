@@ -62,7 +62,11 @@ def test_the_dev_volume_is_the_fixed_external_one() -> None:
 def test_migrate_one_shot_runs_after_the_roles_and_before_the_backend(services: dict) -> None:
     """T11.2.5: compose migrates once per `up`, from the jobs image, never the backend."""
     migrate = services["migrate"]
-    assert migrate["build"] == {"context": "./backend", "dockerfile": "Dockerfile.jobs"}
+    assert migrate["build"] == {
+        "context": "./backend",
+        "dockerfile": "Dockerfile.jobs",
+        "additional_contexts": {"dbscripts": "./scripts/db"},  # backup.sh (T11.2.10)
+    }
     assert migrate["command"] == ["alembic", "upgrade", "head"]
     assert migrate["depends_on"] == {
         "db": {"condition": "service_healthy"},

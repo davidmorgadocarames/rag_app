@@ -26,6 +26,11 @@ warn_unused_configs = true
 module = ["pymupdf4llm", "pymupdf", "pgvector.*", "sentence_transformers"]
 ignore_missing_imports = true
 
+# Azure SDK: only in the slim jobs image (requirements-jobs.txt), not in the dev venv.
+[[tool.mypy.overrides]]
+module = ["azure.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

@@ -78,6 +78,7 @@ frontend         - 600
 dependency-audit - 240
 db-tests         db 300
 migrations-roundtrip db 180
+backup-drill     db 300
 restart-check    docker 900
 eval             seed 1200
 "
@@ -340,6 +341,26 @@ step_migrations-roundtrip() {
     || { echo "  FAIL: downgrade -1 / upgrade head round trip"; return 1; }
   echo "  downgrade -1 → upgrade head: OK"
   return "$rc"
+}
+
+# T11.2.10: backup (file mode, as secrag_backup) → erase a test user → restore with the
+# OFFLINE copy of a throwaway age key → the user stays erased; files > retention removed;
+# controls (no tombstone export → the user comes back; wrong key; non-empty target).
+# Throwaway secrag_drill_* databases on the gate server only (scripts/db/backup_drill.sh).
+step_backup-drill() {
+  need_venv || return 1
+  local tool
+  for tool in age age-keygen pg_dump pg_restore psql jq; do
+    command -v "$tool" >/dev/null || { missing_tool "$tool (scripts/prereqs/install.sh)"; return; }
+  done
+  [ -f "$ROLES_ENV" ] || { echo "  FAIL: $ROLES_ENV missing (created by the gate stack)"; return 1; }
+  set -a
+  # shellcheck source=/dev/null
+  . "$ROLES_ENV"
+  set +a
+  DRILL_ADMIN_URL="postgresql://$GATE_DB_USER:$GATE_DB_PASSWORD@127.0.0.1:$GATE_DB_PORT/postgres" \
+    SECRAG_PYTHON="$PY" bash "$REPO_ROOT/scripts/db/backup_drill.sh" 2>&1 | sed 's/^/  /'
+  return "${PIPESTATUS[0]}"
 }
 
 # T11.2.8: data survives down/up (no -v) even across compose project names (fixed external

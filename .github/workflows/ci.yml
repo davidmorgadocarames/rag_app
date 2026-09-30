@@ -112,7 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build backend/Dockerfile.jobs
-        run: docker build -f backend/Dockerfile.jobs -t secrag-jobs:ci backend
+        run: docker build --build-context dbscripts=scripts/db -f backend/Dockerfile.jobs -t secrag-jobs:ci backend
       - name: rag_app.erasure imports; torch is not importable
         run: |
           docker run --rm secrag-jobs:ci python -c 'import rag_app.erasure, rag_app.keycheck, azure.storage.blob, azure.identity; print("imports ok")'
@@ -124,6 +124,13 @@ jobs:
       - name: Tools (pg_dump 16, age, alembic, non-root)
         run: |
           docker run --rm secrag-jobs:ci sh -c 'pg_dump --version | grep -q "(PostgreSQL) 16\." && age --version && alembic --help >/dev/null && test "$(id -u)" = 10001'
+      - name: Backup Job pieces (T11.2.10; retention from rag_app/retention.py)
+        run: |
+          days="$(docker run --rm secrag-jobs:ci bash /app/scripts/db/backup.sh --retention-days)"
+          want="$(sed -n 's/^BACKUP_RETENTION_DAYS = \([0-9]*\)$/\1/p' backend/src/rag_app/retention.py)"
+          test -n "$want" && test "$days" = "$want"
+          echo "backup.sh in the image: retention $days days"
+          docker run --rm secrag-jobs:ci python -c 'import rag_app.backup_blob, rag_app.tombstones; print("backup modules ok")'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
