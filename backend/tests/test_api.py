@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from rag_app.api.app import create_app
 from rag_app.api.auth import get_current_user
-from rag_app.api.deps import AnswerFn, get_answerer, get_session
+from rag_app.api.deps import AnswerFn, get_answer_reserver, get_answerer, get_session
 from rag_app.generation import Answer, Citation
 
 
@@ -42,6 +42,8 @@ def test_chat_stubbed() -> None:
     app.dependency_overrides[get_session] = lambda: None
     app.dependency_overrides[get_answerer] = _stub_answerer
     app.dependency_overrides[get_current_user] = lambda: object()
+    # The daily cap needs the database: covered in test_daily_cap.
+    app.dependency_overrides[get_answer_reserver] = lambda: lambda _session: None
     client = TestClient(app)
 
     response = client.post("/chat", json={"question": "How do I prevent SQL injection?"})

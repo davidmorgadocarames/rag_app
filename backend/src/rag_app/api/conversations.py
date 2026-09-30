@@ -21,6 +21,12 @@ a worker thread with its own session, committed after every event (the read tran
 ends as soon as retrieval is done); while it is busy (a reranker download at a cold start,
 a slow model) the stream sends an SSE comment ``: keep-alive`` every ``KEEPALIVE_SECONDS``
 so no proxy cuts an idle connection. Clients ignore comment frames.
+
+Daily answer cap (R6-1, DA-G3-1): ``chat_stream`` reserves the answer in ``usage_daily``
+at request start, before the stream (and any LLM call) begins — so an interrupted or failed
+turn is already counted. When the cap is reached the stream is just the ``conversation``
+event and an ``error`` event (``daily_cap_reached``) with the id; nothing is stored and the
+pipeline never runs. The chit-chat fast path (canned reply, no LLM call) is not counted.
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ from rag_app.api.schemas import (
     MessageResponse,
     RenameRequest,
 )
+from rag_app.config import get_settings
 from rag_app.crypto import decrypt, encrypt, unwrap_key
 from rag_app.db.models import Conversation, Message, User
 from rag_app.db.session import make_session_factory
@@ -60,15 +67,20 @@ from rag_app.generation import (
     StreamStage,
     StreamToken,
     answer_question_stream,
+    classify_intent,
 )
 from rag_app.llm import Usage
+from rag_app.usage_cap import DAILY_CAP_CODE, DAILY_CAP_MESSAGE, add_tokens, reserve_answer
 
 router = APIRouter()
 logger = logging.getLogger("rag_app.api.conversations")
 
 # Streaming responses outlive the request-scoped session, so the SSE generator uses
-# its own session from this factory (created lazily, one engine reused per process).
+# its own session from this factory (created lazily, one engine reused per process). The
+# pipeline worker threads can ask for it concurrently, so it is built under a lock
+# (DA-G3-2): two first streams at once never build two engines (one pool leaked).
 _stream_sessions: sessionmaker[Session] | None = None
+_stream_sessions_lock = threading.Lock()
 
 # Error events: a stable code for the UI plus a user-facing message. The exception itself is
 # logged by class name only — its text may carry hosts, prompts or other request data.
@@ -95,6 +107,7 @@ ERROR_MESSAGES = {
         "The connection closed before the answer finished, so no answer was saved. Please"
         " ask again."
     ),
+    DAILY_CAP_CODE: DAILY_CAP_MESSAGE,
 }
 # An SSE comment line: keeps the connection busy while a stage takes long (DA-G2-3; the Azure
 # ingress cuts a connection idle for ~240 s). EventSource and lib/chatStream.ts skip it.
@@ -108,9 +121,13 @@ UNREADABLE_MESSAGE = "[this message cannot be decrypted]"
 
 def _stream_session_factory() -> sessionmaker[Session]:
     global _stream_sessions
-    if _stream_sessions is None:
-        _stream_sessions = make_session_factory()
-    return _stream_sessions
+    factory = _stream_sessions
+    if factory is None:
+        with _stream_sessions_lock:
+            factory = _stream_sessions
+            if factory is None:
+                factory = _stream_sessions = make_session_factory()
+    return factory
 
 
 # --- encryption helpers -----------------------------------------------------
@@ -324,9 +341,21 @@ def _pipeline_events(request: ChatStreamRequest) -> Generator[object | None, Non
 
 
 def _chat_events(
-    user_id: uuid.UUID, wrapped_key: bytes, request: ChatStreamRequest
+    user_id: uuid.UUID,
+    wrapped_key: bytes,
+    request: ChatStreamRequest,
+    *,
+    blocked: str | None = None,
+    counted: bool = False,
 ) -> Generator[str, None, None]:
+    """The SSE body. ``blocked``: an error code decided at request start (the daily cap, or
+    its counter unavailable) — the turn ends right away, nothing is stored, no pipeline.
+    ``counted``: the turn holds a ``usage_daily`` reservation, so its tokens are added."""
     conv_id = request.conversation_id
+    if blocked is not None:
+        yield _sse({"type": "conversation", "conversation_id": conv_id})
+        yield _error_event(conv_id, blocked)
+        return
     try:
         key = unwrap_key(wrapped_key)
     except Exception as exc:  # noqa: BLE001 - e.g. InvalidToken: master key changed
@@ -379,6 +408,8 @@ def _chat_events(
             finally:
                 pipeline.close()
 
+            if counted:
+                add_tokens(session, usage.total_tokens)
             payload = {
                 "text": answer.text,
                 "citations": _citation_dicts(answer),
@@ -448,6 +479,25 @@ class _ClosingStreamingResponse(StreamingResponse):
                     await aclose()
 
 
+def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None, bool]:
+    """The daily-cap reservation of a stream turn, at request start (R6-1, DA-G3-1):
+    ``(blocking error code or None, counted)``. A chit-chat question gets the canned reply
+    with no LLM call, so it is neither counted nor refused. When the counter cannot be
+    written the turn is refused as a storage failure (fail closed: no uncounted LLM call)."""
+    if classify_intent(question) == "chitchat":
+        return None, False
+    cap = get_settings().daily_answer_cap
+    try:
+        allowed = reserve_answer(session, cap)
+    except Exception as exc:  # noqa: BLE001 - database down: the stream reports it
+        session.rollback()
+        logger.warning("chat stream: daily counter unavailable (%s)", type(exc).__name__)
+        return ERROR_STORAGE, False
+    if not allowed:
+        return DAILY_CAP_CODE, False
+    return None, cap > 0
+
+
 @router.post("/chat/stream", dependencies=[Depends(rate_limit_chat)])
 def chat_stream(
     request: ChatStreamRequest, session: SessionDep, user: CurrentUserDep
@@ -460,13 +510,16 @@ def chat_stream(
     if request.conversation_id:
         # Someone else's (or an unknown) conversation is a plain 404 before any streaming.
         _get_owned_conversation(session, user_id, request.conversation_id)
+    blocked, counted = _reserve_stream_answer(session, request.question)
     # DA-G2-2: the dependency's session would otherwise stay checked out, idle in
     # transaction, until the whole stream is sent (FastAPI >= 0.118 exits `yield`
     # dependencies after the response). Closing it ends the transaction and returns the
     # connection; the dependency's own close later is a no-op.
     session.close()
     return _ClosingStreamingResponse(
-        _closing_body(_chat_events(user_id, wrapped_key, request)),
+        _closing_body(
+            _chat_events(user_id, wrapped_key, request, blocked=blocked, counted=counted)
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -12,7 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from rag_app import __version__
 from rag_app.api import auth, conversations
 from rag_app.api.auth import get_current_user
-from rag_app.api.deps import AnswerFn, SessionDep, get_answerer, rate_limit_chat
+from rag_app.api.deps import (
+    AnswerFn,
+    ReserveFn,
+    SessionDep,
+    get_answer_reserver,
+    get_answerer,
+    rate_limit_chat,
+)
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
 from rag_app.config import Settings, check_dev_only_flags, get_settings, validate_api_settings
 from rag_app.db.session import make_engine
@@ -20,6 +27,7 @@ from rag_app.keycheck import check_master_key_fingerprint
 from rag_app.logsafe import install_log_redaction
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
+ReserverDep = Annotated[ReserveFn, Depends(get_answer_reserver)]
 
 
 def startup_checks(settings: Settings) -> None:
@@ -74,7 +82,11 @@ def create_app() -> FastAPI:
         request: ChatRequest,
         session: SessionDep,
         answerer: AnswererDep,
+        reserve: ReserverDep,
     ) -> ChatResponse:
+        # Global daily answer cap (R6-1): counted before the LLM call; 429 once reached. In
+        # the body, so an unauthenticated, rate-limited or invalid call never uses one up.
+        reserve(session)
         answer = answerer(session, request.question, request.version)
         return ChatResponse(
             answer=answer.text,

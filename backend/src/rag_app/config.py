@@ -138,6 +138,11 @@ class Settings(JobSettings):
     rate_limit_refill_per_second: float = 1.0
     rate_limit_chat_cost: float = 5.0  # cost-aware: an LLM answer costs more than 1 token
 
+    # --- Global daily answer cap (R6-1, rag_app.usage_cap) ---
+    # Answers per UTC day for ALL users together, counted in `usage_daily` before any LLM
+    # call. 0 = off (ENV=dev only; ENV=prod requires a positive cap). Azure uses the default.
+    daily_answer_cap: int = 300
+
     # --- Auth / security ---
     jwt_secret: str = ""
     jwt_expires_minutes: int = 30
@@ -192,7 +197,8 @@ def validate_api_settings(settings: Settings) -> None:
 
     Checks ``DATABASE_URL`` (a PostgreSQL URL; explicitly set when ``ENV=prod``),
     ``JWT_SECRET`` (at least 32 characters), ``DATA_MASTER_KEY`` (a valid Fernet key) and
-    ``ENV`` (``dev``/``prod``). Every problem is reported at once, by setting name only.
+    ``ENV`` (``dev``/``prod``) and ``DAILY_ANSWER_CAP`` (never negative; positive with
+    ``ENV=prod``). Every problem is reported at once, by setting name only.
     """
     from cryptography.fernet import Fernet
 
@@ -210,6 +216,10 @@ def validate_api_settings(settings: Settings) -> None:
         problems.append(
             "DATA_MASTER_KEY is not a valid Fernet key (32 url-safe base64-encoded bytes)"
         )
+    if settings.daily_answer_cap < 0:
+        problems.append("DAILY_ANSWER_CAP must be 0 (off, ENV=dev only) or a positive number")
+    elif settings.env == "prod" and settings.daily_answer_cap == 0:
+        problems.append("DAILY_ANSWER_CAP must be positive with ENV=prod (0 = off is dev only)")
     if problems:
         raise SettingsValidationError(
             "refusing to start — invalid settings: " + "; ".join(problems)

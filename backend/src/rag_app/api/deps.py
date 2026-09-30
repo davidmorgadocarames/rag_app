@@ -13,6 +13,7 @@ from rag_app.db.session import make_session_factory
 from rag_app.generation import Answer, answer_question
 from rag_app.ratelimit import RateLimiter
 from rag_app.risk import SignupTracker
+from rag_app.usage_cap import DAILY_CAP_MESSAGE, reserve_answer, seconds_until_utc_midnight
 
 AnswerFn = Callable[[Session, str, str | None], Answer]
 
@@ -66,6 +67,28 @@ def rate_limit_chat(
     cost = get_settings().rate_limit_chat_cost
     if not limiter.allow(f"chat:{_client_ip(request)}", cost=cost):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
+ReserveFn = Callable[[Session], None]
+
+
+def reserve_daily_answer(session: Session) -> None:
+    """``/chat``: count the answer in ``usage_daily`` before the LLM is called (R6-1,
+    DA-G3-1); 429 with ``Retry-After`` (seconds to the next UTC midnight) once the global
+    daily cap is reached. ``/chat`` has no chit-chat fast path, so every call counts.
+
+    Called from the handler body, not as a dependency: dependencies run before the request
+    body is validated, and an invalid request must not use up an answer."""
+    if not reserve_answer(session, get_settings().daily_answer_cap):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            DAILY_CAP_MESSAGE,
+            headers={"Retry-After": str(seconds_until_utc_midnight())},
+        )
+
+
+def get_answer_reserver() -> ReserveFn:
+    return reserve_daily_answer
 
 
 def rate_limit_login(

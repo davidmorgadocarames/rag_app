@@ -145,6 +145,8 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
       DATA_MASTER_KEY: ${DATA_MASTER_KEY:?set DATA_MASTER_KEY}
       ENV: ${ENV:-prod}
+      # Global daily answer cap (R6-1): high locally; must stay positive with ENV=prod.
+      DAILY_ANSWER_CAP: ${DAILY_ANSWER_CAP:-1000}
       FRONTEND_ORIGIN: http://localhost:3000
     # Built in on Docker Desktop; needed on a plain Linux engine.
     extra_hosts:
