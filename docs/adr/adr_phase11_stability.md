@@ -549,3 +549,45 @@ uvicorn only; the purge Job is kept; the 0005 downgrade is not a rollback path.
 
 *Measured the day after each promotion* (Cost Management query) and compared with the caps:
 11a ≈ €0.20 (cap €1), 11b ≈ €0.15 (cap €1).
+
+### Worst-case LLM cost per answer and the daily answer cap (R6-1, DA-31b-3)
+
+`DAILY_ANSWER_CAP` counts **answers**, not tokens, so the cost of one answer must be bounded.
+Every LLM call passes `max_tokens` (a unit test scans the code for calls without it):
+
+| Call (per answer) | Input bound | Output bound |
+|---|---|---|
+| Generation | system prompt + 4 reranked chunks + the question | `max_tokens` = **1024** (`Settings.max_tokens`, unchanged) |
+| Groundedness check | system prompt + the same 4 chunks + the answer | **16** (`GROUNDEDNESS_MAX_TOKENS`; the verdict is one word) |
+
+Before this fix the groundedness call had no `max_tokens`, so its output was bounded only by
+the model's own limit (32K tokens for gpt-4.1-mini). Embeddings run on Ollama (no Azure cost);
+the chit-chat reply makes no LLM call; the query rewrite and the eval judge are CLI/eval only.
+
+**Token bound.** The corpus chunks are ≤ 1,352 characters (322 chunks, mean 651;
+`chunk_size` 1200 + overlap), so a chunk with its `source | version` header is ≤ ~1,450
+characters. The question is ≤ 2,000 characters (API validation). The worst case counts **one
+token per character** (a strict upper bound for this English corpus; ~4 characters per token
+is typical):
+
+- generation in ≈ 100 (system) + 4 × 1,450 + 2,000 + 80 ≈ **8,000**, out ≤ **1,024**;
+- groundedness in ≈ 40 + 4 × 1,450 + 1,024 (the answer) + 40 ≈ **6,900**, out ≤ **16**;
+- **per answer ≤ ~14,900 in + 1,040 out.**
+
+**Price** (Azure OpenAI gpt-4.1-mini, Global Standard list price at the time of writing:
+$0.40 per 1M input tokens, $1.60 per 1M output tokens; re-check the Azure pricing page at
+row 40, a regional/Data Zone deployment costs slightly more):
+
+| Scenario | $ / answer | 300/day: $/day | 300/day: 30 days | 150/day: $/day | 150/day: 30 days |
+|---|---|---|---|---|---|
+| **Worst case** (1 token/char, max question, 1024-token answer) | 0.0076 | 2.29 | **68.6** | 1.14 | **34.3** |
+| Heavy (~4 chars/token, max question, 1024-token answer) | 0.0035 | 1.04 | 31.1 | 0.52 | 15.6 |
+| Typical (mean chunk, short question, ~300-token answer) | 0.0013 | 0.39 | 11.7 | 0.20 | 5.9 |
+
+Worst case: 14,900 × $0.40/1M + 1,040 × $1.60/1M = $0.00596 + $0.00166 = $0.0076. The
+30-day columns assume the cap is **exhausted every day** (sustained abuse); the per-IP rate
+limiter and the deployment's 10K TPM quota do not bind first (300 × 15K ≈ 4.5M tokens/day is
+below 10K TPM × 1,440 min ≈ 14.4M). Against the $86 student credit, 300/day at the worst case
+is ~80 % of it in 30 days; 150/day is ~40 %. The cap value is chosen at row 40
+(D-2026-09-30-8 Q2); the real average per answer is `usage_daily.tokens / answers` (a lower
+bound, DA-31b-4) after the first Azure week.
