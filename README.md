@@ -363,6 +363,33 @@ deletes the account in the app.
 The full procedure is in
 [ADR phase 11 — Key recovery](docs/adr/adr_phase11_stability.md#key-recovery-d-2026-09-29-2).
 
+### Backups
+
+Backups are `pg_dump` files encrypted with [age](https://age-encryption.org) to a **public**
+key; only the owner holds the private key (password manager + an offline copy). Every copy
+is kept at most **14 days** (one constant, `backend/src/rag_app/retention.py`). Erased
+accounts stay erased after a restore: the tombstones are also exported outside the database,
+and a restore applies them again before the app reopens.
+
+```bash
+# Encrypted dump as the read-only role secrag_backup (never inside a git work tree):
+DATABASE_URL=postgresql://secrag_backup:…@127.0.0.1:5432/rag BACKUP_AGE_RECIPIENT=age1… \
+  scripts/db/backup.sh --file                 # → ~/secrag-db-backups/secrag-<ts>.dump.age
+# Weekly copy of the newest Azure Blob dump + tombstone export (Linux az, logged in):
+BACKUP_STORAGE_ACCOUNT=<account> scripts/db/backup-pull.sh
+# Restore into a NEW, EMPTY database as its owner (roles.sql applied on that server first):
+RESTORE_DATABASE_URL=postgresql://<owner>:…@127.0.0.1:5432/<empty db> \
+  scripts/db/restore.sh --dump secrag-<ts>.dump.age --identity <private key file> \
+  --tombstones-dir <tombstone exports>
+```
+
+On Azure the backup Job runs `backup.sh --blob` daily (managed identity, no storage keys)
+and fails if a dump older than 14 days is still there. To schedule `backup-pull.sh` weekly
+from Windows, a Task Scheduler entry can run
+`wsl -e bash -lc 'BACKUP_STORAGE_ACCOUNT=<account> ~/proyectos/rag_app/scripts/db/backup-pull.sh'`.
+The gate step `backup-drill` proves the whole cycle on throwaway databases and keys (see
+[ADR phase 11](docs/adr/adr_phase11_stability.md), decision 5).
+
 ## API at a glance
 
 | Endpoint | Purpose |

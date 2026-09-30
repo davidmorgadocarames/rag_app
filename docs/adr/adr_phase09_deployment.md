@@ -37,8 +37,10 @@ quality before anything ships.
 ## Backups & retention
 
 Postgres backups follow the retention/erasure policy in
-[ADR phase 6](adr_phase06_gdpr_erasure.md): put beyond use, 7-day rotation, replay deletions
-on restore.
+[ADR phase 6](adr_phase06_gdpr_erasure.md): put beyond use, kept at most **14 days** (the
+single retention constant X9, `backend/src/rag_app/retention.py`; refined in
+[ADR phase 11](adr_phase11_stability.md), which also adds encrypted Blob dumps and tombstones
+exported outside the database), replay deletions on restore.
 
 ## Consequences
 

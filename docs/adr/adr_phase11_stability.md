@@ -273,6 +273,39 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    Blob client, non-root (uid 10001), ≈ 490 MB. CI job `jobs-image`: `import rag_app.erasure`
    works, `import torch` fails, `pg_dump` 16 + `age` present, jobs pins audited.
 5. Encrypted backups (14-day retention) with tombstones exported outside the database.
+   *Landed in 11.2 (T11.2.10, T11.2.13):* `scripts/db/backup.sh` dumps **as
+   `secrag_backup`** (it refuses any other role) and pipes `pg_dump -Fc` straight into `age`
+   with the **public** key only — no plaintext dump ever touches a disk. **File mode** writes
+   `secrag-<UTC timestamp>.dump.age` (0600) into a 0700 folder outside any git work tree and
+   deletes dumps whose *name* time is older than the retention (a copied or touched file keeps
+   its real age). **Blob mode** (the backup Job, jobs image, managed identity) streams to a
+   new blob `backups/secrag-<ts>.dump.age` (never overwrites; refuses input without the `age`
+   header) and then runs the **oldest-blob check**: the Job fails when there is no backup blob
+   or the oldest one is older than the promise (the Storage lifecycle rule deletes `backups/`
+   after 12 days, so an older blob means the rule broke). **Retention** is one constant, X9 =
+   **14 days**, in `backend/src/rag_app/retention.py`; the scripts read it from that file,
+   and a test checks the scripts and these docs against it. `scripts/db/restore.sh` runs on
+   the owner's machine (the only place the private key exists — password manager + an offline
+   copy, R4-1): it refuses a non-private identity file or one inside a git work tree, invalid
+   tombstone exports, and a target database that is not **empty**; it decrypts in a stream into
+   `pg_restore --single-transaction --exit-on-error` as the owner (the source owner's
+   default-privilege entries are skipped and `db/roles.sql` re-applies them), runs `alembic
+   upgrade head`, then applies the **union** of the restored and the exported tombstones and
+   `replay_deletions` before the app reopens. **Tombstone export format**
+   (`rag_app/tombstones.py`; the purger of 11.2b writes it every run to Blob `tombstones/`,
+   locally the git-ignored `.tombstones/`): `tombstones-<ts>.jsonl`, one
+   `{"user_id", "requested_at"}` object per line, opaque ids only; any malformed line refuses
+   the whole restore. `scripts/db/backup-pull.sh` (run weekly by the owner with the Linux `az`,
+   `--auth-mode login`) copies the newest dump and the newest tombstone export, still
+   encrypted, and prunes local copies with the same constant. The backup Job image gets
+   `backup.sh` through a named build context (`dbscripts=scripts/db`). **Gate step
+   `backup-drill`** (throwaway databases on the gate server, throwaway age keys):
+   backup → erase a test user → restore with the **offline copy** of the key (the working
+   copy is shredded first) → the user stays erased (tombstone `done`, no key, conversation or
+   message) and the other user is intact; a 15-day-old dump is removed, a 13-day-old one and
+   an unrelated file are kept; controls: without the tombstone export the erased user **comes
+   back** (so the export is what keeps them erased), a wrong key restores nothing, a non-empty
+   target is refused. The real Blob run and `backup-pull.sh` against Azure are row 42.
 6. Asynchronous erasure: short request transaction (crypto-shred + PII scrub) → 202, then a
    batched, resumable purger.
 7. Global daily answer cap.

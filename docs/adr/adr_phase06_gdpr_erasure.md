@@ -32,17 +32,20 @@ invariant.
 
 - Backups are **"put beyond use"** (ICO): not used for any decision, access-controlled,
   and permanently deleted when the backup rotates.
-- **Retention schedule (documented):** backups are kept at most **7 days** and rotate
-  daily; deleted users' data therefore disappears from backups within 7 days. This is a
+- **Retention schedule (documented):** backups are kept at most **14 days** and rotate
+  daily; deleted users' data therefore disappears from backups within 14 days. This is a
   justified, proportionate schedule for a small app — GDPR requires it to be documented
-  and justified, not a specific legal number.
+  and justified, not a specific legal number. *(Amended in Phase 11a: originally 7 days;
+  now the single constant X9 = 14 days in `backend/src/rag_app/retention.py`, which covers
+  point-in-time restore, the encrypted Blob dumps and the local copies — see
+  [ADR phase 11](adr_phase11_stability.md).)*
 - Tombstones (`deletion_requests`) contain **no personal data** and are kept indefinitely
   as the audit/replay record.
 
 ## Transparency
 
 Users are told, at deletion time and in the privacy notice, that: live data is erased
-immediately; encrypted copies in backups are put beyond use and deleted within the 7-day
+immediately; encrypted copies in backups are put beyond use and deleted within the 14-day
 backup window; and deletions are replayed after any restore.
 
 ## Consequences
