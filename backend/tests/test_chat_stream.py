@@ -15,6 +15,8 @@ or the LLM client; a data key wrapped with another master key → ``InvalidToken
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -274,3 +276,171 @@ def test_one_undecryptable_row_does_not_break_the_list(client: Any, db_engine: E
     assert detail.status_code == 200
     assert all(m["error"] for m in detail.json()["messages"])
     _assert_no_orphans(db_engine, user)
+
+
+# --- connections, keep-alive, client disconnect (DA-G2-2, DA-G2-3) -------------------------
+
+
+def _idle_in_transaction(engine: Engine) -> int:
+    with engine.connect() as conn:
+        return int(
+            conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+                    " AND state = 'idle in transaction' AND pid <> pg_backend_pid()"
+                )
+            ).scalar_one()
+        )
+
+
+def test_no_connection_sits_idle_in_transaction_during_a_stream(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-G2-2: while the answer is being generated, neither the request session (FastAPI
+    >= 0.118 closes `yield` dependencies only after the response) nor the pipeline's session
+    holds a connection idle in transaction."""
+    from rag_app.api import conversations
+    from rag_app.generation import StreamStage
+
+    started, release = threading.Event(), threading.Event()
+
+    def slow_pipeline(session: Session, _question: str, **_kw: Any) -> Iterator[Any]:
+        session.execute(text("SELECT 1"))  # the pipeline reads (retrieval), then generates
+        yield StreamStage("generating")
+        started.set()
+        release.wait(timeout=15)
+        raise RuntimeError("the model went away")
+
+    monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
+    user = _make_user(db_engine)
+    outcome: dict[str, list[dict]] = {}
+    call = threading.Thread(target=lambda: outcome.update(e=_stream(client, user, "hello?")))
+    call.start()
+    try:
+        assert started.wait(timeout=15), "the stream never reached the generating stage"
+        time.sleep(0.3)
+        held = _idle_in_transaction(db_engine)
+    finally:
+        release.set()
+        call.join(timeout=30)
+    assert held == 0, f"{held} connection(s) idle in transaction during the stream"
+    _assert_error_contract(outcome["e"], "generation_failed")
+
+
+def test_a_long_stage_sends_keep_alive_comments(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-G2-3: a stage that takes long (reranker download at a cold start) still sends
+    bytes — an SSE comment every KEEPALIVE_SECONDS — so no proxy cuts the idle stream."""
+    from rag_app.api import conversations
+    from rag_app.generation import StreamStage
+
+    def slow_pipeline(_session: Session, _question: str, **_kw: Any) -> Iterator[Any]:
+        yield StreamStage("reranking")
+        time.sleep(0.5)
+        raise RuntimeError("reranker download failed")
+
+    monkeypatch.setattr(conversations, "KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
+    user = _make_user(db_engine)
+    res = client.post("/chat/stream", json={"question": "hi?"}, headers=_auth(user))
+    assert res.status_code == 200
+    frames = res.text.split("\n\n")
+    assert frames.count(": keep-alive") >= 3
+    parsed = [json.loads(f[len("data: ") :]) for f in frames if f.startswith("data: ")]
+    _assert_error_contract(parsed, "retrieval_failed")
+    _assert_no_orphans(db_engine, user)
+
+
+def _interrupted_marker(engine: Engine, user_id: uuid.UUID) -> list[dict]:
+    from rag_app.crypto import decrypt, unwrap_key
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT m.content_encrypted FROM messages m JOIN conversations c"
+                " ON c.id = m.conversation_id WHERE c.user_id = :u AND m.role = 'assistant'"
+            ),
+            {"u": user_id},
+        ).all()
+        wrapped = conn.execute(
+            text("SELECT wrapped_key FROM user_keys WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+    data_key = unwrap_key(bytes(wrapped))
+    return [json.loads(decrypt(data_key, bytes(r[0]))) for r in rows]
+
+
+def test_a_client_that_goes_away_leaves_an_interrupted_marker(
+    env: str, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-G2-3: the stream generator closed after the first event (what Starlette does when
+    the client disconnects) still answers the stored user message: no orphan turn."""
+    from rag_app.api import conversations
+    from rag_app.api.schemas import ChatStreamRequest
+    from rag_app.generation import StreamStage
+
+    def slow_pipeline(_session: Session, _question: str, **_kw: Any) -> Iterator[Any]:
+        yield StreamStage("retrieving")
+        time.sleep(5)
+
+    monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
+    user = _make_user(db_engine)
+    with db_engine.connect() as conn:
+        wrapped = conn.execute(
+            text("SELECT wrapped_key FROM user_keys WHERE user_id = :u"), {"u": user}
+        ).scalar_one()
+    stream = conversations._chat_events(user, bytes(wrapped), ChatStreamRequest(question="hi?"))
+    first = json.loads(next(stream)[len("data: ") :])
+    assert first["type"] == "conversation" and first["conversation_id"]
+    stream.close()  # the client went away
+    assert _turns(db_engine, user) == {first["conversation_id"]: (1, 1)}
+    _assert_no_orphans(db_engine, user)
+    (marker,) = _interrupted_marker(db_engine, user)
+    assert marker["error"] is True and marker["error_code"] == "interrupted"
+
+
+def test_a_real_disconnect_leaves_an_interrupted_marker(
+    env: str, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-G2-3 end to end: a real uvicorn server, a real socket closed after the first event,
+    and the keep-alive that makes the server notice."""
+    import socket
+
+    from rag_app.api import conversations
+    from rag_app.api.app import create_app
+    from rag_app.generation import StreamStage
+    from test_log_hygiene import _Server
+
+    def slow_pipeline(_session: Session, _question: str, **_kw: Any) -> Iterator[Any]:
+        yield StreamStage("retrieving")
+        time.sleep(3)
+        raise RuntimeError("never reached by the client")
+
+    monkeypatch.setattr(conversations, "KEEPALIVE_SECONDS", 0.2)
+    monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
+    user = _make_user(db_engine)
+    body = json.dumps({"question": "hi?"}).encode()
+    token = _auth(user)["Authorization"]
+    with _Server(create_app) as server:
+        host, port = server.base.removeprefix("http://").split(":")
+        sock = socket.create_connection((host, int(port)), timeout=10)
+        sock.sendall(
+            b"POST /chat/stream HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
+            + f"Authorization: {token}\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        received = b""
+        while b'"type": "conversation"' not in received:
+            chunk = sock.recv(4096)
+            assert chunk, "the server closed the stream early"
+            received += chunk
+        sock.close()  # the tab is closed
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            turns = _turns(db_engine, user)
+            if turns and all(a == 1 for _u, a in turns.values()):
+                break
+            time.sleep(0.1)
+    _assert_no_orphans(db_engine, user)
+    (marker,) = _interrupted_marker(db_engine, user)
+    assert marker["error_code"] == "interrupted"

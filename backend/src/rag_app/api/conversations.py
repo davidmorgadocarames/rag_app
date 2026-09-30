@@ -11,20 +11,35 @@ both carrying the id. Every failure (data key unwrap, storage, embeddings/retrie
 reranking, LLM) becomes an ``error`` event — never an unhandled exception that cuts the
 stream. A failed turn is persisted as an assistant **error marker**, so a conversation never
 holds a user message without a reply and the next message reuses the same conversation.
+A client that goes away mid-stream (closed tab, network drop, ingress idle cut) gets an
+``interrupted`` marker the same way (DA-G2-3).
+
+Connections (DA-G2-2): since FastAPI 0.118 a ``yield`` dependency exits only after the
+response is sent, so ``chat_stream`` closes the request session before it returns the
+stream — no connection sits "idle in transaction" for the whole answer. The pipeline runs on
+a worker thread with its own session, committed after every event (the read transaction
+ends as soon as retrieval is done); while it is busy (a reranker download at a cold start,
+a slow model) the stream sends an SSE comment ``: keep-alive`` every ``KEEPALIVE_SECONDS``
+so no proxy cuts an idle connection. Clients ignore comment frames.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Generator
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
+from starlette.concurrency import iterate_in_threadpool
+from starlette.types import Receive, Scope, Send
 
 from rag_app.api.auth import CurrentUserDep
 from rag_app.api.deps import SessionDep, rate_limit_chat
@@ -61,6 +76,7 @@ ERROR_KEY = "key_unavailable"
 ERROR_STORAGE = "storage_failed"
 ERROR_RETRIEVAL = "retrieval_failed"
 ERROR_GENERATION = "generation_failed"
+ERROR_INTERRUPTED = "interrupted"
 ERROR_MESSAGES = {
     ERROR_KEY: (
         "Your conversation data cannot be decrypted right now, so this message was not"
@@ -75,7 +91,15 @@ ERROR_MESSAGES = {
         "The language model is unavailable, so no answer was generated. Please try again"
         " in a moment."
     ),
+    ERROR_INTERRUPTED: (
+        "The connection closed before the answer finished, so no answer was saved. Please"
+        " ask again."
+    ),
 }
+# An SSE comment line: keeps the connection busy while a stage takes long (DA-G2-3; the Azure
+# ingress cuts a connection idle for ~240 s). EventSource and lib/chatStream.ts skip it.
+KEEPALIVE_SECONDS = 15.0
+KEEPALIVE_FRAME = ": keep-alive\n\n"
 # Pipeline stages before the LLM is involved: a failure there is a retrieval failure.
 _RETRIEVAL_STAGES = frozenset({"retrieving", "reranking"})
 UNREADABLE_TITLE = "Unreadable conversation"
@@ -248,9 +272,60 @@ def _start_turn(
     return conv
 
 
+class _PipelineFailed:
+    """An exception raised by the pipeline on the worker thread, handed to the stream."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+_PIPELINE_END = object()
+
+
+def _pipeline_events(request: ChatStreamRequest) -> Generator[object | None, None, None]:
+    """The pipeline's events, produced on a worker thread with its OWN session (committed
+    after every event, so no read transaction stays open while the model generates).
+    Yields ``None`` whenever ``KEEPALIVE_SECONDS`` pass without an event (the caller sends a
+    keep-alive). Re-raises the pipeline's exception here. Closing this generator (client gone)
+    tells the worker to stop at its next event."""
+    events: queue.Queue[object] = queue.Queue()
+    cancel = threading.Event()
+
+    def work() -> None:
+        try:
+            with _stream_session_factory()() as session:
+                for event in answer_question_stream(
+                    session, request.question, version=request.version
+                ):
+                    session.commit()  # ends the read transaction; a no-op when none is open
+                    if cancel.is_set():
+                        break
+                    events.put(event)
+        except BaseException as exc:  # noqa: BLE001 - handed to the stream, which maps it
+            events.put(_PipelineFailed(exc))
+        finally:
+            events.put(_PIPELINE_END)
+
+    threading.Thread(target=work, name="chat-pipeline", daemon=True).start()
+    try:
+        while True:
+            try:
+                item = events.get(timeout=KEEPALIVE_SECONDS)
+            except queue.Empty:
+                yield None
+                continue
+            if item is _PIPELINE_END:
+                return
+            if isinstance(item, _PipelineFailed):
+                raise item.exc
+            yield item
+    finally:
+        cancel.set()
+
+
 def _chat_events(
     user_id: uuid.UUID, wrapped_key: bytes, request: ChatStreamRequest
-) -> Iterator[str]:
+) -> Generator[str, None, None]:
     conv_id = request.conversation_id
     try:
         key = unwrap_key(wrapped_key)
@@ -272,60 +347,105 @@ def _chat_events(
             yield _error_event(conv_id, ERROR_STORAGE)
             return
         conv_id = str(conv.id)
-        yield _sse({"type": "conversation", "conversation_id": conv_id})
-
-        answer: Answer | None = None
-        usage = Usage()
-        stage = "starting"
+        replied = False  # an assistant message (answer or marker) is stored for this turn
         try:
-            for event in answer_question_stream(session, request.question, version=request.version):
-                if isinstance(event, StreamStage):
-                    stage = event.stage
-                    yield _sse({"type": "stage", "stage": event.stage})
-                elif isinstance(event, StreamToken):
-                    yield _sse({"type": "token", "text": event.text})
-                elif isinstance(event, StreamResult):
-                    answer = event.answer
-                    usage = event.usage
-            if answer is None:
-                raise RuntimeError("the pipeline produced no answer")
-        except Exception as exc:  # noqa: BLE001 - surface a clean error event, keep the stream valid
-            code = ERROR_RETRIEVAL if stage in _RETRIEVAL_STAGES else ERROR_GENERATION
-            logger.warning("chat stream: %s at stage %s (%s)", code, stage, type(exc).__name__)
-            _persist_error_marker(session, conv, key, code)
-            yield _error_event(conv_id, code)
-            return
+            yield _sse({"type": "conversation", "conversation_id": conv_id})
 
-        payload = {
-            "text": answer.text,
-            "citations": _citation_dicts(answer),
-            "abstained": answer.abstained,
-            "grounded": answer.grounded,
-        }
-        try:
-            _persist_message(session, conv, key, "assistant", payload, usage)
-            total = _total_tokens(_messages(session, conv.id))
-        except Exception as exc:  # noqa: BLE001 - the answer exists but cannot be stored
-            logger.warning("chat stream: answer not stored (%s)", type(exc).__name__)
-            _persist_error_marker(session, conv, key, ERROR_STORAGE)
-            yield _error_event(conv_id, ERROR_STORAGE)
-            return
-        yield _sse(
-            {
-                "type": "done",
-                "conversation_id": conv_id,
-                "answer": answer.text,
+            answer: Answer | None = None
+            usage = Usage()
+            stage = "starting"
+            pipeline = _pipeline_events(request)
+            try:
+                for event in pipeline:
+                    if event is None:
+                        yield KEEPALIVE_FRAME
+                    elif isinstance(event, StreamStage):
+                        stage = event.stage
+                        yield _sse({"type": "stage", "stage": event.stage})
+                    elif isinstance(event, StreamToken):
+                        yield _sse({"type": "token", "text": event.text})
+                    elif isinstance(event, StreamResult):
+                        answer = event.answer
+                        usage = event.usage
+                if answer is None:
+                    raise RuntimeError("the pipeline produced no answer")
+            except Exception as exc:  # noqa: BLE001 - surface a clean error event, keep the stream valid
+                code = ERROR_RETRIEVAL if stage in _RETRIEVAL_STAGES else ERROR_GENERATION
+                logger.warning("chat stream: %s at stage %s (%s)", code, stage, type(exc).__name__)
+                _persist_error_marker(session, conv, key, code)
+                replied = True
+                yield _error_event(conv_id, code)
+                return
+            finally:
+                pipeline.close()
+
+            payload = {
+                "text": answer.text,
+                "citations": _citation_dicts(answer),
                 "abstained": answer.abstained,
                 "grounded": answer.grounded,
-                "citations": _citation_dicts(answer),
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                },
-                "conversation_total_tokens": total,
             }
-        )
+            try:
+                _persist_message(session, conv, key, "assistant", payload, usage)
+                replied = True
+                total = _total_tokens(_messages(session, conv.id))
+            except Exception as exc:  # noqa: BLE001 - the answer exists but cannot be stored
+                logger.warning("chat stream: answer not stored (%s)", type(exc).__name__)
+                if not replied:
+                    _persist_error_marker(session, conv, key, ERROR_STORAGE)
+                    replied = True
+                yield _error_event(conv_id, ERROR_STORAGE)
+                return
+            yield _sse(
+                {
+                    "type": "done",
+                    "conversation_id": conv_id,
+                    "answer": answer.text,
+                    "abstained": answer.abstained,
+                    "grounded": answer.grounded,
+                    "citations": _citation_dicts(answer),
+                    "usage": {
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                    },
+                    "conversation_total_tokens": total,
+                }
+            )
+        except GeneratorExit:
+            # The client went away mid-stream (DA-G2-3): the user message stays answered.
+            if not replied:
+                logger.warning("chat stream: client disconnected; turn marked interrupted")
+                _persist_error_marker(session, conv, key, ERROR_INTERRUPTED)
+            raise
+
+
+async def _closing_body(events: Generator[str, None, None]) -> AsyncIterator[str]:
+    """The sync SSE generator as the response body, CLOSED when the body ends for any reason
+    — a finished stream, a client disconnect (the task is cancelled) or an error — so its
+    ``GeneratorExit`` handler stores the ``interrupted`` marker right away instead of
+    whenever the garbage collector gets to it (DA-G2-3). The close runs on a worker thread
+    (it writes to the database), shielded from the cancellation that triggered it."""
+    try:
+        async for chunk in iterate_in_threadpool(events):
+            yield chunk
+    finally:
+        with anyio.CancelScope(shield=True):
+            await anyio.to_thread.run_sync(events.close)
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """A StreamingResponse that always closes its body iterator, also when the client
+    disconnects while a chunk is being sent (Starlette leaves it suspended then)."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                with anyio.CancelScope(shield=True):
+                    await aclose()
 
 
 @router.post("/chat/stream", dependencies=[Depends(rate_limit_chat)])
@@ -336,11 +456,17 @@ def chat_stream(
     # generator then works from plain bytes on its own session.
     if user.key is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "user has no data key")
+    user_id, wrapped_key = user.id, user.key.wrapped_key
     if request.conversation_id:
         # Someone else's (or an unknown) conversation is a plain 404 before any streaming.
-        _get_owned_conversation(session, user.id, request.conversation_id)
-    return StreamingResponse(
-        _chat_events(user.id, user.key.wrapped_key, request),
+        _get_owned_conversation(session, user_id, request.conversation_id)
+    # DA-G2-2: the dependency's session would otherwise stay checked out, idle in
+    # transaction, until the whole stream is sent (FastAPI >= 0.118 exits `yield`
+    # dependencies after the response). Closing it ends the transaction and returns the
+    # connection; the dependency's own close later is a no-op.
+    session.close()
+    return _ClosingStreamingResponse(
+        _closing_body(_chat_events(user_id, wrapped_key, request)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
