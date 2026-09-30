@@ -17,6 +17,7 @@ from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthRe
 from rag_app.config import Settings, check_dev_only_flags, get_settings, validate_api_settings
 from rag_app.db.session import make_engine
 from rag_app.keycheck import check_master_key_fingerprint
+from rag_app.logsafe import install_log_redaction
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 
@@ -46,6 +47,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    # Query strings (the e-mail verification token) never reach the access log (T11.2.15).
+    install_log_redaction()
     app = FastAPI(title="SecRAG API", version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,

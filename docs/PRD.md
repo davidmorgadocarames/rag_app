@@ -61,7 +61,8 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
   - *Privacy text*: deleting an account makes the user's data unreadable immediately
     (crypto-shred) and signs them out; the remaining encrypted records are removed within
     24 hours; encrypted backup copies expire within 14 days and a restore re-applies every
-    erasure. Operational logs are kept 30 days and contain no conversation content. On the
+    erasure. Operational logs are kept 30 days and contain no conversation content, email
+    addresses, passwords or tokens (request query strings are redacted). On the
     Azure deployment, questions sent to Azure OpenAI may be retained by Microsoft for abuse
     monitoring for up to 30 days.
 

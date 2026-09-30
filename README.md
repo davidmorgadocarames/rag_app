@@ -217,7 +217,10 @@ a root `.env` — use the same key in both. The API checks this at start-up: it 
 refuses to start when the key is not the one the database was initialised with (a stored
 key fingerprint) — see [Recovering from a changed master key](#recovering-from-a-changed-master-key).
 
-SMTP is optional. Without it, email-verification links are written to the backend log.
+SMTP is optional. Without it no email is sent and nothing personal is logged; in dev the account
+page gets the verification link from `POST /auth/resend-verification`. Logs never contain an email
+address, a password or a token: query strings are redacted from the uvicorn access log (the
+verification link is `GET /auth/verify?token=…`) and database errors never print bound parameters.
 
 Keep `ENV=dev` (from `.env.example`) on a local machine. When `ENV` is unset the app assumes
 `prod`, and in `prod` it refuses to start if any development-only feature flag is enabled.

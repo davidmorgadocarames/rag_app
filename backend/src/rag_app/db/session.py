@@ -13,9 +13,13 @@ def make_engine(database_url: str | None = None) -> Engine:
 
     Only the database URL is read (``JobSettings``), so Jobs build engines without the
     API's secrets (T11.2.2).
+
+    ``hide_parameters``: a database error (e.g. a unique violation on ``users.email``) never
+    renders the bound values into its message, so tracebacks in the logs carry no e-mail
+    address, token hash or ciphertext (T11.2.15).
     """
     url = database_url or get_job_settings().database_url
-    return create_engine(url, future=True)
+    return create_engine(url, future=True, hide_parameters=True)
 
 
 def make_session_factory(engine: Engine | None = None) -> sessionmaker[Session]:
