@@ -12,7 +12,8 @@ stored ``user_keys.wrapped_key`` of the accounts, and prints only OK/KO lines:
                            (--current-key-from-app APP | --current-key-from-env-file PATH)
                            [--apply --i-have-a-pg-dump]
     key_recovery.sh erase --account I --expect-total N --current-key-from-env-file PATH
-                          [--no-candidates] [--apply --i-have-a-snapshot]
+                          [--no-candidates] [--expect-readable R]
+                          [--apply --i-have-a-snapshot]
                                                                  (LOCAL development DB only)
     key_recovery.sh shred                overwrite (random, then zeros) and delete the
                                          candidate file and its directory
@@ -44,7 +45,10 @@ prints "dry run: would update 1 row" and rolls back. The master key is never swi
 for an account that NO key can unwrap. In ONE transaction it checks the total against
 ``--expect-total``, locks the account, proves the current key IS the app's key (DA-E2-1: it
 must match the stored master-key fingerprint when one exists AND unwrap at least one OTHER
-account — a wrong or stale env file makes every account "KO" and is refused), and refuses
+account — a wrong or stale env file makes every account "KO" and is refused; DA-F-1: while no
+fingerprint is stored it must unwrap EVERY other account, or ``--expect-readable R`` must
+equal the readable count and R must be a majority of the other accounts, because an OLD key
+still unwraps the accounts wrapped under it), and refuses
 unless the current key AND every candidate fail on that very blob (it also refuses while any
 candidate line is unreadable or malformed; ``--no-candidates`` = no candidate file because
 key recovery was skipped, D-2026-09-29-2 CHANGED); then it erases the account through the
@@ -549,12 +553,22 @@ def _app_fingerprint() -> tuple[Any, str]:
     return fingerprint, FINGERPRINT_ALGORITHM
 
 
-def _verify_current_key(conn, current, current_text: str, user_id) -> None:  # type: ignore[no-untyped-def]
-    """DA-E2-1: "current key KO" only means something if the current key IS the app's key.
+def _verify_current_key(  # type: ignore[no-untyped-def]
+    conn, current, current_text: str, user_id, expect_readable: int | None = None
+) -> None:
+    """DA-E2-1 / DA-F-1: "current key KO" only means something if the current key IS the
+    app's key.
 
     In the erase transaction: when a fingerprint is stored, the current key must match it;
     and the current key must unwrap at least one OTHER account. A wrong or stale env file
-    (every account KO) is refused before any account is judged unrecoverable."""
+    (every account KO) is refused before any account is judged unrecoverable.
+
+    While NO fingerprint is stored, "unwraps one other account" does not prove it is the
+    app's key (an OLD key unwraps the accounts still under it), so the current key must
+    unwrap EVERY other account — or ``--expect-readable R`` (the readable count ``check``
+    printed with the same key) must equal the readable count AND those R must be a strict
+    majority of the other accounts. ``--expect-readable`` is also enforced when a
+    fingerprint matches."""
     import hmac
 
     fingerprint, algorithm = _app_fingerprint()
@@ -587,6 +601,26 @@ def _verify_current_key(conn, current, current_text: str, user_id) -> None:  # t
             " be the app's key (wrong or stale env file?), so 'current key KO' proves nothing;"
             " erase refuses (DA-E2-1)"
         )
+    if expect_readable is not None and readable != expect_readable:
+        raise Refusal(
+            f"the current key unwraps {readable} of {len(others)} other account(s),"
+            f" --expect-readable says {expect_readable} — run check again; erase refuses"
+            " (DA-F-1)"
+        )
+    if stored is None and readable < len(others):
+        if expect_readable is None:
+            raise Refusal(
+                f"the current key unwraps only {readable} of {len(others)} other account(s)"
+                " and no master-key fingerprint is stored, so it may be an OLD key (stale env"
+                " file) — erase refuses unless it unwraps every other account, or"
+                " --expect-readable R equals the readable count of check (DA-F-1)"
+            )
+        if 2 * readable <= len(others):
+            raise Refusal(
+                f"the current key unwraps {readable} of {len(others)} other account(s), not a"
+                " majority, and no master-key fingerprint is stored — it may be an OLD key;"
+                " erase refuses even with --expect-readable (DA-F-1)"
+            )
     out(
         f"current key verified: unwraps {readable} of {len(others)} other account(s);"
         f" fingerprint {'matches' if stored is not None else 'not stored yet'}"
@@ -660,7 +694,7 @@ def erase(args: argparse.Namespace) -> int:
                     f"account #{args.account} is readable with the current key — erase never"
                     " touches a readable account"
                 )
-            _verify_current_key(conn, current, current_text, user_id)
+            _verify_current_key(conn, current, current_text, user_id, args.expect_readable)
             for j, candidate in enumerate(candidates, start=1):
                 if _unwraps(candidate, blob):
                     raise Refusal(
@@ -755,6 +789,13 @@ def _parser() -> argparse.ArgumentParser:
     e.add_argument("--account", type=int, required=True)
     e.add_argument("--expect-total", type=int, required=True, metavar="N")
     e.add_argument("--current-key-from-env-file", metavar="PATH", required=True)
+    e.add_argument(
+        "--expect-readable",
+        type=int,
+        metavar="R",
+        help="the readable count check printed; needed while no fingerprint is stored and the"
+        " current key does not unwrap every other account (DA-F-1)",
+    )
     e.add_argument("--apply", action="store_true")
     e.add_argument("--i-have-a-snapshot", action="store_true")
     e.add_argument(
