@@ -137,6 +137,36 @@ prune_by_name() {
   return "$bad"
 }
 
+# newest_valid_name <regex> [prefix]: reads names on stdin (one per line, e.g. blob names) and
+# prints the one whose NAME time is the newest among the valid ones — a real date, at most
+# FUTURE_SKEW_SECONDS ahead — with its prefix. Only names that are <prefix><match> are looked
+# at. A matching name that cannot be judged (invalid date, dated in the future) is never
+# picked: it is REPORTED on stderr and the function returns 1 after printing the newest valid
+# one, if any (DA-G1-3: a stray future-dated name must not pass for the latest dump/export —
+# the rule of prune_by_name, DA-F2-1).
+newest_valid_name() {
+  local re="$1" prefix="${2:-}" now name base epoch newest="" newest_epoch=-1 bad=0
+  now="$(date -u +%s)"
+  while IFS= read -r name || [ -n "$name" ]; do
+    name="${name%$'\r'}"
+    [ -n "$name" ] && [[ "$name" == "$prefix"* ]] || continue
+    base="${name#"$prefix"}"
+    [[ "$base" =~ $re ]] || continue
+    if ! epoch="$(name_epoch "$base" "$re")"; then
+      echo "  WARNING: $name has an invalid date in its name — not picked as the latest; check and remove it by hand" >&2
+      bad=1
+    elif [ $((epoch - now)) -gt "$FUTURE_SKEW_SECONDS" ]; then
+      echo "  WARNING: $name is dated in the future — not picked as the latest; check the clock / remove it by hand" >&2
+      bad=1
+    elif [ "$epoch" -gt "$newest_epoch" ]; then
+      newest_epoch="$epoch"
+      newest="$name"
+    fi
+  done
+  [ -z "$newest" ] || echo "$newest"
+  return "$bad"
+}
+
 # is_age_file <file>: the file starts with the age header line.
 is_age_file() { [ "$(head -c ${#AGE_HEADER} -- "$1" 2>/dev/null)" = "$AGE_HEADER" ]; }
 

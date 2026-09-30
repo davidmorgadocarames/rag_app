@@ -5,6 +5,8 @@
 #
 #   BACKUP_STORAGE_ACCOUNT=<account> scripts/db/backup-pull.sh [--dir DIR]
 #
+# "Newest" is by the time in the NAME, among valid names only: a name with an invalid date or
+# dated in the future is never picked, it is reported and the run exits 1 (DA-G1-3).
 # - downloads the newest backups/secrag-<ts>.dump.age (still age-encrypted: nothing is
 #   decrypted here) into DIR (default ~/secrag-db-backups/azure, mode 0700, never inside a
 #   git work tree), unless it is already there;
@@ -20,7 +22,7 @@ set -euo pipefail
 # shellcheck source=scripts/db/backup_lib.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/backup_lib.sh"
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 
 dir="${BACKUP_PULL_DIR:-$HOME/secrag-db-backups/azure}"
 while [ $# -gt 0 ]; do
@@ -46,10 +48,23 @@ chmod 700 -- "$dir" "$dir/tombstones"
 
 azs() { az storage blob "$@" --account-name "$account" --container-name "$container" --auth-mode login --only-show-errors; }
 
-# latest <prefix> <basename regex>: newest blob name under the prefix (names sort by time).
+flagged=0
+# latest <prefix> <basename regex>: the blob under the prefix whose NAME time is the newest
+# VALID one; a name that cannot be judged (invalid date, dated in the future) is never picked
+# — it is reported and the run exits 1 at the end (DA-G1-3). Returns 1 after such a report,
+# 2 when the list call itself fails; an empty result means nothing valid is there.
 latest() {
-  azs list --prefix "$1" --query '[].name' -o tsv \
-    | tr -d '\r' | { grep -E "^$1${2:1}" || true; } | sort | tail -n 1
+  local names
+  names="$(azs list --prefix "$1" --query '[].name' -o tsv)" || return 2
+  newest_valid_name "$2" "$1" <<<"$names"
+}
+# pick <prefix> <regex>: latest, with a failed list call fatal and a report remembered.
+picked=""
+pick() {
+  local rc=0
+  picked="$(latest "$1" "$2")" || rc=$?
+  [ "$rc" -le 1 ] || die "cannot list $1 in $account/$container"
+  [ "$rc" = 0 ] || flagged=1
 }
 
 # fetch <blob name> <target file>: download to a partial file, then rename.
@@ -62,8 +77,9 @@ fetch() {
   chmod 600 -- "$2"
 }
 
-dump="$(latest backups/ "$DUMP_NAME_RE")"
-[ -n "$dump" ] || die "no backup blob under backups/ in $account/$container"
+pick backups/ "$DUMP_NAME_RE"
+dump="$picked"
+[ -n "$dump" ] || die "no valid backup blob under backups/ in $account/$container"
 base="$(basename "$dump")"
 if [ -f "$dir/$base" ]; then
   echo "backup-pull: $base already here"
@@ -76,7 +92,8 @@ else
   echo "backup-pull: downloaded $base ($(stat -c %s "$dir/$base") bytes, age-encrypted)"
 fi
 
-export_name="$(latest tombstones/ "$TOMBSTONE_NAME_RE")"
+pick tombstones/ "$TOMBSTONE_NAME_RE"
+export_name="$picked"
 if [ -n "$export_name" ]; then
   fetch "$export_name" "$dir/tombstones/$(basename "$export_name")"
   echo "backup-pull: tombstone export $(basename "$export_name")"
@@ -85,8 +102,7 @@ else
 fi
 
 echo "backup-pull: retention $days days (X9), tombstone exports $tdays days"
-flagged=0
 prune_by_name "$dir" "$DUMP_NAME_RE" "$days" || flagged=1
 prune_by_name "$dir/tombstones" "$TOMBSTONE_NAME_RE" "$tdays" keep-newest || flagged=1
 echo "backup-pull: $(find "$dir" -maxdepth 1 -type f -name 'secrag-*.dump.age' | wc -l) local dump(s) in $dir"
-[ "$flagged" = 0 ] || die "retention found names it cannot judge (WARNING above) — check them"
+[ "$flagged" = 0 ] || die "found names it cannot judge (WARNING above) — check them"

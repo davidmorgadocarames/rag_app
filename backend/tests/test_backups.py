@@ -519,6 +519,70 @@ def test_backup_pull_copies_the_latest_dump_and_tombstones_and_prunes(tmp_path: 
     assert no_account.returncode != 0 and "BACKUP_STORAGE_ACCOUNT" in no_account.stderr
 
 
+@needs_bash
+def test_backup_pull_never_takes_a_stray_future_or_invalid_name_for_the_latest(
+    tmp_path: Path,
+) -> None:
+    """DA-G1-3: "latest" is the newest VALID name — a stray future-dated or invalid-dated
+    dump/export is reported and not downloaded, the real newest one is, and the run exits 1
+    (the rule of prune_by_name keep-newest, DA-F2-1)."""
+    az_root = tmp_path / "az"
+    container = az_root / "secrag-backups"
+    (container / "backups").mkdir(parents=True)
+    (container / "tombstones").mkdir()
+    older, latest = _stamp(3), _stamp(1)
+    for stamp in (older, latest, "20990101T000000Z", "20261331T000000Z"):
+        (container / "backups" / f"secrag-{stamp}.dump.age").write_bytes(
+            b"age-encryption.org/v1\n" + stamp.encode()
+        )
+    for stamp in (older, latest, "20990101T000000Z"):
+        (container / "tombstones" / f"tombstones-{stamp}.jsonl").write_text("")
+    bin_dir = _fake_bin(tmp_path)
+    (bin_dir / "az").write_text(FAKE_AZ)
+    (bin_dir / "az").chmod(0o755)
+    local = tmp_path / "pulled"
+    local.mkdir(mode=0o700)
+    env = _env(tmp_path, FAKE_AZ_ROOT=str(az_root), BACKUP_STORAGE_ACCOUNT="secragbackups")
+    proc = subprocess.run(
+        ["bash", str(DB_SCRIPTS / "backup-pull.sh"), "--dir", str(local)],
+        env=env, capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert proc.returncode != 0 and "cannot judge" in proc.stderr
+    assert sorted(p.name for p in local.glob("secrag-*")) == [f"secrag-{latest}.dump.age"]
+    assert sorted(p.name for p in (local / "tombstones").iterdir()) == [
+        f"tombstones-{latest}.jsonl"
+    ]
+    assert "backups/secrag-20990101T000000Z.dump.age is dated in the future" in proc.stderr
+    assert "backups/secrag-20261331T000000Z.dump.age has an invalid date" in proc.stderr
+    assert "tombstones/tombstones-20990101T000000Z.jsonl is dated in the future" in proc.stderr
+
+    for stray in (
+        "backups/secrag-20990101T000000Z.dump.age",
+        "backups/secrag-20261331T000000Z.dump.age",
+        "tombstones/tombstones-20990101T000000Z.jsonl",
+    ):
+        (container / stray).unlink()
+    clean = subprocess.run(
+        ["bash", str(DB_SCRIPTS / "backup-pull.sh"), "--dir", str(local)],
+        env=env, capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert clean.returncode == 0, clean.stderr
+
+
+@needs_bash
+def test_backup_pull_stops_when_the_list_call_fails(tmp_path: Path) -> None:
+    bin_dir = _fake_bin(tmp_path)
+    (bin_dir / "az").write_text("#!/usr/bin/env bash\necho 'az: auth failed' >&2\nexit 3\n")
+    (bin_dir / "az").chmod(0o755)
+    local = tmp_path / "pulled"
+    env = _env(tmp_path, BACKUP_STORAGE_ACCOUNT="secragbackups")
+    proc = subprocess.run(
+        ["bash", str(DB_SCRIPTS / "backup-pull.sh"), "--dir", str(local)],
+        env=env, capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert proc.returncode != 0 and "cannot list backups/" in proc.stderr
+
+
 # --- restore.sh refusals (no database needed) -----------------------------------------------
 
 
