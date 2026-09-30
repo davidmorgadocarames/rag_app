@@ -24,6 +24,15 @@ if [ -z "$url" ]; then
   exit 2
 fi
 url="${url/postgresql+psycopg:/postgresql:}"
+# DA-F-5: a password inside the URL moves to PGPASSWORD (this process' environment), so it
+# never reaches psql's command line (ps). Percent-escapes are decoded as libpq would.
+if [[ "$url" =~ ^(postgresql://[^:/@]+):([^@/]*)@(.*)$ ]]; then
+  url_pw="${BASH_REMATCH[2]}"
+  PGPASSWORD="$(printf '%b' "${url_pw//%/\\x}")"
+  export PGPASSWORD
+  url="${BASH_REMATCH[1]}@${BASH_REMATCH[3]}"
+  unset url_pw
+fi
 
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 roles_sql="${ROLES_SQL:-$here/../../db/roles.sql}"

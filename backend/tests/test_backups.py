@@ -103,12 +103,15 @@ def keys(tmp_path: Path) -> tuple[Path, str]:
 
 
 def _fake_bin(tmp_path: Path) -> Path:
-    """A fake pg_dump that records the libpq role/database it was given."""
+    """A fake pg_dump that records the libpq role/database it was given; with
+    FAKE_PG_DUMP_FAIL set it writes a truncated dump and fails (DA-F-2)."""
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir(exist_ok=True)
     pg_dump = bin_dir / "pg_dump"
     pg_dump.write_text(
         '#!/usr/bin/env bash\nprintf "PGDMP fake dump of %s as %s\\n" "$PGDATABASE" "$PGUSER"\n'
+        'if [ -n "${FAKE_PG_DUMP_FAIL:-}" ]; then echo "pg_dump: error: connection lost" >&2;'
+        " exit 3; fi\n"
     )
     pg_dump.chmod(0o755)
     return bin_dir
@@ -299,6 +302,147 @@ def test_blob_mode_end_to_end_with_the_fake_sdk(tmp_path: Path, keys: tuple[Path
     assert again.returncode != 0 and "over the 14-day retention promise" in again.stderr
     no_identity = _backup(tmp_path, "--blob", **{**env, "AZURE_CLIENT_ID": ""})
     assert no_identity.returncode != 0 and "AZURE_CLIENT_ID" in no_identity.stderr
+
+
+# --- DA-F-2: a failed pg_dump never leaves a backup behind -----------------------------------
+
+
+@needs_age
+def test_a_failing_pg_dump_keeps_no_file(tmp_path: Path, keys: tuple[Path, str]) -> None:
+    _key, recipient = keys
+    out_dir = tmp_path / "backups"
+    proc = _backup(
+        tmp_path, "--file", "--dir", str(out_dir), DATABASE_URL=BACKUP_URL,
+        BACKUP_AGE_RECIPIENT=recipient, FAKE_PG_DUMP_FAIL="1",
+    )  # fmt: skip
+    assert proc.returncode != 0
+    assert "pg_dump (rc 3) or age (rc 0) failed — no backup kept or uploaded" in proc.stderr
+    assert list(out_dir.iterdir()) == []  # neither a dump nor a .partial
+
+
+@needs_age
+def test_a_failing_pg_dump_uploads_no_blob(tmp_path: Path, keys: tuple[Path, str]) -> None:
+    _key, recipient = keys
+    root, scratch = tmp_path / "blob", tmp_path / "tmp"
+    scratch.mkdir()
+    env = {
+        "DATABASE_URL": BACKUP_URL,
+        "BACKUP_AGE_RECIPIENT": recipient,
+        "BACKUP_STORAGE_ACCOUNT": "secragbackups",
+        "AZURE_CLIENT_ID": "00000000-0000-0000-0000-000000000001",
+        "FAKE_BLOB_ROOT": str(root),
+        "PYTHONPATH": f"{FAKES}:{REPO / 'backend' / 'src'}",
+        "TMPDIR": str(scratch),
+    }
+    failed = _backup(tmp_path, "--blob", **env, FAKE_PG_DUMP_FAIL="1")
+    assert failed.returncode != 0
+    assert "pg_dump (rc 3) or age (rc 0) failed" in failed.stderr
+    assert not root.exists() or not [p for p in root.rglob("*") if p.is_file()]
+    assert list(scratch.iterdir()) == []  # the temporary ciphertext is gone too
+    ok = _backup(tmp_path, "--blob", **env)  # the same set-up without the fault uploads
+    assert ok.returncode == 0, ok.stderr
+    assert len(list((root / "secrag-backups" / "backups").glob("secrag-*.dump.age"))) == 1
+    assert list(scratch.iterdir()) == []
+
+
+# --- DA-F-3: retention flags names it cannot judge and sweeps stale partial files ------------
+
+
+@needs_bash
+def test_retention_flags_bad_dates_and_sweeps_stale_partials(tmp_path: Path) -> None:
+    folder = tmp_path / "dumps"
+    folder.mkdir()
+    old = f"secrag-{_stamp(BACKUP_RETENTION_DAYS + 1)}.dump.age"
+    fresh = f"secrag-{_stamp(1)}.dump.age"
+    invalid = "secrag-20261399T000000Z.dump.age"  # month 13
+    feb31 = "secrag-20260231T120000Z.dump.age"  # not a real day
+    future = f"secrag-{_stamp(-3)}.dump.age"
+    stale_partial = f".secrag-{_stamp(2)}.dump.age.partial"
+    new_partial = f".secrag-{_stamp(0)}.dump.age.partial"
+    foreign_partial = ".notes.txt.partial"
+    other = "secrag-backup-notes.txt"
+    names = [old, fresh, invalid, feb31, future, stale_partial, new_partial, foreign_partial]
+    for name in [*names, other]:
+        (folder / name).write_text("age-encryption.org/v1\n")
+    two_days = (dt.datetime.now() - dt.timedelta(days=2)).timestamp()
+    for name in (stale_partial, foreign_partial):
+        os.utime(folder / name, (two_days, two_days))
+    lib = DB_SCRIPTS / "backup_lib.sh"
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{lib}"; prune_by_name "$1" "$DUMP_NAME_RE" "$2"', "prune",
+         str(folder), str(BACKUP_RETENTION_DAYS)],
+        capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert proc.returncode == 1, proc.stderr
+    left = {p.name for p in folder.iterdir()}
+    assert left == {fresh, invalid, feb31, future, new_partial, foreign_partial, other}
+    assert f"removed {old} (older than" in proc.stdout
+    assert f"removed {stale_partial} (stale partial file)" in proc.stdout
+    for name in (invalid, feb31):
+        assert f"WARNING: {name} has an invalid date" in proc.stderr
+    assert f"WARNING: {future} is dated in the future" in proc.stderr
+    for name in (invalid, feb31, future):
+        (folder / name).unlink()
+    clean = subprocess.run(
+        ["bash", "-c", f'. "{lib}"; prune_by_name "$1" "$DUMP_NAME_RE" "$2"', "prune",
+         str(folder), str(BACKUP_RETENTION_DAYS)],
+        capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert clean.returncode == 0 and clean.stderr == ""
+
+
+@needs_age
+def test_file_mode_fails_loudly_on_a_dump_name_it_cannot_judge(
+    tmp_path: Path, keys: tuple[Path, str]
+) -> None:
+    _key, recipient = keys
+    out_dir = tmp_path / "backups"
+    out_dir.mkdir()
+    (out_dir / "secrag-20261399T000000Z.dump.age").write_text("age-encryption.org/v1\n")
+    proc = _backup(
+        tmp_path, "--file", "--dir", str(out_dir), DATABASE_URL=BACKUP_URL,
+        BACKUP_AGE_RECIPIENT=recipient,
+    )  # fmt: skip
+    assert proc.returncode != 0
+    assert "the new backup was written, but retention found dump names" in proc.stderr
+    assert len(list(out_dir.glob("secrag-*.dump.age"))) == 2  # new dump kept, bad one kept
+
+
+# --- DA-F-5: apply_roles.sh never puts a URL password on psql's command line -----------------
+
+
+@needs_bash
+def test_apply_roles_moves_the_url_password_to_the_environment(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "psql.log"
+    psql = bin_dir / "psql"
+    psql.write_text(
+        '#!/usr/bin/env bash\n{ printf "argv:%s\\n" "$*"; printf "pw:%s\\n" "$PGPASSWORD"; }'
+        f' >>"{log}"\ncat >/dev/null\n'
+    )
+    psql.chmod(0o755)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("PG") and k not in {"SECRAG_PURGER_PASSWORD", "SECRAG_BACKUP_PASSWORD"}
+    }
+    env |= {
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "DATABASE_URL": "postgresql+psycopg://owner:s3cr%40t-pw@127.0.0.1:1/db",
+    }
+    proc = subprocess.run(
+        ["bash", str(DB_SCRIPTS / "apply_roles.sh")],
+        env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    lines = log.read_text().splitlines()
+    argv = [line for line in lines if line.startswith("argv:")]
+    assert argv and all("s3cr" not in line for line in argv)
+    assert all("postgresql://owner@127.0.0.1:1/db" in line for line in argv)
+    assert {line for line in lines if line.startswith("pw:")} == {"pw:s3cr@t-pw"}
+    drill = (DB_SCRIPTS / "backup_drill.sh").read_text(encoding="utf-8")
+    assert not re.search(r'apply_roles\.sh" "\$\(url_for', drill)
 
 
 # --- backup-pull.sh (fake az) ---------------------------------------------------------------

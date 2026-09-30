@@ -82,6 +82,8 @@ else
 fi
 
 echo "backup-pull: retention $days days (X9)"
-prune_by_name "$dir" "$DUMP_NAME_RE" "$days"
-prune_by_name "$dir/tombstones" "$TOMBSTONE_NAME_RE" "$days" keep-newest
+flagged=0
+prune_by_name "$dir" "$DUMP_NAME_RE" "$days" || flagged=1
+prune_by_name "$dir/tombstones" "$TOMBSTONE_NAME_RE" "$days" keep-newest || flagged=1
 echo "backup-pull: $(find "$dir" -maxdepth 1 -type f -name 'secrag-*.dump.age' | wc -l) local dump(s) in $dir"
+[ "$flagged" = 0 ] || die "retention found names it cannot judge (WARNING above) — check them"

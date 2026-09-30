@@ -60,7 +60,10 @@ fail() { echo "  FAIL: $*"; exit 1; }
 
 # --- 1. source database with two accounts -------------------------------------------------
 for db in "$src" "$rst" "$ctl" "$neg"; do admin_psql -c "CREATE DATABASE $db"; done
-bash "$SECRAG_DB_DIR/apply_roles.sh" "$(url_for "$admin_user" "$admin_pw" "$src")" | sed 's/^/  /'
+# DA-F-5: no password on any command line — the URL carries none; the admin password reaches
+# apply_roles.sh (and its psql) only through the exported PGPASSWORD of pg_env_from_url.
+PGPASSWORD="$admin_pw" bash "$SECRAG_DB_DIR/apply_roles.sh" "postgresql://$admin_user@$host:$port/$src" \
+  | sed 's/^/  /'
 (cd "$SECRAG_REPO_ROOT/backend" \
   && DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$src")" "$py" -m alembic upgrade head 2>&1 \
   | sed 's/^/  /')

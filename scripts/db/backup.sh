@@ -80,10 +80,35 @@ command -v age >/dev/null || die "age not found"
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
 name="secrag-$ts.dump.age"
 echo "backup: pg_dump of $PGDATABASE@$PGHOST as $PGUSER → age (${#recipients[@]} recipient(s)) → $mode"
+umask 077
+
+# encrypt_dump <out>: pg_dump → age → <out> (a temporary name). DA-F-2: a failed or truncated
+# pg_dump still yields a valid age stream, so both exit codes are checked and <out> is removed
+# unless pg_dump AND age succeeded; only then is it promoted (renamed / uploaded).
+encrypt_dump() {
+  local out="$1" st
+  set +e
+  pg_dump -w -Fc | age "${age_args[@]}" >"$out"
+  st=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${st[0]}" != 0 ] || [ "${st[1]}" != 0 ]; then
+    rm -f -- "$out"
+    die "pg_dump (rc ${st[0]}) or age (rc ${st[1]}) failed — no backup kept or uploaded"
+  fi
+  if ! is_age_file "$out"; then
+    rm -f -- "$out"
+    die "the output is not an age file — no backup kept or uploaded"
+  fi
+}
 
 if [ "$mode" = blob ]; then
   py="$(secrag_python)"
-  pg_dump -w -Fc | age "${age_args[@]}" | "$py" -m rag_app.backup_blob upload --name "backups/$name"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/.secrag-backup.XXXXXXXX")"
+  trap 'rm -f -- "$tmp"' EXIT
+  encrypt_dump "$tmp"
+  "$py" -m rag_app.backup_blob upload --name "backups/$name" <"$tmp"
+  rm -f -- "$tmp"
+  trap - EXIT
   "$py" -m rag_app.backup_blob check
   exit 0
 fi
@@ -96,15 +121,12 @@ mkdir -p -- "$dir"
 chmod 700 -- "$dir"
 partial="$dir/.$name.partial"
 trap 'rm -f -- "$partial"' EXIT
-(
-  umask 077
-  pg_dump -w -Fc | age "${age_args[@]}" >"$partial"
-)
-is_age_file "$partial" || die "the output is not an age file — nothing kept"
+encrypt_dump "$partial"
 chmod 600 -- "$partial"
 mv -f -- "$partial" "$dir/$name"
 trap - EXIT
 echo "backup: wrote $dir/$name ($(stat -c %s "$dir/$name") bytes, age-encrypted)"
 echo "backup: retention $days days (X9) in $dir"
-prune_by_name "$dir" "$DUMP_NAME_RE" "$days"
+prune_by_name "$dir" "$DUMP_NAME_RE" "$days" \
+  || die "the new backup was written, but retention found dump names it cannot judge (WARNING above)"
 echo "backup: $(find "$dir" -maxdepth 1 -type f -name 'secrag-*.dump.age' | wc -l) dump(s) kept"
