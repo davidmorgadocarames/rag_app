@@ -68,6 +68,13 @@ Chat (/chat)              [authenticated]
      failed turn is stored as an **assistant error marker**, so no conversation holds a user message
      without a reply. When the data key cannot be unwrapped nothing is stored (nothing can be
      encrypted) and the event carries the requested id, or `null` for a new conversation.
+   - A client that goes away mid-stream (closed tab, network drop) still gets its turn answered:
+     the server stores an `interrupted` error marker. While a stage takes long (e.g. the reranker
+     download at a cold start) the server sends an SSE comment `: keep-alive` every 15 s, so no
+     proxy cuts the idle connection; the client ignores it.
+   - The request's own database session is closed before streaming starts; the pipeline uses its
+     own session and ends its read transaction after every event, so no connection stays idle
+     in a transaction while the model generates.
 3. Response rendering (streamed live):
    - A **stage indicator** shows the current step so the wait is legible.
    - **Answered** → answer text + **citations** (heading, version, effective date) + **token usage** for
@@ -76,6 +83,9 @@ Chat (/chat)              [authenticated]
    - **Error** → the assistant bubble shows the error message (also for a stream that breaks without a
      final event); nothing partial is presented as authoritative. The client keeps the
      `conversation_id` from the first event, so the next message continues the same conversation.
+     If the conversation was deleted elsewhere (404 before streaming), the client drops the id and
+     says so; the next message starts a new conversation. Opening a conversation that cannot be
+     decrypted (409) shows a clear message and an empty thread instead of a blank view.
 4. The user + assistant messages are **persisted encrypted** (per-user key). Follow-ups continue the same
    conversation; **New chat** starts a fresh one.
 
@@ -90,8 +100,10 @@ Chat (/chat)              [authenticated]
 ### 2.6 Account & data deletion
 
 1. **`/account`** shows email and account controls. If the email isn't verified, a **Resend
-   verification** button issues a fresh token (`POST /auth/resend-verification`); in dev (no SMTP) the
-   API returns the verification link so the user can complete `GET /auth/verify` directly.
+   verification** button issues a fresh token (`POST /auth/resend-verification`); only with `ENV=dev`
+   and no SMTP does the API return the verification link, so the user can complete
+   `GET /auth/verify` directly. In prod it never returns the link (without SMTP anyone could
+   otherwise verify an address they do not own).
 2. **Delete my data** → confirmation modal ("This is irreversible").
 3. On confirm → `DELETE /api/account` → **202 Accepted** (asynchronous erasure, ADR phase 11
    decision 6). One short transaction:

@@ -56,6 +56,8 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
   - *Acceptance*: on the negative golden set, the system abstains (does not fabricate) ≥ 95% of the time.
 - **F4 — Conversation history**: a signed-in user can see their past questions and answers.
 - **F5 — Authentication**: email/password sign-up, email verification, login, logout.
+  - The verification link reaches the user only by email; the API hands it to the UI only in
+    local development (`ENV=dev` without SMTP), never in production.
 - **F6 — Abuse defense**: rate limiting and per-user quotas; resistance to mass fake-account signups.
 - **F7 — Data erasure**: a user can delete their account and all associated data (GDPR-style).
   - *Privacy text*: deleting an account makes the user's data in the live service
@@ -64,8 +66,9 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
     data, its wrapped key and the email address until they expire, within 14 days, and a
     restore re-applies every erasure. A minimal erasure record (a random id, dates and a
     status — no email or content) is kept so that a restore cannot bring the account back;
-    its exported copies (random id and date) are kept for 30 days. Operational logs are kept 30 days and contain no conversation content, email
-    addresses, passwords or tokens (request query strings are redacted). On the
+    its exported copies (random id and date) are kept for 30 days. Operational logs are kept
+    30 days and contain no conversation content, email addresses, passwords or tokens
+    (request query strings are redacted; database errors carry no key values). On the
     Azure deployment, questions sent to Azure OpenAI may be retained by Microsoft for abuse
     monitoring for up to 30 days.
 
