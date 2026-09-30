@@ -73,6 +73,9 @@ class ConversationOut(BaseModel):
     title: str
     created_at: dt.datetime
     total_tokens: int
+    # True when this conversation cannot be decrypted (data key or one row unreadable):
+    # listed with a placeholder title instead of failing the whole list (T11.2.16).
+    unreadable: bool = False
 
 
 class MessageOut(BaseModel):
@@ -84,6 +87,8 @@ class MessageOut(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     created_at: dt.datetime
+    # An assistant error marker: the turn failed (T11.2.16); content is the message.
+    error: bool = False
 
 
 class ConversationDetailOut(BaseModel):

@@ -1,5 +1,7 @@
 // Typed client for the SecRAG backend API.
 
+import { consumeChatStream } from "./chatStream";
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export interface Citation {
@@ -44,6 +46,8 @@ export interface ConversationSummary {
   title: string;
   created_at: string;
   total_tokens: number;
+  // true when the conversation cannot be decrypted (listed with a placeholder title)
+  unreadable: boolean;
 }
 
 export interface StoredMessage {
@@ -55,6 +59,8 @@ export interface StoredMessage {
   prompt_tokens: number | null;
   completion_tokens: number | null;
   created_at: string;
+  // an assistant error marker: that turn failed; content is the message shown
+  error: boolean;
 }
 
 export interface ConversationDetail {
@@ -129,10 +135,14 @@ export function deleteConversation(id: string, token: string): Promise<{ detail:
 // --- streaming chat (Server-Sent Events over fetch) ----------------------
 
 export interface StreamCallbacks {
+  // First event of every stream: the conversation the message belongs to (null only when
+  // nothing could be stored, e.g. the data key is unavailable for a new conversation).
+  onConversation?: (id: string) => void;
   onStage?: (stage: string) => void;
   onToken?: (text: string) => void;
   onDone?: (data: ChatDone) => void;
-  onError?: (detail: string) => void;
+  // Always called when the turn fails, with the conversation id when known.
+  onError?: (detail: string, conversationId: string | null) => void;
 }
 
 export async function streamChat(
@@ -140,11 +150,17 @@ export async function streamChat(
   token: string,
   cb: StreamCallbacks,
 ): Promise<void> {
-  const response = await fetch(`${API_URL}/chat/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    cb.onError?.("The server cannot be reached. Please try again.", body.conversation_id ?? null);
+    return;
+  }
   if (!response.ok || !response.body) {
     let detail = `request failed (${response.status})`;
     try {
@@ -153,28 +169,15 @@ export async function streamChat(
     } catch {
       // keep default
     }
-    cb.onError?.(detail);
+    cb.onError?.(detail, body.conversation_id ?? null);
     return;
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let sep: number;
-    while ((sep = buffer.indexOf("\n\n")) >= 0) {
-      const frame = buffer.slice(0, sep);
-      buffer = buffer.slice(sep + 2);
-      const line = frame.split("\n").find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      const event = JSON.parse(line.slice(5).trim());
-      if (event.type === "stage") cb.onStage?.(event.stage);
-      else if (event.type === "token") cb.onToken?.(event.text);
-      else if (event.type === "done") cb.onDone?.(event as ChatDone);
-      else if (event.type === "error") cb.onError?.(event.detail);
-    }
-  }
+  await consumeChatStream(response.body, {
+    onConversation: cb.onConversation,
+    onStage: cb.onStage,
+    onToken: cb.onToken,
+    onDone: (event) => cb.onDone?.(event as unknown as ChatDone),
+    onError: cb.onError,
+  });
 }

@@ -24,6 +24,7 @@ interface UiMessage {
   grounded?: boolean;
   tokens?: number;
   streaming?: boolean;
+  error?: boolean;
 }
 
 const STAGE_LABELS: Record<string, string> = {
@@ -102,6 +103,7 @@ export default function ChatPage() {
           citations: m.citations,
           abstained: m.abstained,
           grounded: m.grounded,
+          error: m.error,
           tokens: (m.prompt_tokens ?? 0) + (m.completion_tokens ?? 0) || undefined,
         })),
       );
@@ -172,6 +174,9 @@ export default function ChatPage() {
       { question, conversation_id: activeId ?? undefined },
       token,
       {
+        // The id arrives first (T11.2.16): keep it even if the turn then fails, so the next
+        // message continues this conversation instead of starting a new one.
+        onConversation: (id) => setActiveId(id),
         onStage: (s) => setStage(s),
         onToken: (t) => appendToken(t),
         onDone: (d) => {
@@ -184,13 +189,15 @@ export default function ChatPage() {
             streaming: false,
           });
           setConvTotal(d.conversation_total_tokens);
-          if (!activeId) setActiveId(d.conversation_id);
+          setActiveId(d.conversation_id);
           void refreshConversations();
           setBusy(false);
           setStage(null);
         },
-        onError: (detail) => {
-          patchLastAssistant({ content: `⚠ ${detail}`, streaming: false });
+        onError: (detail, conversationId) => {
+          patchLastAssistant({ content: detail, streaming: false, error: true });
+          if (conversationId) setActiveId(conversationId);
+          void refreshConversations();
           setBusy(false);
           setStage(null);
         },
@@ -263,6 +270,11 @@ export default function ChatPage() {
               m.role === "user" ? (
                 <div key={i} className="self-end border border-vault-steel-dark px-3 py-2 text-vault-steel-light">
                   {m.content}
+                </div>
+              ) : m.error ? (
+                <div key={i} role="alert" className="border border-vault-danger bg-vault-plate/40 p-4">
+                  <p className="text-xs uppercase tracking-[0.18em] text-vault-danger">Error</p>
+                  <p className="mt-1 text-sm text-vault-steel-light">{m.content}</p>
                 </div>
               ) : m.abstained ? (
                 <div key={i} className="border border-vault-amber bg-vault-plate/40 p-4 text-vault-amber">

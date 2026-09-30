@@ -101,6 +101,9 @@ jobs:
         run: npm run lint
       - name: Typecheck
         run: npm run typecheck
+      # SSE consumer (T11.2.16): node --test with type stripping (Node >= 22.18).
+      - name: Unit tests
+        run: npm test
       - name: Build
         run: npm run build
 

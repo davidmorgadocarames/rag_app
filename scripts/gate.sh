@@ -242,7 +242,7 @@ step_frontend() {
     return 1
   fi
   echo "  toolchain: node $node_v, npm $npm_v"
-  (cd frontend && npm run lint && npm run typecheck && npm run build)
+  (cd frontend && npm run lint && npm run typecheck && npm test && npm run build)
 }
 
 step_dependency-audit() {

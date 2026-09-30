@@ -77,7 +77,7 @@ export default function ChatSidebar({
                 <button
                   type="button"
                   onClick={() => onSelect(c.id)}
-                  className="min-w-0 flex-1 cursor-pointer truncate text-left"
+                  className={`min-w-0 flex-1 cursor-pointer truncate text-left${c.unreadable ? " italic text-vault-steel-dark" : ""}`}
                   title={c.title}
                 >
                   {c.title}

@@ -58,21 +58,32 @@ Chat (/chat)              [authenticated]
    - **Classifies intent.** Small talk / greetings ("hello", "thanks", "who are you") take a **fast-path**:
      an instant, honest, non-sourced reply — no retrieval, no citations, no abstention.
    - Security questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
-   - Streams **Server-Sent Events** back: `stage` (classifying/retrieving/reranking/generating/checking),
-     `token` deltas as the answer is written, then a final `done` with the authoritative answer.
+   - Streams **Server-Sent Events** back. The **first** event is `conversation` with the
+     `conversation_id` (the conversation and the user message are stored first, in one
+     transaction); then `stage` (classifying/retrieving/reranking/generating/checking) and `token`
+     deltas; the stream ends with exactly one `done` (the authoritative answer) or `error` event, both
+     carrying the `conversation_id`.
+   - **Every failure** — data key cannot be unwrapped, storage, embeddings/retrieval, reranking, LLM —
+     ends the stream with an `error` event (`code` + user-facing `detail`), never a cut stream. The
+     failed turn is stored as an **assistant error marker**, so no conversation holds a user message
+     without a reply. When the data key cannot be unwrapped nothing is stored (nothing can be
+     encrypted) and the event carries the requested id, or `null` for a new conversation.
 3. Response rendering (streamed live):
    - A **stage indicator** shows the current step so the wait is legible.
    - **Answered** → answer text + **citations** (heading, version, effective date) + **token usage** for
      that answer; a **running conversation total** shows in the header.
    - **Abstained** → dignified card ("No reliable source in the corpus") — no fabricated content.
-   - **Error** → the assistant bubble shows a clean error; nothing partial is presented as authoritative.
+   - **Error** → the assistant bubble shows the error message (also for a stream that breaks without a
+     final event); nothing partial is presented as authoritative. The client keeps the
+     `conversation_id` from the first event, so the next message continues the same conversation.
 4. The user + assistant messages are **persisted encrypted** (per-user key). Follow-ups continue the same
    conversation; **New chat** starts a fresh one.
 
 ### 2.5 History (sidebar)
 
 1. A **left sidebar** lists the user's conversations (most recent first) with per-conversation token
-   totals; titles derive from the first message (or a user-set rename).
+   totals; titles derive from the first message (or a user-set rename). A conversation that cannot be
+   decrypted is listed as "Unreadable conversation" — one bad row never fails the list.
 2. **Select** one to load its full thread; **New chat**, inline **rename**, and **delete** are available.
    Deleting a conversation cascades to its messages.
 
