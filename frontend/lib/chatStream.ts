@@ -33,6 +33,20 @@ export const CONVERSATION_UNREADABLE =
   "This conversation cannot be decrypted right now, so it cannot be shown or continued. " +
   "Start a new chat, or delete it from the list.";
 
+// The global daily answer cap (R6-1): the server sends this code, with its own message, when
+// the day's answers are used up; no answer was generated. The fallback keeps the bubble clear.
+export const DAILY_CAP_CODE = "daily_cap_reached";
+export const DAILY_CAP_REACHED =
+  "SecRAG has reached its daily answer limit (a cost guard for this public demo). " +
+  "Please come back after midnight UTC.";
+
+/** The message an `error` event shows: the server's detail, else one for its code. */
+export function errorDetail(event: StreamEvent): string {
+  if (typeof event.detail === "string" && event.detail) return event.detail;
+  if (event.code === DAILY_CAP_CODE) return DAILY_CAP_REACHED;
+  return "Something went wrong.";
+}
+
 /**
  * A /chat/stream request refused before any streaming (DA-G2-7): the message to show and the
  * conversation the NEXT message should continue. A 404 means the conversation is gone
@@ -108,7 +122,7 @@ export async function consumeChatStream(
       handlers.onDone?.(event);
     } else if (event.type === "error") {
       finished = true;
-      handlers.onError?.(String(event.detail ?? "Something went wrong."), conversationId);
+      handlers.onError?.(errorDetail(event), conversationId);
     }
   };
 

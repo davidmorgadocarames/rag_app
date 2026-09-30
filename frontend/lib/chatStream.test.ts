@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   CONVERSATION_GONE,
   CONVERSATION_UNREADABLE,
+  DAILY_CAP_REACHED,
   STREAM_INTERRUPTED,
   consumeChatStream,
   conversationLoadError,
@@ -102,6 +103,29 @@ test("keep-alive comment frames are ignored (DA-G2-3)", async () => {
     handlers,
   );
   assert.deepEqual(calls, ["conversation:c1", "done"]);
+});
+
+test("the daily answer cap ends the turn with its message and keeps the id (R6-1)", async () => {
+  const server = "SecRAG has reached its daily answer limit. Please come back after midnight UTC.";
+  const withDetail = record();
+  await consumeChatStream(
+    body(
+      sse({ type: "conversation", conversation_id: "c1" }),
+      sse({ type: "error", conversation_id: "c1", code: "daily_cap_reached", detail: server }),
+    ),
+    withDetail.handlers,
+  );
+  assert.deepEqual(withDetail.calls, ["conversation:c1", `error:c1:${server}`]);
+
+  const noDetail = record();
+  await consumeChatStream(
+    body(
+      sse({ type: "conversation", conversation_id: "c2" }),
+      sse({ type: "error", conversation_id: "c2", code: "daily_cap_reached" }),
+    ),
+    noDetail.handlers,
+  );
+  assert.deepEqual(noDetail.calls, ["conversation:c2", `error:c2:${DAILY_CAP_REACHED}`]);
 });
 
 test("a 404 before streaming drops the stale conversation id (DA-G2-7)", () => {
