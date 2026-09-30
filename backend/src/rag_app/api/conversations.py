@@ -27,6 +27,9 @@ at request start, before the stream (and any LLM call) begins — so an interrup
 turn is already counted. When the cap is reached the stream is just the ``conversation``
 event and an ``error`` event (``daily_cap_reached``) with the id; nothing is stored and the
 pipeline never runs. The chit-chat fast path (canned reply, no LLM call) is not counted.
+Pre-LLM failures do not use up an answer (DA-31b-1): the data key is unwrapped in the
+endpoint before the reservation (``key_unavailable``, nothing counted), and a turn whose user
+message cannot be stored gives its reservation back.
 """
 
 from __future__ import annotations
@@ -70,7 +73,13 @@ from rag_app.generation import (
     classify_intent,
 )
 from rag_app.llm import Usage
-from rag_app.usage_cap import DAILY_CAP_CODE, DAILY_CAP_MESSAGE, add_tokens, reserve_answer
+from rag_app.usage_cap import (
+    DAILY_CAP_CODE,
+    DAILY_CAP_MESSAGE,
+    add_tokens,
+    release_answer,
+    reserve_answer,
+)
 
 router = APIRouter()
 logger = logging.getLogger("rag_app.api.conversations")
@@ -348,8 +357,9 @@ def _chat_events(
     blocked: str | None = None,
     counted: bool = False,
 ) -> Generator[str, None, None]:
-    """The SSE body. ``blocked``: an error code decided at request start (the daily cap, or
-    its counter unavailable) — the turn ends right away, nothing is stored, no pipeline.
+    """The SSE body. ``blocked``: an error code decided at request start (the data key
+    cannot be unwrapped, the daily cap, or its counter unavailable) — the turn ends right
+    away, nothing is stored, no pipeline.
     ``counted``: the turn holds a ``usage_daily`` reservation, so its tokens are added."""
     conv_id = request.conversation_id
     if blocked is not None:
@@ -372,6 +382,8 @@ def _chat_events(
         except Exception as exc:  # noqa: BLE001 - storage down, or the conversation vanished
             session.rollback()
             logger.warning("chat stream: turn not stored (%s)", type(exc).__name__)
+            if counted:  # DA-31b-1: the pipeline never runs, so the answer is given back
+                release_answer(session, get_settings().daily_answer_cap)
             yield _sse({"type": "conversation", "conversation_id": conv_id})
             yield _error_event(conv_id, ERROR_STORAGE)
             return
@@ -479,6 +491,17 @@ class _ClosingStreamingResponse(StreamingResponse):
                     await aclose()
 
 
+def _key_unwraps(wrapped_key: bytes) -> bool:
+    """Whether the user's data key can be unwrapped with the current master key (checked in
+    the endpoint before the daily-cap reservation, DA-31b-1)."""
+    try:
+        unwrap_key(wrapped_key)
+    except Exception as exc:  # noqa: BLE001 - e.g. InvalidToken: master key changed
+        logger.warning("chat stream: data key cannot be unwrapped (%s)", type(exc).__name__)
+        return False
+    return True
+
+
 def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None, bool]:
     """The daily-cap reservation of a stream turn, at request start (R6-1, DA-G3-1):
     ``(blocking error code or None, counted)``. A chit-chat question gets the canned reply
@@ -510,7 +533,13 @@ def chat_stream(
     if request.conversation_id:
         # Someone else's (or an unknown) conversation is a plain 404 before any streaming.
         _get_owned_conversation(session, user_id, request.conversation_id)
-    blocked, counted = _reserve_stream_answer(session, request.question)
+    # DA-31b-1: a data key that cannot be unwrapped (e.g. InvalidToken after a master-key
+    # change) ends the turn with the key error BEFORE the reservation — the turn can never reach
+    # the pipeline, so it must not use up an answer of the daily cap.
+    if _key_unwraps(wrapped_key):
+        blocked, counted = _reserve_stream_answer(session, request.question)
+    else:
+        blocked, counted = ERROR_KEY, False
     # DA-G2-2: the dependency's session would otherwise stay checked out, idle in
     # transaction, until the whole stream is sent (FastAPI >= 0.118 exits `yield`
     # dependencies after the response). Closing it ends the transaction and returns the

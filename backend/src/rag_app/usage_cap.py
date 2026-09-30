@@ -20,6 +20,11 @@ read-then-write). A turn that later fails or is interrupted has already been cou
 spent (or may have spent) tokens. Tokens are added afterwards, when the pipeline reports
 them (``add_tokens``); ``/chat`` has no token accounting, so its answers count with 0 tokens.
 
+A turn that never reaches the pipeline does not use up an answer (DA-31b-1): the stream
+endpoint unwraps the user's data key *before* reserving, so an account whose key cannot be
+unwrapped is refused without counting, and a turn whose user message cannot be stored gives
+its reservation back (``release_answer``).
+
 The chit-chat fast path (a greeting answered with a canned reply, no LLM call) is not
 counted. ``DAILY_ANSWER_CAP=0`` switches the cap off (``ENV=dev`` only — ``ENV=prod`` requires
 a positive cap, see ``rag_app.config``); then nothing is read or written.
@@ -50,6 +55,7 @@ _RESERVE_SQL = text(
     " ON CONFLICT (day) DO UPDATE SET answers = u.answers + 1 WHERE u.answers < :cap"
     " RETURNING u.answers"
 )
+_RELEASE_SQL = text("UPDATE usage_daily SET answers = answers - 1 WHERE day = :day AND answers > 0")
 _ADD_TOKENS_SQL = text(
     "INSERT INTO usage_daily AS u (day, answers, tokens) VALUES (:day, 0, :tokens)"
     " ON CONFLICT (day) DO UPDATE SET tokens = u.tokens + EXCLUDED.tokens"
@@ -83,6 +89,22 @@ def reserve_answer(session: Session, cap: int, *, now: dt.datetime | None = None
     if int(row[0]) == cap:
         logger.warning("daily answer cap reached: day=%s cap=%d (last answer)", day, cap)
     return True
+
+
+def release_answer(session: Session, cap: int, *, now: dt.datetime | None = None) -> None:
+    """Give back a reservation whose turn never reached the pipeline (DA-31b-1: the user
+    message could not be stored). Best effort: when the database is down the answer stays
+    counted (fail closed). A turn that straddles midnight gives it back to the new day, never
+    below 0. ``cap <= 0``: the cap is off, nothing to do."""
+    if cap <= 0:
+        return
+    day = (now or utc_now()).astimezone(dt.UTC).date()
+    try:
+        session.execute(_RELEASE_SQL, {"day": day})
+        session.commit()
+    except Exception as exc:  # noqa: BLE001 - the answer simply stays counted
+        session.rollback()
+        logger.warning("usage_daily: reservation not released (%s)", type(exc).__name__)
 
 
 def add_tokens(session: Session, tokens: int, *, now: dt.datetime | None = None) -> None:

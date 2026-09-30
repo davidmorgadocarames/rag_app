@@ -427,3 +427,128 @@ def test_the_cap_reached_log_line_has_no_personal_data(
     lines = [r.getMessage() for r in caplog.records if r.name == "rag_app.usage_cap"]
     assert lines and all("daily answer cap reached" in line for line in lines)
     assert all(str(user) not in line and "@" not in line and QUESTION not in line for line in lines)
+
+
+# --- DA-31b-1: pre-LLM failures do not use up an answer ----------------------------------------
+
+
+def _make_user_with_foreign_key(engine: Engine) -> uuid.UUID:
+    """A user whose data key was wrapped by ANOTHER master key (the Azure InvalidToken case)."""
+    from rag_app.crypto import generate_user_key
+    from rag_app.db.models import User, UserKey
+    from rag_app.security import hash_password
+
+    with Session(engine) as session:
+        user = User(
+            email=f"cap-{uuid.uuid4().hex[:10]}@example.test",
+            password_hash=hash_password("correct horse battery"),
+        )
+        session.add(user)
+        session.flush()
+        wrapped = Fernet(Fernet.generate_key()).encrypt(generate_user_key())
+        session.add(UserKey(user_id=user.id, wrapped_key=wrapped))
+        session.commit()
+        return user.id
+
+
+@pytest.mark.db
+def test_a_key_that_cannot_be_unwrapped_does_not_use_up_an_answer(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-31b-1: the key is unwrapped BEFORE the reservation: the existing key error event,
+    no pipeline, and the counter untouched (more attempts than the cap, none counted)."""
+    from rag_app.api import conversations
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
+    user = _make_user_with_foreign_key(db_engine)
+    for _ in range(4):  # the cap is 3
+        events = _events(
+            client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user))
+        )
+        assert [e["type"] for e in events] == ["conversation", "error"]
+        assert events[-1]["code"] == "key_unavailable"
+    assert pipeline.calls == 0
+    assert _usage(db_engine) == (0, 0)
+
+
+@pytest.mark.db
+def test_a_turn_that_cannot_be_stored_gives_its_answer_back(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-31b-1: the user message cannot be stored → ``storage_failed``, no pipeline, and the
+    reservation is released (the counter is back where it was)."""
+    from sqlalchemy.exc import OperationalError
+
+    from rag_app.api import conversations
+
+    def _down(*_a: object, **_k: object) -> None:
+        raise OperationalError("INSERT", {}, Exception("server closed the connection"))
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
+    monkeypatch.setattr(conversations, "_start_turn", _down)
+    user = _make_user(db_engine)
+    _set_answers(db_engine, 1)
+    events = _events(client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user)))
+    assert events[-1]["code"] == "storage_failed"
+    assert pipeline.calls == 0
+    assert _usage(db_engine)[0] == 1
+
+
+# --- DA-31b-2: the counter cannot be written → fail closed, no LLM call -----------------------
+
+
+def _counter_down(*_a: object, **_k: object) -> bool:
+    from sqlalchemy.exc import OperationalError
+
+    raise OperationalError("INSERT INTO usage_daily", {}, Exception("connection refused"))
+
+
+@pytest.mark.db
+def test_stream_fails_closed_when_the_counter_cannot_be_written(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rag_app.api import conversations
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
+    monkeypatch.setattr(conversations, "reserve_answer", _counter_down)
+    user = _make_user(db_engine)
+    events = _events(client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user)))
+    assert [e["type"] for e in events] == ["conversation", "error"]
+    assert events[-1]["code"] == "storage_failed"
+    assert pipeline.calls == 0, "an uncounted turn reached the pipeline (fail open)"
+    with db_engine.connect() as conn:
+        n = conn.execute(
+            text("SELECT count(*) FROM conversations WHERE user_id = :u"), {"u": user}
+        ).scalar_one()
+    assert n == 0
+
+
+@pytest.mark.db
+def test_chat_fails_closed_when_the_counter_cannot_be_written(
+    client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from rag_app.api import deps
+    from rag_app.api.auth import get_current_user
+    from rag_app.generation import Answer
+
+    calls: list[str] = []
+
+    def answerer() -> Any:
+        def _answer(_session: Any, question: str, _version: str | None) -> Answer:
+            calls.append(question)
+            return Answer(text="Use prepared statements.")
+
+        return _answer
+
+    app = client.app
+    app.dependency_overrides[deps.get_answerer] = answerer
+    app.dependency_overrides[get_current_user] = lambda: object()
+    monkeypatch.setattr(deps, "reserve_answer", _counter_down)
+    res = TestClient(app, raise_server_exceptions=False).post("/chat", json={"question": QUESTION})
+    assert 500 <= res.status_code < 600
+    assert calls == [], "the answerer (LLM) ran without a counted answer (fail open)"
