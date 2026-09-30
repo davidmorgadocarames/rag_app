@@ -1,6 +1,8 @@
 # ADR phase 11 — Stability: data persistence and rerank latency
 
-- **Status:** Proposed (skeleton, 2026-09-27; completed at the 11a and 11b promotions)
+- **Status:** 11a **Accepted** locally (2026-10-01: every 11a decision below has landed on
+  the phase branch, `gate.sh --full` PASS); Azure evidence (promotion, smoke, cost) is added
+  at the 11a promotion; 11b is still open.
 - **Parts:** **11a** — persistence, migrations Job, asynchronous erasure (branch
   `phase-11a-persistence`); **11b** — rerank latency and baked model images (branch
   `phase-11b-latency`).
@@ -181,7 +183,7 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
 
 ## Decisions
 
-*To be completed as 11a/11b land.* Planned sections:
+Decisions 1–7 and 9 landed in 11a (the italic notes say where); decision 8 is 11b.
 
 1. Fixed development volume and an isolated gate project. *Landed in 11.0 (gate part):*
    `compose.gate.yml` (project `secrag-gate`, volume `secrag_gate_pgdata`, DB on
@@ -225,8 +227,9 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    (`down -v` included). `scripts/dev/create_dev_volume.sh` creates it once on a new machine
    and never touches an existing one. The gate never references it: `compose.gate.yml` has
    its own volume, and `restart_check.sh` swaps it for a throwaway volume and refuses any
-   development volume. The stray `rag_app_pgdata` (schema + corpus only, no user rows) is no
-   longer used; removing it is a manual, verified step.
+   development volume. The stray `rag_app_pgdata` (schema + corpus only, no user rows) was
+   removed by hand after read-only checks (D-2026-09-30-1); it no longer exists (checked
+   2026-10-01).
 2. Fail-fast settings validation in the API lifespan; master-key fingerprint. *Landed in 11.0:*
    `ENV` (`dev`/`prod`, default `prod`) and a lifespan guard that refuses any development-only
    flag with `ENV=prod`. The registry is derived from the fields declared with
@@ -375,8 +378,44 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    errors, 0 pool timeouts, pool peak **9 of 15**; the purger killed at 16,000 messages
    (tombstone `running`), an overlapping run skipped, the next run purged the 300,000
    messages in 2.2-3.3 s (tombstones `done`, 0 rows left, longest transaction ≤ 0.044 s).
-7. Global daily answer cap.
+7. Global daily answer cap (R6-1). *Landed in 11.2 (T11.2.14):* registration is open and
+   every cloud request arrives through one shared proxy IP, so the per-IP limiter cannot
+   bound total spend and the budget alert only notifies. `rag_app.usage_cap` counts
+   **answers per UTC day for all users together** in `usage_daily` (0005: `day`, `answers`,
+   `tokens` — no personal data). The answer is **reserved at request start**, before any LLM
+   call, with one race-safe statement (`INSERT … ON CONFLICT (day) DO UPDATE SET answers =
+   answers + 1 WHERE answers < cap RETURNING`; 8 concurrent requests at `cap − 1` get
+   exactly one answer). A turn that fails *before* the pipeline (the data key does not
+   unwrap — checked before the reservation — or its user message cannot be stored, which
+   gives the reservation back) does not count; a turn that fails or is interrupted *in* the
+   pipeline does, because it may have spent tokens; the canned greeting makes no LLM call and
+   is not counted. At the cap: `/chat` → **429** with `Retry-After` (seconds to UTC
+   midnight); `/chat/stream` → the `conversation` event and an `error` event
+   `daily_cap_reached` with a friendly message, nothing stored, no pipeline. The counter
+   failing closes the door (`storage_failed`), it never opens it. `DAILY_ANSWER_CAP` defaults
+   to **300** in code (so Azure is capped even without the variable), `0` switches it off
+   with `ENV=dev` only; `ENV=prod` refuses 0 and negative values. Every LLM call passes
+   `max_tokens` (generation 1024, groundedness 16), so one answer has a bounded worst-case
+   cost — the table under [Costs](#costs) chooses the Azure value (300 or 150) at the
+   promotion.
 8. (11b) One shared reranker, baked model images, latency gate.
+9. Promotion hardening found while building 11a (R6-5 and the stream findings).
+   *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
+   nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=
+   [redacted]`); every app engine hides bound SQL parameters; a racing duplicate sign-up is
+   a 409 with nothing logged; Postgres runs with `log_error_verbosity=terse` (compose, gate;
+   Azure at the promotion); the verification link is returned by the API only with
+   `ENV=dev` (Azure has no SMTP until 12b, so returning it would let anyone verify an
+   address they do not own). **Stream errors** — the first SSE event carries the
+   `conversation_id`; every failure ends the stream with one `error` event, the failed turn
+   is stored as an assistant error marker, a client that goes away gets an `interrupted`
+   marker, `: keep-alive` comments every 15 s keep proxies from cutting a long stage, and no
+   database connection stays idle in a transaction while the model generates; one
+   undecryptable row never fails the conversation list. **Dependencies** — FastAPI/starlette
+   and sentence-transformers/transformers on current releases, torch pinned, the reranker
+   pinned to a full Hub commit and loaded offline when cached; `dependency-audit` has no
+   interim Python exception left (postcss in Next only). The evaluation did not move:
+   recall 1.0 · faithfulness 1.0 · correctness 0.9 · abstention 1.0 before and after.
 
 ## Key recovery (D-2026-09-29-2)
 
@@ -542,13 +581,117 @@ it; note the total `N` that `check` prints):
 
 ## Rollback
 
-*Written before each promotion.* 11a: previous backend digest with the command overridden to
-uvicorn only; the purge Job is kept; the 0005 downgrade is not a rollback path.
+*Written before each promotion.* **11a — written 2026-10-01, to be reviewed by the user
+before the Azure pre-merge.**
+
+**Principles.**
+
+- **Images roll back, the schema does not.** 0005 is expand-only (DoD, expand/contract), so
+  the pre-11a image runs on it. The 0005 downgrade is **not** a rollback path: it refuses as
+  soon as one account has been erased, and it would drop the tombstone bookkeeping.
+- **CD never rolls back.** It skips a SHA that is already deployed, older, or not the tip of
+  `main`. A rollback is a **manual `az containerapp update` to the previous digests** (below);
+  the lasting fix is a **forward-fix commit** through the normal gate. A plain `git revert`
+  of the 11a merge is not a rollback either: the reverted tree has no `0005` file, so the
+  migration Job fails ("Can't locate revision") and CD stops before the apps — safe, but it
+  deploys nothing — and the reverted backend `CMD` would migrate at start again.
+- **Additive changes stay:** the Azure data fix (the owner's unreadable account deleted),
+  PITR, the database roles and grants, the Storage account and its blobs, the Jobs' identity,
+  the `master_key_fingerprint` row (the old image ignores it).
+
+**Previous images** (recorded 2026-10-01 with read-only `az containerapp show` and
+`docker buildx imagetools inspect` of the deployed tags): the running revision
+`secrag-backend--latest` (single revision mode, min 0 / max 1) runs
+`rag_app-backend:dee9cbc…`, whose `CMD` is `sh -c "alembic upgrade head && uvicorn …"`.
+
+```bash
+RG=rg-secrag
+OLD_BACKEND=ghcr.io/davidmorgadocarames/rag_app-backend@sha256:dfbb568bfcd6be33a396a36ceb9702db3d55ce30d1872101ea01bbdc68394b1e
+OLD_FRONTEND=ghcr.io/davidmorgadocarames/rag_app-frontend@sha256:6706e998094190e709ea7e555e7788d1dbc4de2b91ad9a7c93e2112c9885e04c
+UVICORN='exec uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000'
+```
+
+**Pre-step, before the first real CD run (D-2026-09-30-4).** Once the migration Job has moved
+the database to 0005, the pre-11a image's own `alembic upgrade head` fails on a revision it
+does not know, so **every cold start** (min replicas 0 → every wake-up) would crash-loop
+between CD's `migrate` and `apps` steps, and for as long as a failed `apps` step leaves the
+old revision in place. So, in the pre-merge, the running backend gets the **same image with
+its command overridden to uvicorn only**:
+
+```bash
+az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND" \
+  --command "/bin/sh" --args "-c" "$UVICORN" --revision-suffix pre11a-uvicorn
+az containerapp show -g $RG -n secrag-backend \
+  --query "properties.template.containers[0].{image:image,command:command,args:args}" -o json
+curl -fsS "https://$(az containerapp show -g $RG -n secrag-backend \
+  --query properties.configuration.ingress.fqdn -o tsv)/health"   # wake-up; then log in and open a conversation
+```
+
+This also rehearses the rollback command below on the live app. The override stays in the
+template when CD later updates the image; it is equivalent to the 11a image's own `CMD`
+(uvicorn only, `/bin/sh` exists in `python:3.12-slim`), so it is kept.
+
+**Main trigger — "migrate OK, apps update failed".** CD's migration step is green (database
+at 0005), then the apps step fails, or the new backend revision is not healthy (for example
+it refuses to start: invalid settings, master-key fingerprint, R5-5), or the Azure smoke finds
+a fault that blocks users.
+
+1. **See what is running:** `az containerapp revision list -g $RG -n secrag-backend -o table`
+   and the `show` query above. If the backend still runs `$OLD_BACKEND` with the override
+   (the update never applied), there is nothing to roll back: users are on the old app over
+   0005 (effects below) until a forward fix is deployed.
+2. **Roll both apps back together** (the new frontend expects the 11a API, the old one the
+   old API):
+
+   ```bash
+   ts=$(date -u +%Y%m%d%H%M)
+   az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND" \
+     --command "/bin/sh" --args "-c" "$UVICORN" --revision-suffix "rb-$ts"
+   az containerapp update -g $RG -n secrag-frontend --image "$OLD_FRONTEND" --revision-suffix "rb-$ts"
+   ```
+
+   Then the scale check (min 0 / max 1 on every app), `/health`, a login and a conversation
+   read, and a note of the time (the window of the effects below).
+3. **Jobs.** The **purge Job is kept**, on its hourly schedule if it was already switched: it
+   runs the new jobs image against 0005 independently of the app image and keeps the 24 h
+   promise of every 202 already sent; the tombstones that the old image's synchronous
+   `DELETE /account` writes get the 0005 default `pending`, and since that user row is
+   already gone the purger closes them as `done` with 0 rows. The **migration and backup
+   Jobs are deleted by default** (`az containerapp job delete -g $RG -n <job> --yes`): no
+   one can start a migration while the apps are rolled back, and the next attempt re-creates
+   both from YAML (placeholder image + Manual trigger, then `job update --image` to the
+   deployed digest, X1). The **Storage account and its blobs are kept** (encrypted; the
+   12-day lifecycle rule keeps running).
+4. **Forward fix:** a new commit on `main` through the full gate; CD compares it with the last
+   *successful* deployment and redeploys. Re-create the deleted Jobs first (the migration
+   step needs its Job).
+
+**Accepted short-window effects of the old image on 0005** (keep the rollback short):
+
+- It does not filter `deleted_at`: an account erased by the 11a app whose JWT is still valid
+  (≤ 30 min) can still authenticate; its data stays unreadable (the key is gone) and it can
+  never log in again (email and password are NULL).
+- `/auth/me` for such an account → 500 (the old response model requires an email).
+- No daily answer cap (the old code ignores `usage_daily`): only the 10K TPM deployment cap
+  and the budget alert bound the spend.
+- The old emailer logs the address and the link, and the old resend endpoint returns the
+  verification link with no SMTP: the R6-5 log promise and email verification do not hold
+  while rolled back.
+- The old stream has no `conversation`/`error`/keep-alive events; `DELETE /account` is the
+  old synchronous delete (one long transaction; fine at today's data size).
+- The old image ignores the master-key fingerprint: no secret is changed while rolled back.
+
+**Data problems are not image rollbacks:** a wrong data fix is repaired from the row-40
+`pg_dump` or PITR (≤ 14 days) into a **new** server/database, never over the live one;
+roles, grants and Storage are additive and need no rollback.
 
 ## Costs
 
 *Measured the day after each promotion* (Cost Management query) and compared with the caps:
-11a ≈ €0.20 (cap €1), 11b ≈ €0.15 (cap €1).
+11a ≈ €0.20 (cap €1), 11b ≈ €0.15 (cap €1). 11a adds recurring Jobs (hourly purge ≈
+€0.13/month, daily backup ≈ €0.03/month, slim image, scale to zero between runs) and one
+Storage account (a few MB of encrypted dumps, 12-day lifecycle); the migration Job runs only
+during a deploy. The measured value is added after the promotion.
 
 ### Worst-case LLM cost per answer and the daily answer cap (R6-1, DA-31b-3)
 

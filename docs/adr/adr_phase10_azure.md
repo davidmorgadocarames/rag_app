@@ -48,7 +48,8 @@
   the eval gate and blocks the very push that triggers CD, and the Azure deploy job is
   `needs: [images]`, so a bad build never reaches Azure — same guarantee as Phase 9.
 - **Container runs its own migrations.** Per ADR phase 9 the backend image runs
-  `alembic upgrade head` before uvicorn. A managed Postgres connection string carries no
+  `alembic upgrade head` before uvicorn. *(Superseded in Phase 11a: an Azure migration Job
+  started by CD before the apps — [ADR phase 11](adr_phase11_stability.md), decision 3.)* A managed Postgres connection string carries no
   `+driver`, which would default to psycopg2 (not shipped — the project is psycopg v3
   only), so `DATABASE_URL` is normalized to `postgresql+psycopg://` in one place
   (`Settings`), covering both the app engine and the migration engine.

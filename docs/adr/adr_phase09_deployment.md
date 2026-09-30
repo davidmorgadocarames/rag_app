@@ -1,6 +1,10 @@
 # ADR phase 9 — Deployment (containers + CD to GHCR)
 
-- **Status:** Accepted (2026-09-19)
+- **Status:** Accepted (2026-09-19). *Amended in Phase 11a:* the backend image no longer runs
+  `alembic upgrade head` at start (replica race, crash loop on a failed migration) —
+  migrations run as a compose one-shot service and an Azure migration Job before the apps
+  ([ADR phase 11](adr_phase11_stability.md), decision 3). The text below is the original
+  decision.
 - **Context:** Phase 9. The CI/CD-first goal needs the app packaged and shipped
   automatically. But the RAG depends on **Ollama with a GPU** (qwen generation +
   bge-m3 embeddings), which typical free tiers do not provide, and the backend image
