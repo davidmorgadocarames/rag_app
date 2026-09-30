@@ -9,7 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from rag_app.api.deps import SessionDep, SignupTrackerDep, rate_limit_login
 from rag_app.api.schemas import (
@@ -83,20 +83,26 @@ def register(
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
 
-    user = User(email=request.email, password_hash=hash_password(request.password))
-    session.add(user)
-    session.flush()
-    session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
-
     raw_token = generate_verification_token()
-    session.add(
-        EmailVerificationToken(
-            user_id=user.id,
-            token_hash=hash_token(raw_token),
-            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=24),
+    try:
+        user = User(email=request.email, password_hash=hash_password(request.password))
+        session.add(user)
+        session.flush()
+        session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
+        session.add(
+            EmailVerificationToken(
+                user_id=user.id,
+                token_hash=hash_token(raw_token),
+                expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=24),
+            )
         )
-    )
-    session.commit()
+        session.commit()
+    except IntegrityError:
+        # A concurrent registration of the same address won the race (double click): the
+        # unique index said no. Same answer as the check above, and nothing is logged — the
+        # driver's message carries the address in Postgres' DETAIL line (DA-G2-1).
+        session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered") from None
 
     send_verification_email(request.email, raw_token)
     tracker.record(ip)
@@ -125,7 +131,9 @@ def verify_email(token: str, session: SessionDep) -> MessageResponse:
 
 @router.post("/auth/resend-verification", response_model=ResendVerificationResponse)
 def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVerificationResponse:
-    """Issue a fresh verification token. In dev (no SMTP) return the link to the UI."""
+    """Issue a fresh verification token. Only with ENV=dev and no SMTP is the link returned
+    to the UI; in prod it never is — without SMTP anyone could otherwise verify an address
+    they do not own (DA-G2-5)."""
     if user.email_verified:
         return ResendVerificationResponse(detail="Email already verified.")
     if user.email is None:  # scrubbed by erasure (0005); nothing to send to
@@ -140,8 +148,14 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
     )
     session.commit()
     send_verification_email(user.email, raw_token)
-    link = None if get_settings().smtp_host else verification_link(raw_token)
-    return ResendVerificationResponse(detail="Verification email sent.", verification_link=link)
+    settings = get_settings()
+    if settings.smtp_host:
+        return ResendVerificationResponse(detail="Verification email sent.")
+    if settings.env == "dev":
+        return ResendVerificationResponse(
+            detail="Verification email sent.", verification_link=verification_link(raw_token)
+        )
+    return ResendVerificationResponse(detail="Verification email requested.")
 
 
 @router.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_login)])

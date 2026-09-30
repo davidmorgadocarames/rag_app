@@ -25,6 +25,9 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    # terse: the server log leaves out DETAIL lines, e.g. a unique violation's
+    # "Key (email)=(…) already exists" (DA-G2-1). The same setting on Azure (runbook row 40).
+    command: ["postgres", "-c", "log_error_verbosity=terse"]
     environment:
       POSTGRES_USER: rag
       POSTGRES_PASSWORD: rag

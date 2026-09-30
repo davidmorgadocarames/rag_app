@@ -58,7 +58,8 @@ class MessageResponse(BaseModel):
 
 class ResendVerificationResponse(BaseModel):
     detail: str
-    # Only populated in dev (no SMTP configured), so the UI can offer the link.
+    # Only populated with ENV=dev and no SMTP configured, so the UI can offer the link;
+    # never in prod (DA-G2-5).
     verification_link: str | None = None
 
 

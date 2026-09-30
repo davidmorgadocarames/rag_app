@@ -294,3 +294,126 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
     # the erasure scrubbed the address, so nothing is left to leak later either
     with Session(db_engine) as session:
         assert session.query(User).filter(User.email == email).count() == 0
+
+
+# --- DA-G2-1: a concurrent sign-up never leaks the address ----------------------------------
+
+
+@pytest.mark.db
+def test_a_racing_duplicate_sign_up_is_a_409_and_logs_no_email(
+    db_engine: Engine, monkeypatch: pytest.MonkeyPatch, captured_logs: _Collect
+) -> None:
+    """Two registrations of one address at once (double click): the API's existence check
+    passes for both, the unique index rejects the second INSERT. On Postgres the driver's
+    message carries ``DETAIL: Key (email)=(…) already exists`` — it must end as a 409, never
+    as a 500 whose traceback prints the address (SQLite's message has no value, so this runs
+    on the real database)."""
+    from sqlalchemy import create_engine, text
+
+    from rag_app.api.app import create_app
+
+    monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("JWT_SECRET", "t" * 48)
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("SMTP_HOST", "")
+
+    email = f"dave.{uuid.uuid4().hex[:8]}@example.test"
+    password = "correct horse battery staple " + uuid.uuid4().hex[:6]
+    result: dict[str, Any] = {}
+    with _Server(create_app) as server:
+        _attach(captured_logs)
+        # The test's own statements are logged too (sqlalchemy.engine at INFO): its engine
+        # hides the bound values like the app's does, so only the app is under test.
+        racer_engine = create_engine(db_engine.url, hide_parameters=True)
+        with racer_engine.connect() as racer:
+            # The other registration: its row is inserted but not committed yet, so the API's
+            # SELECT does not see it and its INSERT waits on the unique index.
+            racer.begin()
+            racer.execute(
+                text(
+                    "INSERT INTO users (id, email, password_hash, email_verified)"
+                    " VALUES (:i, :e, 'x', false)"
+                ),
+                {"i": uuid.uuid4(), "e": email},
+            )
+            call = threading.Thread(
+                target=lambda: result.update(
+                    r=server.call("POST", "/auth/register", {"email": email, "password": password})
+                )
+            )
+            call.start()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:  # wait until the API's INSERT is blocked
+                waiting = racer.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+                        " AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()"
+                    )
+                ).scalar()
+                if waiting:
+                    break
+                time.sleep(0.05)
+            racer.commit()  # the other registration wins → unique violation in the API
+            call.join(timeout=30)
+        racer_engine.dispose()
+        time.sleep(0.2)
+    status, body = result["r"]
+    assert status == 409 and body == {"detail": "email already registered"}
+    assert email not in json.dumps(body)
+    assert not _leaks(captured_logs.rendered, [email, email.split("@", 1)[0]])
+    with db_engine.begin() as conn:
+        assert (
+            conn.execute(text("SELECT count(*) FROM users WHERE email = :e"), {"e": email}).scalar()
+            == 1
+        )
+        conn.execute(text("DELETE FROM users WHERE email = :e"), {"e": email})
+
+
+def test_postgres_logs_no_detail_lines_locally() -> None:
+    """DA-G2-1: the local and gate Postgres run with log_error_verbosity=terse (no DETAIL
+    line with a key value in the server log); Azure gets the same in row 40 (runbook)."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for compose in ("docker-compose.yml", "compose.gate.yml"):
+        assert "log_error_verbosity=terse" in (root / compose).read_text(), compose
+
+
+# --- DA-G2-5: the verification link only ever goes to the UI in dev -------------------------
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_resend_returns_the_link_only_in_dev(
+    db_engine: Engine, monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from rag_app.api.app import create_app
+    from rag_app.crypto import generate_user_key, wrap_key
+    from rag_app.db.models import User, UserKey
+    from rag_app.security import create_token
+
+    monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("JWT_SECRET", "t" * 48)
+    monkeypatch.setenv("ENV", env)
+    monkeypatch.setenv("SMTP_HOST", "")
+    with Session(db_engine) as session:
+        user = User(email=f"erin.{uuid.uuid4().hex[:8]}@example.test", password_hash="x")
+        session.add(user)
+        session.flush()
+        session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
+        session.commit()
+        user_id = user.id
+    client = TestClient(create_app())
+    res = client.post(
+        "/auth/resend-verification",
+        headers={"Authorization": f"Bearer {create_token(str(user_id))}"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    if env == "dev":
+        assert body["verification_link"] and "token=" in body["verification_link"]
+    else:
+        assert body["verification_link"] is None
+        assert "token" not in json.dumps(body) and body["detail"]

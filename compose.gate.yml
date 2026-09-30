@@ -17,6 +17,8 @@ name: secrag-gate
 services:
   db:
     image: pgvector/pgvector:pg16
+    # terse: no DETAIL lines (a unique violation's key value) in the server log (DA-G2-1).
+    command: ["postgres", "-c", "log_error_verbosity=terse"]
     environment:
       POSTGRES_USER: secrag_gate
       POSTGRES_PASSWORD: ${GATE_DB_PASSWORD:?gate.sh sets GATE_DB_PASSWORD}
