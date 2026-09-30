@@ -307,8 +307,8 @@ refuses to run if that fails.
   symlink anywhere on the path, a path inside any git work tree, or one on a Windows drive
   (`/mnt`, 9p/drvfs). `.gitignore` also ignores `**/.secrag-recovery/` and `**/candidates`
   (defensive; the gitleaks allowlist is unchanged).
-- `check --accounts all|1,2 [--current-key-from-app APP | --current-key-from-env-file PATH]`
-  reads the wrapped keys through libpq in a READ ONLY transaction (only the requested
+- `check --accounts all|1,2 [--current-key-from-app APP | --current-key-from-env-file PATH]
+  [--no-candidates]` reads the wrapped keys through libpq in a READ ONLY transaction (only the requested
   accounts) and prints only `account #i: current key OK|KO` and
   `account #i: candidate #j OK|KO`, plus a summary. Accounts are numbered by
   `users.created_at, users.id`, never identified.
@@ -320,8 +320,12 @@ refuses to run if that fails.
 - `erase --account I --expect-total N --current-key-from-env-file PATH [--apply
   --i-have-a-snapshot]` (**local development DB only**, D-2026-09-30-2 / DA-E-9): for an
   account that **no** key can unwrap. One transaction: checks the total, locks the account,
-  refuses unless the current key **and every candidate** fail on that very blob (and while
-  any candidate line is unreadable or malformed), then erases it through the app's own
+  **proves the current key is the app's key** (DA-E2-1: it must match the stored master-key
+  fingerprint when one exists **and** unwrap at least one *other* account — a wrong or stale
+  env file makes every account "KO", so it is refused), refuses unless the current key **and
+  every candidate** fail on that very blob (and while any candidate line is unreadable or
+  malformed; `--no-candidates` when no candidate file exists because recovery was skipped —
+  `check` accepts it too), then erases it through the app's own
   erasure path (`rag_app.erasure.erase_user`: the user row is deleted with its key,
   conversations and messages by cascade, and a `done` tombstone is written, one commit).
   Without `--apply` it is a read-only dry run. It needs the 0005 schema (the app's tombstone
@@ -363,6 +367,16 @@ on the throwaway: wrong total and readable account #2 refused, dry run changed n
 readable. The throwaway containers and volumes were removed; the development volumes were
 not touched.
 
+**Decision update (D-2026-09-29-2 CHANGED, 2026-09-30):** the owner does not need the old
+conversations, so **no recovery is attempted** and no candidate file is created; the path is
+**erase**. Locally: `pg_dump` → `roles.sql` + migration 0005 → `check --accounts all
+--no-candidates --current-key-from-env-file backend/.env` (note `N`) → `erase --account I
+--expect-total N --no-candidates --current-key-from-env-file backend/.env` (dry run), then the
+same with `--apply --i-have-a-snapshot` → `check --accounts all --expect-total N-1
+--no-candidates …` → all OK → first API start. On Azure the owner deletes the unreadable
+account in the running app and re-registers before row 40. With no candidate file there is
+nothing to `shred`. The recovery procedure below stays documented for a future key incident.
+
 **Procedure** (the user's real candidates; nothing is run on the developer's database before
 it; note the total `N` that `check` prints):
 
@@ -379,7 +393,9 @@ it; note the total `N` that `check` prints):
   (read-only, any time); on a match, after the row-40 `pg_dump`, the same `rewrap` with
   `--read-write` on the tunnel; re-run the row-15 snippet → KO 0. No match: the owner deletes
   the account in the running pre-11a app before the promotion (`erase` refuses the tunnel).
-- Then `shred`.
+- `shred` only **after both outcomes** — the local one (rewrap or erase) **and** the Azure one
+  (row-40 rewrap or the owner's deletion) — because the Azure `rewrap` still needs the
+  candidate (DA-E2-2); shredding earlier means refilling the file from the password manager.
 
 ## Rollback
 

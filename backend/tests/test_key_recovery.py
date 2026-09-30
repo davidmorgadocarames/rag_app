@@ -873,3 +873,95 @@ def test_erase_end_to_end_through_the_app_erasure_path(
     old_schema = erase("2", "2", *snap)
     assert old_schema.returncode == 2 and "migration 0005" in old_schema.stderr
     assert _scan_for_leaks(secrets, since, outputs, {cand, env_file}, home) == []
+
+
+@pytest.mark.db
+def test_erase_refuses_a_current_key_that_is_not_the_apps_key(
+    recovery_db: URL, home: Path, tmp_path: Path, secrets: Secrets
+) -> None:
+    """DA-E2-1: with a wrong/stale env file every account is "current key KO"; erase must
+    refuse unless the current key unwraps another account and matches a stored fingerprint.
+    Also --no-candidates (D-2026-09-29-2 CHANGED: no candidate file exists)."""
+    from rag_app.keycheck import FINGERPRINT_ALGORITHM, fingerprint
+
+    current, lost, other = secrets.key(), secrets.key(), secrets.key()
+    data_keys, ids = _seed(recovery_db, [current, lost, current])
+    for key in data_keys:
+        secrets.values.append(key.decode())
+    pg = _pg_env(recovery_db)
+    snap = ("--apply", "--i-have-a-snapshot")
+    since = time.time() - 1
+    outputs: list[str] = []
+
+    def env_file_for(key: str, name: str) -> Path:
+        path = tmp_path / name
+        path.write_text(f"DATA_MASTER_KEY={key}\n")
+        path.chmod(0o600)
+        return path
+
+    right = env_file_for(current, "right.env")
+    random_key = env_file_for(secrets.key(), "random.env")
+
+    def erase(env_file: Path, *extra: str):
+        proc = _run(home, "erase", "--account", "2", "--expect-total", "3", "--no-candidates",
+                    "--current-key-from-env-file", str(env_file), *extra, env=pg)  # fmt: skip
+        outputs.extend([proc.stdout, proc.stderr])
+        return proc
+
+    def unchanged() -> None:
+        assert _query(recovery_db, "SELECT count(*) FROM users") == [(3,)]
+        assert _query(recovery_db, "SELECT count(*) FROM deletion_requests") == [(0,)]
+
+    # a random "current" key: every account is KO for it → refused, nothing erased
+    wrong = erase(random_key, *snap)
+    assert wrong.returncode == 2, wrong.stderr
+    assert "unwraps none of the 2 other account(s)" in wrong.stderr
+    assert "erased" not in wrong.stdout
+    unchanged()
+    assert not _cand_path(home).exists()  # --no-candidates never needs the file
+
+    def set_fingerprint(key: str) -> None:
+        engine = create_engine(recovery_db, future=True)
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM master_key_fingerprint"))
+                conn.execute(
+                    text(
+                        "INSERT INTO master_key_fingerprint (id, fingerprint, algorithm)"
+                        " VALUES (1, :fp, :alg)"
+                    ),
+                    {"fp": fingerprint(key), "alg": FINGERPRINT_ALGORITHM},
+                )
+        finally:
+            engine.dispose()
+
+    # a stored fingerprint of another key → refused even though the key unwraps others
+    set_fingerprint(other)
+    mismatch = erase(right, *snap)
+    assert mismatch.returncode == 2
+    assert "does not match the master-key fingerprint" in mismatch.stderr
+    unchanged()
+
+    set_fingerprint(current)
+    dry = erase(right)
+    assert dry.returncode == 0, dry.stderr
+    assert "candidates: none (--no-candidates: key recovery skipped)" in dry.stdout
+    assert "current key verified: unwraps 2 of 2 other account(s); fingerprint matches" in (
+        dry.stdout
+    )
+    assert "account #2: current key KO, no candidates tried (--no-candidates)" in dry.stdout
+    unchanged()
+
+    applied = erase(right, *snap)
+    assert applied.returncode == 0, applied.stderr
+    assert "account #2: erased through the app's erasure path" in applied.stdout
+    assert _query(recovery_db, "SELECT user_id, status FROM deletion_requests") == [
+        (ids[1], "done")
+    ]
+    assert _query(recovery_db, "SELECT count(*) FROM users") == [(2,)]
+    after = _run(home, "check", "--accounts", "all", "--expect-total", "2", "--no-candidates",
+                 "--current-key-from-env-file", str(right), env=pg)  # fmt: skip
+    outputs.extend([after.stdout, after.stderr])
+    assert after.returncode == 0, after.stderr
+    assert "summary: 2 account(s) checked of 2; 2 readable with the current key" in after.stdout
+    assert _scan_for_leaks(secrets, since, outputs, {right, random_key}, home) == []

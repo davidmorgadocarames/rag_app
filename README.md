@@ -342,18 +342,24 @@ nano ~/.secrag-recovery/candidates             # one key per line — never on t
 # locally, against a throwaway copy of the database (PG* variables), or on Azure inside
 # scripts/azure/db-tunnel.sh (read-only):
 scripts/azure/key_recovery.sh check --accounts all --current-key-from-env-file backend/.env
-scripts/azure/key_recovery.sh shred            # overwrite + delete the candidates afterwards
+# ... rewrap / erase (below); only when EVERY outcome is done — local and Azure:
+scripts/azure/key_recovery.sh shred            # overwrite + delete the candidates
 ```
 
 It prints the total (`accounts: N in total`) and only `account #i: candidate #j OK|KO`
 lines; pass that `N` back as `--expect-total N` so a later command refuses if accounts were
 added or erased in between. A match is re-wrapped under the current key with `rewrap` (dry
-run by default; `--apply` only after a `pg_dump`). On the local development DB, an account
-that no key unwraps is erased with
+run by default; `--apply` only after a `pg_dump`). Keep the candidate file until both the
+local and the Azure outcome are done (the Azure `rewrap` needs it too), then `shred`. On the
+local development DB, an account that no key unwraps is erased with
 `key_recovery.sh erase --account I --expect-total N --current-key-from-env-file backend/.env`
-(dry run; then `--apply --i-have-a-snapshot`): it re-checks the current key and every
-candidate in the same transaction and uses the app's own erasure path (tombstone). It needs
-migration 0005 and never runs against Azure — there the owner deletes the account in the app.
+(dry run; then `--apply --i-have-a-snapshot`): in the same transaction it proves the current
+key is the app's key (it must match the stored master-key fingerprint, if any, and unwrap at
+least one *other* account — a wrong env file is refused), re-checks the current key and every
+candidate on that account, and uses the app's own erasure path (tombstone). When no recovery
+is attempted (no candidate file), `check` and `erase` take `--no-candidates` and there is
+nothing to shred. It needs migration 0005 and never runs against Azure — there the owner
+deletes the account in the app.
 The full procedure is in
 [ADR phase 11 — Key recovery](docs/adr/adr_phase11_stability.md#key-recovery-d-2026-09-29-2).
 

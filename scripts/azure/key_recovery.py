@@ -6,13 +6,14 @@ stored ``user_keys.wrapped_key`` of the accounts, and prints only OK/KO lines:
 
     key_recovery.sh init                 create ~/.secrag-recovery/candidates (dir 0700, file
                                          0600, empty) and print how to fill it
-    key_recovery.sh check --accounts all|1,2 [--expect-total N]
+    key_recovery.sh check --accounts all|1,2 [--expect-total N] [--no-candidates]
                           [--current-key-from-app APP | --current-key-from-env-file PATH]
     key_recovery.sh rewrap --account I --candidate J [--expect-total N]
                            (--current-key-from-app APP | --current-key-from-env-file PATH)
                            [--apply --i-have-a-pg-dump]
     key_recovery.sh erase --account I --expect-total N --current-key-from-env-file PATH
-                          [--apply --i-have-a-snapshot]          (LOCAL development DB only)
+                          [--no-candidates] [--apply --i-have-a-snapshot]
+                                                                 (LOCAL development DB only)
     key_recovery.sh shred                overwrite (random, then zeros) and delete the
                                          candidate file and its directory
 
@@ -41,13 +42,17 @@ prints "dry run: would update 1 row" and rolls back. The master key is never swi
 
 ``erase`` (D-2026-09-30-2, local only — on Azure the owner deletes the account in the app):
 for an account that NO key can unwrap. In ONE transaction it checks the total against
-``--expect-total``, locks the account, and refuses unless the current key AND every
-candidate fail on that very blob (it also refuses while any candidate line is unreadable or
-malformed); then it erases the account through the app's own erasure path
-(``rag_app.erasure.erase_user``: user row deleted with its key, conversations and messages by
-cascade, tombstone ``done`` written, one commit). Without ``--apply`` it is a read-only dry
-run. It refuses a non-local ``PGHOST``/``PGHOSTADDR``, ``PGSERVICE``, a run inside the tunnel,
-and a schema older than migration 0005 (the app's tombstone columns).
+``--expect-total``, locks the account, proves the current key IS the app's key (DA-E2-1: it
+must match the stored master-key fingerprint when one exists AND unwrap at least one OTHER
+account — a wrong or stale env file makes every account "KO" and is refused), and refuses
+unless the current key AND every candidate fail on that very blob (it also refuses while any
+candidate line is unreadable or malformed; ``--no-candidates`` = no candidate file because
+key recovery was skipped, D-2026-09-29-2 CHANGED); then it erases the account through the
+app's own erasure path (``rag_app.erasure.erase_user``: user row deleted with its key,
+conversations and messages by cascade, tombstone ``done`` written, one commit). Without
+``--apply`` it is a read-only dry run. It refuses a non-local ``PGHOST``/``PGHOSTADDR``,
+``PGSERVICE``, a run inside the tunnel, and a schema older than migration 0005 (the app's
+tombstone columns).
 
 If an error happens after COMMIT was sent (``--apply``), the tool cannot know whether the
 change was committed: it prints "state unknown — run check again" instead of "nothing
@@ -312,6 +317,17 @@ def shred(path: Path) -> None:
 
 
 def current_key(args: argparse.Namespace):  # type: ignore[no-untyped-def]
+    value = _current_key_text(args)
+    if value is None:
+        return None
+    try:
+        return _fernet(value)
+    except (ValueError, binascii.Error, UnicodeError):
+        raise Refusal("the current DATA_MASTER_KEY is not a valid Fernet key") from None
+
+
+def _current_key_text(args: argparse.Namespace) -> str | None:
+    """The current master key as text (kept in memory only; never printed)."""
     if getattr(args, "current_key_from_app", None):
         rg = args.rg or os.environ.get("DB_TUNNEL_RG") or "rg-secrag"
         proc = subprocess.run(
@@ -352,10 +368,7 @@ def current_key(args: argparse.Namespace):  # type: ignore[no-untyped-def]
             raise Refusal("no DATA_MASTER_KEY in the env file")
     else:
         return None
-    try:
-        return _fernet(value)
-    except (ValueError, binascii.Error, UnicodeError):
-        raise Refusal("the current DATA_MASTER_KEY is not a valid Fernet key") from None
+    return value
 
 
 # --- database (libpq environment; the tunnel sets it on Azure) -------------------------------
@@ -396,8 +409,14 @@ def _unwraps(fernet, blob: bytes) -> bool:  # type: ignore[no-untyped-def]
 
 
 def check(args: argparse.Namespace) -> int:
-    candidates = load_candidates(args.candidates)
+    candidates: list[object | None] = []
+    if args.no_candidates:
+        out("candidates: none (--no-candidates: key recovery skipped)")
+    else:
+        candidates = load_candidates(args.candidates)
     current = current_key(args)
+    if current is None and not candidates:
+        raise Refusal("--no-candidates needs the current master key (--current-key-from-…)")
     wanted = None if args.accounts == "all" else _parse_accounts(args.accounts)
     with _connect() as conn:
         conn.execute("SET TRANSACTION READ ONLY")
@@ -522,18 +541,79 @@ def _app_erasure() -> tuple[Any, Any]:
     return erase_user, DeletionRequest
 
 
+def _app_fingerprint() -> tuple[Any, str]:
+    """The app's master-key fingerprint function (the API's start-up check, T11.2.4)."""
+    _app_erasure()  # puts this checkout's backend/src on sys.path
+    from rag_app.keycheck import FINGERPRINT_ALGORITHM, fingerprint
+
+    return fingerprint, FINGERPRINT_ALGORITHM
+
+
+def _verify_current_key(conn, current, current_text: str, user_id) -> None:  # type: ignore[no-untyped-def]
+    """DA-E2-1: "current key KO" only means something if the current key IS the app's key.
+
+    In the erase transaction: when a fingerprint is stored, the current key must match it;
+    and the current key must unwrap at least one OTHER account. A wrong or stale env file
+    (every account KO) is refused before any account is judged unrecoverable."""
+    import hmac
+
+    fingerprint, algorithm = _app_fingerprint()
+    if conn.exec_driver_sql("SELECT to_regclass('master_key_fingerprint')").scalar_one() is None:
+        raise Refusal(
+            "the schema is older than the app's erasure path (migration 0005) — run"
+            " db-roles and migrate first"
+        )
+    stored = conn.exec_driver_sql(
+        "SELECT fingerprint, algorithm FROM master_key_fingerprint WHERE id = 1"
+    ).fetchone()
+    if stored is not None and (
+        stored[1] != algorithm or not hmac.compare_digest(str(stored[0]), fingerprint(current_text))
+    ):
+        raise Refusal(
+            "the current key does not match the master-key fingerprint stored in the database"
+            " — wrong or stale env file? erase refuses (DA-E2-1)"
+        )
+    others = [
+        bytes(blob)
+        for _n, other_id, blob in conn.exec_driver_sql(
+            ACCOUNTS_SQL, {"all": True, "wanted": []}
+        ).fetchall()
+        if other_id != user_id
+    ]
+    readable = sum(_unwraps(current, blob) for blob in others)
+    if readable == 0:
+        raise Refusal(
+            f"the current key unwraps none of the {len(others)} other account(s) — it may not"
+            " be the app's key (wrong or stale env file?), so 'current key KO' proves nothing;"
+            " erase refuses (DA-E2-1)"
+        )
+    out(
+        f"current key verified: unwraps {readable} of {len(others)} other account(s);"
+        f" fingerprint {'matches' if stored is not None else 'not stored yet'}"
+    )
+
+
 def erase(args: argparse.Namespace) -> int:
     if args.apply and not args.i_have_a_snapshot:
         raise Refusal("--apply needs --i-have-a-snapshot (pg_dump or volume snapshot first)")
     _local_only()
-    candidates = load_candidates(args.candidates)
+    candidates: list[object | None] = []
+    if args.no_candidates:
+        # D-2026-09-29-2 CHANGED (2026-09-30): no recovery is attempted, so no candidate file
+        # exists; the account is erased on the current-key checks alone.
+        out("candidates: none (--no-candidates: key recovery skipped)")
+    else:
+        candidates = load_candidates(args.candidates)
     bad = [j for j, c in enumerate(candidates, start=1) if c is None]
     if bad:
         raise Refusal(
             "candidate(s) " + ", ".join(f"#{j}" for j in bad) + " could not be read — erase"
             " needs every candidate tried; fix or remove those lines first"
         )
+    current_text = _current_key_text(args)
     current = current_key(args)
+    if current is None or current_text is None:
+        raise Refusal("erase needs the current master key (--current-key-from-env-file)")
     erase_user, deletion_request = _app_erasure()
 
     from sqlalchemy import create_engine, event
@@ -580,6 +660,7 @@ def erase(args: argparse.Namespace) -> int:
                     f"account #{args.account} is readable with the current key — erase never"
                     " touches a readable account"
                 )
+            _verify_current_key(conn, current, current_text, user_id)
             for j, candidate in enumerate(candidates, start=1):
                 if _unwraps(candidate, blob):
                     raise Refusal(
@@ -587,8 +668,12 @@ def erase(args: argparse.Namespace) -> int:
                         " rewrap instead of erasing it"
                     )
             out(
-                f"account #{args.account}: current key KO, every candidate"
-                f" ({len(candidates)}) KO"
+                f"account #{args.account}: current key KO, "
+                + (
+                    f"every candidate ({len(candidates)}) KO"
+                    if candidates
+                    else "no candidates tried (--no-candidates)"
+                )
             )
             if not args.apply:
                 session.rollback()
@@ -656,6 +741,11 @@ def _parser() -> argparse.ArgumentParser:
         )
         if name == "check":
             s.add_argument("--accounts", required=True, help="'all' or e.g. 1,3")
+            s.add_argument(
+                "--no-candidates",
+                action="store_true",
+                help="current key only, no candidate file (D-2026-09-29-2 CHANGED)",
+            )
         else:
             s.add_argument("--account", type=int, required=True)
             s.add_argument("--candidate", type=int, required=True)
@@ -667,6 +757,11 @@ def _parser() -> argparse.ArgumentParser:
     e.add_argument("--current-key-from-env-file", metavar="PATH", required=True)
     e.add_argument("--apply", action="store_true")
     e.add_argument("--i-have-a-snapshot", action="store_true")
+    e.add_argument(
+        "--no-candidates",
+        action="store_true",
+        help="no candidate file: key recovery was skipped (D-2026-09-29-2 CHANGED)",
+    )
     return p
 
 
