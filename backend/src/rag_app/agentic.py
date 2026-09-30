@@ -28,6 +28,9 @@ _REWRITE_SYSTEM = (
     "terminology to improve document retrieval. Keep it a single question and output "
     "only the rewritten question, with no preamble."
 )
+# A rewritten question is one sentence; bound the output like every other LLM call
+# (DA-31b-3). The API never calls this (CLI / eval only).
+REWRITE_MAX_TOKENS = 128
 
 
 @dataclass
@@ -55,7 +58,7 @@ def reformulate(chat: ChatClient, query: str) -> str:
         {"role": "system", "content": _REWRITE_SYSTEM},
         {"role": "user", "content": query},
     ]
-    return chat.chat(messages, temperature=0.0).strip()
+    return chat.chat(messages, temperature=0.0, max_tokens=REWRITE_MAX_TOKENS).strip()
 
 
 def answer_agentic(

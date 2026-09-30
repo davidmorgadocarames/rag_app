@@ -36,6 +36,12 @@ _SYSTEM_PROMPT = (
     f"- If the context does not contain the answer, reply with exactly: {INSUFFICIENT}\n"
 )
 
+# Output bounds (DA-31b-3): every LLM call passes ``max_tokens`` so the worst-case cost of one
+# answer is fixed (see ADR 11 "Costs"). Generation uses ``Settings.max_tokens`` (1024, the value
+# it has always had). The groundedness verdict is one word (GROUNDED / NOT_GROUNDED, a few
+# tokens), so 16 is ample and caps a runaway reply.
+GROUNDEDNESS_MAX_TOKENS = 16
+
 _GROUNDEDNESS_SYSTEM = (
     "You check whether an ANSWER is fully supported by the CONTEXT. "
     "Reply with exactly one word: GROUNDED or NOT_GROUNDED."
@@ -122,7 +128,9 @@ def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[Retrieve
         {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
         {"role": "user", "content": user},
     ]
-    return parse_groundedness(chat.chat(messages, temperature=0.0))
+    return parse_groundedness(
+        chat.chat(messages, temperature=0.0, max_tokens=GROUNDEDNESS_MAX_TOKENS)
+    )
 
 
 def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk]) -> Answer:
@@ -358,7 +366,9 @@ def _check_groundedness_counted(
         {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
         {"role": "user", "content": user},
     ]
-    verdict = "".join(chat.chat_stream(messages, temperature=0.0, usage=usage))
+    verdict = "".join(
+        chat.chat_stream(messages, temperature=0.0, max_tokens=GROUNDEDNESS_MAX_TOKENS, usage=usage)
+    )
     return parse_groundedness(verdict)
 
 

@@ -15,6 +15,9 @@ _JUDGE_SYSTEM = (
     "REFERENCE answer for the QUESTION. Ignore wording and extra detail; judge only "
     "factual agreement. Reply with exactly one word: CORRECT or INCORRECT."
 )
+# The verdict is one word; bounded like every other LLM call (DA-31b-3). Eval only, on
+# the local Ollama judge — generous so a short preamble never truncates the verdict.
+JUDGE_MAX_TOKENS = 64
 
 
 def parse_verdict(raw: str) -> bool:
@@ -36,4 +39,4 @@ def judge_correctness(chat: OllamaChat, question: str, reference: str, candidate
         {"role": "system", "content": _JUDGE_SYSTEM},
         {"role": "user", "content": user},
     ]
-    return parse_verdict(chat.chat(messages, temperature=0.0))
+    return parse_verdict(chat.chat(messages, temperature=0.0, max_tokens=JUDGE_MAX_TOKENS))

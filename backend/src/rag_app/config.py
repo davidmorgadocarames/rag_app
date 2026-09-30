@@ -126,6 +126,8 @@ class Settings(JobSettings):
     top_k: int = 20
     rerank_top_n: int = 4
     max_agent_steps: int = 6
+    # Output bound of the answer generation call (DA-31b-3; the worst-case cost per answer in
+    # ADR 11 "Costs" uses it). The groundedness check has its own bound (generation.py).
     max_tokens: int = 1024
 
     # --- Agentic router ---
