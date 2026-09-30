@@ -40,7 +40,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from rag_app.db.models import DeletionRequest, User, UserKey
-from rag_app.retention import BACKUP_RETENTION_DAYS
+from rag_app.retention import BACKUP_RETENTION_DAYS, TOMBSTONE_EXPORT_RETENTION_DAYS
 
 # The promise of the 202 message (PHASE_PLANNING 11.2b): the purger removes the remaining
 # encrypted rows within this many hours (an hourly Job, well inside the deadline).
@@ -50,10 +50,22 @@ PURGE_DEADLINE_HOURS = 24
 REQUEST_LOCK_TIMEOUT = "2s"
 REQUEST_STATEMENT_TIMEOUT = "5s"
 
+# DA-G1-4: the request path's lock/statement timeout (or a cancel) is retryable — 503 with
+# Retry-After, nothing changed (the transaction rolled back).
+ERASURE_RETRYABLE_SQLSTATES = frozenset({"55P03", "57014"})
+ERASURE_RETRY_AFTER_SECONDS = 5
+
+# The 202 text (DA-G1-9 i/ii): "unreadable at once" holds for the live service; the backups
+# still hold the wrapped key and the email until they expire; the kept tombstone record and
+# its exports are disclosed. PRD F7, ADR phase 6 and the account page say the same.
 ERASURE_ACCEPTED_MESSAGE = (
-    "Account deleted. Your data is unreadable from now on; remaining encrypted rows are"
-    f" removed within {PURGE_DEADLINE_HOURS} h and backup copies within"
-    f" {BACKUP_RETENTION_DAYS} days."
+    "Account deleted. Your data in the live service is unreadable from now on, and the"
+    f" remaining encrypted rows are removed within {PURGE_DEADLINE_HOURS} h. Encrypted backup"
+    " copies still hold your encrypted data, its wrapped key and your email address until"
+    f" they are deleted, within {BACKUP_RETENTION_DAYS} days. A minimal erasure record"
+    " (a random id, dates and a status; no email or content) is kept so that a restore from"
+    " backup cannot bring the account back; its exported copies are kept for"
+    f" {TOMBSTONE_EXPORT_RETENTION_DAYS} days."
 )
 
 OPEN_STATUSES = ("pending", "running", "failed")

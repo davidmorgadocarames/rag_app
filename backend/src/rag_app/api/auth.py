@@ -9,6 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from rag_app.api.deps import SessionDep, SignupTrackerDep, rate_limit_login
 from rag_app.api.schemas import (
@@ -23,7 +24,12 @@ from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.db.models import EmailVerificationToken, User, UserKey
 from rag_app.emailer import send_verification_email, verification_link
-from rag_app.erasure import ERASURE_ACCEPTED_MESSAGE, request_erasure
+from rag_app.erasure import (
+    ERASURE_ACCEPTED_MESSAGE,
+    ERASURE_RETRY_AFTER_SECONDS,
+    ERASURE_RETRYABLE_SQLSTATES,
+    request_erasure,
+)
 from rag_app.risk import is_high_risk, signup_risk_score
 from rag_app.security import (
     create_token,
@@ -105,7 +111,10 @@ def verify_email(token: str, session: SessionDep) -> MessageResponse:
     )
     if record is None or record.used_at is not None or record.expires_at < now:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired token")
-    user = session.get(User, record.user_id)
+    # An erased account (deleted_at set; its token rows live until the purge) is not an
+    # account any more: no state change, and no row lock the purger would have to wait for
+    # (DA-G1-5).
+    user = session.scalar(select(User).where(User.id == record.user_id, User.deleted_at.is_(None)))
     if user is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid token")
     user.email_verified = True
@@ -164,5 +173,17 @@ def delete_account(user: CurrentUserDep, session: SessionDep) -> MessageResponse
 
     See docs/adr/adr_phase06_gdpr_erasure.md and docs/adr/adr_phase11_stability.md.
     """
-    request_erasure(session, user.id)
+    try:
+        request_erasure(session, user.id)
+    except OperationalError as exc:
+        # The short transaction hit its lock/statement timeout (another transaction holds the
+        # user's row): nothing was changed (rolled back) — a retryable 503, not a 500 (DA-G1-4).
+        session.rollback()
+        if getattr(exc.orig, "sqlstate", None) in ERASURE_RETRYABLE_SQLSTATES:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "The account is busy right now; nothing was deleted. Please try again.",
+                headers={"Retry-After": str(ERASURE_RETRY_AFTER_SECONDS)},
+            ) from exc
+        raise
     return MessageResponse(detail=ERASURE_ACCEPTED_MESSAGE)

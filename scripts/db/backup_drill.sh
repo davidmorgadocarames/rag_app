@@ -23,7 +23,9 @@
 #      purger) → the erased account stays erased (tombstone "done", no key/conversation/
 #      message), the kept one is intact
 #   6. controls: without the tombstone export the erased account comes back (the export is
-#      what keeps it erased); a wrong key restores nothing; a non-empty target is refused
+#      what keeps it erased); a purger pass that stops at its time limit with an erasure
+#      still open fails the restore — no "DONE" (DA-G1-8); a wrong key restores nothing; a
+#      non-empty target is refused
 set -euo pipefail
 
 # shellcheck source=scripts/db/backup_lib.sh
@@ -46,12 +48,12 @@ admin_psql() { PGDATABASE=postgres psql -X -w -q -v ON_ERROR_STOP=1 "$@"; }
 
 suffix="$(openssl rand -hex 4)"
 src="secrag_drill_src_$suffix" rst="secrag_drill_rst_$suffix"
-ctl="secrag_drill_ctl_$suffix" neg="secrag_drill_neg_$suffix"
+ctl="secrag_drill_ctl_$suffix" neg="secrag_drill_neg_$suffix" lim="secrag_drill_lim_$suffix"
 work="$(mktemp -d "${TMPDIR:-/tmp}/secrag-backup-drill.XXXXXX")"
 chmod 700 "$work"
 cleanup() {
   local db
-  for db in "$src" "$rst" "$ctl" "$neg"; do
+  for db in "$src" "$rst" "$ctl" "$neg" "$lim"; do
     admin_psql -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
   done
   find "$work" -type f -name '*.key' -exec shred -u {} + 2>/dev/null || true
@@ -63,7 +65,7 @@ ok() { echo "  ok: $*"; }
 fail() { echo "  FAIL: $*"; exit 1; }
 
 # --- 1. source database with two accounts -------------------------------------------------
-for db in "$src" "$rst" "$ctl" "$neg"; do admin_psql -c "CREATE DATABASE $db"; done
+for db in "$src" "$rst" "$ctl" "$neg" "$lim"; do admin_psql -c "CREATE DATABASE $db"; done
 # DA-F-5: no password on any command line — the URL carries none; the admin password reaches
 # apply_roles.sh (and its psql) only through the exported PGPASSWORD of pg_env_from_url.
 PGPASSWORD="$admin_pw" bash "$SECRAG_DB_DIR/apply_roles.sh" "postgresql://$admin_user@$host:$port/$src" \
@@ -131,6 +133,13 @@ restore_into "$ctl" "$work/empty" "$work/offline-copy/backup.key" >"$work/ctl.lo
 jq -e --arg e "$erase" '.[$e].user' <<<"$(state "$ctl")" >/dev/null \
   || fail "control: without the export the erased account should come back (the drill proves nothing)"
 ok "control: without the tombstone export the erased account comes back — the export keeps it erased"
+# DA-G1-8: a purger pass that hits its time limit (0 s here) with the erasure still open.
+if RESTORE_PURGE_MAX_SECONDS=0 restore_into "$lim" "$work/tombstones" "$work/offline-copy/backup.key" >"$work/lim.log" 2>&1; then
+  fail "a restore whose purger pass stopped at its time limit exited 0"
+fi
+if grep -q "restore: DONE" "$work/lim.log"; then fail "time limit: the restore printed DONE with an erasure still open"; fi
+grep -q "still open after this run" "$work/lim.log" || fail "time limit: unexpected error: $(tail -n 1 "$work/lim.log")"
+ok "time limit: the purger pass stopped with an erasure still open → restore failed, no DONE"
 if restore_into "$neg" "$work/tombstones" "$work/keys/wrong.key" >"$work/neg.log" 2>&1; then
   fail "a wrong key restored something"
 fi

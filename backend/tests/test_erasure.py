@@ -45,10 +45,27 @@ def test_the_registry_is_leaf_first_with_users_last() -> None:
 
 
 def test_the_202_message_uses_the_retention_constant() -> None:
+    from rag_app.retention import TOMBSTONE_EXPORT_RETENTION_DAYS
+
     message = erasure.ERASURE_ACCEPTED_MESSAGE
     assert f"within {BACKUP_RETENTION_DAYS} days" in message
     assert f"within {erasure.PURGE_DEADLINE_HOURS} h" in message
-    assert message.startswith("Account deleted. Your data is unreadable from now on")
+    # DA-G1-9 (i): "unreadable at once" only for the live service; the backups still hold
+    # the wrapped key and the email. (ii): the kept record and its export retention.
+    assert message.startswith("Account deleted. Your data in the live service is unreadable")
+    assert "wrapped key" in message and "email address" in message
+    assert "random id, dates and a status" in message
+    assert f"kept for {TOMBSTONE_EXPORT_RETENTION_DAYS} days" in message
+
+
+@pytest.mark.parametrize(
+    "doc", ["docs/PRD.md", "docs/adr/adr_phase06_gdpr_erasure.md", "frontend/app/account/page.tsx"]
+)
+def test_the_privacy_texts_disclose_backups_and_the_kept_record(doc: str) -> None:
+    body = " ".join((Path(__file__).resolve().parents[2] / doc).read_text().split())
+    assert "live service" in body  # DA-G1-9 (i)
+    assert "wrapped key" in body and "email address" in body
+    assert "random id" in body and "30 days" in body  # DA-G1-9 (ii)
 
 
 # --- fixtures ---------------------------------------------------------------------------
@@ -239,6 +256,70 @@ def test_the_request_path_never_waits_long_for_a_lock(db_engine: Engine, master_
         holder.rollback()
     assert "lock timeout" in str(err.value).lower() and waited < 4
     assert _counts(db_engine, user_id)["keys"] == 1  # rolled back: nothing half-done
+
+
+@pytest.mark.db
+def test_a_lock_timeout_on_delete_account_is_a_retryable_503(
+    db_engine: Engine, master_key: str
+) -> None:
+    """DA-G1-4: the API maps the request path's lock timeout to 503 + Retry-After (not a
+    generic 500); nothing changed, and the same request succeeds once the lock is gone."""
+    from fastapi.testclient import TestClient
+
+    from rag_app.api.app import create_app
+    from rag_app.security import create_token
+
+    user_id, _ = _make_user(db_engine, conversations=1, messages=1)
+    auth = {"Authorization": f"Bearer {create_token(str(user_id))}"}
+    client = TestClient(create_app(), raise_server_exceptions=False)
+    with db_engine.connect() as holder:
+        holder.begin()
+        holder.execute(text("SELECT 1 FROM users WHERE id = :u FOR UPDATE"), {"u": user_id})
+        busy = client.delete("/account", headers=auth)
+        holder.rollback()
+    assert busy.status_code == 503, busy.text
+    assert busy.headers["Retry-After"] == str(erasure.ERASURE_RETRY_AFTER_SECONDS)
+    assert "try again" in busy.json()["detail"]
+    state = _counts(db_engine, user_id)
+    assert state["keys"] == 1 and state["tombstone"] is None  # nothing changed
+    assert client.get("/auth/me", headers=auth).status_code == 200  # still signed in
+    assert client.delete("/account", headers=auth).status_code == 202
+
+
+@pytest.mark.db
+def test_verify_ignores_an_erased_account(db_engine: Engine, master_key: str) -> None:
+    """DA-G1-5: a verification link of an erased account (its token row lives until the
+    purge) is refused and changes nothing."""
+    from fastapi.testclient import TestClient
+
+    from rag_app.api.app import create_app
+    from rag_app.db.models import EmailVerificationToken
+    from rag_app.security import generate_verification_token, hash_token
+
+    user_id, _ = _make_user(db_engine, conversations=0, token=False)
+    raw = generate_verification_token()
+    with Session(db_engine) as session:
+        session.add(
+            EmailVerificationToken(
+                user_id=user_id,
+                token_hash=hash_token(raw),
+                expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=1),
+            )
+        )
+        session.commit()
+    _request(db_engine, user_id)
+    client = TestClient(create_app())
+    res = client.get("/auth/verify", params={"token": raw})
+    assert res.status_code == 400 and res.json()["detail"] == "invalid token"
+    with db_engine.connect() as conn:
+        verified, used = conn.execute(
+            text(
+                "SELECT u.email_verified, t.used_at FROM users u"
+                " JOIN email_verification_tokens t ON t.user_id = u.id WHERE u.id = :u"
+            ),
+            {"u": user_id},
+        ).one()
+    assert verified is False and used is None  # no state change on the erased account
 
 
 # --- T11.2b.4: the batched purger as secrag_purger ---------------------------------------
@@ -465,6 +546,79 @@ def test_the_cli_prints_counts_only(
     out = capsys.readouterr().out
     assert "1 done" in out and "messages 2" in out
     assert not UUID_RE.search(out.replace(str(tmp_path), "")) and "@" not in out
+
+
+def _age(engine: Engine, request_id: uuid.UUID, hours: float) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE deletion_requests SET requested_at = now() - make_interval(hours => :h)"
+                " WHERE id = :i"
+            ),
+            {"h": hours, "i": request_id},
+        )
+
+
+@pytest.mark.db
+def test_an_overdue_erasure_is_a_warning_and_exit_1(
+    db_engine: Engine,
+    purger_engine: Engine,
+    master_key: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DA-G1-1: a tombstone still open more than PURGE_DEADLINE_HOURS after the request
+    (the 202 promise) fails the run visibly — also a run that could not do the work (time
+    limit) and a run skipped because another one holds the lock."""
+    from rag_app.purger import ADVISORY_LOCK_KEY, Purger, main
+
+    user_id, _ = _make_user(db_engine, conversations=1, messages=2)
+    request_id = _request(db_engine, user_id)
+    try:
+        fresh = Purger(purger_engine, sleep=_no_sleep, max_seconds=0).run()
+        assert fresh.overdue == 0 and fresh.open_left and fresh.ok  # < 24 h: not overdue
+        _age(db_engine, request_id, erasure.PURGE_DEADLINE_HOURS + 1)
+        late = Purger(purger_engine, sleep=_no_sleep, max_seconds=0).run()
+        assert late.overdue == 1 and not late.ok
+        assert main(["purge", "--no-export", "--max-seconds", "0"]) == 1
+        err = capsys.readouterr().err
+        assert "purger: WARNING: 1 erasure(s) overdue" in err
+        assert not UUID_RE.search(err)
+        with purger_engine.connect() as other_run:
+            other_run.execute(text("SELECT pg_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY})
+            other_run.commit()
+            skipped = Purger(purger_engine, sleep=_no_sleep).run()
+            other_run.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
+            other_run.commit()
+        assert skipped.skipped and skipped.overdue == 1 and not skipped.ok
+        assert "1 overdue" in skipped.summary()
+    finally:
+        done = Purger(purger_engine, sleep=_no_sleep).run(only=request_id)
+    assert done.done == 1 and done.overdue == 0 and done.ok  # purged: no longer overdue
+
+
+@pytest.mark.db
+def test_until_done_fails_while_an_erasure_is_still_open(
+    db_engine: Engine,
+    purger_engine: Engine,
+    master_key: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """DA-G1-8: ``--until-done`` (restore.sh) exits 1 when the run stops at its time limit
+    with work left; without it the same run is not an error (the next hourly run resumes)."""
+    from rag_app.purger import Purger, main
+
+    user_id, _ = _make_user(db_engine, conversations=1, messages=2)
+    request_id = _request(db_engine, user_id)
+    try:
+        assert Purger(purger_engine, sleep=_no_sleep, max_seconds=0).run().ok
+        stopped = Purger(purger_engine, sleep=_no_sleep, max_seconds=0, until_done=True).run()
+        assert stopped.open_left and stopped.unfinished and not stopped.ok
+        rc = main(["purge", "--no-export", "--max-seconds", "0", "--until-done"])
+        assert rc == 1 and "still open after this run" in capsys.readouterr().err
+        assert _counts(db_engine, user_id)["tombstone"] == "pending"
+    finally:
+        Purger(purger_engine, sleep=_no_sleep).run(only=request_id)
+    assert _counts(db_engine, user_id)["users"] == 0
 
 
 # --- T11.2b.5: purge_orphaned / replay_deletions enqueue ---------------------------------

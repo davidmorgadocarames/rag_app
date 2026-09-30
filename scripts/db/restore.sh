@@ -18,7 +18,10 @@
 #      pulled by backup-pull.sh — or the local export folder), then `replay_deletions`
 #      (every tombstoned account the dump brought back loses its key again, is scrubbed and
 #      re-queued) and one purger run as the owner (removes their rows; no export here — the
-#      running purge Job exports): every erased account stays erased (R4-3, R5-2)
+#      running purge Job exports) with --until-done: if it stops at its time limit
+#      (RESTORE_PURGE_MAX_SECONDS, default the purger's 1500 s) or fails with a tombstone
+#      still open, the restore FAILS — no "DONE" (DA-G1-8); every erased account stays
+#      erased (R4-3, R5-2)
 #
 # --tombstones-dir is mandatory (an empty directory is valid only if nothing was ever erased).
 # The target URL comes from the environment, never argv (it carries the password).
@@ -29,7 +32,7 @@ set -euo pipefail
 # shellcheck source=scripts/db/backup_lib.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/backup_lib.sh"
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
 
 dump="" identity="" tombstones=""
 while [ $# -gt 0 ]; do
@@ -44,6 +47,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$dump" ] && [ -n "$identity" ] && [ -n "$tombstones" ] || { usage >&2; exit 2; }
 [ -n "${RESTORE_DATABASE_URL:-}" ] || die "RESTORE_DATABASE_URL (owner, empty target database) is not set"
+purge_limit=()
+if [ -n "${RESTORE_PURGE_MAX_SECONDS:-}" ]; then
+  [[ "$RESTORE_PURGE_MAX_SECONDS" =~ ^[0-9]+$ ]] || die "RESTORE_PURGE_MAX_SECONDS must be a whole number of seconds"
+  purge_limit=(--max-seconds "$RESTORE_PURGE_MAX_SECONDS")
+fi
 for tool in age pg_restore psql; do
   command -v "$tool" >/dev/null || die "$tool not found"
 done
@@ -99,6 +107,7 @@ echo "restore: db/roles.sql applied"
 
 # --- 4. tombstones: union + replay + purge -------------------------------------------------
 DATABASE_URL="$RESTORE_DATABASE_URL" "$py" -m rag_app.tombstones restore-union --dir "$tombstones"
-DATABASE_URL="$RESTORE_DATABASE_URL" "$py" -m rag_app.erasure purge --no-export   || die "the purger run after the replay failed — do not reopen; run it again (python -m rag_app.erasure purge --no-export)"
+DATABASE_URL="$RESTORE_DATABASE_URL" "$py" -m rag_app.erasure purge --no-export --until-done "${purge_limit[@]}" \
+  || die "the purger run after the replay did not finish every erasure — do not reopen; run it again until it exits 0 (python -m rag_app.erasure purge --no-export --until-done)"
 echo "restore: DONE — every tombstoned account is erased again; the app may reopen"
 echo "restore: start the app with the SAME DATA_MASTER_KEY as the source database (escrowed with the age key)"

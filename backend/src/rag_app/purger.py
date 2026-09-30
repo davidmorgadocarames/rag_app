@@ -22,12 +22,19 @@ One run:
    ``TOMBSTONE_EXPORT_RETENTION_DAYS`` (30), always keeping the newest valid one (DA-F-8);
    a name it cannot judge is reported, nothing is deleted and the run exits 1 (DA-F2-1).
 
+5. counts the tombstones still open (``pending``/``running``/``failed``) at the end — also
+   when the run was skipped — and those open for more than ``PURGE_DEADLINE_HOURS`` (the
+   202 promise): any **overdue** one is a WARNING and exit 1, so a purge Job that never runs
+   on schedule, keeps failing or keeps being skipped fails visibly (DA-G1-1).
+
 Output is counts only (never an id or an email). Exit 1 when a tombstone failed, the export
-failed or an export name needs a look (the WARNING line says which); 0 otherwise (also when
-another run held the lock).
+failed, an export name needs a look, or an erasure is overdue (the WARNING line says which);
+with ``--until-done`` (``restore.sh``) also when ANY tombstone is still open after the run —
+time limit, failure or a skipped run (DA-G1-8); 0 otherwise (also when another run held the
+lock and nothing is overdue).
 
     python -m rag_app.erasure purge [--batch-size N] [--max-seconds S] [--pause-seconds P]
-                                    [--export-dir DIR | --no-export]
+                                    [--export-dir DIR | --no-export] [--until-done]
     python -m rag_app.erasure purge-now <request-id> [...]   # one tombstone, now
     python -m rag_app.erasure loop [--interval S] [...]      # compose runner (hourly)
 """
@@ -50,7 +57,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from rag_app.erasure import OPEN_STATUSES, PURGE_STEPS
+from rag_app.erasure import OPEN_STATUSES, PURGE_DEADLINE_HOURS, PURGE_STEPS
 
 # Arbitrary, fixed: every purger (CLI, Job, compose loop) uses the same key.
 ADVISORY_LOCK_KEY = 0x5EC_2A6_11B
@@ -83,14 +90,38 @@ class RunResult:
     problems: list[str] = field(default_factory=list)
     errors: int = 0
     last_error: str | None = None
+    # After the run (DA-G1-1, DA-G1-8): tombstones still open, and those open for more than
+    # PURGE_DEADLINE_HOURS; None when they could not be counted (that is an error).
+    open_left: int | None = None
+    overdue: int | None = None
+    until_done: bool = False
+
+    @property
+    def unfinished(self) -> bool:
+        """``--until-done``: the run did not leave every tombstone ``done``."""
+        return self.until_done and (self.skipped or self.open_left != 0)
 
     @property
     def ok(self) -> bool:
-        return self.failed == 0 and self.errors == 0 and not self.problems
+        return (
+            self.failed == 0
+            and self.errors == 0
+            and not self.problems
+            and not self.overdue
+            and not self.unfinished
+        )
 
     def summary(self) -> str:
+        still_open = (
+            f"{self.open_left} still open, {self.overdue} overdue (> {PURGE_DEADLINE_HOURS} h)"
+            if self.open_left is not None
+            else "open tombstones not counted"
+        )
         if self.skipped:
-            return "purger: another run holds the advisory lock — skipped (runs never overlap)"
+            return (
+                "purger: another run holds the advisory lock — skipped (runs never overlap);"
+                f" {still_open}"
+            )
         rows = ", ".join(f"{k} {v}" for k, v in self.rows.items() if v) or "none"
         parts = [
             f"purger: {self.processed} request(s) processed: {self.done} done,"
@@ -99,6 +130,7 @@ class RunResult:
             f"{self.batches} batch transaction(s), longest {self.max_transaction_seconds:.3f} s,"
             f" {self.backoffs} back-off(s)",
             f"export: {self.export or 'none'}; pruned {len(self.pruned)} old export(s)",
+            still_open,
         ]
         if self.last_error:
             parts.append(f"last error: {self.last_error}")
@@ -161,10 +193,12 @@ class Purger:
         sleep: Callable[[float], None] = time.sleep,
         after_batch: Callable[[str, int], None] | None = None,
         pause_seconds: float = 0.0,
+        until_done: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
         self.engine = engine
+        self.until_done = until_done
         self.batch_size = batch_size
         self.max_seconds = max_seconds
         self.export = export
@@ -282,7 +316,7 @@ class Purger:
     # --- one run ----------------------------------------------------------------------
 
     def run(self, only: uuid.UUID | None = None) -> RunResult:
-        result = RunResult()
+        result = RunResult(until_done=self.until_done)
         self._deadline = time.monotonic() + self.max_seconds
         with self.engine.connect() as lock_conn:
             got = lock_conn.execute(
@@ -291,13 +325,35 @@ class Purger:
             lock_conn.commit()
             if not got:
                 result.skipped = True
-                return result
-            try:
-                self._run_locked(result, only)
-            finally:
-                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
-                lock_conn.commit()
+            else:
+                try:
+                    self._run_locked(result, only)
+                finally:
+                    lock_conn.execute(
+                        text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY}
+                    )
+                    lock_conn.commit()
+        self._count_open(result)
         return result
+
+    def _count_open(self, result: RunResult) -> None:
+        """Open tombstones left, and those older than the 202 promise (DA-G1-1) — counted
+        on every run, a skipped one too: a Job that never gets to work still fails loudly."""
+        try:
+            with self.engine.connect() as conn:
+                overdue, open_left = conn.execute(
+                    text(
+                        "SELECT count(*) FILTER (WHERE requested_at"
+                        "   < now() - make_interval(hours => :h)), count(*)"
+                        " FROM deletion_requests WHERE status = ANY(:open)"
+                    ),
+                    {"h": PURGE_DEADLINE_HOURS, "open": list(OPEN_STATUSES)},
+                ).one()
+        except SQLAlchemyError as exc:
+            result.errors += 1
+            result.last_error = f"count open: {_error_class(exc)}"
+            return
+        result.overdue, result.open_left = int(overdue), int(open_left)
 
     def _run_locked(self, result: RunResult, only: uuid.UUID | None) -> None:
         with self.engine.begin() as conn:
@@ -382,6 +438,21 @@ def _report(result: RunResult) -> int:
             " check it and remove it by hand",
             file=sys.stderr,
         )
+    if result.overdue:
+        print(
+            f"purger: WARNING: {result.overdue} erasure(s) overdue — open for more than"
+            f" {PURGE_DEADLINE_HOURS} h (the 202 promise); check that the purge Job runs on its"
+            " schedule, and why it fails or is skipped",
+            file=sys.stderr,
+        )
+    if result.unfinished:
+        left = "unknown" if result.open_left is None else result.open_left
+        print(
+            f"purger: FAIL — {left} erasure(s) still open after this run (time limit, failure"
+            " or another run holding the lock); --until-done needs every tombstone done —"
+            " run it again",
+            file=sys.stderr,
+        )
     return 0 if result.ok else 1
 
 
@@ -399,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
         p.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
         p.add_argument("--pause-seconds", type=float, default=0.0)
+        p.add_argument(
+            "--until-done",
+            action="store_true",
+            help="exit 1 unless every tombstone is done after the run (restore.sh)",
+        )
         where = p.add_mutually_exclusive_group()
         where.add_argument("--export-dir", type=Path)
         where.add_argument("--no-export", action="store_true")
@@ -419,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
             max_seconds=args.max_seconds,
             export=target,
             pause_seconds=args.pause_seconds,
+            until_done=args.until_done,
         )
         if args.cmd == "purge":
             return _report(purger.run())
