@@ -1,6 +1,6 @@
 // Typed client for the SecRAG backend API.
 
-import { consumeChatStream } from "./chatStream";
+import { consumeChatStream, refusedStream } from "./chatStream";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -69,7 +69,14 @@ export interface ConversationDetail {
   messages: StoredMessage[];
 }
 
-class ApiError extends Error {}
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -83,7 +90,7 @@ async function request<T>(path: string, options: RequestInit = {}, token?: strin
     } catch {
       // keep the default message
     }
-    throw new ApiError(detail);
+    throw new ApiError(detail, response.status);
   }
   return (await response.json()) as T;
 }
@@ -141,8 +148,9 @@ export interface StreamCallbacks {
   onStage?: (stage: string) => void;
   onToken?: (text: string) => void;
   onDone?: (data: ChatDone) => void;
-  // Always called when the turn fails, with the conversation id when known.
-  onError?: (detail: string, conversationId: string | null) => void;
+  // Always called when the turn fails, with the conversation id when known;
+  // dropConversation: the conversation is gone (404) — the next message starts a new one.
+  onError?: (detail: string, conversationId: string | null, dropConversation?: boolean) => void;
 }
 
 export async function streamChat(
@@ -169,7 +177,9 @@ export async function streamChat(
     } catch {
       // keep default
     }
-    cb.onError?.(detail, body.conversation_id ?? null);
+    // DA-G2-7: a 404 drops the stale conversation id (the next message starts a new one).
+    const refused = refusedStream(response.status, detail, body.conversation_id ?? null);
+    cb.onError?.(refused.detail, refused.conversationId, refused.dropConversation);
     return;
   }
 

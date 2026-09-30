@@ -9,11 +9,13 @@ import {
   type Citation,
   type ConversationSummary,
   deleteConversation as apiDeleteConversation,
+  ApiError,
   getConversation,
   listConversations,
   renameConversation as apiRenameConversation,
   streamChat,
 } from "@/lib/api";
+import { conversationLoadError } from "@/lib/chatStream";
 import { getToken } from "@/lib/session";
 
 interface UiMessage {
@@ -114,7 +116,18 @@ export default function ChatPage() {
         ),
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load conversation");
+      // DA-G2-7: an unreadable (409) or vanished (404) conversation gets a clear message and
+      // an empty thread, so nothing is sent into it.
+      const status = err instanceof ApiError ? err.status : undefined;
+      const detail = err instanceof Error ? err.message : "Could not load conversation";
+      const outcome = conversationLoadError(status, detail);
+      if (outcome.clear) {
+        setActiveId(null);
+        setMessages([]);
+        setConvTotal(0);
+        if (status === 404) void refreshConversations();
+      }
+      setError(outcome.message);
     }
   }
 
@@ -194,9 +207,12 @@ export default function ChatPage() {
           setBusy(false);
           setStage(null);
         },
-        onError: (detail, conversationId) => {
+        onError: (detail, conversationId, dropConversation) => {
           patchLastAssistant({ content: detail, streaming: false, error: true });
-          if (conversationId) setActiveId(conversationId);
+          // After a 404 (the conversation was deleted elsewhere) the id is dropped, so the
+          // next message starts a new conversation instead of failing again (DA-G2-7).
+          if (dropConversation) setActiveId(null);
+          else if (conversationId) setActiveId(conversationId);
           void refreshConversations();
           setBusy(false);
           setStage(null);

@@ -2,7 +2,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { STREAM_INTERRUPTED, consumeChatStream, parseFrames } from "./chatStream.ts";
+import {
+  CONVERSATION_GONE,
+  CONVERSATION_UNREADABLE,
+  STREAM_INTERRUPTED,
+  consumeChatStream,
+  conversationLoadError,
+  parseFrames,
+  refusedStream,
+} from "./chatStream.ts";
 
 function body(...chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -84,4 +92,42 @@ test("malformed frames are skipped", () => {
   const [events, rest] = parseFrames("data: {oops\n\n" + sse({ type: "stage", stage: "x" }) + "data: {");
   assert.deepEqual(events, [{ type: "stage", stage: "x" }]);
   assert.equal(rest, "data: {");
+});
+
+test("keep-alive comment frames are ignored (DA-G2-3)", async () => {
+  const { calls, handlers } = record();
+  await consumeChatStream(
+    body(": keep-alive\n\n", sse({ type: "conversation", conversation_id: "c1" }), ": keep-alive\n\n",
+      sse({ type: "done", conversation_id: "c1" })),
+    handlers,
+  );
+  assert.deepEqual(calls, ["conversation:c1", "done"]);
+});
+
+test("a 404 before streaming drops the stale conversation id (DA-G2-7)", () => {
+  assert.deepEqual(refusedStream(404, "conversation not found", "c1"), {
+    detail: CONVERSATION_GONE,
+    conversationId: null,
+    dropConversation: true,
+  });
+  assert.deepEqual(refusedStream(429, "rate limit exceeded", "c1"), {
+    detail: "rate limit exceeded",
+    conversationId: "c1",
+    dropConversation: false,
+  });
+});
+
+test("an unreadable (409) or vanished (404) conversation gets a clear message (DA-G2-7)", () => {
+  assert.deepEqual(conversationLoadError(409, "this conversation cannot be decrypted right now"), {
+    message: CONVERSATION_UNREADABLE,
+    clear: true,
+  });
+  assert.deepEqual(conversationLoadError(404, "conversation not found"), {
+    message: CONVERSATION_GONE,
+    clear: true,
+  });
+  assert.deepEqual(conversationLoadError(500, "request failed (500)"), {
+    message: "request failed (500)",
+    clear: false,
+  });
 });

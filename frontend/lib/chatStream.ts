@@ -4,7 +4,8 @@
 // token events; the stream ends with exactly one "done" or "error" event, both carrying the
 // conversation id. This consumer guarantees the UI one terminal callback in every case:
 // a stream that ends (or breaks) without "done"/"error" is reported as an error, so the UI
-// never hangs on a stage.
+// never hangs on a stage. Comment frames (": keep-alive", sent while a stage takes long)
+// carry no data line and are ignored.
 //
 // Plain TypeScript with no imports, so `node --test` can run it with type stripping.
 
@@ -23,6 +24,45 @@ export interface StreamHandlers {
 
 export const STREAM_INTERRUPTED =
   "The connection to the server was interrupted before the answer finished. Please try again.";
+
+export const CONVERSATION_GONE =
+  "This conversation no longer exists (it was deleted). " +
+  "Your next message starts a new conversation.";
+
+export const CONVERSATION_UNREADABLE =
+  "This conversation cannot be decrypted right now, so it cannot be shown or continued. " +
+  "Start a new chat, or delete it from the list.";
+
+/**
+ * A /chat/stream request refused before any streaming (DA-G2-7): the message to show and the
+ * conversation the NEXT message should continue. A 404 means the conversation is gone
+ * (deleted elsewhere): the id is dropped, so the next message starts a new conversation
+ * instead of failing with 404 again. Any other failure keeps the id.
+ */
+export function refusedStream(
+  status: number,
+  detail: string,
+  conversationId: string | null,
+): { detail: string; conversationId: string | null; dropConversation: boolean } {
+  if (status === 404) {
+    return { detail: CONVERSATION_GONE, conversationId: null, dropConversation: true };
+  }
+  return { detail, conversationId, dropConversation: false };
+}
+
+/**
+ * Loading a conversation failed (DA-G2-7): 409 = its data cannot be decrypted (a clear
+ * message instead of a blank view); 404 = it is gone. `clear` = leave that conversation (the
+ * thread is emptied, so nothing is sent into it).
+ */
+export function conversationLoadError(
+  status: number | undefined,
+  detail: string,
+): { message: string; clear: boolean } {
+  if (status === 409) return { message: CONVERSATION_UNREADABLE, clear: true };
+  if (status === 404) return { message: CONVERSATION_GONE, clear: true };
+  return { message: detail, clear: false };
+}
 
 /** Split complete SSE frames off the buffer; returns [events, rest of the buffer]. */
 export function parseFrames(buffer: string): [StreamEvent[], string] {
