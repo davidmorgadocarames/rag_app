@@ -278,13 +278,25 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    with the **public** key only — no plaintext dump ever touches a disk. **File mode** writes
    `secrag-<UTC timestamp>.dump.age` (0600) into a 0700 folder outside any git work tree and
    deletes dumps whose *name* time is older than the retention (a copied or touched file keeps
-   its real age). **Blob mode** (the backup Job, jobs image, managed identity) streams to a
-   new blob `backups/secrag-<ts>.dump.age` (never overwrites; refuses input without the `age`
-   header) and then runs the **oldest-blob check**: the Job fails when there is no backup blob
-   or the oldest one is older than the promise (the Storage lifecycle rule deletes `backups/`
-   after 12 days, so an older blob means the rule broke). **Retention** is one constant, X9 =
+   its real age). **Blob mode** (the backup Job, jobs image, managed identity) encrypts to a
+   private temporary file, then uploads it to a new blob `backups/secrag-<ts>.dump.age` (never
+   overwrites; refuses input without the `age` header) and then runs the **oldest-blob
+   check**: the Job fails when there is no backup blob or the oldest one is older than the
+   promise (the Storage lifecycle rule deletes `backups/` after 12 days, so an older blob
+   means the rule broke). **A failed dump leaves nothing** (DA-F-2): a failed or truncated
+   `pg_dump` still produces a valid `age` stream, so both modes check the exit codes of
+   `pg_dump` **and** `age` and promote the temporary file (rename / upload) only when both
+   are 0; otherwise it is deleted and the run fails. **Retention** is one constant, X9 =
    **14 days**, in `backend/src/rag_app/retention.py`; the scripts read it from that file,
-   and a test checks the scripts and these docs against it. `scripts/db/restore.sh` runs on
+   and a test checks the scripts and these docs against it. The pruners only ever delete
+   files whose name matches the dump (or tombstone export) pattern; a matching name with an
+   invalid date or a time more than a day in the future is kept but **reported** and the run
+   fails (it would otherwise be kept forever), and a leftover `.<name>.partial` older than a
+   day (a killed run) is removed (DA-F-3). **A dump is readable only with the same
+   `DATA_MASTER_KEY`** (DA-F-7): it holds the wrapped user keys and the stored master-key
+   fingerprint, so the master key is escrowed next to the age private key (password manager
+   + offline copy), and the app that serves a restored database must use that very key (any
+   other key fails closed at start-up). `scripts/db/restore.sh` runs on
    the owner's machine (the only place the private key exists — password manager + an offline
    copy, R4-1): it refuses a non-private identity file or one inside a git work tree, invalid
    tombstone exports, and a target database that is not **empty**; it decrypts in a stream into
@@ -355,7 +367,11 @@ refuses to run if that fails.
   account that **no** key can unwrap. One transaction: checks the total, locks the account,
   **proves the current key is the app's key** (DA-E2-1: it must match the stored master-key
   fingerprint when one exists **and** unwrap at least one *other* account — a wrong or stale
-  env file makes every account "KO", so it is refused), refuses unless the current key **and
+  env file makes every account "KO", so it is refused; DA-F-1: while **no** fingerprint is
+  stored, an OLD key still unwraps the accounts wrapped under it, so the current key must
+  unwrap **every** other account, or `--expect-readable R` must equal the readable count that
+  `check` printed with the same key **and** R must be a majority of the other accounts),
+  refuses unless the current key **and
   every candidate** fail on that very blob (and while any candidate line is unreadable or
   malformed; `--no-candidates` when no candidate file exists because recovery was skipped —
   `check` accepts it too), then erases it through the app's own
@@ -402,13 +418,51 @@ not touched.
 
 **Decision update (D-2026-09-29-2 CHANGED, 2026-09-30):** the owner does not need the old
 conversations, so **no recovery is attempted** and no candidate file is created; the path is
-**erase**. Locally: `pg_dump` → `roles.sql` + migration 0005 → `check --accounts all
---no-candidates --current-key-from-env-file backend/.env` (note `N`) → `erase --account I
---expect-total N --no-candidates --current-key-from-env-file backend/.env` (dry run), then the
-same with `--apply --i-have-a-snapshot` → `check --accounts all --expect-total N-1
---no-candidates …` → all OK → first API start. On Azure the owner deletes the unreadable
-account in the running app and re-registers before row 40. With no candidate file there is
-nothing to `shred`. The recovery procedure below stays documented for a future key incident.
+**erase**. On Azure the owner deletes the unreadable account in the running app and
+re-registers before row 40. With no candidate file there is nothing to `shred`. The recovery
+procedure further below stays documented for a future key incident.
+
+**Local erase — the command list** (WSL login shell, repository root; run on 2026-09-30 with
+N = 5, I = 1; stop at the first unexpected line):
+
+```bash
+docker ps -a --filter volume=rag_ia_pgdata --format '{{.Names}} {{.Status}}'
+docker rm <stale container>   # any pre-T11.2.1 container on the volume (it was rag_ia-db-1,
+                              # bound to 0.0.0.0:5432); the volume is kept, never `down -v`
+# compose needs JWT_SECRET/DATA_MASTER_KEY only for interpolation: inline dummies, NEVER export
+JWT_SECRET=unused DATA_MASTER_KEY=unused docker compose up -d --no-deps db
+umask 077; ts=$(date -u +%Y%m%dT%H%M%SZ)
+PGPASSWORD=rag pg_dump -h 127.0.0.1 -p 5432 -U rag -d rag -Fc \
+  -f ~/secrag-backups/rag_ia-pre-erase-$ts.dump
+pg_restore -l ~/secrag-backups/rag_ia-pre-erase-$ts.dump | grep -c 'TABLE DATA'   # > 0
+JWT_SECRET=unused DATA_MASTER_KEY=unused docker compose up -d db-roles migrate
+JWT_SECRET=unused DATA_MASTER_KEY=unused docker compose wait migrate    # exit 0; 0004 -> 0005
+KR() { PGHOST=127.0.0.1 PGPORT=5432 PGUSER=rag PGPASSWORD=rag PGDATABASE=rag \
+  scripts/azure/key_recovery.sh "$@"; }
+KR check --accounts all --no-candidates --current-key-from-env-file backend/.env
+#   → "accounts: N in total"; only account #I KO
+KR erase --account I --expect-total N --no-candidates --current-key-from-env-file backend/.env
+#   → "current key verified: unwraps N-1 of N-1 other account(s); fingerprint not stored yet"
+KR erase --account I --expect-total N --no-candidates --current-key-from-env-file backend/.env \
+  --apply --i-have-a-snapshot
+KR check --accounts all --expect-total N-1 --no-candidates \
+  --current-key-from-env-file backend/.env                              # N-1 of N-1 readable
+env | grep -c '^DATA_MASTER_KEY='   # must be 0: an env var would override backend/.env
+(cd backend && PYTHONPATH=src .venv/bin/uvicorn rag_app.api.app:app --host 127.0.0.1 --port 8000)
+#   first start → /health ok, fingerprint stored; Ctrl-C
+PGPASSWORD=rag psql -h 127.0.0.1 -U rag -d rag -tAc 'SELECT count(*) FROM master_key_fingerprint'  # 1
+```
+
+- **Pre-erase dump**: plaintext (`pg_dump -Fc`, not age), mode 0600 in `~/secrag-backups`
+  (next to the read-only volume snapshots) — **not** `~/secrag-db-backups`, whose pruner only
+  knows `secrag-<ts>.dump.age` names and would never delete it. It expires with the
+  snapshots (X9, 14 days; deleted by hand). Rollback = restore it into a NEW empty database:
+  it is schema 0004, and the 0005 downgrade is not a rollback path.
+- `migrate` and `erase` both run as `rag`, the compose owner; `erase` connects through libpq
+  on 127.0.0.1:5432 (`--no-deps db` binds it there only).
+- **First API start**: native (it reads `backend/.env`, the very key `erase` verified), with
+  no `DATA_MASTER_KEY` in the shell; compose would need the real key exported. A start with
+  any other key fails closed (R5-5: stored keys do not unwrap, or the fingerprint differs).
 
 **Procedure** (the user's real candidates; nothing is run on the developer's database before
 it; note the total `N` that `check` prints):
@@ -420,7 +474,8 @@ it; note the total `N` that `check` prints):
   migration 0005 (compose `db-roles`, `migrate`; they read no user key), `erase --account I
   --expect-total N --current-key-from-env-file backend/.env` (dry run), then the same with
   `--apply --i-have-a-snapshot`, then `check --accounts all --expect-total N-1` → all OK —
-  before the first API start (which writes the fingerprint only when every key unwraps).
+  before the first API start (which writes the fingerprint only when every key unwraps); the
+  exact commands are the local erase list above.
 - Azure (row 40, orchestrator) — `db-tunnel.sh --password-from-app --
   scripts/azure/key_recovery.sh check --accounts all --current-key-from-app secrag-backend`
   (read-only, any time); on a match, after the row-40 `pg_dump`, the same `rewrap` with

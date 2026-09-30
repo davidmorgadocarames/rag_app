@@ -20,6 +20,8 @@
 #
 # --tombstones-dir is mandatory (an empty directory is valid only if nothing was ever erased).
 # The target URL comes from the environment, never argv (it carries the password).
+# The app on the restored database needs the SAME DATA_MASTER_KEY the source used (the dump
+# holds the wrapped user keys and the master-key fingerprint; any other key fails closed).
 set -euo pipefail
 
 # shellcheck source=scripts/db/backup_lib.sh
@@ -96,3 +98,4 @@ echo "restore: db/roles.sql applied"
 # --- 4. tombstones: union + replay --------------------------------------------------------
 DATABASE_URL="$RESTORE_DATABASE_URL" "$py" -m rag_app.tombstones restore-union --dir "$tombstones"
 echo "restore: DONE — every tombstoned account is erased again; the app may reopen"
+echo "restore: start the app with the SAME DATA_MASTER_KEY as the source database (escrowed with the age key)"

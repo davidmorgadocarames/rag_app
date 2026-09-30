@@ -355,12 +355,18 @@ local development DB, an account that no key unwraps is erased with
 `key_recovery.sh erase --account I --expect-total N --current-key-from-env-file backend/.env`
 (dry run; then `--apply --i-have-a-snapshot`): in the same transaction it proves the current
 key is the app's key (it must match the stored master-key fingerprint, if any, and unwrap at
-least one *other* account — a wrong env file is refused), re-checks the current key and every
-candidate on that account, and uses the app's own erasure path (tombstone). When no recovery
-is attempted (no candidate file), `check` and `erase` take `--no-candidates` and there is
-nothing to shred. It needs migration 0005 and never runs against Azure — there the owner
-deletes the account in the app.
-The full procedure is in
+least one *other* account — a wrong env file is refused; while no fingerprint is stored it
+must unwrap **every** other account, or `--expect-readable R` must match `check`'s readable
+count, because an old key still opens the accounts wrapped under it), re-checks the current
+key and every candidate on that account, and uses the app's own erasure path (tombstone).
+When no recovery is attempted (no candidate file), `check` and `erase` take `--no-candidates`
+and there is nothing to shred. It needs migration 0005 and never runs against Azure — there
+the owner deletes the account in the app. Locally, compose needs `JWT_SECRET=unused
+DATA_MASTER_KEY=unused` **inline** (interpolation only) to start `db`, `db-roles` and
+`migrate`; a stale container on the same volume is removed first; the plaintext pre-erase
+`pg_dump` goes to `~/secrag-backups` and is deleted within 14 days; and the first API start
+after the erase is the **native** one (it reads `backend/.env`, with no `DATA_MASTER_KEY` in
+the shell). The exact command list and the full procedure are in
 [ADR phase 11 — Key recovery](docs/adr/adr_phase11_stability.md#key-recovery-d-2026-09-29-2).
 
 ### Backups
@@ -382,6 +388,13 @@ RESTORE_DATABASE_URL=postgresql://<owner>:…@127.0.0.1:5432/<empty db> \
   scripts/db/restore.sh --dump secrag-<ts>.dump.age --identity <private key file> \
   --tombstones-dir <tombstone exports>
 ```
+
+A restored database is readable only with the **same `DATA_MASTER_KEY`** it was dumped
+under: the dump carries the wrapped user keys and the stored master-key fingerprint. Keep
+that key escrowed next to the age private key (password manager + offline copy) and start
+the app on the restored database with it — any other key fails closed at start-up. A failed
+`pg_dump` never leaves a dump behind (file or blob), and the pruners report — and never
+delete — a dump name with an impossible or future date.
 
 On Azure the backup Job runs `backup.sh --blob` daily (managed identity, no storage keys)
 and fails if a dump older than 14 days is still there. To schedule `backup-pull.sh` weekly
