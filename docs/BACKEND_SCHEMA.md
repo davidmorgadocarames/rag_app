@@ -154,6 +154,28 @@ users 1───∞ query_logs
 
 ## 4. Erasure coverage (GDPR)
 
+**As implemented (11a, asynchronous erasure — ADR phase 11 decision 6).** `DELETE /account`
+runs one short transaction: delete `user_keys` (crypto-shred), set `users.email` and
+`users.password_hash` to NULL, set `users.deleted_at`, and upsert `deletion_requests`
+(`status = pending`). The purger (`rag_app.purger`, role `secrag_purger`) follows the
+purge-step registry `rag_app.erasure.PURGE_STEPS`, leaf-first — `messages` → `conversations`
+→ `email_verification_tokens` → `users` — in batches with `FOR UPDATE SKIP LOCKED`, recording
+`progress`/`attempts`/`last_error` on the tombstone and one row per run in `purger_runs`.
+**Schema-scan rule (X3):** every column named `user_id`, `*_user_id`, `admin_id` or `*_hmac`
+needs a purge step or a documented exemption (today: `deletion_requests.user_id` — the opaque
+tombstone kept for replay; `user_keys.user_id` — deleted in the request transaction); a test
+fails otherwise. Tables added later (sessions, lockout, audit, …) add their step with their
+migration.
+
+Migration 0005 columns used here: `users.deleted_at`, nullable `users.email`/`password_hash`,
+`deletion_requests.status` (`pending`/`running`/`done`/`failed`), `progress` (jsonb, rows
+deleted per step), `attempts`, `last_error` (error class only), `updated_at`,
+`completed_at`; `purger_runs` (`started_at`, `finished_at`, `requests_processed`, `errors`,
+`last_error`). Tombstones stay in the database; the exports leave out those `done` for more
+than 15 days.
+
+**Target list (planning):**
+
 Deleting a user removes/renders-unrecoverable, at minimum:
 `users`, `user_keys`, `*_tokens`, `sessions`, `login_attempts` (for that user), `conversations`,
 `messages`, `citations`, `query_logs` — **plus** any per-user cache entries and external trace records.

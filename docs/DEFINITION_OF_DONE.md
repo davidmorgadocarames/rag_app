@@ -108,6 +108,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
 | | | | `backup-drill` | gate DB | 300 s |
+| | | | `erasure-scale` | gate DB | 600 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
@@ -122,12 +123,23 @@ Postgres service (after `roles.sql`), and a DB test proves that a broken downgra
 
 `backup-drill` (T11.2.10, `scripts/db/backup_drill.sh`): throwaway `secrag_drill_*`
 databases on the gate server and throwaway `age` keys (never the real backup key) —
-`backup.sh --file` as `secrag_backup` → erase a test user and export the tombstones →
+`backup.sh --file` as `secrag_backup` → erase a test user through the API's request path and
+run the purger as `secrag_purger` (rows gone, tombstone `done`, export written) →
 `restore.sh` into an empty database with the **offline copy** of the key (the working copy is
 shredded first) → the erased user stays erased and the other is intact; a dump older than the
 retention (X9, 14 days, by the time in its name) is removed, a younger one and unrelated
 files are kept; controls: without the tombstone export the user comes back, a wrong key and a
 non-empty target restore nothing.
+
+`erasure-scale` (T11.2b.7, `rag_app.devtools.erasure_scale`): a throwaway `secrag_scale_*`
+database on the gate server; a synthetic user with **100,000 messages**; the real API in a
+child process (pool 5 + 10 overflow); 8 workers of login + conversation listing + reads (+ a
+few stub chat calls — no GPU) while the user sends `DELETE /account` → **request < 200 ms**,
+202 with the 14-day constant, token refused and key/email gone right after; **pool never
+exhausted** (peak below capacity, no checkout timeout); **no failed load request, no lock
+error**; the purger as `secrag_purger` (real login) is SIGKILLed mid-way (tombstone
+`running`), an overlapping run is skipped, the next run leaves the tombstone **`done`** with 0
+rows; the longest purger transaction < 2 s.
 
 `restart-check` (T11.2.8, `scripts/restart_check.sh`; not in `--fast`): the **real**
 `docker-compose.yml` plus `scripts/restart_check.compose.yml`, which swaps the external dev

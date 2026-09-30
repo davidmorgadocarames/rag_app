@@ -82,10 +82,19 @@ Chat (/chat)              [authenticated]
    verification** button issues a fresh token (`POST /auth/resend-verification`); in dev (no SMTP) the
    API returns the verification link so the user can complete `GET /auth/verify` directly.
 2. **Delete my data** → confirmation modal ("This is irreversible").
-3. On confirm → `DELETE /api/account`:
-   - **Crypto-shred**: destroy the user's encryption key.
-   - Remove relational rows, **vectors**, **cache entries**, and **trace/log** references tied to the user.
-   - Invalidate sessions → redirect to **Landing** with confirmation.
+3. On confirm → `DELETE /api/account` → **202 Accepted** (asynchronous erasure, ADR phase 11
+   decision 6). One short transaction:
+   - **Crypto-shred**: delete the user's wrapped data key — every stored message and title
+     is unreadable from that moment.
+   - **Scrub** the email and password hash; mark the account deleted (`deleted_at`): the
+     current token stops working at once and the email can be registered again.
+   - Queue a **tombstone** (`pending`).
+4. The page shows the server's message ("Account deleted. Your data is unreadable from now
+   on; remaining encrypted rows are removed within 24 h and backup copies within 14 days.")
+   and signs the user out; **Back to the home page** leads to Landing.
+5. The **purger** (hourly Job on Azure, compose `purger` locally) deletes the remaining rows
+   in small batches, leaf-first — messages → conversations → verification tokens → the user
+   row — and marks the tombstone `done`. Restores replay the tombstones before reopening.
 
 ## 3. Route → auth matrix
 

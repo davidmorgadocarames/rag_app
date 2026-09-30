@@ -319,7 +319,46 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    back** (so the export is what keeps them erased), a wrong key restores nothing, a non-empty
    target is refused. The real Blob run and `backup-pull.sh` against Azure are row 42.
 6. Asynchronous erasure: short request transaction (crypto-shred + PII scrub) → 202, then a
-   batched, resumable purger.
+   batched, resumable purger. *Landed in 11.2b (T11.2b.1–8):* **refines ADR phase 6**
+   ("immediate hard delete" → "immediate crypto-shred + PII scrub, batched physical deletion
+   ≤ 24 h, backups ≤ 14 days"; see its *Refinement* section). `DELETE /account` →
+   `rag_app.erasure.request_erasure`: one transaction with `SET LOCAL lock_timeout = '2s'`
+   and `statement_timeout = '5s'` deletes the `user_keys` row, sets `email`/`password_hash`
+   to NULL and `deleted_at`, and upserts the tombstone `pending` → **202** with
+   `ERASURE_ACCEPTED_MESSAGE` (the 24 h deadline and the X9 constant, tested); no export in the
+   request path. `get_current_user` and login ignore `deleted_at` users (a live token → 401
+   at once). **Purger** (`rag_app.purger`; CLI `python -m rag_app.erasure purge |
+   purge-now <request-id> | loop`), run as `secrag_purger` (0005 grants — no schema change
+   was needed, 0005 stays as authored): `pg_try_advisory_lock` on its own connection (an
+   overlapping run is skipped); a `purger_runs` row; for each open tombstone (`pending`,
+   `running`, `failed`) it claims it (`running`, attempts + 1), refuses an account without
+   `deleted_at`, and follows the registry `PURGE_STEPS` leaf-first — each batch (1,000 rows)
+   is its own transaction (`lock_timeout` 2 s, `statement_timeout` 5 s, `FOR UPDATE SKIP
+   LOCKED`) that also records the per-step progress; a timeout or rows held by another
+   transaction back off exponentially (0.5 → 8 s) and after 5 retries the tombstone is
+   `failed` (error class only; retried next run). A killed run leaves `running` + progress
+   and the next run resumes; `--max-seconds` (1500) stops claiming work before the Job's
+   replica timeout. **X3 scan:** `uncovered_user_columns` scans `information_schema` for
+   `user_id`, `*_user_id`, `admin_id`, `*_hmac`; exemptions `deletion_requests.user_id`,
+   `user_keys.user_id`. **Tombstone export** on every run: Blob `tombstones/` when
+   `TOMBSTONE_STORAGE_ACCOUNT` is set (managed identity), else a local folder (compose:
+   `./.tombstones`); entries `done` for more than 15 days are left out; **exports older than
+   30 days are pruned, the newest valid one always kept** (DA-F-8, user decision
+   2026-09-30), and while any export name cannot be judged (invalid or future date) nothing
+   is pruned and the run exits 1 (DA-F2-1 — the same rule now in `backup_lib.sh
+   prune_by_name … keep-newest`, used by `backup-pull.sh` with the 30 days).
+   `replay_deletions` re-applies the short step and re-queues; `purge_orphaned` enqueues;
+   `restore.sh` runs the purger (owner, `--no-export`) after the replay; `backup-drill` now
+   erases through the request path and purges as `secrag_purger`. **Local runner:** compose
+   service `purger` (jobs image, `loop --interval ${PURGE_INTERVAL_SECONDS:-3600}`, runs as
+   the WSL user so the exports are theirs). **Gate step `erasure-scale`**
+   (`rag_app.devtools.erasure_scale`, throwaway `secrag_scale_*` database): a synthetic user
+   with 100,000 messages, the real API in a child process (pool 5 + 10), 8 workers of login +
+   listing + reads + a few stub chat calls; measured on 2026-09-30: `DELETE /account` 202 in
+   **39 ms**, 1,460 load requests with 0 failures, 0 lock errors, 0 pool timeouts, pool peak
+   **9 of 15**; the purger killed at 17,000 messages (tombstone `running`), an overlapping run
+   skipped, the next run finished in 0.9 s (tombstone `done`, 0 rows left, longest
+   transaction 0.021 s).
 7. Global daily answer cap.
 8. (11b) One shared reranker, baked model images, latency gate.
 

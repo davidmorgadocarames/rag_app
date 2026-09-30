@@ -58,6 +58,12 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
 - **F5 — Authentication**: email/password sign-up, email verification, login, logout.
 - **F6 — Abuse defense**: rate limiting and per-user quotas; resistance to mass fake-account signups.
 - **F7 — Data erasure**: a user can delete their account and all associated data (GDPR-style).
+  - *Privacy text*: deleting an account makes the user's data unreadable immediately
+    (crypto-shred) and signs them out; the remaining encrypted records are removed within
+    24 hours; encrypted backup copies expire within 14 days and a restore re-applies every
+    erasure. Operational logs are kept 30 days and contain no conversation content. On the
+    Azure deployment, questions sent to Azure OpenAI may be retained by Microsoft for abuse
+    monitoring for up to 30 days.
 
 ### 5.2 Later / optional
 

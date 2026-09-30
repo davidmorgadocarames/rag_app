@@ -31,9 +31,11 @@ this project is built around them:
   Denial-of-Wallet. Signup risk scoring resists Sybil abuse, and the pipeline defends
   against indirect prompt injection.
 - **Privacy by design.** Each user's data is encrypted with a per-user key. Erasing an
-  account hard-deletes the data and **crypto-shreds** the key. Tombstones let the
-  deletions be replayed after any restore from backup
-  ([ADR phase 6](docs/adr/adr_phase06_gdpr_erasure.md)).
+  account **crypto-shreds** the key and scrubs the email in one short transaction (the data
+  is unreadable at once, `202 Accepted`); a batched, resumable purger then deletes the
+  remaining rows within 24 h without long locks. Tombstones let the deletions be replayed
+  after any restore from backup ([ADR phase 6](docs/adr/adr_phase06_gdpr_erasure.md),
+  [ADR phase 11](docs/adr/adr_phase11_stability.md) decision 6).
 - **Engineering discipline.** A written Definition of Done is enforced by a pre-push gate
   covering lint, strict typing, tests (including DB tests on a throw-away database), secret
   scanning, dependency audit, the frontend build and evals.
@@ -403,6 +405,34 @@ from Windows, a Task Scheduler entry can run
 The gate step `backup-drill` proves the whole cycle on throwaway databases and keys (see
 [ADR phase 11](docs/adr/adr_phase11_stability.md), decision 5).
 
+Tombstone exports are written by the purger on every run (Azure: Blob `tombstones/`;
+locally: the git-ignored `.tombstones/`). Each export is the full list, so exports older
+than **30 days** are pruned and the newest valid one is always kept; if a file name cannot
+be judged (an impossible or future date), nothing is pruned and the run exits non-zero with
+a WARNING line naming the file. `backup-pull.sh` applies the same rule to its local copies.
+
+### Account erasure
+
+`DELETE /account` answers **202** after one short transaction: the user's data key is
+deleted (crypto-shred — everything they wrote is unreadable from that moment), the email
+and password hash are scrubbed, the account is marked deleted (its tokens stop working) and a
+tombstone is queued. The **purger** removes the remaining rows in small batches, leaf-first
+(messages → conversations → verification tokens → the user row), as the least-privilege role
+`secrag_purger`: an hourly Job on Azure, and locally the compose service `purger` (set
+`SECRAG_PURGER_PASSWORD` in the shell or a root `.env`; `PURGE_INTERVAL_SECONDS`, default
+3600). By hand:
+
+```bash
+DATABASE_URL=postgresql+psycopg://secrag_purger:…@127.0.0.1:5432/rag \
+  python -m rag_app.erasure purge --export-dir .tombstones       # every pending erasure
+python -m rag_app.erasure purge-now <request-id> --export-dir .tombstones
+```
+
+The gate step `erasure-scale` erases a synthetic user with 100,000 messages under
+concurrent login and listing load and checks the request stays under 200 ms, the connection
+pool is never exhausted, no lock error reaches another request and a purger killed mid-way
+is completed by the next run.
+
 ## API at a glance
 
 | Endpoint | Purpose |
@@ -412,7 +442,7 @@ The gate step `backup-drill` proves the whole cycle on throwaway databases and k
 | `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage |
 | `POST /chat` | Authenticated one-shot, non-persisting answer with citations and `abstained`/`grounded` flags |
 | `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |
-| `DELETE /account` | GDPR erasure: hard delete, crypto-shred and tombstone |
+| `DELETE /account` | GDPR erasure, **202 Accepted**: crypto-shred + PII scrub at once; the rows are purged within 24 h, backup copies expire within 14 days |
 
 ## Architecture decision records
 

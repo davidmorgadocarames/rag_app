@@ -13,6 +13,8 @@ export default function AccountPage() {
   const [confirming, setConfirming] = useState(false);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
   const [verifyLink, setVerifyLink] = useState<string | null>(null);
+  // The server's 202 message after an erasure (it states the purge and backup deadlines).
+  const [deleted, setDeleted] = useState<string | null>(null);
 
   async function onResend() {
     const token = getToken();
@@ -51,12 +53,32 @@ export default function AccountPage() {
     const token = getToken();
     if (!token) return;
     try {
-      await deleteAccount(token);
+      const res = await deleteAccount(token);
       clearToken();
-      router.push("/");
+      setDeleted(res.detail);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     }
+  }
+
+  if (deleted) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-6 px-6">
+        <h1 className="text-2xl font-bold tracking-[0.12em] text-vault-steel-light">
+          Account deleted
+        </h1>
+        <p className="text-sm text-vault-steel-light" role="status">
+          {deleted}
+        </p>
+        <button
+          type="button"
+          onClick={() => router.push("/")}
+          className="w-fit cursor-pointer border border-vault-steel-dark px-4 py-2 text-sm tracking-[0.1em] text-vault-steel transition-colors hover:border-vault-steel hover:text-vault-steel-light"
+        >
+          Back to the home page
+        </button>
+      </main>
+    );
   }
 
   return (
@@ -108,7 +130,10 @@ export default function AccountPage() {
       <div className="mt-4 border border-vault-danger p-4">
         <p className="font-medium tracking-[0.06em] text-vault-danger">Delete my data</p>
         <p className="mt-1 text-sm text-vault-steel">
-          Erases your account and all associated data. This is irreversible.
+          Erases your account and all associated data. This is irreversible. Your data becomes
+          unreadable immediately and you are signed out; the remaining encrypted records are
+          removed within 24 hours and encrypted backup copies expire within the backup
+          retention period.
         </p>
         {error && <p className="mt-2 text-sm text-vault-danger">{error}</p>}
         {confirming ? (
