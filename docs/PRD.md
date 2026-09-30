@@ -59,6 +59,10 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
   - The verification link reaches the user only by email; the API hands it to the UI only in
     local development (`ENV=dev` without SMTP), never in production.
 - **F6 — Abuse defense**: rate limiting and per-user quotas; resistance to mass fake-account signups.
+  - *Daily answer cap*: the public demo answers at most a fixed number of questions per day
+    for everyone together (300 on Azure), so abuse cannot run up an unbounded bill. When the
+    day's answers are used up, the chat says so in a friendly message and asks the user to
+    come back after midnight UTC; greetings still get their canned reply.
 - **F7 — Data erasure**: a user can delete their account and all associated data (GDPR-style).
   - *Privacy text*: deleting an account makes the user's data in the live service
     unreadable immediately (crypto-shred) and signs them out; the remaining encrypted records

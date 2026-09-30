@@ -28,8 +28,10 @@ this project is built around them:
   isolated gate stack, and a regression blocks the push before CD can deploy it.
 - **Security and abuse resistance.** The app has its own auth (argon2 + JWT + email
   verification) and cost-aware token-bucket rate limiting against brute force and
-  Denial-of-Wallet. Signup risk scoring resists Sybil abuse, and the pipeline defends
-  against indirect prompt injection.
+  Denial-of-Wallet. A **global daily answer cap** (`DAILY_ANSWER_CAP`, 300 a day on Azure)
+  is counted in Postgres before any LLM call, so one day of abuse has a fixed worst-case
+  cost. Signup risk scoring resists Sybil abuse, and the pipeline defends against indirect
+  prompt injection.
 - **Privacy by design.** Each user's data is encrypted with a per-user key. Erasing an
   account **crypto-shreds** the key and scrubs the email in one short transaction (the data
   is unreadable at once, `202 Accepted`); a batched, resumable purger then deletes the
@@ -455,8 +457,16 @@ a purger killed mid-way is completed by the next run.
 |---|---|
 | `POST /auth/register` · `POST /auth/login` · `GET /auth/me` | Account creation (risk-scored), login (rate-limited), current user |
 | `GET /auth/verify` · `POST /auth/resend-verification` | Email verification |
-| `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage |
-| `POST /chat` | Authenticated one-shot, non-persisting answer with citations and `abstained`/`grounded` flags |
+| `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage; once the daily answer cap is reached, an `error` event (`daily_cap_reached`) |
+| `POST /chat` | Authenticated one-shot, non-persisting answer with citations and `abstained`/`grounded` flags; `429` + `Retry-After` (until UTC midnight) once the daily answer cap is reached |
+
+**Daily answer cap.** Registration is open and the cloud chat sits behind one shared proxy
+IP, so the per-IP rate limit cannot bound total spend on its own. Every answer that needs
+the LLM is counted in `usage_daily` (one row per UTC day: answers and tokens, no personal
+data) at the **start** of the request, in one race-safe `INSERT … ON CONFLICT … WHERE
+answers < cap` statement. Failed and interrupted turns count too, because they spend tokens;
+the canned greeting reply makes no LLM call and does not count. Set `DAILY_ANSWER_CAP`
+(default 300; `0` switches it off, `ENV=dev` only).
 | `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |
 | `DELETE /account` | GDPR erasure, **202 Accepted**: crypto-shred + PII scrub at once; the rows are purged within 24 h, backup copies expire within 14 days |
 

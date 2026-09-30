@@ -97,6 +97,17 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
 - **Auth**: email/password, argon2, email verification, JWT/session, login rate limiting.
 - **Rate limiting**: token bucket per IP/user; **cost-aware** variant (a query consumes tokens ∝ its
   cost) to defend against **Denial of Wallet**.
+- **Global daily answer cap (R6-1)**: `DAILY_ANSWER_CAP` answers per UTC day for all users
+  together (default 300; `0` = off, allowed only with `ENV=dev`; `ENV=prod` refuses to start
+  without a positive cap). The counter is `usage_daily` (`day`, `answers`, `tokens` — no
+  personal data). `/chat` and `/chat/stream` reserve the answer at request start, before any
+  LLM call, with one `INSERT … ON CONFLICT (day) DO UPDATE … WHERE answers < cap RETURNING`
+  (race-safe: concurrent requests at `cap − 1` get exactly one answer). Failed or
+  interrupted turns stay counted; tokens are added when the pipeline reports them. At the
+  cap: `/chat` → `429` with `Retry-After` (seconds to UTC midnight); `/chat/stream` → the
+  `conversation` event and an `error` event (`daily_cap_reached`) with the id, nothing
+  stored. The chit-chat canned reply (no LLM call) is not counted. Each refusal logs
+  `daily answer cap reached: day=… cap=…` (no personal data) for the Phase 13 banner.
 - **Sybil/DoS defense**: risk scoring on signup (account age, IP velocity/reputation, disposable-email
   detection), CAPTCHA/proof-of-work, per-user quotas.
 - **Access control**: ACL filter applied **in the vector query**, so unauthorized chunks are never
