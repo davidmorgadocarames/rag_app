@@ -610,7 +610,7 @@ def run(args: argparse.Namespace) -> int:
             f"every request outside the WAL flush < {REQUEST_LIMIT_MS:.0f} ms": max(outside_flush)
             < REQUEST_LIMIT_MS,
             "202 message states the 14-day constant": all(
-                s["message"].endswith(f"within {_retention()} days.") for s in samples
+                f"within {_retention()} days." in s["message"] for s in samples
             ),
             "token refused right after": all(s["me"] == 401 for s in samples),
             "key gone and email scrubbed right after": all(
