@@ -100,9 +100,14 @@ Chat (/chat)              [authenticated]
    - **Scrub** the email and password hash; mark the account deleted (`deleted_at`): the
      current token stops working at once and the email can be registered again.
    - Queue a **tombstone** (`pending`).
-4. The page shows the server's message ("Account deleted. Your data is unreadable from now
-   on; remaining encrypted rows are removed within 24 h and backup copies within 14 days.")
-   and signs the user out; **Back to the home page** leads to Landing.
+4. The page shows the server's message (`ERASURE_ACCEPTED_MESSAGE`: the data in the live
+   service is unreadable from now on and the remaining rows go within 24 h; backup copies
+   still hold the wrapped key and the email until they are deleted within 14 days; a minimal
+   erasure record — random id, dates, status — is kept, its exports for 30 days)
+   and signs the user out; **Back to the home page** leads to Landing. If another
+   transaction holds the account for more than 2 s, the server answers **503** with
+   `Retry-After` and nothing is deleted: the page shows the message, the user stays signed
+   in and can try again.
 5. The **purger** (hourly Job on Azure, compose `purger` locally) deletes the remaining rows
    in small batches, leaf-first — messages → conversations → verification tokens → the user
    row — and marks the tombstone `done`. Restores replay the tombstones before reopening.

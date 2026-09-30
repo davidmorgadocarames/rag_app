@@ -130,10 +130,13 @@ export default function AccountPage() {
       <div className="mt-4 border border-vault-danger p-4">
         <p className="font-medium tracking-[0.06em] text-vault-danger">Delete my data</p>
         <p className="mt-1 text-sm text-vault-steel">
-          Erases your account and all associated data. This is irreversible. Your data becomes
-          unreadable immediately and you are signed out; the remaining encrypted records are
-          removed within 24 hours and encrypted backup copies expire within the backup
-          retention period.
+          Erases your account and all associated data. This is irreversible. Your data in the
+          live service becomes unreadable immediately and you are signed out; the remaining
+          encrypted records are removed within 24 hours. Encrypted backup copies still hold
+          your encrypted data, its wrapped key and your email address until they are deleted,
+          within 14 days. A minimal erasure record (a random id, dates and a status; no email
+          or content) is kept so that a restore cannot bring the account back; its exported
+          copies are kept for 30 days.
         </p>
         {error && <p className="mt-2 text-sm text-vault-danger">{error}</p>}
         {confirming ? (

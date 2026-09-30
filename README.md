@@ -433,6 +433,13 @@ DATABASE_URL=postgresql+psycopg://secrag_purger:…@127.0.0.1:5432/rag \
 python -m rag_app.erasure purge-now <request-id> --export-dir .tombstones
 ```
 
+Every run also counts the erasures still open: one open for more than 24 h (the promise of
+the 202) is reported as `purger: WARNING: N erasure(s) overdue` and the run exits 1, so a
+purge Job that is not scheduled, keeps failing or keeps being skipped shows up as failed.
+`--until-done` (used by `restore.sh`) exits 1 while any erasure is still open. If the short
+transaction of `DELETE /account` cannot get the account's row lock within 2 s, the API
+answers **503** with `Retry-After` and nothing is changed.
+
 The gate step `erasure-scale` erases synthetic users with 100,000 messages each under
 concurrent login and listing load and checks the request stays under 200 ms (measured:
 35-74 ms), the connection pool is never exhausted, no lock error reaches another request and

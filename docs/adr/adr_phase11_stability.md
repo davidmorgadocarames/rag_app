@@ -338,7 +338,15 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
    transaction back off exponentially (0.5 → 8 s) and after 5 retries the tombstone is
    `failed` (error class only; retried next run). A killed run leaves `running` + progress
    and the next run resumes; `--max-seconds` (1500) stops claiming work before the Job's
-   replica timeout. **X3 scan:** `uncovered_user_columns` scans `information_schema` for
+   replica timeout. *G1 fixes:* every run (a skipped one too) counts the open tombstones and
+   those open for more than 24 h — any **overdue** one prints `purger: WARNING: N erasure(s)
+   overdue` and exits 1, so a Job that never runs on schedule, keeps failing or keeps being
+   skipped fails visibly (DA-G1-1); `--until-done` (used by `restore.sh`) exits 1 while any
+   tombstone is still open, so a restore whose purger pass stops at its time limit never
+   prints "DONE" (DA-G1-8). A lock/statement timeout in the request path answers **503** with
+   `Retry-After` (nothing changed) instead of a 500 (DA-G1-4); `/auth/verify` ignores erased
+   accounts (DA-G1-5); `backup-pull.sh` picks the newest dump/export among valid,
+   non-future names only (DA-G1-3). **X3 scan:** `uncovered_user_columns` scans `information_schema` for
    `user_id`, `*_user_id`, `admin_id`, `*_hmac`; exemptions `deletion_requests.user_id`,
    `user_keys.user_id`. **Tombstone export** on every run: Blob `tombstones/` when
    `TOMBSTONE_STORAGE_ACCOUNT` is set (managed identity), else a local folder (compose:

@@ -40,9 +40,13 @@ deleted in bulk the same way. Since 11a (D-ER):
 1. **Request path — one short transaction** (`lock_timeout` 2 s, `statement_timeout` 5 s):
    delete the `user_keys` row (crypto-shred: the data is unreadable at once), scrub `email` and
    `password_hash`, set `users.deleted_at` (login and every token check ignore the account
-   immediately), tombstone `pending` → **202 Accepted**: "Account deleted. Your data is
-   unreadable from now on; remaining encrypted rows are removed within 24 h and backup copies
-   within 14 days." Its cost does not depend on the size of the history.
+   immediately), tombstone `pending` → **202 Accepted**: "Account deleted. Your data in the
+   live service is unreadable from now on, and the remaining encrypted rows are removed
+   within 24 h. Encrypted backup copies still hold your encrypted data, its wrapped key and
+   your email address until they are deleted, within 14 days. A minimal erasure record (a
+   random id, dates and a status; no email or content) is kept so that a restore from backup
+   cannot bring the account back; its exported copies are kept for 30 days." Its cost does
+   not depend on the size of the history.
 2. **Purger** (`python -m rag_app.erasure purge`, role `secrag_purger`, hourly Job on Azure,
    compose loop locally): a purge-step registry, leaf-first (messages → conversations →
    verification tokens → the `users` row last); batches of ~1,000 rows, each its own short
@@ -56,8 +60,11 @@ deleted in bulk the same way. Since 11a (D-ER):
    traffic).
 
 The "no key → purge" invariant, the tombstones and the replay are unchanged; what changed is
-*when* the rows disappear (≤ 24 h instead of inside the request) — the data is unreadable
-from the first moment either way.
+*when* the rows disappear (≤ 24 h instead of inside the request) — the data in the live
+service is unreadable from the first moment either way. **Backups are the exception, for at
+most 14 days:** a dump or point-in-time copy taken before the erasure still holds the wrapped
+data key and the plaintext email (inside the age/PITR encryption, "beyond use"); it expires
+with the backup retention, and a restore from it re-erases the account before reopening.
 
 ## Backups & retention
 
@@ -70,15 +77,22 @@ from the first moment either way.
   now the single constant X9 = 14 days in `backend/src/rag_app/retention.py`, which covers
   point-in-time restore, the encrypted Blob dumps and the local copies — see
   [ADR phase 11](adr_phase11_stability.md).)*
-- Tombstones (`deletion_requests`) contain **no personal data** and are kept indefinitely
-  as the audit/replay record.
+- Tombstones (`deletion_requests`) hold a random `user_id`, the dates, a status and
+  per-step counts — **no email or content** — and are kept as the audit/replay record; the
+  users are told so (the 202 text and the privacy text). Once the backups (14 days) and the
+  logs (30 days) have expired, nothing links the id to a person. **Planned:** delete `done`
+  tombstones older than ~60 days when the `retention` role arrives (X4; it needs a DELETE
+  grant in that phase's migration). Their **exports** (random id + request date, Blob
+  `tombstones/` and the local copies) are kept **30 days**, the newest always.
 
 ## Transparency
 
-Users are told, at deletion time and in the privacy notice, that: their data is unreadable
-immediately (crypto-shred) and the remaining encrypted rows are deleted within 24 hours
-(11a); encrypted copies in backups are put beyond use and deleted within the 14-day backup
-window; and deletions are replayed after any restore. The privacy text also states that
+Users are told, at deletion time and in the privacy notice, that: their data in the live
+service is unreadable immediately (crypto-shred) and the remaining encrypted rows are
+deleted within 24 hours (11a); encrypted copies in backups — which still hold the wrapped
+key and the email address — are put beyond use and deleted within the 14-day backup window;
+a minimal erasure record (random id, dates, status) is kept and its exports for 30 days; and
+deletions are replayed after any restore. The privacy text also states that
 operational logs are kept 30 days without content and that Azure OpenAI may retain prompts
 for abuse monitoring for up to 30 days (Azure deployment).
 
