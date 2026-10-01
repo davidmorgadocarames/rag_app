@@ -256,9 +256,12 @@ Decisions 1–7 and 9 landed in 11a (the italic notes say where); decision 8 is 
    `scripts/cd/azure_jobs.sh`: `job update --image <jobs digest>` verified, `job start` with
    no overrides, wait; Failed/Stopped/Degraded or a timeout stop the pipeline) → apps → purge
    and backup Job images (digest). Job names come from repo variables; the Jobs are
-   versioned YAML (`deploy/azure/jobs/*.yaml`: Manual trigger, placeholder image and
-   secrets, parallelism 1, timeout, retry limit) applied by hand — CD never applies YAML or
-   touches schedules. A dry run prints the same order step by step, and the dispatch input
+   versioned YAML (`deploy/azure/jobs/*.yaml`: placeholder image and secrets, parallelism 1,
+   timeout, retry limit; the migration Job has a Manual trigger, the purge and backup Jobs a
+   **Schedule trigger with the dormant cron `0 0 1 1 *`** — D-2026-10-01-5, because
+   `az containerapp job update` cannot change a trigger type, only the cron of a Schedule
+   Job; the real cron is set by hand after the promotion's CD run) applied by hand — CD never
+   applies YAML or touches schedules. A dry run prints the same order step by step, and the dispatch input
    `simulate_failure` (dry runs only) stops it at the migration step. **Migration 0005**
    (expand): `master_key_fingerprint`, `users.deleted_at`, nullable `email`/`password_hash`,
    tombstone status/progress/attempts/last error (old tombstones = `done`), `purger_runs`,
@@ -393,11 +396,11 @@ Decisions 1–7 and 9 landed in 11a (the italic notes say where); decision 8 is 
    midnight); `/chat/stream` → the `conversation` event and an `error` event
    `daily_cap_reached` with a friendly message, nothing stored, no pipeline. The counter
    failing closes the door (`storage_failed`), it never opens it. `DAILY_ANSWER_CAP` defaults
-   to **300** in code (so Azure is capped even without the variable), `0` switches it off
-   with `ENV=dev` only; `ENV=prod` refuses 0 and negative values. Every LLM call passes
-   `max_tokens` (generation 1024, groundedness 16), so one answer has a bounded worst-case
-   cost — the table under [Costs](#costs) chooses the Azure value (300 or 150) at the
-   promotion.
+   to **150** in code — the Azure value (D-2026-10-01-1), so Azure is capped at it even if
+   the variable is lost (gotcha 7) — `0` switches it off with `ENV=dev` only; `ENV=prod`
+   refuses 0 and negative values. Every LLM call passes `max_tokens` (generation 1024,
+   groundedness 16), so one answer has a bounded worst-case cost — the table under
+   [Costs](#costs) is the basis of the 150 choice.
 8. (11b) One shared reranker, baked model images, latency gate.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
@@ -581,8 +584,8 @@ it; note the total `N` that `check` prints):
 
 ## Rollback
 
-*Written before each promotion.* **11a — written 2026-10-01, to be reviewed by the user
-before the Azure pre-merge.**
+*Written before each promotion.* **11a — written 2026-10-01, revised the same day after the DA
+pre-promotion review (DA-P-1, 3, 5, 9, 10); reviewed by the user before the Azure pre-merge.**
 
 **Principles.**
 
@@ -608,8 +611,22 @@ before the Azure pre-merge.**
 RG=rg-secrag
 OLD_BACKEND=ghcr.io/davidmorgadocarames/rag_app-backend@sha256:dfbb568bfcd6be33a396a36ceb9702db3d55ce30d1872101ea01bbdc68394b1e
 OLD_FRONTEND=ghcr.io/davidmorgadocarames/rag_app-frontend@sha256:6706e998094190e709ea7e555e7788d1dbc4de2b91ad9a7c93e2112c9885e04c
-UVICORN='exec uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000'
+FQDN=$(az containerapp show -g $RG -n secrag-backend --query properties.configuration.ingress.fqdn -o tsv)
 ```
+
+**The uvicorn-only command override.** `--command "env" --args "UVICORN_HOST=0.0.0.0"
+"UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app"`: `env` sets uvicorn's own host/port
+variables and `exec`s uvicorn (no shell; uvicorn is PID 1 and gets SIGTERM directly), which
+is the 11a image's `CMD`. It contains no argument that starts with `-` on purpose: az 2.90
+reads a leading `-` inside `--args` as one of its own options (`--command "/bin/sh" --args
+"-c" …` fails with "unrecognized arguments", DA-P-1). Checked 2026-10-01: it parses in az
+2.90; in the **pre-11a digest above** over a 0005 database it starts (`Uvicorn running on
+http://0.0.0.0:8000`, `/health` 200), while that image's own `CMD` exits 255 there ("Can't
+locate revision 0005"); in the **11a image** it starts with the fingerprint written. Both
+images have `WORKDIR /app`, `PYTHONPATH=/app/src` and no `ENTRYPOINT`, so no `--app-dir` is
+needed, and the override adds no container environment variable (gotcha 7 does not apply).
+Revision suffixes carry a timestamp (`ts=$(date -u +%Y%m%d%H%M%S)`) so a repeated command does
+not collide with an existing revision name.
 
 **Pre-step, before the first real CD run (D-2026-09-30-4).** Once the migration Job has moved
 the database to 0005, the pre-11a image's own `alembic upgrade head` fails on a revision it
@@ -619,52 +636,94 @@ old revision in place. So, in the pre-merge, the running backend gets the **same
 its command overridden to uvicorn only**:
 
 ```bash
+ts=$(date -u +%Y%m%d%H%M%S)
 az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND" \
-  --command "/bin/sh" --args "-c" "$UVICORN" --revision-suffix pre11a-uvicorn
+  --command "env" --args "UVICORN_HOST=0.0.0.0" "UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app" \
+  --revision-suffix "pre11a-$ts"
 az containerapp show -g $RG -n secrag-backend \
   --query "properties.template.containers[0].{image:image,command:command,args:args}" -o json
-curl -fsS "https://$(az containerapp show -g $RG -n secrag-backend \
-  --query properties.configuration.ingress.fqdn -o tsv)/health"   # wake-up; then log in and open a conversation
+# expect image = $OLD_BACKEND, command = ["env"],
+#        args = ["UVICORN_HOST=0.0.0.0","UVICORN_PORT=8000","uvicorn","rag_app.api.app:app"]
+curl -fsS "https://$FQDN/health"   # wake-up; then log in and open a conversation
 ```
 
-This also rehearses the rollback command below on the live app. The override stays in the
-template when CD later updates the image; it is equivalent to the 11a image's own `CMD`
-(uvicorn only, `/bin/sh` exists in `python:3.12-slim`), so it is kept.
+This also rehearses the rollback command below on the live app (nothing has changed in the
+database yet, so a failure here simply stops the promotion). The override stays in the
+template when CD later updates the image; it is equivalent to the 11a image's own `CMD`, so it
+is kept.
 
-**Main trigger — "migrate OK, apps update failed".** CD's migration step is green (database
-at 0005), then the apps step fails, or the new backend revision is not healthy (for example
-it refuses to start: invalid settings, master-key fingerprint, R5-5), or the Azure smoke finds
-a fault that blocks users.
+**Health gate after CD = the rollback trigger (DA-P-5).** CD's `update` returns when the
+revision is provisioned, not when the app is healthy, so a backend that refuses to start
+(invalid settings, master-key fingerprint, R5-5) still leaves a green run. Right after CD, and
+**before** the purge/backup crons are switched on:
+
+```bash
+curl -fsS "https://$FQDN/health"   # wakes the new revision; must answer 200
+az containerapp revision list -g $RG -n secrag-backend \
+  --query "[?properties.active].{name:name,health:properties.healthState,running:properties.runningState,image:properties.template.containers[0].image}" -o table
+# expect one active revision on the NEW backend digest, Healthy, Running
+# master_key_fingerprint has exactly 1 row (db-tunnel.sh … psql -c "SELECT count(*) FROM master_key_fingerprint")
+```
+
+Any of the three failing is the **main trigger**.
+
+**Main trigger — "migrate OK, apps failed or unhealthy".** CD's migration step is green
+(database at 0005), then the apps step fails, or the health gate above fails, or the Azure
+smoke finds a fault that blocks users. **Not a trigger (DA-P-10):** the apps updated and pass
+the health gate and only CD's last step ("Purge and backup Job images") failed — the
+deployment shows `failure`, but users are fine: **roll forward** — set the two Job images by
+hand from the migration Job's digest (step 3 below, without the delete) and continue.
 
 1. **See what is running:** `az containerapp revision list -g $RG -n secrag-backend -o table`
    and the `show` query above. If the backend still runs `$OLD_BACKEND` with the override
-   (the update never applied), there is nothing to roll back: users are on the old app over
-   0005 (effects below) until a forward fix is deployed.
+   (the update never applied), there is nothing to roll back for the apps: users are on the
+   old app over 0005 (effects below) — do step 3 and fix forward.
 2. **Roll both apps back together** (the new frontend expects the 11a API, the old one the
    old API):
 
    ```bash
-   ts=$(date -u +%Y%m%d%H%M)
+   ts=$(date -u +%Y%m%d%H%M%S)
    az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND" \
-     --command "/bin/sh" --args "-c" "$UVICORN" --revision-suffix "rb-$ts"
+     --command "env" --args "UVICORN_HOST=0.0.0.0" "UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app" \
+     --revision-suffix "rb-$ts"
    az containerapp update -g $RG -n secrag-frontend --image "$OLD_FRONTEND" --revision-suffix "rb-$ts"
    ```
 
    Then the scale check (min 0 / max 1 on every app), `/health`, a login and a conversation
    read, and a note of the time (the window of the effects below).
-3. **Jobs.** The **purge Job is kept**, on its hourly schedule if it was already switched: it
-   runs the new jobs image against 0005 independently of the app image and keeps the 24 h
-   promise of every 202 already sent; the tombstones that the old image's synchronous
-   `DELETE /account` writes get the 0005 default `pending`, and since that user row is
-   already gone the purger closes them as `done` with 0 rows. The **migration and backup
-   Jobs are deleted by default** (`az containerapp job delete -g $RG -n <job> --yes`): no
-   one can start a migration while the apps are rolled back, and the next attempt re-creates
-   both from YAML (placeholder image + Manual trigger, then `job update --image` to the
-   deployed digest, X1). The **Storage account and its blobs are kept** (encrypted; the
-   12-day lifecycle rule keeps running).
+3. **Jobs (DA-P-3, D-2026-10-01-4).** The main trigger fails CD **before** its last step, so
+   the purge and backup Jobs still run the placeholder image on the dormant cron. The
+   migration Job is the only one that carries the deployed jobs digest — read it **before**
+   deleting that Job:
+
+   ```bash
+   JOBS_IMAGE=$(az containerapp job show -g $RG -n "$AZURE_MIGRATE_JOB" \
+     --query "properties.template.containers[0].image" -o tsv)
+   echo "$JOBS_IMAGE"   # must be ghcr.io/davidmorgadocarames/rag_app-jobs@sha256:…; else take it
+                        # from the CD run's image digests and stop until it is known
+   for job in "$AZURE_PURGE_JOB" "$AZURE_BACKUP_JOB"; do
+     az containerapp job update -g $RG -n "$job" --image "$JOBS_IMAGE"
+     az containerapp job show -g $RG -n "$job" \
+       --query "{image:properties.template.containers[0].image,cron:properties.configuration.scheduleTriggerConfig.cronExpression,timeout:properties.configuration.replicaTimeout,retry:properties.configuration.replicaRetryLimit}" -o json
+   done
+   az containerapp job update -g $RG -n "$AZURE_PURGE_JOB" --cron-expression "0 * * * *"
+   az containerapp job update -g $RG -n "$AZURE_BACKUP_JOB" --cron-expression "0 3 * * *"
+   az containerapp job delete -g $RG -n "$AZURE_MIGRATE_JOB" --yes
+   ```
+
+   The **purge Job is kept**: it runs the new jobs image against 0005 independently of the
+   app image and keeps the 24 h promise of every 202 already sent; the tombstones that the old
+   image's synchronous `DELETE /account` writes get the 0005 default `pending`, and since that
+   user row is already gone the purger closes them as `done` with 0 rows. The **backup Job is
+   kept** too (D-2026-10-01-4: it only reads as `secrag_backup`, does not depend on the app
+   image, and keeps the 14-day copies flowing). The **migration Job is deleted**: no one can
+   start a migration while the apps are rolled back; the next attempt re-creates it from YAML
+   (placeholder image, then `job update --image` to the deployed digest, X1, and the owner's
+   secret). The **Storage account and its blobs are kept** (encrypted; the 12-day lifecycle
+   rule keeps running).
 4. **Forward fix:** a new commit on `main` through the full gate; CD compares it with the last
-   *successful* deployment and redeploys. Re-create the deleted Jobs first (the migration
-   step needs its Job).
+   *successful* deployment and redeploys. Re-create the migration Job first (the migration
+   step needs it).
 
 **Accepted short-window effects of the old image on 0005** (keep the rollback short):
 
@@ -731,6 +790,8 @@ Worst case: 14,900 × $0.40/1M + 1,040 × $1.60/1M = $0.00596 + $0.00166 = $0.00
 30-day columns assume the cap is **exhausted every day** (sustained abuse); the per-IP rate
 limiter and the deployment's 10K TPM quota do not bind first (300 × 15K ≈ 4.5M tokens/day is
 below 10K TPM × 1,440 min ≈ 14.4M). Against the $86 student credit, 300/day at the worst case
-is ~80 % of it in 30 days; 150/day is ~40 %. The cap value is chosen at row 40
-(D-2026-09-30-8 Q2); the real average per answer is `usage_daily.tokens / answers` (a lower
-bound, DA-31b-4) after the first Azure week.
+is ~80 % of it in 30 days; 150/day is ~40 %. **Decision (D-2026-10-01-1): 150/day** on
+Azure, which is also the code default (a lost env var cannot raise it); demo traffic is far
+below it, and raising it later is one change of the existing variable plus a `printenv` check
+in the running revision. The real average per answer is `usage_daily.tokens / answers` (a
+lower bound, DA-31b-4) after the first Azure week.
