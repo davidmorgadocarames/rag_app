@@ -15,6 +15,9 @@
   (backend, frontend) and store data in **Azure Database for PostgreSQL Flexible Server**
   with the `pgvector` extension enabled (`alembic upgrade head` runs against it). No
   migration to Azure Container Registry — Container Apps keep pulling from GHCR.
+  *(The Container Apps environment created here, `secrag-env`, was an Express environment —
+  no Jobs, no revision suffixes; Phase 11a replaced it with the standard environment
+  `secrag-cae`: [ADR phase 11](adr_phase11_stability.md), decision 10.)*
 - **Model tier via a pluggable provider.** Introduce a `ChatClient` interface with two
   implementations — `OllamaChat` (local) and `AzureOpenAIChat` (hosted) — selected by a
   new `LLM_PROVIDER` setting (default `ollama`). The cloud deployment sets

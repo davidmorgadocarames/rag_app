@@ -183,7 +183,7 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
 
 ## Decisions
 
-Decisions 1–7 and 9 landed in 11a (the italic notes say where); decision 8 is 11b.
+Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8 is 11b.
 
 1. Fixed development volume and an isolated gate project. *Landed in 11.0 (gate part):*
    `compose.gate.yml` (project `secrag-gate`, volume `secrag_gate_pgdata`, DB on
@@ -419,6 +419,36 @@ Decisions 1–7 and 9 landed in 11a (the italic notes say where); decision 8 is 
    pinned to a full Hub commit and loaded offline when cached; `dependency-audit` has no
    interim Python exception left (postcss in Next only). The evaluation did not move:
    recall 1.0 · faithfulness 1.0 · correctness 0.9 · abstention 1.0 before and after.
+10. Container Apps environment: Express → standard (workload profiles). *Done on Azure on
+    2026-10-01, before the promotion.* **Why:** the Phase 10 environment `secrag-env` turned
+    out to be an **Express** environment — it rejects Container Apps Jobs (decisions 3, 5 and
+    6 need three of them) and revision suffixes, and it has no workload profiles. Express
+    quirks met while preparing the promotion: `az containerapp revision restart` failed with
+    `InternalServerError`; changing an app's environment variable did not restart the running
+    replica; `printenv` through `az containerapp exec` printed nothing, so a variable is read
+    with `python -c "import os; print(os.environ.get(…))"` instead. **How:** a new standard
+    environment **`secrag-cae`** in the same resource group and region (Spain Central), on the
+    same Log Analytics workspace, with the **Consumption** workload profile. az 2.90's
+    `containerapp env create` cannot ask for an environment mode (the resource provider then
+    defaults to Express), so it was created with `az rest --method put` on
+    `…/managedEnvironments/secrag-cae?api-version=2026-07-01` with
+    `properties.environmentMode = WorkloadProfiles`, and the mode was read back. **Gate G**
+    before any app moved: a throwaway Schedule Job (`0 * * * *`, Consumption profile) was
+    created and started in the new environment, and reachability probes passed; on failure
+    only the new, empty environment would have been deleted. Then the three apps were
+    recreated there with the **same names** (min 0 / max 1): the backend on the pre-11a digest
+    with the uvicorn-only override of the [Rollback](#rollback) pre-step and
+    `DAILY_ANSWER_CAP=150`; the frontend rebuilt from the deployed commit (`dee9cbc-cae`) with
+    the new backend URL baked in (`NEXT_PUBLIC_API_URL` is build-time, ADR phase 10; the
+    repository variable was updated for CD); Ollama pinned by digest (0.35.0). The old
+    environment was deleted after the smoke. **Consequences:** the public URLs changed (new
+    default domain; any old link to the Express domain is dead, and so is every frontend image
+    that baked it); **one** environment hosts the apps and the Jobs; the
+    subscription's quota allows one standard environment in the region, so a second one (for
+    example, a blue/green move) means deleting this one first; the Consumption profile keeps
+    scale-to-zero billing, so the cost model under [Costs](#costs) is unchanged. Every
+    `az containerapp update` in this ADR is written without a revision suffix — the form that
+    was tested.
 
 ## Key recovery (D-2026-09-29-2)
 
@@ -603,14 +633,17 @@ pre-promotion review (DA-P-1, 3, 5, 9, 10); reviewed by the user before the Azur
   the `master_key_fingerprint` row (the old image ignores it).
 
 **Previous images** (recorded 2026-10-01 with read-only `az containerapp show` and
-`docker buildx imagetools inspect` of the deployed tags): the running revision
-`secrag-backend--latest` (single revision mode, min 0 / max 1) runs
-`rag_app-backend:dee9cbc…`, whose `CMD` is `sh -c "alembic upgrade head && uvicorn …"`.
+`docker buildx imagetools inspect` of the deployed tags; updated the same day for the move to
+`secrag-cae`, decision 10): the backend (single revision mode, min 0 / max 1) runs
+`rag_app-backend:dee9cbc…`, whose `CMD` is `sh -c "alembic upgrade head && uvicorn …"`. The
+previous frontend is the `dee9cbc-cae` rebuild, which bakes the `secrag-cae` backend URL; the
+original `dee9cbc` frontend digest (`6706e998…`) bakes the deleted Express domain and must
+never be rolled back to.
 
 ```bash
 RG=rg-secrag
 OLD_BACKEND=ghcr.io/davidmorgadocarames/rag_app-backend@sha256:dfbb568bfcd6be33a396a36ceb9702db3d55ce30d1872101ea01bbdc68394b1e
-OLD_FRONTEND=ghcr.io/davidmorgadocarames/rag_app-frontend@sha256:6706e998094190e709ea7e555e7788d1dbc4de2b91ad9a7c93e2112c9885e04c
+OLD_FRONTEND=ghcr.io/davidmorgadocarames/rag_app-frontend@sha256:e924953b88a845c7b9bfb336784ed14fcbaa8fce995919031648281d946f2181
 FQDN=$(az containerapp show -g $RG -n secrag-backend --query properties.configuration.ingress.fqdn -o tsv)
 ```
 
@@ -625,21 +658,20 @@ http://0.0.0.0:8000`, `/health` 200), while that image's own `CMD` exits 255 the
 locate revision 0005"); in the **11a image** it starts with the fingerprint written. Both
 images have `WORKDIR /app`, `PYTHONPATH=/app/src` and no `ENTRYPOINT`, so no `--app-dir` is
 needed, and the override adds no container environment variable (gotcha 7 does not apply).
-Revision suffixes carry a timestamp (`ts=$(date -u +%Y%m%d%H%M%S)`) so a repeated command does
-not collide with an existing revision name.
+No revision suffix is passed (decision 10): Azure names each new revision itself, so a
+repeated command never collides with an existing revision name.
 
 **Pre-step, before the first real CD run (D-2026-09-30-4).** Once the migration Job has moved
 the database to 0005, the pre-11a image's own `alembic upgrade head` fails on a revision it
 does not know, so **every cold start** (min replicas 0 → every wake-up) would crash-loop
 between CD's `migrate` and `apps` steps, and for as long as a failed `apps` step leaves the
 old revision in place. So, in the pre-merge, the running backend gets the **same image with
-its command overridden to uvicorn only**:
+its command overridden to uvicorn only** (done 2026-10-01: the backend recreated in
+`secrag-cae`, decision 10, was created with this override; the check below still applies):
 
 ```bash
-ts=$(date -u +%Y%m%d%H%M%S)
 az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND" \
-  --command "env" --args "UVICORN_HOST=0.0.0.0" "UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app" \
-  --revision-suffix "pre11a-$ts"
+  --command "env" --args "UVICORN_HOST=0.0.0.0" "UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app"
 az containerapp show -g $RG -n secrag-backend \
   --query "properties.template.containers[0].{image:image,command:command,args:args}" -o json
 # expect image = $OLD_BACKEND, command = ["env"],
@@ -682,11 +714,9 @@ hand from the migration Job's digest (step 3 below, without the delete) and cont
    old API):
 
    ```bash
-   ts=$(date -u +%Y%m%d%H%M%S)
    az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND" \
-     --command "env" --args "UVICORN_HOST=0.0.0.0" "UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app" \
-     --revision-suffix "rb-$ts"
-   az containerapp update -g $RG -n secrag-frontend --image "$OLD_FRONTEND" --revision-suffix "rb-$ts"
+     --command "env" --args "UVICORN_HOST=0.0.0.0" "UVICORN_PORT=8000" "uvicorn" "rag_app.api.app:app"
+   az containerapp update -g $RG -n secrag-frontend --image "$OLD_FRONTEND"
    ```
 
    Then the scale check (min 0 / max 1 on every app), `/health`, a login and a conversation
@@ -792,6 +822,7 @@ limiter and the deployment's 10K TPM quota do not bind first (300 × 15K ≈ 4.5
 below 10K TPM × 1,440 min ≈ 14.4M). Against the $86 student credit, 300/day at the worst case
 is ~80 % of it in 30 days; 150/day is ~40 %. **Decision (D-2026-10-01-1): 150/day** on
 Azure, which is also the code default (a lost env var cannot raise it); demo traffic is far
-below it, and raising it later is one change of the existing variable plus a `printenv` check
-in the running revision. The real average per answer is `usage_daily.tokens / answers` (a
+below it, and raising it later is one change of the existing variable plus a check in the
+running revision (`az containerapp exec` with `python -c`, since `printenv` printed nothing on
+the Express environment, decision 10). The real average per answer is `usage_daily.tokens / answers` (a
 lower bound, DA-31b-4) after the first Azure week.
