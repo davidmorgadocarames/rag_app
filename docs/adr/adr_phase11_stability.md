@@ -9,6 +9,8 @@
 - **Related:** [ADR phase 6](adr_phase06_gdpr_erasure.md) (erasure, refined by 11a),
   [ADR phase 9](adr_phase09_deployment.md) (migrations at container start, superseded by
   11a), [ADR phase 10](adr_phase10_azure.md) (Azure deployment).
+- **Phase report:** [Phase 11a report](../phases/phase-11a.md) — Azure promotion, smoke,
+  restore rehearsal and cost evidence.
 
 ## Context
 
