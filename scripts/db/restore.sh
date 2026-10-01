@@ -11,8 +11,13 @@
 #      symlink, not inside a git work tree); the tombstone exports are valid; the target
 #      database is EMPTY (no relation in `public`) and the roles of db/roles.sql exist
 #   2. decrypt with the identity (streamed — no plaintext dump on disk) → pg_restore as the
-#      owner, one transaction, stop at the first error (default-privilege entries of the
-#      source owner are skipped; step 3 sets them for this owner)
+#      owner (--no-owner), one transaction, stop at the first error, from a FILTERED list
+#      (rag_app.restore_toc; one summary line says what was skipped): the extensions the cloud
+#      provider manages (MANAGED_EXTENSIONS below + RESTORE_SKIP_EXTENSIONS, space-separated)
+#      and their comments; ACLs in pg_catalog and on schema public; default-privilege entries
+#      (step 3 sets them for this owner); ACL entries naming a role the target lacks (their
+#      grants to existing roles are re-applied). Grants on the app's tables are kept. Any
+#      other extension in the dump must be available on the target (checked first)
 #   3. db/roles.sql (default privileges), `alembic upgrade head`
 #   4. the UNION of the restored tombstones and every exported one (Blob `tombstones/` —
 #      pulled by backup-pull.sh — or the local export folder), then `replay_deletions`
@@ -32,7 +37,14 @@ set -euo pipefail
 # shellcheck source=scripts/db/backup_lib.sh
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/backup_lib.sh"
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Extensions the cloud provider installs and manages on its servers, which no other server
+# has: never restored (with their COMMENT). Add a name here when a provider adds one; for a
+# one-off restore, RESTORE_SKIP_EXTENSIONS="name …" adds to it.
+#   azure      Azure Database for PostgreSQL Flexible Server (CREATE EXTENSION azure)
+#   pgaadauth  Azure: Microsoft Entra ID authentication
+MANAGED_EXTENSIONS=(azure pgaadauth)
 
 dump="" identity="" tombstones=""
 while [ $# -gt 0 ]; do
@@ -95,8 +107,25 @@ case "$rc" in
   *) die "$dump decrypts, but pg_restore cannot read it as a pg_dump archive (pg_restore -l rc $AGE_READER_RC) — nothing restored" ;;
 esac
 grep -qv '^;' "$work/toc" || die "$dump decrypts, but its archive lists no entries — nothing restored"
-grep -v ' DEFAULT ACL ' "$work/toc" >"$work/toc.restore" || true
-echo "restore: decrypted; $(grep -vc '^;' "$work/toc") archive entries ($(grep -c ' DEFAULT ACL ' "$work/toc" || true) default-privilege entries left to db/roles.sql)"
+echo "restore: decrypted; $(grep -vc '^;' "$work/toc") archive entries"
+# The filtered list (rag_app.restore_toc): render the ACL entries (no data) to read the roles
+# they name, then keep what this server can take.
+skip_ext=()
+# shellcheck disable=SC2206  # RESTORE_SKIP_EXTENSIONS is a space-separated list of names
+for ext in "${MANAGED_EXTENSIONS[@]}" ${RESTORE_SKIP_EXTENSIONS:-}; do skip_ext+=(--skip-extension "$ext"); done
+psql_t -c "SELECT rolname FROM pg_roles" >"$work/roles"
+psql_t -c "SELECT name FROM pg_available_extensions" >"$work/extensions"
+"$py" -m rag_app.restore_toc acl-list --toc "$work/toc" "${skip_ext[@]}" >"$work/acl.list"
+: >"$work/acl.sql"
+if [ -s "$work/acl.list" ]; then
+  rc=0
+  age_decrypt_to "$identity" "$dump" pg_restore -v -f "$work/acl.sql" -L "$work/acl.list" 2>"$work/acl.log" || rc=$?
+  [ "$rc" = 0 ] || die "cannot read the ACL entries of $dump (age rc $AGE_DECRYPT_RC, pg_restore rc $AGE_READER_RC): $(grep -v '^pg_restore: \(creating\|processing\|connecting\)' "$work/acl.log" | tail -n 2) — nothing restored"
+fi
+"$py" -m rag_app.restore_toc filter --toc "$work/toc" --acl-sql "$work/acl.sql" \
+  --roles "$work/roles" --extensions "$work/extensions" "${skip_ext[@]}" \
+  --out "$work/toc.restore" --extra-sql "$work/acl.extra.sql" \
+  || die "the dump cannot be restored on this server (above) — nothing restored"
 rc=0
 age_decrypt_to "$identity" "$dump" \
   pg_restore -w --no-owner --single-transaction --exit-on-error -L "$work/toc.restore" -d "$PGDATABASE" \
@@ -107,6 +136,11 @@ case "$rc" in
   *) die "pg_restore failed (rc $AGE_READER_RC) — its single transaction was rolled back, nothing restored" ;;
 esac
 echo "restore: pg_restore done (one transaction)"
+if [ -s "$work/acl.extra.sql" ]; then
+  psql -X -w -q -v ON_ERROR_STOP=1 --single-transaction -f "$work/acl.extra.sql" \
+    || die "re-applying the grants of ACL entries that named missing roles failed — do not reopen; drop $PGDATABASE and restore again into a new, empty database"
+  echo "restore: grants to existing roles from those ACL entries re-applied"
+fi
 
 # --- 3. roles + migrations ----------------------------------------------------------------
 roles_sql="$SECRAG_REPO_ROOT/db/roles.sql"

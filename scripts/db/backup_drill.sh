@@ -14,7 +14,11 @@
 #   1. fresh database, db/roles.sql, alembic upgrade head, two synthetic accounts
 #      (keep / erase) with keys, a conversation and messages, and a 2 MiB table of random
 #      bytes (drill_bulk) so the dump is far larger than a pipe buffer, like a real one
-#      (F-2026-10-01-R: a tiny dump hid that `age -d | pg_restore -l` dies of SIGPIPE)
+#      (F-2026-10-01-R: a tiny dump hid that `age -d | pg_restore -l` dies of SIGPIPE);
+#      plus what a real Azure dump carries: the extension `azure` (a stand-in the gate
+#      installs; it cannot be created in any other database, as on a non-Azure server) and
+#      grants to a role that is DROPPED before the restore (pg_catalog function, schema
+#      public, a table next to a secrag_backup grant, a table it owns)
 #   2. throwaway keypair; its private key is copied to an "offline" folder (the password
 #      manager / offline copy of R4-1) and the working copy is shredded
 #   3. backup.sh --file as secrag_backup into a folder that already holds a 15-day-old dump,
@@ -24,7 +28,9 @@
 #      one purger run AS secrag_purger (11.2b): rows removed, tombstone done, export written
 #   5. restore.sh with the OFFLINE key into a new empty database (union → replay_deletions →
 #      purger) → the erased account stays erased (tombstone "done", no key/conversation/
-#      message), the kept one and drill_bulk are intact
+#      message), the kept one and drill_bulk are intact; `azure` and the pg_catalog grant
+#      skipped, `vector` restored, secrag_purger/secrag_backup privileges on every public
+#      table and sequence identical to the source, one "skipped" summary line
 #   6. controls: without the tombstone export the erased account comes back (the export is
 #      what keeps it erased); a purger pass that stops at its time limit with an erasure
 #      still open fails the restore — no "DONE" (DA-G1-8); a wrong key restores nothing; an
@@ -53,6 +59,7 @@ admin_psql() { PGDATABASE=postgres psql -X -w -q -v ON_ERROR_STOP=1 "$@"; }
 suffix="$(openssl rand -hex 4)"
 src="secrag_drill_src_$suffix" rst="secrag_drill_rst_$suffix"
 ctl="secrag_drill_ctl_$suffix" neg="secrag_drill_neg_$suffix" lim="secrag_drill_lim_$suffix"
+gone="secrag_drill_gone_$suffix"   # a role that exists at backup time only (Azure's azuresu…)
 work="$(mktemp -d "${TMPDIR:-/tmp}/secrag-backup-drill.XXXXXX")"
 chmod 700 "$work"
 cleanup() {
@@ -60,6 +67,7 @@ cleanup() {
   for db in "$src" "$rst" "$ctl" "$neg" "$lim"; do
     admin_psql -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
   done
+  admin_psql -c "DROP ROLE IF EXISTS $gone" >/dev/null 2>&1 || true
   find "$work" -type f -name '*.key' -exec shred -u {} + 2>/dev/null || true
   rm -rf -- "$work"
 }
@@ -91,6 +99,35 @@ PGDATABASE="$src" psql -X -w -q -v ON_ERROR_STOP=1 -c "
 bulk_digest() { PGDATABASE="$1" psql -X -w -tA -c "SELECT count(*) || ':' || md5(string_agg(blob, ''::bytea ORDER BY id)) FROM drill_bulk"; }
 bulk="$(bulk_digest "$src")"
 ok "source database $src: drill_bulk (2 MiB of random bytes) $bulk"
+# What a real Azure dump carries besides the app (the 2026-10-01 rehearsal: pg_restore failed
+# on CREATE EXTENSION azure, and grants to azuresu / azure_pg_admin exist only there).
+[ "$(admin_psql -tA -c "SELECT count(*) FROM pg_available_extensions WHERE name = 'azure'")" = 1 ] \
+  || fail "the stand-in azure extension is not installed on this server (run the drill through scripts/gate.sh)"
+PGDATABASE="$src" psql -X -w -q -v ON_ERROR_STOP=1 -c "
+  SET secrag.drill_azure_source = 'on';
+  CREATE EXTENSION azure;
+  CREATE ROLE $gone NOLOGIN;
+  GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_reset() TO $gone, secrag_backup;
+  GRANT USAGE ON SCHEMA public TO $gone;
+  CREATE TABLE drill_mixed_acl (id int);
+  GRANT SELECT ON drill_mixed_acl TO $gone;
+  CREATE TABLE drill_gone_owned (id int);
+  ALTER TABLE drill_gone_owned OWNER TO $gone;"
+# secrag_purger / secrag_backup privileges on every table and sequence of public.
+privileges() {
+  PGDATABASE="$1" psql -X -w -tA -c "
+    SELECT string_agg(c.relname || '/' || r.rolname || ':' || p.priv, ' ' ORDER BY c.relname, r.rolname, p.priv)
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    CROSS JOIN pg_roles r
+    CROSS JOIN unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'USAGE']) p(priv)
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'S')
+      AND r.rolname IN ('secrag_purger', 'secrag_backup')
+      AND CASE WHEN c.relkind = 'S'
+               THEN CASE WHEN p.priv IN ('USAGE', 'SELECT', 'UPDATE') THEN has_sequence_privilege(r.oid, c.oid, p.priv) ELSE false END
+               ELSE CASE WHEN p.priv <> 'USAGE' THEN has_table_privilege(r.oid, c.oid, p.priv) ELSE false END
+          END"
+}
+ok "source database $src: extension azure (stand-in), grants to role $gone (pg_catalog, schema public, drill_mixed_acl next to secrag_backup), drill_gone_owned owned by it"
 
 # --- 2. throwaway keypair; decrypt only with the offline copy -----------------------------
 mkdir -m 700 "$work/keys" "$work/offline-copy" "$work/backups" "$work/tombstones" "$work/empty"
@@ -119,6 +156,13 @@ size="$(stat -c %s "$dump")"
 [ "$size" -gt 1048576 ] || fail "the dump is only $size bytes — the drill must use one above the pipe buffer (F-2026-10-01-R)"
 if age -d -i "$work/keys/wrong.key" "$dump" >/dev/null 2>&1; then fail "a wrong key decrypts the dump"; fi
 ok "backup as secrag_backup: $(basename "$dump") (age, $size bytes); > $days days removed, $((days - 1)) days kept, other files untouched"
+src_privileges="$(privileges "$src")"
+[[ "$src_privileges" == *"drill_mixed_acl/secrag_backup:SELECT"* && "$src_privileges" == *"/secrag_purger:DELETE"* ]] \
+  || fail "the source lacks the grants the drill compares: $src_privileges"
+# The role exists only at backup time (as azuresu / azure_pg_admin exist only on Azure).
+PGDATABASE="$src" psql -X -w -q -v ON_ERROR_STOP=1 -c "REASSIGN OWNED BY $gone TO $admin_user; DROP OWNED BY $gone"
+admin_psql -c "DROP ROLE $gone"
+ok "role $gone dropped after the backup: the dump names a role this server no longer has"
 
 state() { DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$1")" "$py" -m rag_app.devtools.backup_drill state --user "$keep" --user "$erase"; }
 
@@ -136,7 +180,7 @@ restore_into() { # restore_into <db> <tombstone dir> <identity> [dump]
 }
 
 # --- 5. restore with the offline key: the user stays erased -------------------------------
-restore_into "$rst" "$work/tombstones" "$work/offline-copy/backup.key" 2>&1 | sed 's/^/  /'
+restore_into "$rst" "$work/tombstones" "$work/offline-copy/backup.key" 2>&1 | tee "$work/rst.log" | sed 's/^/  /'
 s="$(state "$rst")"
 jq -e --arg k "$keep" '.[$k] | .user and .key and .conversations == 1 and .messages == 2 and .tombstone == null' <<<"$s" >/dev/null \
   || fail "the kept account is not intact after the restore: $(jq -c --arg k "$keep" '.[$k]' <<<"$s")"
@@ -144,6 +188,21 @@ jq -e --arg e "$erase" '.[$e] | (.user | not) and (.key | not) and .conversation
   || fail "the erased account came back after the restore: $(jq -c --arg e "$erase" '.[$e]' <<<"$s")"
 [ "$(bulk_digest "$rst")" = "$bulk" ] || fail "drill_bulk differs after the restore: $(bulk_digest "$rst") (source $bulk)"
 ok "restore (offline key) into $rst: erased account stays erased (tombstone done, no key/conversation/message); kept account and drill_bulk intact"
+summary="$(grep '^restore: kept .* entries, skipped' "$work/rst.log")" || fail "restore printed no skipped-entries summary"
+for want in "managed extensions" "pg_catalog ACLs" "public-schema ACLs" "ACL entries naming a missing role" "[extensions: azure]" "roles missing here: $gone"; do
+  [[ "$summary" == *"$want"* ]] || fail "summary lacks '$want': $summary"
+done
+rst_ext="$(PGDATABASE="$rst" psql -X -w -tA -c "SELECT string_agg(extname, ',' ORDER BY extname) FROM pg_extension WHERE extname IN ('azure', 'vector')")"
+[ "$rst_ext" = vector ] || fail "extensions after the restore: '$rst_ext' (want vector only)"
+[ "$(PGDATABASE="$rst" psql -X -w -tA -c "SELECT has_function_privilege('secrag_backup', 'pg_catalog.pg_stat_reset()', 'EXECUTE')")" = f ] \
+  || fail "a pg_catalog grant from the dump reached the target"
+rst_privileges="$(privileges "$rst")"
+[ "$rst_privileges" = "$src_privileges" ] \
+  || fail "secrag_purger/secrag_backup privileges differ after the restore: $(diff <(tr ' ' '\n' <<<"$src_privileges") <(tr ' ' '\n' <<<"$rst_privileges") | grep '^[<>]' | tr '\n' ' ')"
+[ "$(PGDATABASE="$rst" psql -X -w -tA -c "SELECT tableowner FROM pg_tables WHERE tablename = 'drill_gone_owned'")" = "$admin_user" ] \
+  || fail "drill_gone_owned is not owned by the restoring owner"
+ok "Azure-shaped entries: azure skipped, vector restored, pg_catalog grant not applied, privileges of secrag_purger/secrag_backup identical to the source ($(wc -w <<<"$src_privileges") grants), missing-role object owned by the restorer"
+ok "${summary#restore: }"
 
 # --- 6. controls --------------------------------------------------------------------------
 restore_into "$ctl" "$work/empty" "$work/offline-copy/backup.key" >"$work/ctl.log" 2>&1 \

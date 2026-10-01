@@ -347,6 +347,32 @@ step_migrations-roundtrip() {
 # OFFLINE copy of a throwaway age key → the user stays erased; files > retention removed;
 # controls (no tombstone export → the user comes back; wrong key; non-empty target).
 # Throwaway secrag_drill_* databases on the gate server only (scripts/db/backup_drill.sh).
+# install_drill_azure_extension: a stand-in for Azure's `azure` extension in the gate DB
+# container (thrown away with it): only a session with secrag.drill_azure_source=on (the
+# drill's source database) can create it; anywhere else CREATE EXTENSION fails like
+# "extension azure is not available" on a non-Azure server — so a dump of the source
+# carries the same TOC entries as a real Azure dump.
+install_drill_azure_extension() {
+  # shellcheck disable=SC2016  # $(pg_config …) expands inside the container
+  local into='cat >"$(pg_config --sharedir)/extension/$1"'
+  compose exec -T db sh -c "$into" _ azure.control <<'EOF' || return 1
+comment = 'secrag backup-drill stand-in for the Azure-only extension'
+default_version = '1.0'
+relocatable = false
+schema = pg_catalog
+superuser = true
+EOF
+  compose exec -T db sh -c "$into" _ azure--1.0.sql <<'EOF'
+DO $$
+BEGIN
+  IF current_setting('secrag.drill_azure_source', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'extension "azure" is not available (backup-drill stand-in: only the drill source may create it)';
+  END IF;
+END
+$$;
+EOF
+}
+
 step_backup-drill() {
   need_venv || return 1
   local tool
@@ -358,6 +384,7 @@ step_backup-drill() {
   # shellcheck source=/dev/null
   . "$ROLES_ENV"
   set +a
+  install_drill_azure_extension || { echo "  FAIL: cannot install the stand-in azure extension in the gate DB"; return 1; }
   DRILL_ADMIN_URL="postgresql://$GATE_DB_USER:$GATE_DB_PASSWORD@127.0.0.1:$GATE_DB_PORT/postgres" \
     SECRAG_PYTHON="$PY" bash "$REPO_ROOT/scripts/db/backup_drill.sh" 2>&1 | sed 's/^/  /'
   return "${PIPESTATUS[0]}"
