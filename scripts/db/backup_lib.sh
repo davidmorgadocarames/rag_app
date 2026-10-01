@@ -170,6 +170,24 @@ newest_valid_name() {
 # is_age_file <file>: the file starts with the age header line.
 is_age_file() { [ "$(head -c ${#AGE_HEADER} -- "$1" 2>/dev/null)" = "$AGE_HEADER" ]; }
 
+# age_decrypt_to <identity> <file> <command…>: `age -d -i <identity> <file> | <command…>` with
+# the two exit codes told apart (F-2026-10-01-R). A reader that stops once it has what it needs
+# (`pg_restore -l` after the TOC) closes the pipe early, and age then dies of SIGPIPE (141) on
+# any file larger than the pipe buffer: that is NOT a decryption failure, but a bare pipeline
+# under pipefail reports it as one. Returns
+#   0   the command succeeded; age finished (0) or was cut off by the command (141)
+#   10  age failed on its own: wrong key, or a corrupt / truncated file (age says why on stderr)
+#   11  the command failed (age fine, or cut off when the command gave up)
+# and leaves both codes in AGE_DECRYPT_RC / AGE_READER_RC for the caller's message.
+age_decrypt_to() {
+  local identity="$1" file="$2" st
+  shift 2
+  age -d -i "$identity" -- "$file" | "$@" && st=("${PIPESTATUS[@]}") || st=("${PIPESTATUS[@]}")
+  AGE_DECRYPT_RC="${st[0]}" AGE_READER_RC="${st[1]}"
+  case "$AGE_DECRYPT_RC" in 0 | 141) ;; *) return 10 ;; esac
+  [ "$AGE_READER_RC" = 0 ] || return 11
+}
+
 # inside_git_work_tree <path>: the path (or its nearest existing parent) is in a git work tree.
 inside_git_work_tree() {
   local p="$1"

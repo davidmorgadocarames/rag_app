@@ -85,13 +85,27 @@ echo "restore: target $PGDATABASE@$PGHOST:$PGPORT as $PGUSER is empty; roles pre
 work="$(mktemp -d "${TMPDIR:-/tmp}/secrag-restore.XXXXXX")"
 chmod 700 "$work"
 trap 'rm -rf -- "$work"' EXIT
-if ! age -d -i "$identity" "$dump" | pg_restore -l >"$work/toc"; then
-  die "cannot decrypt $dump with this identity (wrong key?) — nothing restored"
-fi
+# age_decrypt_to, not a bare pipeline: `pg_restore -l` stops reading after the TOC, so age dies
+# of SIGPIPE on any real-size dump — not a wrong key (F-2026-10-01-R).
+rc=0
+age_decrypt_to "$identity" "$dump" pg_restore -l >"$work/toc" || rc=$?
+case "$rc" in
+  0) ;;
+  10) die "cannot decrypt $dump with this identity (age rc $AGE_DECRYPT_RC: wrong key, or a corrupt/truncated file) — nothing restored" ;;
+  *) die "$dump decrypts, but pg_restore cannot read it as a pg_dump archive (pg_restore -l rc $AGE_READER_RC) — nothing restored" ;;
+esac
+grep -qv '^;' "$work/toc" || die "$dump decrypts, but its archive lists no entries — nothing restored"
 grep -v ' DEFAULT ACL ' "$work/toc" >"$work/toc.restore" || true
 echo "restore: decrypted; $(grep -vc '^;' "$work/toc") archive entries ($(grep -c ' DEFAULT ACL ' "$work/toc" || true) default-privilege entries left to db/roles.sql)"
-age -d -i "$identity" "$dump" \
-  | pg_restore -w --no-owner --single-transaction --exit-on-error -L "$work/toc.restore" -d "$PGDATABASE"
+rc=0
+age_decrypt_to "$identity" "$dump" \
+  pg_restore -w --no-owner --single-transaction --exit-on-error -L "$work/toc.restore" -d "$PGDATABASE" \
+  || rc=$?
+case "$rc" in
+  0) ;;
+  10) die "decryption failed during the restore (age rc $AGE_DECRYPT_RC; pg_restore rc $AGE_READER_RC) — do not reopen; drop $PGDATABASE and restore again into a new, empty database" ;;
+  *) die "pg_restore failed (rc $AGE_READER_RC) — its single transaction was rolled back, nothing restored" ;;
+esac
 echo "restore: pg_restore done (one transaction)"
 
 # --- 3. roles + migrations ----------------------------------------------------------------

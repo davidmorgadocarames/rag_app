@@ -12,19 +12,23 @@
 # key; key files are shredded at the end and nothing prints a private key).
 #
 #   1. fresh database, db/roles.sql, alembic upgrade head, two synthetic accounts
-#      (keep / erase) with keys, a conversation and messages
+#      (keep / erase) with keys, a conversation and messages, and a 2 MiB table of random
+#      bytes (drill_bulk) so the dump is far larger than a pipe buffer, like a real one
+#      (F-2026-10-01-R: a tiny dump hid that `age -d | pg_restore -l` dies of SIGPIPE)
 #   2. throwaway keypair; its private key is copied to an "offline" folder (the password
 #      manager / offline copy of R4-1) and the working copy is shredded
 #   3. backup.sh --file as secrag_backup into a folder that already holds a 15-day-old dump,
-#      a 13-day-old dump and an unrelated file → only the 15-day-old one is removed
+#      a 13-day-old dump and an unrelated file → only the 15-day-old one is removed; the
+#      dump is > 1 MiB
 #   4. erase the test account with the API's request path (key gone, tombstone pending), then
 #      one purger run AS secrag_purger (11.2b): rows removed, tombstone done, export written
 #   5. restore.sh with the OFFLINE key into a new empty database (union → replay_deletions →
 #      purger) → the erased account stays erased (tombstone "done", no key/conversation/
-#      message), the kept one is intact
+#      message), the kept one and drill_bulk are intact
 #   6. controls: without the tombstone export the erased account comes back (the export is
 #      what keeps it erased); a purger pass that stops at its time limit with an erasure
-#      still open fails the restore — no "DONE" (DA-G1-8); a wrong key restores nothing; a
+#      still open fails the restore — no "DONE" (DA-G1-8); a wrong key restores nothing; an
+#      age file that is not a pg_dump archive is refused as such (not as a wrong key); a
 #      non-empty target is refused
 set -euo pipefail
 
@@ -76,6 +80,17 @@ PGPASSWORD="$admin_pw" bash "$SECRAG_DB_DIR/apply_roles.sh" "postgresql://$admin
 ids="$(DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$src")" "$py" -m rag_app.devtools.backup_drill seed)"
 keep="$(jq -r .keep <<<"$ids")" erase="$(jq -r .erase <<<"$ids")"
 ok "source database $src: 2 synthetic accounts (keep, erase)"
+# F-2026-10-01-R: 2048 rows × 1 KiB of random bytes (incompressible) → a dump of ~2 MiB, far
+# above the 64 KiB pipe buffer, so every `age -d | <reader>` in restore.sh meets a reader that
+# stops early (the 1.8 MB Azure dump did; the tiny drill dump never did).
+PGDATABASE="$src" psql -X -w -q -v ON_ERROR_STOP=1 -c "
+  CREATE TABLE drill_bulk (id int PRIMARY KEY, blob bytea NOT NULL);
+  INSERT INTO drill_bulk
+    SELECT g, decode((SELECT string_agg(md5(random()::text || g || i), '') FROM generate_series(1, 64) i), 'hex')
+    FROM generate_series(1, 2048) g;"
+bulk_digest() { PGDATABASE="$1" psql -X -w -tA -c "SELECT count(*) || ':' || md5(string_agg(blob, ''::bytea ORDER BY id)) FROM drill_bulk"; }
+bulk="$(bulk_digest "$src")"
+ok "source database $src: drill_bulk (2 MiB of random bytes) $bulk"
 
 # --- 2. throwaway keypair; decrypt only with the offline copy -----------------------------
 mkdir -m 700 "$work/keys" "$work/offline-copy" "$work/backups" "$work/tombstones" "$work/empty"
@@ -100,8 +115,10 @@ dump="$(find "$work/backups" -maxdepth 1 -name 'secrag-*.dump.age' ! -name "$old
 [ ! -e "$work/backups/$old" ] || fail "the dump older than $days days was not removed"
 [ -e "$work/backups/$recent" ] || fail "the $((days - 1))-day-old dump was removed"
 [ -e "$work/backups/notes.txt" ] || fail "an unrelated file was removed"
+size="$(stat -c %s "$dump")"
+[ "$size" -gt 1048576 ] || fail "the dump is only $size bytes — the drill must use one above the pipe buffer (F-2026-10-01-R)"
 if age -d -i "$work/keys/wrong.key" "$dump" >/dev/null 2>&1; then fail "a wrong key decrypts the dump"; fi
-ok "backup as secrag_backup: $(basename "$dump") (age); > $days days removed, $((days - 1)) days kept, other files untouched"
+ok "backup as secrag_backup: $(basename "$dump") (age, $size bytes); > $days days removed, $((days - 1)) days kept, other files untouched"
 
 state() { DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$1")" "$py" -m rag_app.devtools.backup_drill state --user "$keep" --user "$erase"; }
 
@@ -113,9 +130,9 @@ DATABASE_URL="$(url_for secrag_purger "$SECRAG_PURGER_PASSWORD" "$src")"   "$py"
 jq -e --arg e "$erase" '.[$e] | (.user | not) and (.key | not) and .conversations == 0 and .messages == 0 and .tombstone == "done"' <<<"$(state "$src")" >/dev/null   || fail "purger: the erased account was not purged: $(jq -c --arg e "$erase" '.[$e]' <<<"$(state "$src")")"
 ls "$work/tombstones"/tombstones-*.jsonl >/dev/null 2>&1 || fail "the purger wrote no tombstone export"
 ok "erased the test account after the backup (request path → purger as secrag_purger: done); tombstones exported"
-restore_into() { # restore_into <db> <tombstone dir> <identity>
+restore_into() { # restore_into <db> <tombstone dir> <identity> [dump]
   RESTORE_DATABASE_URL="$(url_for "$admin_user" "$admin_pw" "$1")" \
-    bash "$SECRAG_DB_DIR/restore.sh" --dump "$dump" --identity "$3" --tombstones-dir "$2"
+    bash "$SECRAG_DB_DIR/restore.sh" --dump "${4:-$dump}" --identity "$3" --tombstones-dir "$2"
 }
 
 # --- 5. restore with the offline key: the user stays erased -------------------------------
@@ -125,7 +142,8 @@ jq -e --arg k "$keep" '.[$k] | .user and .key and .conversations == 1 and .messa
   || fail "the kept account is not intact after the restore: $(jq -c --arg k "$keep" '.[$k]' <<<"$s")"
 jq -e --arg e "$erase" '.[$e] | (.user | not) and (.key | not) and .conversations == 0 and .messages == 0 and .tombstone == "done"' <<<"$s" >/dev/null \
   || fail "the erased account came back after the restore: $(jq -c --arg e "$erase" '.[$e]' <<<"$s")"
-ok "restore (offline key) into $rst: erased account stays erased (tombstone done, no key/conversation/message); kept account intact"
+[ "$(bulk_digest "$rst")" = "$bulk" ] || fail "drill_bulk differs after the restore: $(bulk_digest "$rst") (source $bulk)"
+ok "restore (offline key) into $rst: erased account stays erased (tombstone done, no key/conversation/message); kept account and drill_bulk intact"
 
 # --- 6. controls --------------------------------------------------------------------------
 restore_into "$ctl" "$work/empty" "$work/offline-copy/backup.key" >"$work/ctl.log" 2>&1 \
@@ -147,6 +165,15 @@ grep -q "cannot decrypt" "$work/neg.log" || fail "wrong key: unexpected error: $
 [ "$(PGDATABASE="$neg" psql -X -w -tA -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'")" = 0 ] \
   || fail "wrong key: the target is not empty"
 ok "wrong key: refused, nothing restored"
+# An age file (right key) that is not a pg_dump archive, larger than the pipe buffer: refused
+# as such — not as a wrong key (pg_restore gives up after the header and age dies of SIGPIPE).
+head -c 2097152 /dev/urandom | age -r "$recipient" >"$work/notadump.age"
+if restore_into "$neg" "$work/tombstones" "$work/offline-copy/backup.key" "$work/notadump.age" >"$work/notadump.log" 2>&1; then
+  fail "an age file that is not a pg_dump archive restored something"
+fi
+grep -q "cannot read it as a pg_dump archive" "$work/notadump.log" \
+  || fail "not a pg_dump archive: unexpected error: $(tail -n 1 "$work/notadump.log")"
+ok "not a pg_dump archive (2 MiB, right key): refused as such, not as a wrong key"
 if restore_into "$rst" "$work/tombstones" "$work/offline-copy/backup.key" >"$work/nonempty.log" 2>&1; then
   fail "a restore into a non-empty database was not refused"
 fi

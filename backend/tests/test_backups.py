@@ -620,6 +620,43 @@ def test_restore_refuses_an_unsafe_identity_or_bad_exports(
         assert "AGE-SECRET-KEY" not in proc.stdout + proc.stderr
 
 
+@needs_age
+@needs_bash
+def test_a_reader_that_stops_early_is_not_a_decryption_failure(
+    tmp_path: Path, keys: tuple[Path, str]
+) -> None:
+    """F-2026-10-01-R: `pg_restore -l` stops after the TOC, so on a file larger than the pipe
+    buffer age dies of SIGPIPE (141); under pipefail the bare pipeline called that a wrong key.
+    age_decrypt_to (backup_lib.sh) tells the cases apart."""
+    key, recipient = keys
+    big = tmp_path / "big.age"
+    big.write_bytes(
+        subprocess.run(
+            ["age", "-r", recipient], input=os.urandom(3 * 1024 * 1024),
+            capture_output=True, check=True,
+        ).stdout
+    )  # fmt: skip
+    wrong = tmp_path / "wrong.key"
+    subprocess.run(["age-keygen", "-o", str(wrong)], check=True, capture_output=True)
+
+    def run(script: str, identity: Path) -> str:
+        return subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; . "$1"; {script}', "_",
+             str(DB_SCRIPTS / "backup_lib.sh"), str(identity), str(big)],
+            capture_output=True, text=True, timeout=60, check=True,
+        ).stdout.strip()  # fmt: skip
+
+    # The old pattern really fails on a file this size: age is cut off by SIGPIPE.
+    old = 'age -d -i "$2" "$3" | head -c 5 >/dev/null || echo "${PIPESTATUS[*]}"'
+    assert run(old, key) == "141 0"
+    probe = 'rc=0; age_decrypt_to "$2" "$3" {} >/dev/null 2>&1 || rc=$?; '
+    probe += 'echo "$rc $AGE_DECRYPT_RC $AGE_READER_RC"'
+    assert run(probe.format("head -c 5"), key) == "0 141 0"  # an early stop is fine
+    assert run(probe.format("cat"), key) == "0 0 0"  # read to the end
+    assert run(probe.format("head -c 5"), wrong) == "10 1 0"  # wrong key
+    assert run(probe.format("false"), key).startswith("11 ")  # the reader failed
+
+
 # --- tombstone export format ----------------------------------------------------------------
 
 
