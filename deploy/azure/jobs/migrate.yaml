@@ -2,7 +2,7 @@
 # (runbook, PHASE_TASKS row 40) — CD never applies Job YAML and never changes triggers (X1).
 #
 #   az containerapp job create -g rg-secrag -n <AZURE_MIGRATE_JOB> --yaml deploy/azure/jobs/migrate.yaml
-#   az containerapp job secret set -g rg-secrag -n <AZURE_MIGRATE_JOB> --secrets database-url=<owner URL>
+#   az containerapp job secret set ...   # by the OWNER: backend secret piped in, `=@-` (runbook)
 #   az containerapp job update -g rg-secrag -n <AZURE_MIGRATE_JOB> --image <deployed jobs digest>
 #
 # - The image is a PLACEHOLDER: CD sets the jobs image by digest (`job update --image`) before

@@ -241,16 +241,27 @@ def test_cd_never_touches_job_schedules_or_job_yaml() -> None:
 JOB_YAMLS = sorted((REPO_ROOT / "deploy" / "azure" / "jobs").glob("*.yaml"))
 
 
-def test_job_definitions_are_manual_single_placeholder_image_and_secretless() -> None:
-    """T11.2.6 / X1: versioned Job YAML, applied by hand with a Manual trigger, placeholder
-    image (CD sets the digest), parallelism 1, timeout + retry limit, no secret values and no
-    API secrets (JobSettings)."""
+DORMANT_CRON = "0 0 1 1 *"  # D-2026-10-01-5: 00:00 UTC on 1 January only
+
+
+def test_job_definitions_are_dormant_single_placeholder_image_and_secretless() -> None:
+    """T11.2.6 / X1: versioned Job YAML applied by hand, placeholder image (CD sets the
+    digest), parallelism 1, timeout + retry limit, no secret values and no API secrets
+    (JobSettings). The migration Job is Manual; purge/backup are Schedule Jobs with a dormant
+    cron (D-2026-10-01-5: az cannot change a trigger type later, only the cron)."""
     assert [p.stem for p in JOB_YAMLS] == ["backup", "migrate", "purge"]
     for path in JOB_YAMLS:
         job = yaml.safe_load(path.read_text(encoding="utf-8"))
         config = job["properties"]["configuration"]
-        assert config["triggerType"] == "Manual", path.name
-        assert config["manualTriggerConfig"]["parallelism"] == 1
+        if path.stem == "migrate":
+            assert config["triggerType"] == "Manual"
+            trigger = config["manualTriggerConfig"]
+        else:
+            assert config["triggerType"] == "Schedule", path.name
+            assert "manualTriggerConfig" not in config, path.name
+            trigger = config["scheduleTriggerConfig"]
+            assert trigger["cronExpression"] == DORMANT_CRON, path.name
+        assert trigger["parallelism"] == 1 and trigger["replicaCompletionCount"] == 1
         assert config["replicaTimeout"] > 0 and "replicaRetryLimit" in config
         for secret in config.get("secrets", []):
             assert secret["value"].startswith("<") and secret["value"].endswith(">"), path.name

@@ -1,10 +1,14 @@
 # Azure Container Apps Job: encrypted database backup to Blob (T11.2.10, block F). AUTHORED
-# HERE, APPLIED BY HAND (runbook, row 40) with a MANUAL trigger; switched to a daily Schedule by
-# hand after the promotion (row 41) — CD never applies Job YAML and never changes triggers (X1).
+# HERE, APPLIED BY HAND (runbook, row 40) as a SCHEDULE Job with a DORMANT cron (`0 0 1 1 *`:
+# 00:00 UTC on 1 January only); right after the promotion's CD run and its health gate (row 41)
+# only the cron is switched to daily by hand (D-2026-10-01-5 — az 2.90 `job update` cannot
+# change a trigger type, only the cron of a Schedule Job). CD never applies Job YAML and never
+# changes triggers or schedules (X1). `az containerapp job start` runs it on demand at any time.
 #
 #   az containerapp job create -g rg-secrag -n <AZURE_BACKUP_JOB> --yaml deploy/azure/jobs/backup.yaml
-#   az containerapp job secret set -g rg-secrag -n <AZURE_BACKUP_JOB> --secrets database-url=<secrag_backup URL>
+#   az containerapp job secret set ...   # by the OWNER, URL read with `read -rs` (runbook)
 #   az containerapp job update -g rg-secrag -n <AZURE_BACKUP_JOB> --image <deployed jobs digest>
+#   az containerapp job update -g rg-secrag -n <AZURE_BACKUP_JOB> --cron-expression "0 3 * * *"
 #
 # - Image: PLACEHOLDER (CD updates it to the deployed jobs digest after the apps, X1).
 # - Runs as the read-only role `secrag_backup`; `pg_dump` 16 → `age` (PUBLIC key only; the
@@ -21,8 +25,9 @@ identity:
 properties:
   environmentId: /subscriptions/<subscription-id>/resourceGroups/rg-secrag/providers/Microsoft.App/managedEnvironments/<environment-name>
   configuration:
-    triggerType: Manual
-    manualTriggerConfig:
+    triggerType: Schedule
+    scheduleTriggerConfig:
+      cronExpression: "0 0 1 1 *"   # dormant until the post-CD switch to "0 3 * * *"
       parallelism: 1
       replicaCompletionCount: 1
     replicaTimeout: 1800
