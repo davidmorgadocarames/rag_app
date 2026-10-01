@@ -58,7 +58,7 @@ Chat (/chat)              [authenticated]
 2. Client → `POST /chat/stream` (Bearer token). Server:
    - Applies the **per-user rate limit / quota** (cost-aware). Over limit → 429.
    - Checks the **global daily answer cap** (`DAILY_ANSWER_CAP` answers per UTC day for all
-     users together — a cost guard for the public demo; 300 by default). The answer is
+     users together — a cost guard for the public demo; 150 by default). The answer is
      counted **before** any LLM call, after the user's data key is known to unwrap. Once the
      cap is reached the stream sends the `conversation` event and one `error` event
      (`daily_cap_reached`, "SecRAG has reached its daily answer limit … come back after

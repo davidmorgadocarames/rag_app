@@ -142,8 +142,9 @@ class Settings(JobSettings):
 
     # --- Global daily answer cap (R6-1, rag_app.usage_cap) ---
     # Answers per UTC day for ALL users together, counted in `usage_daily` before any LLM
-    # call. 0 = off (ENV=dev only; ENV=prod requires a positive cap). Azure uses the default.
-    daily_answer_cap: int = 300
+    # call. 0 = off (ENV=dev only; ENV=prod requires a positive cap). Azure runs 150
+    # (D-2026-10-01-1) = this default, so a lost env var (gotcha 7) can never raise it.
+    daily_answer_cap: int = 150
 
     # --- Auth / security ---
     jwt_secret: str = ""

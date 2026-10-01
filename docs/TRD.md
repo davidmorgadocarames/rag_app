@@ -98,7 +98,7 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
 - **Rate limiting**: token bucket per IP/user; **cost-aware** variant (a query consumes tokens ∝ its
   cost) to defend against **Denial of Wallet**.
 - **Global daily answer cap (R6-1)**: `DAILY_ANSWER_CAP` answers per UTC day for all users
-  together (default 300; `0` = off, allowed only with `ENV=dev`; `ENV=prod` refuses to start
+  together (default 150 = the Azure value; `0` = off, allowed only with `ENV=dev`; `ENV=prod` refuses to start
   without a positive cap). The counter is `usage_daily` (`day`, `answers`, `tokens` — no
   personal data). `/chat` and `/chat/stream` reserve the answer at request start, before any
   LLM call, with one `INSERT … ON CONFLICT (day) DO UPDATE … WHERE answers < cap RETURNING`

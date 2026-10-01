@@ -49,7 +49,7 @@ def test_the_default_cap_is_on_and_valid_in_prod(monkeypatch: pytest.MonkeyPatch
     monkeypatch.delenv("DAILY_ANSWER_CAP", raising=False)
     monkeypatch.delenv("ENV", raising=False)
     settings = _settings()
-    assert settings.env == "prod" and settings.daily_answer_cap == 300
+    assert settings.env == "prod" and settings.daily_answer_cap == 150
     validate_api_settings(settings)
 
 

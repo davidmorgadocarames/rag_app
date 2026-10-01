@@ -28,7 +28,7 @@ this project is built around them:
   isolated gate stack, and a regression blocks the push before CD can deploy it.
 - **Security and abuse resistance.** The app has its own auth (argon2 + JWT + email
   verification) and cost-aware token-bucket rate limiting against brute force and
-  Denial-of-Wallet. A **global daily answer cap** (`DAILY_ANSWER_CAP`, 300 a day on Azure)
+  Denial-of-Wallet. A **global daily answer cap** (`DAILY_ANSWER_CAP`, 150 a day on Azure)
   is counted in Postgres before any LLM call, so one day of abuse has a fixed worst-case
   cost. Signup risk scoring resists Sybil abuse, and the pipeline defends against indirect
   prompt injection.
@@ -481,7 +481,7 @@ pipeline count too, because they may have spent tokens; a turn refused before th
 greeting reply makes no LLM call and does not count. Every LLM call has a `max_tokens`
 bound, so the worst-case cost of a day at the cap is known in advance
 ([ADR phase 11 — Costs](docs/adr/adr_phase11_stability.md#costs)). Set `DAILY_ANSWER_CAP`
-(default 300; `0` switches it off, `ENV=dev` only).
+(default 150 = the Azure value; `0` switches it off, `ENV=dev` only).
 
 ## Architecture decision records
 
