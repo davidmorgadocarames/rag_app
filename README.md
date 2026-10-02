@@ -94,7 +94,9 @@ flowchart LR
     GATE --> CI[CI on GitHub Actions]
     CI -->|success on main| CD[CD: images by digest]
     CD -->|OIDC, no stored secrets| MIG[Migration Job<br/>alembic upgrade head]
-    MIG -->|only if it succeeded| ACA[Azure Container Apps<br/>frontend · backend · embeddings]
+    MIG -->|only if it succeeded| OLL[Ollama Container App<br/>bge-m3 baked in]
+    OLL -->|then| ACA[Azure Container Apps<br/>frontend · backend]
+    ACA --> HC["Post-deploy health check<br/>backend /health · frontend /"]
     CD --> JOBS[Purge + backup Jobs<br/>slim jobs image]
     ACA --> PG[(Azure PostgreSQL<br/>Flexible Server + pgvector)]
     JOBS --> PG
@@ -105,7 +107,12 @@ flowchart LR
 CD runs only after CI succeeded on `main`, refuses a commit without the `secrag/gate-full`
 status that a local `gate.sh --full` PASS publishes, skips docs-only changes and never rolls
 back; migrations run as a Job before the apps are updated, never at container start
-([ADR phase 11](docs/adr/adr_phase11_stability.md), decisions 1 and 3).
+([ADR phase 11](docs/adr/adr_phase11_stability.md), decisions 1 and 3). The Ollama Container
+App updates BEFORE the backend/frontend apps (T11.4.3: the backend calls it synchronously for
+embeddings, so it must already be serving the baked-in `bge-m3` model before the backend's new
+revision takes traffic); after the apps are updated, CD polls the backend's `/health` and the
+frontend's `/` over their public ingress URLs with a bounded timeout and fails the run if
+either never comes up (`scripts/cd/health_check.sh`).
 
 ## Tech stack
 
@@ -115,7 +122,7 @@ back; migrations run as a Job before the apps are updated, never at container st
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, pydantic-settings |
 | Database | PostgreSQL 16 + pgvector (HNSW) + full-text search |
 | LLM | Ollama `qwen2.5:7b-instruct` (local) · Azure OpenAI `gpt-4.1-mini` (cloud) |
-| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, baked into the backend image and always loaded offline, ONE shared instance per process) |
+| Embeddings / reranking | `bge-m3` (baked into a custom Ollama image on Azure, T11.4.3 — no pull on cold start) · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, baked into the backend image and always loaded offline, ONE shared instance per process) |
 | Security | argon2, JWT, Fernet envelope encryption (crypto-shred), token bucket |
 | Evaluation | Separate retrieval and generation metrics, LLM judge, regression gate |
 | Quality | ruff, mypy `--strict`, pytest, ESLint, `tsc`, pre-commit, gitleaks |
@@ -360,9 +367,14 @@ the answer, a user id or an IP.
 
 The same numbers feed Prometheus histograms (label: `stage` only) plus an in-flight chat
 requests gauge, served on a **separate internal metrics port** (`METRICS_PORT`, default
-`9100`) — never the API port, and never published to the host. The `prometheus` service in
-`docker-compose.yml` scrapes it (7-day retention, UI on `http://127.0.0.1:9090`, image pinned
-by digest):
+`9100`) — never the API port, and never published to the host. `METRICS_BIND_ADDR` (default
+`0.0.0.0`, needed so the separate `prometheus` container can reach it over the compose
+network) can be narrowed to `127.0.0.1` once the only reader is a same-pod/sidecar scraper —
+nothing reads this port on Azure today (DA-11bA-2; no managed Prometheus there, R6-1), and
+Container Apps ingress is configured once, by hand, at creation time and only ever targets
+port 8000 regardless of this setting (`az containerapp update` in CD never touches ingress).
+The `prometheus` service in `docker-compose.yml` scrapes it (7-day retention, UI on
+`http://127.0.0.1:9090`, image pinned by digest):
 
 ```bash
 docker compose up -d --build backend prometheus   # (needs db/db-roles/migrate already up)
@@ -413,7 +425,24 @@ the baked snapshot can never drift from what is actually requested at runtime) i
 image's Hugging Face cache at build time, then sets `HF_HUB_OFFLINE=1`. A cold container —
 including the very first start on Azure, with no egress at all — reranks with no network
 call, ever; CI's `backend-image` job proves this with a throwaway `docker run --network
-none` container (no access to any real data/volume).
+none` container (no access to any real data/volume). The download layer copies only the two
+files (`rag_app/__init__.py`, `rag_app/config.py`) `get_settings()` needs, before the rest of
+`src/` — so an ordinary code-only commit reuses the cached layer instead of re-downloading the
+snapshot (DA-11bC-1; CI also caches it, `type=gha`).
+
+**Custom Ollama image (T11.4.3).** `ollama/Dockerfile`: `FROM ollama/ollama@sha256:…` (a
+specific, digest-pinned release — never `:latest`, which floats) with `bge-m3` pulled into the
+image's model store at build time (start the server, wait, pull, stop — the only way to bake
+an Ollama model). Fixes the Azure `secrag-ollama` ephemeral-storage loss (today's container
+runs `docker.io/ollama/ollama:latest` and drops the pulled model on every scale-to-zero /
+replica restart — runbook gotcha 4): a fresh container embeds with **no** `ollama pull` ever
+needed again. Proven offline the same way as the reranker — a throwaway `docker run --network
+none` container's `/api/embed` returns a real embedding vector (CI's `ollama-image` job,
+`ci.yml`). CD builds, pushes and deploys this image to `secrag-ollama` **before**
+`secrag-backend`/`secrag-frontend` (the backend calls Ollama synchronously for embeddings, so
+it must already be serving the baked-in model before the backend's new revision takes
+traffic). See `docs/adr/adr_phase11_stability.md` decision 8 for the pinned digests, image
+size and the full reasoning.
 
 ### Recovering from a changed master key
 

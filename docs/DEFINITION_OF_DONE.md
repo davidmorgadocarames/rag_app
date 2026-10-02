@@ -35,7 +35,10 @@ are a human/agent checklist.
   their thresholds; results do not regress below `baseline_metrics.json`; the LLM-judge is
   validated against human labels; correct-abstention rate on the negative set meets its threshold.
   Enforced by the gate step `eval` (in `--full`).
-- **Phase 10 (cloud)** — the deployed Azure URL responds to a health check; the eval gate
+- **Phase 10 (cloud)** — the deployed Azure URL responds to a health check — automated from
+  11b (block D): CD's `deploy` job polls the backend's `/health` and the frontend's `/` over
+  their public ingress URLs with a bounded timeout, after the apps are updated, and fails the
+  run if either never comes up (`scripts/cd/health_check.sh`); the eval gate
   ran and passed **before** the Azure deploy step (not just before the GHCR push) — the
   pre-push gate blocks the very push that triggers CD, and (from Phase 11a) CD runs only
   after CI succeeded on `main` and deploys only a SHA carrying `secrag/gate-full` (below);
@@ -67,10 +70,14 @@ are a human/agent checklist.
   (git modes, shellcheck, venv, dependency-audit, adr-links). **Right after the promotion
   push** (DA-C-4), check locally that the status really exists for the pushed SHA:
   `bash scripts/cd/gate_status.sh verify <sha> --wait 300 --creator <owner>` → `deploy
-  allowed`. **Recovery** when it is missing (the background publisher died, e.g. WSL shut
-  down; see `.git/secrag-gate/publish-status.log`): after a `--full` PASS for that SHA,
+  allowed`. **Recovery** when it is missing (the detached background publisher was killed
+  outright — a machine sleep, a Docker Desktop/WSL restart, a reboot — between its "waiting"
+  log line and ever posting or timing out, 11b block D; see
+  `.git/secrag-gate/publish-status.log`): after a `--full` PASS for that SHA,
   `bash scripts/cd/gate_status.sh publish <sha>`, then **"Re-run failed jobs"** on the CD
-  run whose `gate-status` job timed out.
+  run whose `gate-status` job timed out. The NEXT `--full` run that publishes for a later SHA
+  also checks for exactly this: a dead, still-unresolved prior "waiting" entry surfaces as a
+  `WARNING` in that run's own output (not only in the log).
 - **Rollback block before the merge (Phase 11+)** — every promotion that changes Azure has a
   written rollback block, reviewed by the owner **before** the merge: the previous image
   digests and the exact commands, the trigger, what is kept and what is deleted, and the

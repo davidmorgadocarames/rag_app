@@ -532,6 +532,82 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    image — removing one more cold-start variable before T11.4.3's custom Ollama image and
    T11.4.4's chained cold-start measurement; no app setting needs to change (`HF_HUB_OFFLINE`
    is baked into the image itself, not read from an env var today).
+   *Landed in 11.4 (block D, DA-11bC-1):* the download layer's `COPY` was narrowed to the two
+   files `get_settings()` actually needs (`rag_app/__init__.py`, `rag_app/config.py` — neither
+   imports any other `rag_app` module, guarded by a static test) and moved BEFORE the full
+   `COPY src ./src`, so an ordinary code-only commit reuses the ~2.1–2.3 GB cached layer
+   instead of re-downloading it (Docker's layer cache is sequential: the old order invalidated
+   the download on every commit, locally and in CI, which had no registry/GHA cache at all).
+   Confirmed live: a code-only change elsewhere under `src/` → `CACHED`; a change to either
+   copied file or to `reranker_model`/`reranker_revision` → re-downloads, as intended. CI's
+   `backend-image` job now builds through `docker/build-push-action` with a GHA layer cache
+   (`type=gha`), same for the three other images CD builds (frontend, jobs, and the new
+   `ollama` image below).
+   *Landed in 11.4 (T11.4.3, block D):* **custom Ollama image** — `ollama/Dockerfile`: `FROM
+   ollama/ollama@sha256:292ee7945dfc3d5840a181f3ab86fedb1e66703e02c8af98b50f4da56b7e278c`
+   (version **0.35.1** — confirmed inside the pulled image with `ollama --version`; the newest
+   stable release at pin time, one day newer than what Docker Hub's `:latest` tag pointed at,
+   `0.35.0`/`sha256:2a6e883b…` — today's Azure `secrag-ollama` still runs `docker.io/
+   ollama/ollama:latest`, which floats). `bge-m3` is pulled into the image's model store inside
+   ONE `RUN` step (start the server, poll `ollama list` until it answers, `ollama pull
+   bge-m3`, `pkill`, the only way to bake an Ollama model — there is no "pull without a
+   server" mode); `ARG EMBED_MODEL=bge-m3` must equal `Settings.embed_model`, guarded by a
+   test. **Proof** (throwaway `docker run --network none` container, own name, removed after):
+   `ollama list` shows `bge-m3` already present; a raw HTTP POST to `/api/embed` (crafted with
+   bash's `/dev/tcp` — no `curl`/`wget` ships in the base image) returns a real embedding
+   vector, fully offline. **Recorded digests:** `bge-m3`'s own manifest digest, read from
+   `/api/tags` inside the built image —
+   `7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab` — is the SAME one the
+   gate's seed staleness check already records for the native-Ollama `bge-m3`, confirming the
+   registry serves one consistent manifest under that tag. **Image size** (same `docker
+   images`-vs-`du` discrepancy as the backend image, same containerd-snapshotter display
+   quirk — `du` is the number to trust): on-disk **~6.3 GB** (base ~3.7 GB content + the
+   ~1.1 GB `bge-m3` model store), `docker images` SIZE ~11.6 GB. Build time ~20–40 s locally
+   once the base layers are cached. CI's new `ollama-image` job (ci.yml) runs the same build +
+   offline-embed proof (measured locally only so far; the real CI run's wall-clock/disk
+   numbers are not yet in this ADR — add them once CD actually runs for this phase, per the
+   promotion checklist). **CD order:** `secrag-ollama` is built, pushed and deployed BEFORE
+   `secrag-backend`/`secrag-frontend` — the backend calls Ollama synchronously for embeddings
+   on every chat/ingestion request, so Ollama must already be serving the baked-in model
+   before the backend's new revision can safely take traffic (the same "dependency before
+   dependent" reasoning as the migration Job running before the apps, decision 3). Always
+   built and deployed on every real CD run, same as the other three images (no extra
+   change-detection logic was added just for this one, for consistency). **Runbook/promotion
+   items** (not applied here — orchestrator-owned, see PHASE_STATUS "Block D results" for the
+   full list): the new GHCR package must be public before the first pull; the Azure
+   `secrag-ollama` app's image reference switches from `docker.io/ollama/ollama:latest` to the
+   GHCR digest; rollback = the previous Ollama digest, alongside the backend's (T11.6b.3).
+   *Landed in 11.4 (block D, deferred from 11a):* **post-deploy health check** —
+   `scripts/cd/health_check.sh` polls a URL for a bounded timeout and compares the HTTP
+   status (no `-f`: a non-2xx response must still be read and compared, not swallowed; only a
+   real connection failure falls back to `000`); CD's `deploy` job resolves the backend's and
+   the frontend's public ingress FQDNs and polls `/health` and `/` respectively, AFTER the
+   Container Apps are updated and BEFORE the purge/backup Jobs' images are updated — a broken
+   revision now fails the CD run instead of going live unnoticed. No secrets: only the URL and
+   the resulting HTTP status are ever printed, never a response body; every value reaches the
+   script through `env:`, never pasted into a `run:` script (DA-C2-3).
+   *Landed in 11.3 (DA-11bA-2, block D follow-up):* `Settings.metrics_bind_addr` (default
+   `0.0.0.0`, needed by compose's separate `prometheus` container) makes the metrics server's
+   bind address configurable; recommended (not applied) for Azure once a same-pod/sidecar
+   scraper is the only reader — nothing reads this port on Azure today (no managed
+   Prometheus, R6-1). Confirmed CD never touches a Container App's ingress at all (`az
+   containerapp update` is only ever called with `--image`; ingress is configured once, by
+   hand, at `az containerapp create` time per the runbook, and only ever targets port 8000),
+   so this setting cannot change what is internet-reachable either way.
+   *Investigated (not a code fix, block D):* the detached `secrag/gate-full` publisher's log
+   occasionally shows "waiting for `<sha>`" with no later "published" line (2 of ~17 entries
+   across 11a/11b so far). Ruled out: a WSL-VM idle-teardown killing the backgrounded process
+   (disproven empirically — a `setsid`/`nohup` worker survived a controlled 100 s+ gap with no
+   `wsl` process attached) and `gate_publish.sh`'s own `cp -f` racing a still-running
+   publisher's script file (bash caches the whole script after its first read; a reproduction
+   confirms a later overwrite does not affect an already-running instance). Most likely cause:
+   a genuine OS/VM-level interruption (machine sleep, a Docker Desktop/WSL restart, a reboot)
+   kills the detached process outright, with no chance to log anything — an environmental
+   limitation, not a logic bug, and not reproducible by a test. Mitigated with a visibility
+   fix: the publisher's own pid is now recorded in its log line, and a LATER
+   `gate_publish.sh` run detects a dead, still-unresolved prior entry (double-checked live, in
+   case it was published some other way since) and prints a clear warning in its own attended
+   output instead of leaving it silently buried in a log file nobody checks automatically.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=
