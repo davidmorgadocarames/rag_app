@@ -14,10 +14,26 @@
 # GH_REPO=<owner>/<repo> selects the repository (default: the current clone's, via gh).
 # Needs `gh` with a token that may read/write commit statuses (repo scope locally; the
 # workflow token with `statuses: read` in CD).
+#
+# GATE_STATUS_FAKE_CLOCK=1 (tests only, 11a open item / 11b flaky-test fix): replaces the
+# real wall-clock ($SECONDS, sleep) with a fake counter that advances by exactly one whole
+# second per poll and never sleeps for real. The --wait loop (deadline arithmetic, poll
+# count) runs the identical code path either way — only the time source changes — so a
+# test can assert an EXACT, deterministic number of polls instead of depending on real
+# scheduling (flaky under load: tests/test_cd_pipeline.py::test_verify_waits_for_a_late_status).
 set -euo pipefail
 
 CONTEXT="secrag/gate-full"
 POLL_SECONDS="${GATE_STATUS_POLL_SECONDS:-15}"
+
+if [ -n "${GATE_STATUS_FAKE_CLOCK:-}" ]; then
+  _fake_clock=0
+  _now() { printf '%s' "$_fake_clock"; }
+  _sleep() { _fake_clock=$((_fake_clock + 1)); }
+else
+  _now() { printf '%s' "$SECONDS"; }
+  _sleep() { sleep "$1"; }
+fi
 
 usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -47,16 +63,16 @@ if [ -z "${GH_REPO:-}" ]; then
   GH_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)" || exit 1
 fi
 export GH_REPO
-deadline=$((SECONDS + wait_s))
+deadline=$(($(_now) + wait_s))
 
 case "$cmd" in
   publish)
     until gh api "repos/$GH_REPO/commits/$sha" --silent >/dev/null 2>&1; do
-      if [ "$SECONDS" -ge "$deadline" ]; then
+      if [ "$(_now)" -ge "$deadline" ]; then
         echo "gate_status: $sha is not on GitHub (yet) — $CONTEXT not published"
         exit 3
       fi
-      sleep "$POLL_SECONDS"
+      _sleep "$POLL_SECONDS"
     done
     gh api -X POST "repos/$GH_REPO/statuses/$sha" \
       -f state=success -f context="$CONTEXT" -f description="${description:0:140}" \
@@ -75,8 +91,8 @@ case "$cmd" in
         echo "gate_status: $CONTEXT=success for $sha (posted by ${by:-?}) — deploy allowed"
         exit 0
       fi
-      [ "$SECONDS" -lt "$deadline" ] || break
-      sleep "$POLL_SECONDS"
+      [ "$(_now)" -lt "$deadline" ] || break
+      _sleep "$POLL_SECONDS"
     done
     if [ -z "$state" ]; then
       reason="no $CONTEXT status"
