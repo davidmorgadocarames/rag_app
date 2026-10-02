@@ -14,6 +14,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -24,6 +27,7 @@ CD_YML = REPO_ROOT / ".github" / "workflows" / "cd.yml"
 GATE_STATUS = REPO_ROOT / "scripts" / "cd" / "gate_status.sh"
 PLAN = REPO_ROOT / "scripts" / "cd" / "plan.sh"
 AZURE_JOBS = REPO_ROOT / "scripts" / "cd" / "azure_jobs.sh"
+HEALTH_CHECK = REPO_ROOT / "scripts" / "cd" / "health_check.sh"
 SHA = "a" * 40
 
 needs_tools = pytest.mark.skipif(
@@ -204,7 +208,7 @@ def test_the_dry_run_shows_the_real_order_and_can_simulate_a_migrate_failure(cd:
     inputs = _triggers(cd)["workflow_dispatch"]["inputs"]
     assert inputs["simulate_failure"]["default"] is False
     names = [s.get("name", "") for s in cd["jobs"]["dry-run"]["steps"] if "name" in s]
-    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4"]
+    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5"]
     assert "Images" in names[1] and "Migration Job" in names[2] and "Apps" in names[3]
     migrate = cd["jobs"]["dry-run"]["steps"][3]
     assert "azure_jobs.sh" in migrate["run"] and "--simulate-failure" in migrate["run"]
@@ -916,3 +920,155 @@ def test_a_real_manual_deploy_requires_ci_success(cd: dict) -> None:
     assert 'if [ "$REAL" = true ]; then' in ci["run"] and "exit 1" in ci["run"]
     plan_step = next(s for s in steps if s.get("id") == "plan")
     assert steps.index(ci) < steps.index(plan_step)
+
+
+# --- Post-deploy health check (scripts/cd/health_check.sh; deferred from 11a) ------------
+
+
+class _FixedStatusHandler(BaseHTTPRequestHandler):
+    status_code = 200
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's naming
+        self.send_response(self.status_code)
+        self.end_headers()
+
+    def log_message(self, *args: object) -> None:  # silence per-request stderr noise
+        pass
+
+
+@pytest.fixture
+def http_server() -> Iterator[tuple[str, type[_FixedStatusHandler]]]:
+    """A real, throwaway HTTP server on 127.0.0.1 answering every request with
+    ``handler.status_code`` (mutable per test) — no fake process, no mocked curl."""
+    handler = type(f"Handler{id(object())}", (_FixedStatusHandler,), {"status_code": 200})
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", handler
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@needs_tools
+def test_health_check_passes_once_the_expected_status_is_served(http_server) -> None:
+    base_url, handler = http_server
+    handler.status_code = 200
+    proc = _run(
+        HEALTH_CHECK, f"{base_url}/health", "--timeout", "5", "--interval", "1", env=os.environ
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"{base_url}/health -> 200 (ok)" in proc.stdout
+
+
+@needs_tools
+def test_health_check_accepts_a_non_200_expected_status(http_server) -> None:
+    base_url, handler = http_server
+    handler.status_code = 404
+    proc = _run(
+        HEALTH_CHECK,
+        f"{base_url}/x",
+        "--timeout",
+        "5",
+        "--interval",
+        "1",
+        "--expect-status",
+        "404",
+        env=os.environ,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@needs_tools
+def test_health_check_times_out_on_the_wrong_status(http_server) -> None:
+    base_url, handler = http_server
+    handler.status_code = 500
+    proc = _run(
+        HEALTH_CHECK, f"{base_url}/health", "--timeout", "2", "--interval", "1", env=os.environ
+    )
+    assert proc.returncode == 1
+    assert "did not answer 200 within 2s" in proc.stderr
+    assert "last status: 500" in proc.stderr
+
+
+@needs_tools
+def test_health_check_times_out_when_nothing_is_listening(tmp_path: Path) -> None:
+    # An unused local port: a real connection-level failure, not an HTTP error.
+    proc = _run(
+        HEALTH_CHECK,
+        "http://127.0.0.1:1/health",
+        "--timeout",
+        "2",
+        "--interval",
+        "1",
+        env=os.environ,
+    )
+    assert proc.returncode == 1
+    assert "last status: 000" in proc.stderr
+
+
+@needs_tools
+def test_health_check_eventually_succeeds_after_the_app_wakes_up(http_server) -> None:
+    """The realistic case: a scale-to-zero app is still starting when the first poll runs."""
+    base_url, handler = http_server
+    handler.status_code = 503
+
+    def _wake_up() -> None:
+        import time
+
+        time.sleep(1.2)
+        handler.status_code = 200
+
+    threading.Thread(target=_wake_up, daemon=True).start()
+    proc = _run(
+        HEALTH_CHECK, f"{base_url}/health", "--timeout", "5", "--interval", "1", env=os.environ
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["http://x", "--timeout", "nope"],
+        ["http://x", "--expect-status", "abc"],
+        ["http://x", "--bogus"],
+    ],
+)
+def test_health_check_usage_errors(args: list[str]) -> None:
+    assert _run(HEALTH_CHECK, *args, env=os.environ).returncode == 2
+
+
+def test_health_check_never_prints_a_response_body() -> None:
+    """No secrets rule: the script only ever prints the URL and the HTTP status."""
+    text = HEALTH_CHECK.read_text(encoding="utf-8")
+    assert "-o /dev/null" in text
+    assert "-w '%{http_code}'" in text
+
+
+def test_deploy_job_polls_health_after_updating_the_apps_and_before_the_job_images(
+    cd: dict,
+) -> None:
+    deploy = cd["jobs"]["deploy"]
+    steps = deploy["steps"]
+    apps_idx = next(i for i, s in enumerate(steps) if "inlineScript" in s.get("with", {}))
+    jobs_idx = next(
+        i for i, s in enumerate(steps) if "azure_jobs.sh update-image" in s.get("run", "")
+    )
+    health_runs = [i for i, s in enumerate(steps) if "health_check.sh" in s.get("run", "")]
+    assert len(health_runs) >= 2, "backend AND frontend must both be polled"
+    assert apps_idx < min(health_runs) < jobs_idx
+    text = "\n".join(s.get("run", "") for s in steps if "health_check.sh" in s.get("run", ""))
+    assert "/health" in text  # backend readiness endpoint
+    # A failed health check must fail the job (no `continue-on-error`, no `|| true`).
+    assert not any(
+        s.get("continue-on-error") for s in steps if "health_check.sh" in s.get("run", "")
+    )
+
+
+def test_dry_run_echoes_the_health_check_step(cd: dict) -> None:
+    names = [s.get("name", "") for s in cd["jobs"]["dry-run"]["steps"] if "name" in s]
+    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5"]
+    assert "health" in names[4].lower()
