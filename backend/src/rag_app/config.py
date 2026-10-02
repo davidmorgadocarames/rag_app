@@ -164,6 +164,13 @@ class Settings(JobSettings):
     next_public_api_url: str = Field(default="http://localhost:8000")
     frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
 
+    # --- Metrics (T11.3.2, TF4) ---
+    # Prometheus histograms + the in-flight gauge are served on this SEPARATE internal
+    # port — never the API port (`/metrics` would expose route/volume/error shape to the
+    # browser). Only Prometheus (compose network / Azure, never published to a host port
+    # or the internet) reads it.
+    metrics_port: int = 9100
+
 
 def get_settings() -> Settings:
     """Return the application settings loaded from the environment."""

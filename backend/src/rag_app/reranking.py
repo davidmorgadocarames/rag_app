@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
 
+from rag_app import timing
 from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
 from rag_app.retrieval import RetrievedChunk, hybrid_search
@@ -100,7 +101,10 @@ class CrossEncoderReranker:
 
     def _ensure_model(self) -> CrossEncoder:
         if self._model is None:
-            self._model = load_cross_encoder(self.model_name, self.revision)
+            # Measured separately from inference (T11.3.1): the first request after a cold
+            # start pays this once (warm-up removes it from later requests, T11.4.1).
+            with timing.stage("rerank_load"):
+                self._model = load_cross_encoder(self.model_name, self.revision)
         return self._model
 
     def rerank(
@@ -111,7 +115,8 @@ class CrossEncoderReranker:
             return []
         model = self._ensure_model()
         pairs = [(query, candidate.text) for candidate in candidates]
-        scores = model.predict(pairs)
+        with timing.stage("rerank_inference"):
+            scores = model.predict(pairs)
         return order_by_scores(candidates, [float(score) for score in scores], top_n)
 
 

@@ -12,13 +12,16 @@ prompt-injection defense).
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
+from rag_app import timing
 from rag_app.config import get_settings
 from rag_app.llm import ChatClient, Message, Usage, make_chat_client
+from rag_app.metrics import observe_stage
 from rag_app.retrieval import RetrievedChunk, hybrid_search
 
 INSUFFICIENT = "INSUFFICIENT_CONTEXT"
@@ -134,17 +137,26 @@ def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[Retrieve
 
 
 def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk]) -> Answer:
-    """Generate a grounded, cited answer from already-retrieved chunks (or abstain)."""
+    """Generate a grounded, cited answer from already-retrieved chunks (or abstain).
+
+    Also used by the eval runner and ``agentic.py`` (T11.3.1): outside a ``timing``
+    recorder (only ``answer_question``/``answer_question_stream`` open one) the ``stage``/
+    ``mark_first_token`` calls below are no-ops.
+    """
     if not chunks:
         return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
 
     max_tokens = get_settings().max_tokens
-    raw = chat.chat(build_messages(query, chunks), temperature=0.0, max_tokens=max_tokens)
+    with timing.stage("generate"):
+        raw = chat.chat(build_messages(query, chunks), temperature=0.0, max_tokens=max_tokens)
+    # Non-streaming: the full response arrives at once, so "first token" == "generate done".
+    timing.mark_first_token()
     answer = parse_answer(raw, chunks)
     if answer.abstained:
         return answer
 
-    answer.grounded = check_groundedness(chat, answer.text, chunks)
+    with timing.stage("groundedness"):
+        answer.grounded = check_groundedness(chat, answer.text, chunks)
     if not answer.grounded:
         return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
     return answer
@@ -159,21 +171,27 @@ def answer_question(
     use_rerank: bool = True,
     version: str | None = None,
 ) -> Answer:
-    """Full RAG: retrieve -> generate -> groundedness check -> cited answer or abstention."""
+    """Full RAG: retrieve -> generate -> groundedness check -> cited answer or abstention.
+
+    T11.3.1: one JSON timing record per answer (classify is streaming-only — this path
+    never has a chit-chat fast path) plus the same durations into the Prometheus
+    histograms (T11.3.2, never on the API port).
+    """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
     chat = chat or make_chat_client()
 
-    if use_rerank:
-        from rag_app.reranking import CrossEncoderReranker, retrieve
+    with timing.recorder(streaming=False, on_stage=observe_stage):
+        if use_rerank:
+            from rag_app.reranking import CrossEncoderReranker, retrieve
 
-        chunks = retrieve(
-            session, query, reranker=CrossEncoderReranker(), top_n=top_n, version=version
-        )
-    else:
-        chunks = hybrid_search(session, query, top_k=top_n, version=version)
+            chunks = retrieve(
+                session, query, reranker=CrossEncoderReranker(), top_n=top_n, version=version
+            )
+        else:
+            chunks = hybrid_search(session, query, top_k=top_n, version=version)
 
-    return answer_from_chunks(chat, query, chunks)
+        return answer_from_chunks(chat, query, chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -300,57 +318,73 @@ def answer_question_stream(
 
     Mirrors ``answer_question`` but yields progress so the UI can show what is happening
     and stream the answer. ``answer_question`` itself is left untouched (eval gate).
+
+    T11.3.1: one JSON timing record per answer (classify, embed, hybrid search, rerank
+    load/inference, time to first token, total) plus the same durations into the
+    Prometheus histograms (T11.3.2, never on the API port). The ``with`` block spans every
+    ``yield``: a client disconnect (``GeneratorExit``, closed by the caller) still exits it
+    normally, so a partial/interrupted answer is still timed and logged.
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
     chat = chat or make_chat_client()
     usage = Usage()
 
-    yield StreamStage(stage="classifying")
-    if classify_intent(query) == "chitchat":
-        yield StreamStage(stage="responding")
-        for word in _CHITCHAT_REPLY.split(" "):
-            yield StreamToken(text=word + " ")
-        yield StreamResult(
-            answer=Answer(text=_CHITCHAT_REPLY, abstained=False, grounded=True), usage=usage
-        )
-        return
+    with timing.recorder(streaming=True, on_stage=observe_stage):
+        yield StreamStage(stage="classifying")
+        with timing.stage("classify"):
+            intent = classify_intent(query)
+        if intent == "chitchat":
+            yield StreamStage(stage="responding")
+            for word in _CHITCHAT_REPLY.split(" "):
+                yield StreamToken(text=word + " ")
+            yield StreamResult(
+                answer=Answer(text=_CHITCHAT_REPLY, abstained=False, grounded=True), usage=usage
+            )
+            return
 
-    yield StreamStage(stage="retrieving")
-    chunks = hybrid_search(session, query, top_k=settings.top_k, version=version)
+        yield StreamStage(stage="retrieving")
+        chunks = hybrid_search(session, query, top_k=settings.top_k, version=version)
 
-    if use_rerank and chunks:
-        from rag_app.reranking import CrossEncoderReranker
+        if use_rerank and chunks:
+            from rag_app.reranking import CrossEncoderReranker
 
-        yield StreamStage(stage="reranking")
-        chunks = CrossEncoderReranker().rerank(query, chunks, top_n)
-    else:
-        chunks = chunks[:top_n]
-
-    if not chunks:
-        yield StreamResult(
-            answer=Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False), usage=usage
-        )
-        return
-
-    yield StreamStage(stage="generating")
-    raw = ""
-    for item in _stream_answer_tokens(chat, query, chunks, usage):
-        if isinstance(item, StreamToken):
-            yield item
+            yield StreamStage(stage="reranking")
+            chunks = CrossEncoderReranker().rerank(query, chunks, top_n)
         else:
-            raw = item
+            chunks = chunks[:top_n]
 
-    answer = parse_answer(raw, chunks)
-    if answer.abstained:
+        if not chunks:
+            yield StreamResult(
+                answer=Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False), usage=usage
+            )
+            return
+
+        yield StreamStage(stage="generating")
+        raw = ""
+        first_token = True
+        generate_start = time.perf_counter()
+        for item in _stream_answer_tokens(chat, query, chunks, usage):
+            if isinstance(item, StreamToken):
+                if first_token:
+                    timing.mark_first_token()
+                    first_token = False
+                yield item
+            else:
+                raw = item
+        timing.record("generate", time.perf_counter() - generate_start)
+
+        answer = parse_answer(raw, chunks)
+        if answer.abstained:
+            yield StreamResult(answer=answer, usage=usage)
+            return
+
+        yield StreamStage(stage="checking")
+        with timing.stage("groundedness"):
+            answer.grounded = _check_groundedness_counted(chat, answer.text, chunks, usage)
+        if not answer.grounded:
+            answer = Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
         yield StreamResult(answer=answer, usage=usage)
-        return
-
-    yield StreamStage(stage="checking")
-    answer.grounded = _check_groundedness_counted(chat, answer.text, chunks, usage)
-    if not answer.grounded:
-        answer = Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
-    yield StreamResult(answer=answer, usage=usage)
 
 
 def _check_groundedness_counted(
