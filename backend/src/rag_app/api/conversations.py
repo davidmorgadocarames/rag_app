@@ -74,6 +74,7 @@ from rag_app.generation import (
     classify_intent,
 )
 from rag_app.llm import Usage
+from rag_app.reranking import get_shared_reranker
 from rag_app.usage_cap import (
     DAILY_CAP_CODE,
     DAILY_CAP_MESSAGE,
@@ -321,8 +322,13 @@ def _pipeline_events(request: ChatStreamRequest) -> Generator[object | None, Non
     def work() -> None:
         try:
             with _stream_session_factory()() as session:
+                # T11.4.1: the ONE process-wide shared reranker — never a fresh load per
+                # stream.
                 for event in answer_question_stream(
-                    session, request.question, version=request.version
+                    session,
+                    request.question,
+                    version=request.version,
+                    reranker=get_shared_reranker(),
                 ):
                     session.commit()  # ends the read transaction; a no-op when none is open
                     if cancel.is_set():

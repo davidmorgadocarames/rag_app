@@ -54,9 +54,11 @@ def run_pipeline(
 ) -> PipelineReport:
     from rag_app.agentic import answer_agentic
     from rag_app.generation import answer_from_chunks
-    from rag_app.reranking import CrossEncoderReranker, retrieve
+    from rag_app.reranking import get_shared_reranker, retrieve
 
-    reranker = CrossEncoderReranker()
+    # T11.4.1: the ONE process-wide shared instance — one load for BOTH pipelines in this
+    # run (`main()` calls `run_pipeline` twice, "simple" then "agentic"), not two.
+    reranker = get_shared_reranker()
     results: list[ItemResult] = []
     latencies: list[float] = []
     rewrites = 0

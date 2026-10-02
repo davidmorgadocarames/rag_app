@@ -24,12 +24,14 @@ def evaluate(
     """Evaluate each golden item end-to-end (retrieve -> rerank -> answer -> judge)."""
     from rag_app.eval.judge import judge_correctness
     from rag_app.generation import answer_from_chunks
-    from rag_app.reranking import CrossEncoderReranker, retrieve
+    from rag_app.reranking import get_shared_reranker, retrieve
 
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
     chat = chat or OllamaChat()
-    reranker = CrossEncoderReranker()
+    # T11.4.1: the ONE process-wide shared instance (same as the live API) — one load for
+    # the whole golden-set run, not one per item.
+    reranker = get_shared_reranker()
 
     results: list[ItemResult] = []
     for item in items:

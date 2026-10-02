@@ -84,12 +84,13 @@ def answer_agentic(
     version: str | None = None,
 ) -> RoutedAnswer:
     """Retrieve; if thin, reformulate + retry; then generate a grounded answer."""
-    from rag_app.reranking import CrossEncoderReranker, retrieve
+    from rag_app.reranking import get_shared_reranker, retrieve
 
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
     chat = chat or make_chat_client()
-    reranker = reranker or CrossEncoderReranker()
+    # T11.4.1: the ONE process-wide shared instance by default, never a fresh load per call.
+    reranker = reranker or get_shared_reranker()
 
     chunks = retrieve(session, query, reranker=reranker, top_n=top_n, version=version)
     rewrote = False

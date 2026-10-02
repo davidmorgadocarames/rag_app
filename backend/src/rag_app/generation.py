@@ -15,6 +15,7 @@ import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,9 @@ from rag_app.config import get_settings
 from rag_app.llm import ChatClient, Message, Usage, make_chat_client
 from rag_app.metrics import observe_stage
 from rag_app.retrieval import RetrievedChunk, hybrid_search
+
+if TYPE_CHECKING:
+    from rag_app.reranking import CrossEncoderReranker
 
 INSUFFICIENT = "INSUFFICIENT_CONTEXT"
 _ABSTENTION_TEXT = "I don't have a reliable source for that in the corpus."
@@ -180,6 +184,7 @@ def answer_question(
     query: str,
     *,
     chat: ChatClient | None = None,
+    reranker: CrossEncoderReranker | None = None,
     top_n: int | None = None,
     use_rerank: bool = True,
     version: str | None = None,
@@ -189,6 +194,11 @@ def answer_question(
     T11.3.1: one JSON timing record per answer (classify is streaming-only — this path
     never has a chit-chat fast path) plus the same durations into the Prometheus
     histograms (T11.3.2, never on the API port).
+
+    ``reranker`` (T11.4.1): defaults to the ONE process-wide shared instance
+    (``reranking.get_shared_reranker()``) — never a fresh ``CrossEncoderReranker()`` per
+    call, which reloaded the ~2.2 GB cross-encoder on every answer before this fix. Pass an
+    explicit instance (e.g. a throwaway one in a test) to override it.
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
@@ -196,10 +206,14 @@ def answer_question(
 
     with timing.recorder(streaming=False, on_stage=observe_stage):
         if use_rerank:
-            from rag_app.reranking import CrossEncoderReranker, retrieve
+            from rag_app.reranking import get_shared_reranker, retrieve
 
             chunks = retrieve(
-                session, query, reranker=CrossEncoderReranker(), top_n=top_n, version=version
+                session,
+                query,
+                reranker=reranker or get_shared_reranker(),
+                top_n=top_n,
+                version=version,
             )
         else:
             chunks = hybrid_search(session, query, top_k=top_n, version=version)
@@ -329,6 +343,7 @@ def answer_question_stream(
     query: str,
     *,
     chat: ChatClient | None = None,
+    reranker: CrossEncoderReranker | None = None,
     top_n: int | None = None,
     use_rerank: bool = True,
     version: str | None = None,
@@ -343,6 +358,9 @@ def answer_question_stream(
     Prometheus histograms (T11.3.2, never on the API port). The ``with`` block spans every
     ``yield``: a client disconnect (``GeneratorExit``, closed by the caller) still exits it
     normally, so a partial/interrupted answer is still timed and logged.
+
+    ``reranker`` (T11.4.1): see ``answer_question`` — defaults to the ONE process-wide
+    shared instance, never a fresh load per stream.
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
@@ -366,10 +384,10 @@ def answer_question_stream(
         chunks = hybrid_search(session, query, top_k=settings.top_k, version=version)
 
         if use_rerank and chunks:
-            from rag_app.reranking import CrossEncoderReranker
+            from rag_app.reranking import get_shared_reranker
 
             yield StreamStage(stage="reranking")
-            chunks = CrossEncoderReranker().rerank(query, chunks, top_n)
+            chunks = (reranker or get_shared_reranker()).rerank(query, chunks, top_n)
         else:
             chunks = chunks[:top_n]
 

@@ -9,7 +9,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from rag_app import __version__, metrics, timing
+from rag_app import __version__, metrics, reranking, timing
 from rag_app.api import auth, conversations
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import (
@@ -52,11 +52,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Start-up checks (``startup_checks``): any failure aborts the start.
 
     Starts the Prometheus metrics server on its own internal port (T11.3.2) — never on
-    this API port — only once the fail-closed checks above have passed.
+    this API port — only once the fail-closed checks above have passed. Then loads and
+    warms up the ONE shared cross-encoder reranker (T11.4.1): the first real chat request
+    pays no model-load/first-inference cost, because it is already resident by the time
+    this coroutine yields and the app starts serving traffic.
     """
     settings = get_settings()
     startup_checks(settings)
     metrics.start_metrics_server(settings.metrics_port)
+    reranking.get_shared_reranker().warm_up()
     yield
 
 

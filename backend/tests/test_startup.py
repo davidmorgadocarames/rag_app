@@ -129,6 +129,26 @@ def test_building_the_app_does_not_validate() -> None:
     assert client.get("/health").status_code == 200
 
 
+def test_the_api_lifespan_warms_up_the_shared_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T11.4.1: the lifespan loads and warms up the ONE shared reranker before the app starts
+    serving traffic — so the first real chat request never pays the model-load/first-
+    inference cost (that cost is paid here, once, at start-up instead)."""
+    from rag_app.api import app as app_module
+
+    calls: list[object] = []
+
+    class _FakeReranker:
+        def warm_up(self) -> None:
+            calls.append(True)
+
+    monkeypatch.setattr(app_module, "get_settings", lambda: _settings())
+    monkeypatch.setattr(app_module, "check_master_key_fingerprint", lambda *_a: "match")
+    monkeypatch.setattr(app_module.reranking, "get_shared_reranker", lambda: _FakeReranker())
+    with TestClient(create_app()):
+        pass
+    assert calls == [True]
+
+
 def test_job_settings_have_no_api_secrets() -> None:
     fields = set(JobSettings.model_fields)
     assert fields == {"env", "database_url"}

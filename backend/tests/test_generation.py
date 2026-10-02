@@ -195,6 +195,60 @@ def test_answer_question_stream_emits_one_timing_record(
         assert key in payload
 
 
+# --- T11.4.1: both generation paths default to the ONE shared reranker --------------------
+
+
+def test_answer_question_uses_the_shared_reranker_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    shared = reranking.get_shared_reranker()
+    seen: list[object] = []
+
+    def fake_retrieve(
+        _session: object,
+        _query: str,
+        *,
+        reranker: object,
+        candidate_k: int | None = None,
+        top_n: int | None = None,
+        version: str | None = None,
+    ) -> list[object]:
+        seen.append(reranker)
+        return [_chunk()]
+
+    monkeypatch.setattr(reranking, "retrieve", fake_retrieve)
+    chat = _FakeChatSync("Use prepared statements [1].")
+
+    generation.answer_question(None, "q", chat=chat, use_rerank=True)  # type: ignore[arg-type]
+    assert seen == [shared]
+
+
+def test_answer_question_stream_uses_the_shared_reranker_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    shared = reranking.get_shared_reranker()
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    seen: list[object] = []
+
+    def fake_rerank(self: object, _query: str, chunks: list[object], _top_n: int) -> list[object]:
+        seen.append(self)
+        return chunks
+
+    monkeypatch.setattr(reranking.CrossEncoderReranker, "rerank", fake_rerank)
+    chat = _FakeChatStreamSeq([["Use ", "[1]."], ["GROUNDED"]])
+
+    list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "How do I prevent SQL injection?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+    assert seen == [shared]
+
+
 def test_answer_question_stream_chitchat_still_emits_one_timing_record(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -76,6 +76,9 @@ class _FakeCrossEncoder:
         if kwargs.get("local_files_only") and not type(self).cached:
             raise OSError("not in the local cache")
 
+    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        return [0.5 for _ in pairs]
+
 
 @pytest.fixture()
 def fake_st(monkeypatch: pytest.MonkeyPatch) -> type[_FakeCrossEncoder]:
@@ -98,6 +101,7 @@ def test_a_cached_model_loads_offline_at_the_pinned_revision(fake_st: type) -> N
             "local_files_only": True,
             "revision": PINNED,
             "trust_remote_code": False,
+            "max_length": 512,
         }
     ]
 
@@ -121,3 +125,56 @@ def test_offline_mode_never_downloads(fake_st: type, monkeypatch: pytest.MonkeyP
     with pytest.raises(RerankerModelError, match="HF_HUB_OFFLINE"):
         load_cross_encoder("BAAI/bge-reranker-v2-m3", PINNED)
     assert len(fake_st.calls) == 1 and fake_st.calls[0]["local_files_only"] is True
+
+
+# --- T11.4.1: single shared reranker (loaded once, injected everywhere) --------------------
+
+
+def test_the_cross_encoder_max_length_is_512(fake_st: type[_FakeCrossEncoder]) -> None:
+    from rag_app.reranking import RERANKER_MAX_LENGTH, load_cross_encoder
+
+    fake_st.cached = True
+    assert RERANKER_MAX_LENGTH == 512
+    load_cross_encoder("BAAI/bge-reranker-v2-m3", PINNED)
+    assert fake_st.calls[0]["max_length"] == 512
+
+
+def test_warm_up_loads_the_model_and_runs_one_dummy_predict(
+    fake_st: type[_FakeCrossEncoder],
+) -> None:
+    from rag_app.reranking import CrossEncoderReranker
+
+    fake_st.cached = True
+    reranker = CrossEncoderReranker()
+    assert reranker._model is None
+    reranker.warm_up()
+    assert reranker._model is not None
+    assert len(fake_st.calls) == 1  # the model was constructed exactly once
+
+    # A real request afterwards finds the model already loaded (no second construction).
+    reranker.rerank("q", [_chunk("a")], top_n=1)
+    assert len(fake_st.calls) == 1
+
+
+def test_get_shared_reranker_is_a_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    first = reranking.get_shared_reranker()
+    second = reranking.get_shared_reranker()
+    assert first is second
+
+
+def test_get_shared_reranker_constructs_the_model_only_once_across_many_calls(
+    monkeypatch: pytest.MonkeyPatch, fake_st: type[_FakeCrossEncoder]
+) -> None:
+    """Done-when (T11.4.1): one load across N requests, proven by the ``CrossEncoder``
+    constructor call count — not just object identity."""
+    import rag_app.reranking as reranking
+
+    fake_st.cached = True
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    for _ in range(5):
+        shared = reranking.get_shared_reranker()
+        shared.rerank("q", [_chunk("a"), _chunk("b")], top_n=1)
+    assert len(fake_st.calls) == 1
