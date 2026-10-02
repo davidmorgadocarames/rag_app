@@ -187,6 +187,19 @@ def test_images_build_the_jobs_image(cd: dict) -> None:
     assert cd["jobs"]["images"]["outputs"]["jobs_digest"] == "${{ steps.jobs.outputs.digest }}"
 
 
+def test_images_build_the_ollama_image_with_a_gha_cache(cd: dict) -> None:
+    """T11.4.3 + DA-11bC-1: the custom Ollama image is built from its own Dockerfile and
+    cached the same way the other three images are."""
+    step = next(s for s in cd["jobs"]["images"]["steps"] if s.get("id") == "ollama")
+    assert step["with"]["context"] == "./ollama"
+    assert step["with"]["file"] == "./ollama/Dockerfile"
+    assert "type=gha" in step["with"]["cache-from"]
+    assert "type=gha" in step["with"]["cache-to"]
+    assert cd["jobs"]["images"]["outputs"]["ollama_digest"] == "${{ steps.ollama.outputs.digest }}"
+    steps = cd["jobs"]["images"]["steps"]
+    assert any(s.get("uses", "").startswith("docker/setup-buildx-action") for s in steps)
+
+
 def test_the_dry_run_shows_the_real_order_and_can_simulate_a_migrate_failure(cd: dict) -> None:
     inputs = _triggers(cd)["workflow_dispatch"]["inputs"]
     assert inputs["simulate_failure"]["default"] is False
@@ -213,8 +226,28 @@ def test_deploy_job_refuses_without_gate_status_and_deploys_by_digest(cd: dict) 
     )
     assert "-backend@${{ needs.images.outputs.backend_digest }}" in script
     assert "-frontend@${{ needs.images.outputs.frontend_digest }}" in script
+    assert "-ollama@${{ needs.images.outputs.ollama_digest }}" in script
     assert deploy["permissions"]["deployments"] == "write"
     assert deploy["permissions"]["id-token"] == "write"
+
+
+def test_ollama_app_is_updated_before_backend_and_frontend(cd: dict) -> None:
+    """T11.4.3: the backend calls Ollama synchronously for embeddings, so Ollama must
+    already be serving the baked-in model before the backend's new revision can take
+    traffic (same "dependency before dependent" order as the migration Job before the
+    apps)."""
+    deploy = cd["jobs"]["deploy"]
+    script = next(
+        s["with"]["inlineScript"]
+        for s in deploy["steps"]
+        if "with" in s and "inlineScript" in s["with"]
+    )
+    ollama_at = script.index("AZURE_OLLAMA_APP")
+    backend_at = script.index("AZURE_BACKEND_APP")
+    frontend_at = script.index("AZURE_FRONTEND_APP")
+    assert ollama_at < backend_at < frontend_at
+    ollama_image = deploy["env"]["OLLAMA_IMAGE"]
+    assert ollama_image.endswith("-ollama@${{ needs.images.outputs.ollama_digest }}")
 
 
 def _commands(path: Path) -> str:

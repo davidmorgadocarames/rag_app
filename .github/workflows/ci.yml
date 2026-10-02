@@ -200,6 +200,54 @@ jobs:
       - name: Image size (informational; ADR records a local before/after)
         run: docker images secrag-backend:ci --format "{{.Size}}"
 
+  # Custom Ollama image (T11.4.3): `bge-m3` baked in at build time (fixes the Azure
+  # `secrag-ollama` ephemeral-storage loss — ADR phase 11, runbook gotcha 4). Measured
+  # locally: ~6.3 GB on-disk (`du`), build ~40s (base image layers cached after the first
+  # pull); fits a GH-hosted runner's disk/time budget the same way backend-image (~3.9 GB)
+  # already does — `df -h` below records the real runner numbers for the record.
+  ollama-image:
+    name: Ollama image (build, bge-m3 baked in, offline embed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Disk space before the build (informational)
+        run: df -h /
+      - name: Build ollama/Dockerfile
+        uses: docker/build-push-action@v6
+        with:
+          context: ollama
+          file: ollama/Dockerfile
+          tags: secrag-ollama:ci
+          load: true
+          cache-from: type=gha,scope=ollama-image
+          cache-to: type=gha,mode=max,scope=ollama-image
+      - name: bge-m3 is already pulled (ollama list, no server needed)
+        run: |
+          docker run --rm --entrypoint ollama secrag-ollama:ci list | grep -q bge-m3
+      - name: Embeds with networking disabled (throwaway container, no volumes)
+        run: |
+          docker rm -f secrag-ollama-ci-embed 2>/dev/null || true
+          docker run -d --name secrag-ollama-ci-embed --network none secrag-ollama:ci
+          for _ in $(seq 1 30); do
+            docker exec secrag-ollama-ci-embed ollama list >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec secrag-ollama-ci-embed bash -c '
+          body="{\"model\":\"bge-m3\",\"input\":\"hello world\"}"
+          len=${#body}
+          exec 3<>/dev/tcp/127.0.0.1/11434
+          printf "POST /api/embed HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "$len" "$body" >&3
+          response="$(cat <&3)"
+          echo "$response" | grep -q "\"embeddings\":\[\[" || { echo "::error::no embeddings in the response"; echo "$response"; exit 1; }
+          echo "offline embed ok"
+          '
+          docker rm -f secrag-ollama-ci-embed
+      - name: Image size (informational; ADR records a local before/after) and disk space after
+        run: |
+          docker images secrag-ollama:ci --format "{{.Size}}"
+          df -h /
+
   gitleaks:
     name: Secret scan
     runs-on: ubuntu-latest

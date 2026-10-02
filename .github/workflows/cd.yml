@@ -13,17 +13,22 @@ name: CD
 #   gate-status  the SHA must carry the commit status `secrag/gate-full` = success, posted by
 #                `scripts/gate.sh --full` for exactly that SHA (D-2026-09-27-7 b); otherwise
 #                the deploy is REFUSED (a skipped pre-push hook can no longer reach Azure)
-#   images       build + push backend, frontend and the slim jobs image, tagged with the SHA;
-#                deployed BY DIGEST
+#   images       build + push backend, frontend, ollama (T11.4.3) and the slim jobs image,
+#                tagged with the SHA; deployed BY DIGEST
 #   migrate      re-checks the gate status; the migration Job gets the jobs image (digest) and
 #                is started with no overrides; CD waits and STOPS on a failure, before the apps
 #                (scripts/cd/azure_jobs.sh, T11.2.6)
-#   deploy       re-checks the gate status, records a deployment, updates the apps, then the
-#                purge and backup Jobs' images (digest, X1; T11.2.11)
+#   deploy       re-checks the gate status, records a deployment, updates the apps — `secrag-
+#                ollama` BEFORE `secrag-backend`/`secrag-frontend` (the backend calls Ollama
+#                synchronously for embeddings on every chat/ingestion request; Ollama must
+#                already be serving the baked-in model before backend's new revision can take
+#                traffic, same "dependency before dependent" order as the migration Job before
+#                the apps) — then the purge and backup Jobs' images (digest, X1; T11.2.11)
 #
-# Order: images → migrate Job → apps → Job images. Job names come from repo variables
-# (AZURE_MIGRATE_JOB, AZURE_PURGE_JOB, AZURE_BACKUP_JOB); the Jobs themselves are created by
-# hand from deploy/azure/jobs/*.yaml (runbook) — CD never applies YAML or enables schedules.
+# Order: images → migrate Job → ollama app → backend/frontend apps → Job images. Job names
+# come from repo variables (AZURE_MIGRATE_JOB, AZURE_PURGE_JOB, AZURE_BACKUP_JOB); the Jobs
+# themselves are created by hand from deploy/azure/jobs/*.yaml (runbook) — CD never applies
+# YAML or enables schedules.
 #
 # One SHA everywhere: head_sha of the CI run (workflow_run) or the dispatched commit.
 # Manual runs (workflow_dispatch) default to dry_run=true: plan + gate-status run (read-only)
@@ -236,6 +241,7 @@ jobs:
           echo "Would build and push:"
           echo "  ghcr.io/$REPO-backend:$SHA"
           echo "  ghcr.io/$REPO-frontend:$SHA"
+          echo "  ghcr.io/$REPO-ollama:$SHA   (bge-m3 baked in, T11.4.3)"
           echo "  ghcr.io/$REPO-jobs:$SHA   (slim jobs image: migrations, purge, backup)"
       - name: 2. Migration Job (jobs image by digest, start, wait — a failure stops here)
         if: steps.plan.outputs.go == 'true'
@@ -246,13 +252,18 @@ jobs:
           args=(migrate --rg "$RESOURCE_GROUP" --job "$MIGRATE_JOB" --image "$JOBS_IMAGE" --dry-run)
           [ "$SIMULATE_FAILURE" != true ] || args+=(--simulate-failure)
           bash scripts/cd/azure_jobs.sh "${args[@]}"
-      - name: 3. Apps (backend, frontend by digest)
+      - name: 3. Apps (ollama, then backend/frontend, by digest)
         if: steps.plan.outputs.go == 'true'
         env:
+          OLLAMA_APP: ${{ vars.AZURE_OLLAMA_APP || '<AZURE_OLLAMA_APP>' }}
           BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
           FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
         run: |
-          echo "Would record a deployment and update by digest: $BACKEND_APP, $FRONTEND_APP (rg $RESOURCE_GROUP)"
+          echo "Would record a deployment and update by digest, in order:"
+          echo "  1. $OLLAMA_APP   (ollama — must serve the baked model before backend takes traffic)"
+          echo "  2. $BACKEND_APP"
+          echo "  3. $FRONTEND_APP"
+          echo "(rg $RESOURCE_GROUP)"
       - name: 4. Purge and backup Job images (digest; schedules never touched)
         if: steps.plan.outputs.go == 'true'
         env:
@@ -276,10 +287,13 @@ jobs:
       backend_digest: ${{ steps.backend.outputs.digest }}
       frontend_digest: ${{ steps.frontend.outputs.digest }}
       jobs_digest: ${{ steps.jobs.outputs.digest }}
+      ollama_digest: ${{ steps.ollama.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.plan.outputs.sha }}
+
+      - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
@@ -296,6 +310,8 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}-backend:latest
             ghcr.io/${{ github.repository }}-backend:${{ needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=backend-image
+          cache-to: type=gha,mode=max,scope=backend-image
 
       - name: Build & push frontend
         id: frontend
@@ -311,6 +327,8 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}-frontend:latest
             ghcr.io/${{ github.repository }}-frontend:${{ needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=frontend-image
+          cache-to: type=gha,mode=max,scope=frontend-image
 
       # Slim jobs image (T11.2.12): migration, purge and backup Jobs.
       - name: Build & push jobs image
@@ -325,15 +343,33 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}-jobs:latest
             ghcr.io/${{ github.repository }}-jobs:${{ needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=jobs-image
+          cache-to: type=gha,mode=max,scope=jobs-image
+
+      # Custom Ollama image (T11.4.3): `bge-m3` baked in at build time — see ollama/Dockerfile.
+      - name: Build & push ollama image
+        id: ollama
+        uses: docker/build-push-action@v6
+        with:
+          context: ./ollama
+          file: ./ollama/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-ollama:latest
+            ghcr.io/${{ github.repository }}-ollama:${{ needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=ollama-image
+          cache-to: type=gha,mode=max,scope=ollama-image
 
       - name: Digests
         env:
           BACKEND_DIGEST: ${{ steps.backend.outputs.digest }}
           FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
           JOBS_DIGEST: ${{ steps.jobs.outputs.digest }}
+          OLLAMA_DIGEST: ${{ steps.ollama.outputs.digest }}
         run: |
           echo "backend  $BACKEND_DIGEST"
           echo "frontend $FRONTEND_DIGEST"
+          echo "ollama   $OLLAMA_DIGEST"
           echo "jobs     $JOBS_DIGEST"
 
   # T11.2.6: migrations run as an Azure Container Apps Job from the jobs image, BEFORE the apps.
@@ -394,6 +430,7 @@ jobs:
       SHA: ${{ needs.plan.outputs.sha }}
       BACKEND_IMAGE: ghcr.io/${{ github.repository }}-backend@${{ needs.images.outputs.backend_digest }}
       FRONTEND_IMAGE: ghcr.io/${{ github.repository }}-frontend@${{ needs.images.outputs.frontend_digest }}
+      OLLAMA_IMAGE: ghcr.io/${{ github.repository }}-ollama@${{ needs.images.outputs.ollama_digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -407,8 +444,11 @@ jobs:
 
       - name: Images must be pinned by digest
         run: |
-          case "$BACKEND_IMAGE $FRONTEND_IMAGE" in
-            *@sha256:*@sha256:*) echo "backend  $BACKEND_IMAGE"; echo "frontend $FRONTEND_IMAGE" ;;
+          case "$BACKEND_IMAGE $FRONTEND_IMAGE $OLLAMA_IMAGE" in
+            *@sha256:*@sha256:*@sha256:*)
+              echo "backend  $BACKEND_IMAGE"
+              echo "frontend $FRONTEND_IMAGE"
+              echo "ollama   $OLLAMA_IMAGE" ;;
             *) echo "::error::missing image digest"; exit 1 ;;
           esac
 
@@ -431,11 +471,18 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy new images to the Container Apps (by digest)
+      # T11.4.3: `secrag-ollama` updates FIRST — see the order note at the top of this file
+      # (the backend calls Ollama synchronously for embeddings, so it must already be
+      # serving the baked-in model before backend's new revision can take traffic).
+      - name: Deploy new images to the Container Apps (by digest; ollama before backend/frontend)
         uses: azure/cli@v2
         with:
           azcliversion: latest
           inlineScript: |
+            az containerapp update \
+              --name "${{ vars.AZURE_OLLAMA_APP }}" \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --image "ghcr.io/${{ github.repository }}-ollama@${{ needs.images.outputs.ollama_digest }}"
             az containerapp update \
               --name "${{ vars.AZURE_BACKEND_APP }}" \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
