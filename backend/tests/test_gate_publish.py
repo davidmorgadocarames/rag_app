@@ -26,7 +26,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Answers `repo view`; `commits/<sha>` fails until it has been asked FAKE_GH_LAND_AFTER
-# times (the push has not landed yet); every call is logged.
+# times (the push has not landed yet); every call is logged. `commits/<sha>/statuses` (the
+# `verify` query _warn_stale_publishers uses) is a SEPARATE branch, checked first so it never
+# shares the land-after poll counter: it answers "success" only for FAKE_GH_RESOLVED_SHA
+# (a stale sha that turned out to be published some other way — DA-11bB-1), "" (no status)
+# for every other sha, same as a real repo with no secrag/gate-full status at all.
 FAKE_GH = """\
 import os, sys
 args = " ".join(sys.argv[1:])
@@ -37,6 +41,11 @@ if args.startswith("repo view"):
     print("owner/repo")
     sys.exit(0)
 if "-X POST" in args and "/statuses/" in args:
+    sys.exit(0)
+if "/statuses?per_page=100" in args:
+    resolved = os.environ.get("FAKE_GH_RESOLVED_SHA", "")
+    if resolved and f"commits/{resolved}/statuses" in args:
+        print("success owner")
     sys.exit(0)
 if "/commits/" in args:
     counter = log + ".polls"
@@ -188,6 +197,108 @@ def test_before_the_push_lands_a_detached_publisher_posts_later(repo: Path, tmp_
     assert f"published secrag/gate-full=success for {sha}" in text
     (post,) = _posts(tmp_path)
     assert f"statuses/{sha}" in post
+
+
+def test_the_waiting_line_records_the_publishers_pid(repo: Path, tmp_path) -> None:
+    sha = _git(repo, "rev-parse", "HEAD")
+    proc = _publish(repo, tmp_path, env=_env(tmp_path, land_after=3))
+    assert proc.returncode == 0, proc.stderr
+    log = tmp_path / "state" / "publish-status.log"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and "published" not in log.read_text():
+        time.sleep(0.2)
+    waiting_line = next(
+        line for line in log.read_text().splitlines() if line.startswith("20") and sha in line
+    )
+    assert "[pid=" in waiting_line
+    pid = int(waiting_line.split("[pid=")[1].rstrip("]"))
+    assert pid > 0
+
+
+def test_a_dead_unresolved_prior_publisher_is_surfaced_as_a_warning(repo: Path, tmp_path) -> None:
+    """11b block D: a detached publisher can be killed outright (machine sleep, a Docker
+    Desktop/WSL restart, a reboot) between its "waiting" line and ever posting or timing
+    out — no error, no further log line. A LATER gate_publish.sh run must surface that in
+    its own (attended) output, not leave it silently buried in the log."""
+    sha = _git(repo, "rev-parse", "HEAD")
+    old_sha = "1" * 40
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "publish-status.log").write_text(
+        f"2020-01-01T00:00:00Z waiting for {old_sha} on owner/repo (up to 900s) [pid=999999999]\n",
+        encoding="utf-8",
+    )
+    proc = _publish(repo, tmp_path, env=_env(tmp_path, land_after=1))
+    assert proc.returncode == 0, proc.stderr
+    assert f"WARNING — an earlier detached publisher for {old_sha}" in proc.stdout
+    assert "never posted secrag/gate-full" in proc.stdout
+    assert (
+        f"WARNING — an earlier detached publisher for {old_sha}"
+        in (state / "publish-status.log").read_text()
+    )
+    # the CURRENT sha's own publish still proceeds normally afterward
+    deadline = time.monotonic() + 30
+    while (
+        time.monotonic() < deadline
+        and f"published secrag/gate-full=success for {sha}"
+        not in (state / "publish-status.log").read_text()
+    ):
+        time.sleep(0.2)
+    assert (
+        f"published secrag/gate-full=success for {sha}"
+        in (state / "publish-status.log").read_text()
+    )
+
+
+def test_a_dead_prior_publisher_resolved_some_other_way_is_not_a_warning(
+    repo: Path, tmp_path
+) -> None:
+    """Confirms the live check (not just the log): a stale sha whose status DID get
+    published some other way since (the DA-11bB-1 case) must not be flagged."""
+    old_sha = "2" * 40
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "publish-status.log").write_text(
+        f"2020-01-01T00:00:00Z waiting for {old_sha} on owner/repo (up to 900s) [pid=999999999]\n",
+        encoding="utf-8",
+    )
+    env = _env(tmp_path, land_after=1, FAKE_GH_RESOLVED_SHA=old_sha)
+    proc = _publish(repo, tmp_path, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stdout
+    assert "WARNING" not in (state / "publish-status.log").read_text()
+
+
+def test_a_prior_publisher_still_polling_is_not_a_warning(repo: Path, tmp_path) -> None:
+    """A live pid (still within its 900s window) must never be flagged, even if its sha
+    has not resolved yet — it may still succeed."""
+    old_sha = "3" * 40
+    state = tmp_path / "state"
+    state.mkdir()
+    pid = os.getpid()
+    (state / "publish-status.log").write_text(
+        f"2020-01-01T00:00:00Z waiting for {old_sha} on owner/repo (up to 900s) [pid={pid}]\n",
+        encoding="utf-8",
+    )
+    proc = _publish(repo, tmp_path, env=_env(tmp_path, land_after=1))
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stdout
+
+
+def test_a_prior_publisher_already_resolved_locally_is_not_a_warning(repo: Path, tmp_path) -> None:
+    """A "published" line already in the log for the stale sha is resolution enough — no
+    live check is even needed (and none happens: FAKE_GH has no route configured for it)."""
+    old_sha = "4" * 40
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "publish-status.log").write_text(
+        f"2020-01-01T00:00:00Z waiting for {old_sha} on owner/repo (up to 900s) [pid=999999999]\n"
+        f"gate_status: published secrag/gate-full=success for {old_sha} (owner/repo)\n",
+        encoding="utf-8",
+    )
+    proc = _publish(repo, tmp_path, env=_env(tmp_path, land_after=1))
+    assert proc.returncode == 0, proc.stderr
+    assert "WARNING" not in proc.stdout
 
 
 def test_gate_hands_every_run_to_the_publisher_with_its_real_result() -> None:
