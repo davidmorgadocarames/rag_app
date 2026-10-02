@@ -10,6 +10,7 @@ server.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -21,6 +22,46 @@ from rag_app.config import Settings, get_settings
 _TIMEOUT_SECONDS = 180
 
 Message = dict[str, str]
+
+# T11.3.4: an early warning for a prompt that may not fit the explicit `num_ctx` passed for
+# its call type (answer/groundedness, config.py). Ollama truncates a request that does not
+# fit `num_ctx` SILENTLY (no error, no HTTP status) instead of failing, so without this the
+# bug would be invisible. This logger is never configured with its own handler: a
+# `.warning()` call is at/above `logging.lastResort`'s threshold (WARNING), so it reaches
+# stderr even though this app never calls `logging.basicConfig` (unlike `rag_app.timing`'s
+# INFO-level records, which needed `install_timing_log()` — T11.3.1 finding DA-11bA, block A).
+logger = logging.getLogger("rag_app.llm")
+
+# Deliberately crude (chars / 4): good enough to catch an order-of-magnitude misconfiguration
+# (an oversized context silently truncated by Ollama) as an early warning, without adding a
+# real tokenizer dependency just to log one.
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _estimate_prompt_tokens(messages: list[Message]) -> int:
+    return sum(len(m.get("content", "")) for m in messages) // _CHARS_PER_TOKEN_ESTIMATE
+
+
+def _warn_if_may_overflow(
+    messages: list[Message], *, max_tokens: int | None, num_ctx: int | None, call_type: str
+) -> None:
+    """Log (never raise — Ollama itself does not) when a prompt may not fit ``num_ctx``.
+
+    No PII (same discipline as ``rag_app.timing``): only the call type and token counts,
+    never the message content.
+    """
+    if num_ctx is None:
+        return
+    estimated = _estimate_prompt_tokens(messages) + (max_tokens or 0)
+    if estimated > num_ctx:
+        logger.warning(
+            "llm context may overflow num_ctx: call_type=%s estimated_tokens~%d num_ctx=%d"
+            " (Ollama truncates context silently instead of failing — raise num_ctx or"
+            " shrink the prompt)",
+            call_type,
+            estimated,
+            num_ctx,
+        )
 
 
 @dataclass
@@ -52,6 +93,8 @@ class ChatClient(Protocol):
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
     ) -> str: ...
 
     def chat_stream(
@@ -61,6 +104,8 @@ class ChatClient(Protocol):
         temperature: float = 0.0,
         max_tokens: int | None = None,
         usage: Usage | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
     ) -> Iterator[str]: ...
 
 
@@ -73,10 +118,14 @@ class OllamaChat:
         self.model = model or settings.llm_model
         self.keep_alive = settings.ollama_keep_alive
 
-    def _options(self, temperature: float, max_tokens: int | None) -> dict[str, float | int]:
+    def _options(
+        self, temperature: float, max_tokens: int | None, num_ctx: int | None
+    ) -> dict[str, float | int]:
         options: dict[str, float | int] = {"temperature": temperature}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
         return options
 
     def chat(
@@ -85,8 +134,17 @@ class OllamaChat:
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
     ) -> str:
-        """Send a chat request and return the assistant message content."""
+        """Send a chat request and return the assistant message content.
+
+        ``num_ctx`` (T11.3.4) is explicit per call type; a request without it falls back to
+        Ollama's own default (2048) rather than the currently loaded model's context —
+        callers that need to stay on the same loaded context (config.py's note on
+        ``num_ctx_answer``/``num_ctx_groundedness``) must always pass the same value.
+        """
+        _warn_if_may_overflow(messages, max_tokens=max_tokens, num_ctx=num_ctx, call_type=call_type)
         response = httpx.post(
             f"{self.host}/api/chat",
             json={
@@ -94,7 +152,7 @@ class OllamaChat:
                 "messages": messages,
                 "stream": False,
                 "keep_alive": self.keep_alive,
-                "options": self._options(temperature, max_tokens),
+                "options": self._options(temperature, max_tokens, num_ctx),
             },
             timeout=_TIMEOUT_SECONDS,
         )
@@ -111,13 +169,16 @@ class OllamaChat:
         temperature: float = 0.0,
         max_tokens: int | None = None,
         usage: Usage | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
     ) -> Iterator[str]:
         """Stream the assistant response token-by-token.
 
         Yields content deltas as they arrive. If a ``usage`` accumulator is passed,
         the final token counts (``prompt_eval_count`` / ``eval_count``) are added to
-        it once the stream completes.
+        it once the stream completes. See ``chat`` for ``num_ctx``/``call_type``.
         """
+        _warn_if_may_overflow(messages, max_tokens=max_tokens, num_ctx=num_ctx, call_type=call_type)
         with httpx.stream(
             "POST",
             f"{self.host}/api/chat",
@@ -126,7 +187,7 @@ class OllamaChat:
                 "messages": messages,
                 "stream": True,
                 "keep_alive": self.keep_alive,
-                "options": self._options(temperature, max_tokens),
+                "options": self._options(temperature, max_tokens, num_ctx),
             },
             timeout=_TIMEOUT_SECONDS,
         ) as response:
@@ -213,8 +274,15 @@ class AzureOpenAIChat:
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
     ) -> str:
-        """Send a chat request and return the assistant message content."""
+        """Send a chat request and return the assistant message content.
+
+        ``num_ctx``/``call_type`` are accepted (the same ``ChatClient`` shape as
+        ``OllamaChat``) but unused: Azure OpenAI's context window is fixed by the deployment,
+        not by a per-request option (T11.3.4 — see config.py's ``num_ctx_answer`` note).
+        """
         response = httpx.post(
             self._url(),
             headers=self._headers(),
@@ -231,12 +299,15 @@ class AzureOpenAIChat:
         temperature: float = 0.0,
         max_tokens: int | None = None,
         usage: Usage | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
     ) -> Iterator[str]:
         """Stream the assistant response token-by-token (Server-Sent Events).
 
         Yields content deltas as they arrive. If a ``usage`` accumulator is passed,
         the token counts from the final ``usage`` chunk are added to it (Azure emits
-        them because ``stream_options.include_usage`` is set).
+        them because ``stream_options.include_usage`` is set). ``num_ctx``/``call_type``:
+        see ``chat``.
         """
         with httpx.stream(
             "POST",

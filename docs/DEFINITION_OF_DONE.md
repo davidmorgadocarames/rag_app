@@ -116,6 +116,28 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `backup-drill` | gate DB | 300 s |
 | | | | `erasure-scale` | gate DB | 600 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
+| | | | `latency` | gate DB + seed + Ollama | 900 s |
+
+`latency` (T11.3.5, `rag_app.eval.latency`): runs the golden set (14 questions) `N`=3 times
+through its own inlined per-call-site shape (`reranking.retrieve` + `generation.
+answer_from_chunks`), records p50/p95 per stage with machine/model details (CPU, GPU, RAM,
+model names/revisions, reranker device, `top_k`/`rerank_top_n`, git commit). A routine run
+(this step, no flag) writes the git-ignored `eval/latency_results.json`;
+`--update-baseline` writes the git-tracked `eval/latency_baseline.json` instead — same
+results/baseline split as `eval` (`results.json`/`baseline_metrics.json`), so ordinary timing
+jitter never dirties the tree on a routine `--full` (found running block B's own closing
+gate: the step's unconditional overwrite of the tracked file blocked `secrag/gate-full` from
+publishing). Reranker on CPU for the Azure-relevant numbers (today's pinned torch is
+CPU-only anyway — see ADR 11 decision 8). This step only RECORDS — no pass/fail threshold yet
+(`T11.6b.1`, once the eval-guided optimisation has picked a baseline worth enforcing).
+Measured on the development machine (2026-10-02, 11.3 block B): 42 answers in 412-429 s
+across three runs. **Note (T11.4.1, block C):** this module still builds a FRESH
+`CrossEncoderReranker()` per golden-set item ON PURPOSE (so the committed "before" baseline
+stays comparable); it does NOT exercise the single-shared-reranker fix that `/chat`,
+`/chat/stream`, the `eval` gate step and `agentic.py` now use by default
+(`reranking.get_shared_reranker()`) — confirmed by re-running this step after T11.4.1:
+`rerank_load` is unchanged (p50 ~1086 ms). T11.4.4 (block E) decides how the "after"
+measurement accounts for this before checking the rerank floor below.
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →
@@ -164,7 +186,9 @@ Gate-project setup (up + roles + migrate + seed restore) has its own 300 s budge
 cached venv (below) has 900 s. Measured on the development machine (2026-10-01, end of
 11a): `--fast` ≈ 1 min in the main tree (≈ 2 min from the pre-push worktree), `--full`
 ≈ 6 min (eval ≈ 2.5 min, restart-check ≈ 1 min, db-tests ≈ 40 s, erasure-scale ≈ 17 s,
-backup-drill ≈ 10 s) — well inside the 30-minute target.
+backup-drill ≈ 10 s) — well inside the 30-minute target. Re-measured 2026-10-02 (11b block B,
+after the `latency` step was added): `--full` ≈ 14 min (860 s: eval ≈ 4 min, `latency`
+≈ 7 min, the rest unchanged) — still well inside the 30-minute target.
 
 **Venv matching the pins** (DA-B-4). The gate resolves the backend venv before any step: the
 main tree's `backend/.venv` when the checked tree's requirements hash equals the main tree's

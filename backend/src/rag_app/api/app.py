@@ -9,7 +9,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from rag_app import __version__
+from rag_app import __version__, metrics, reranking, timing
 from rag_app.api import auth, conversations
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import (
@@ -49,14 +49,26 @@ def startup_checks(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Start-up checks (``startup_checks``): any failure aborts the start."""
-    startup_checks(get_settings())
+    """Start-up checks (``startup_checks``): any failure aborts the start.
+
+    Starts the Prometheus metrics server on its own internal port (T11.3.2) — never on
+    this API port — only once the fail-closed checks above have passed. Then loads and
+    warms up the ONE shared cross-encoder reranker (T11.4.1): the first real chat request
+    pays no model-load/first-inference cost, because it is already resident by the time
+    this coroutine yields and the app starts serving traffic.
+    """
+    settings = get_settings()
+    startup_checks(settings)
+    metrics.start_metrics_server(settings.metrics_port)
+    reranking.get_shared_reranker().warm_up()
     yield
 
 
 def create_app() -> FastAPI:
     # Query strings (the e-mail verification token) never reach the access log (T11.2.15).
     install_log_redaction()
+    # Per-answer timing JSON lines actually reach stdout (T11.3.1; see install_timing_log).
+    timing.install_timing_log()
     app = FastAPI(title="SecRAG API", version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
@@ -86,23 +98,24 @@ def create_app() -> FastAPI:
     ) -> ChatResponse:
         # Global daily answer cap (R6-1): counted before the LLM call; 429 once reached. In
         # the body, so an unauthenticated, rate-limited or invalid call never uses one up.
-        reserve(session)
-        answer = answerer(session, request.question, request.version)
-        return ChatResponse(
-            answer=answer.text,
-            abstained=answer.abstained,
-            grounded=answer.grounded,
-            citations=[
-                CitationOut(
-                    marker=c.marker,
-                    chunk_uid=c.chunk_uid,
-                    heading=c.heading,
-                    version=c.version,
-                    effective_date=c.effective_date,
-                )
-                for c in answer.citations
-            ],
-        )
+        with metrics.track_in_flight():
+            reserve(session)
+            answer = answerer(session, request.question, request.version)
+            return ChatResponse(
+                answer=answer.text,
+                abstained=answer.abstained,
+                grounded=answer.grounded,
+                citations=[
+                    CitationOut(
+                        marker=c.marker,
+                        chunk_uid=c.chunk_uid,
+                        heading=c.heading,
+                        version=c.version,
+                        effective_date=c.effective_date,
+                    )
+                    for c in answer.citations
+                ],
+            )
 
     return app
 

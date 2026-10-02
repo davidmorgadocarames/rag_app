@@ -8,6 +8,7 @@ scores are trusted; see docs/DEFINITION_OF_DONE.md (Phase 4).
 
 from __future__ import annotations
 
+from rag_app.config import get_settings
 from rag_app.llm import Message, OllamaChat
 
 _JUDGE_SYSTEM = (
@@ -28,7 +29,15 @@ def parse_verdict(raw: str) -> bool:
 
 
 def judge_correctness(chat: OllamaChat, question: str, reference: str, candidate: str) -> bool:
-    """Return True if the candidate answer is judged factually correct."""
+    """Return True if the candidate answer is judged factually correct.
+
+    DA-11bB-1 (block C): ``eval/benchmark.py`` and ``eval/runner.py`` reuse ONE ``OllamaChat``
+    for the whole golden-set loop, calling generate -> groundedness -> this judge back to
+    back on the SAME resident qwen — exactly the "same process/keep-alive window" T11.3.4's
+    reload-cost finding warns about, not a hypothetical future one. ``num_ctx`` is therefore
+    pinned to ``num_ctx_answer`` (equal to ``num_ctx_groundedness``, config.py) so the judge
+    never forces a reload before the next item's generate call.
+    """
     user = (
         f"QUESTION:\n{question}\n\n"
         f"REFERENCE:\n{reference}\n\n"
@@ -39,4 +48,12 @@ def judge_correctness(chat: OllamaChat, question: str, reference: str, candidate
         {"role": "system", "content": _JUDGE_SYSTEM},
         {"role": "user", "content": user},
     ]
-    return parse_verdict(chat.chat(messages, temperature=0.0, max_tokens=JUDGE_MAX_TOKENS))
+    return parse_verdict(
+        chat.chat(
+            messages,
+            temperature=0.0,
+            max_tokens=JUDGE_MAX_TOKENS,
+            num_ctx=get_settings().num_ctx_answer,
+            call_type="judge",
+        )
+    )

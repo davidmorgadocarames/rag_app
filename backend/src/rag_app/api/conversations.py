@@ -50,6 +50,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import iterate_in_threadpool
 from starlette.types import Receive, Scope, Send
 
+from rag_app import metrics
 from rag_app.api.auth import CurrentUserDep
 from rag_app.api.deps import SessionDep, rate_limit_chat
 from rag_app.api.schemas import (
@@ -73,6 +74,7 @@ from rag_app.generation import (
     classify_intent,
 )
 from rag_app.llm import Usage
+from rag_app.reranking import get_shared_reranker
 from rag_app.usage_cap import (
     DAILY_CAP_CODE,
     DAILY_CAP_MESSAGE,
@@ -320,8 +322,13 @@ def _pipeline_events(request: ChatStreamRequest) -> Generator[object | None, Non
     def work() -> None:
         try:
             with _stream_session_factory()() as session:
+                # T11.4.1: the ONE process-wide shared reranker — never a fresh load per
+                # stream.
                 for event in answer_question_stream(
-                    session, request.question, version=request.version
+                    session,
+                    request.question,
+                    version=request.version,
+                    reranker=get_shared_reranker(),
                 ):
                     session.commit()  # ends the read transaction; a no-op when none is open
                     if cancel.is_set():
@@ -463,6 +470,15 @@ def _chat_events(
             raise
 
 
+def _chat_events_with_metrics(*args: Any, **kwargs: Any) -> Generator[str, None, None]:
+    """``_chat_events`` wrapped so one SSE turn counts toward the in-flight chat gauge
+    (T11.3.2) for its whole duration — including the pipeline run, not just request setup.
+    ``yield from`` forwards ``GeneratorExit``/exceptions through unchanged, so
+    ``_chat_events``'s own disconnect handling (the ``interrupted`` marker) is untouched."""
+    with metrics.track_in_flight():
+        yield from _chat_events(*args, **kwargs)
+
+
 async def _closing_body(events: Generator[str, None, None]) -> AsyncIterator[str]:
     """The sync SSE generator as the response body, CLOSED when the body ends for any reason
     — a finished stream, a client disconnect (the task is cancelled) or an error — so its
@@ -545,10 +561,11 @@ def chat_stream(
     # dependencies after the response). Closing it ends the transaction and returns the
     # connection; the dependency's own close later is a no-op.
     session.close()
+    events = _chat_events_with_metrics(
+        user_id, wrapped_key, request, blocked=blocked, counted=counted
+    )
     return _ClosingStreamingResponse(
-        _closing_body(
-            _chat_events(user_id, wrapped_key, request, blocked=blocked, counted=counted)
-        ),
+        _closing_body(events),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

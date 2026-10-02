@@ -144,6 +144,48 @@ jobs:
           pip install "$(grep -E '^pip-audit==' backend/requirements-dev.txt)"
           pip-audit --no-deps --disable-pip -r backend/requirements-jobs.txt
 
+  # Backend image (T11.4.2): the cross-encoder reranker is baked into the image's Hugging
+  # Face cache at build time (pinned revision, config.py), HF_HUB_OFFLINE=1 set after — so a
+  # cold container reranks with NO network at all, even on a first-ever start. `--network
+  # none` on a throwaway container is the actual proof, not just "the model imports".
+  backend-image:
+    name: Backend image (build, reranker baked in, offline rerank)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend/Dockerfile
+        run: docker build -f backend/Dockerfile -t secrag-backend:ci backend
+      - name: HF_HUB_OFFLINE is set in the image
+        run: |
+          docker run --rm secrag-backend:ci python -c \
+            'import os; assert os.environ.get("HF_HUB_OFFLINE") == "1"; print("HF_HUB_OFFLINE=1 ok")'
+      - name: Reranks with networking disabled (throwaway container, no volumes)
+        run: |
+          docker run --rm --network none secrag-backend:ci python -c '
+          from rag_app.reranking import CrossEncoderReranker
+          from rag_app.retrieval import RetrievedChunk
+          r = CrossEncoderReranker()
+          r.warm_up()
+          chunks = [RetrievedChunk(chunk_uid="a::0", heading="h",
+                                    text="Use prepared statements to prevent SQL injection.",
+                                    version="2021", effective_date=None, score=0.0)]
+          out = r.rerank("How do I prevent SQL injection?", chunks, top_n=1)
+          assert out and isinstance(out[0].score, float)
+          print("offline rerank ok, score=", out[0].score)
+          '
+      - name: A model NOT baked into the image still fails offline (the guard is real)
+        run: |
+          if docker run --rm --network none secrag-backend:ci python -c '
+          from rag_app.reranking import load_cross_encoder
+          load_cross_encoder("someone/not-baked-model", "a" * 40)
+          ' 2>/dev/null; then
+            echo "::error::an uncached model unexpectedly loaded offline"
+            exit 1
+          fi
+          echo "uncached model correctly refused offline: ok"
+      - name: Image size (informational; ADR records a local before/after)
+        run: docker images secrag-backend:ci --format "{{.Size}}"
+
   gitleaks:
     name: Secret scan
     runs-on: ubuntu-latest

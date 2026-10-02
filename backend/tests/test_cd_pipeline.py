@@ -458,14 +458,28 @@ def test_verify(tmp_path: Path, latest: str, creator: str, rc: int, expected: st
 
 @needs_tools
 def test_verify_waits_for_a_late_status(tmp_path: Path) -> None:
-    """With --wait the check polls: a background publisher may post a little later."""
+    """With --wait the check polls: a background publisher may post a little later.
+
+    Deterministic (11a open item / 11b flaky-test fix): GATE_STATUS_FAKE_CLOCK replaces
+    real wall-clock sleeping with a fake counter inside gate_status.sh that advances by
+    exactly one second per poll (same --wait loop, same deadline arithmetic — only the
+    time source differs), so the poll count no longer depends on real scheduling. Before
+    this fix the test slept for real (GATE_STATUS_POLL_SECONDS=0.3, --wait 1) and failed
+    once on CI under load (fewer than 2 polls completed in the 1 s budget).
+    """
     env = _fake_gh(tmp_path, [{"match": "statuses", "stdout": " \n"}])
     proc = _run(
-        GATE_STATUS, "verify", SHA, "--wait", "1", env={**env, "GATE_STATUS_POLL_SECONDS": "0.3"}
+        GATE_STATUS,
+        "verify",
+        SHA,
+        "--wait",
+        "2",
+        env={**env, "GATE_STATUS_FAKE_CLOCK": "1"},
     )
     assert proc.returncode == 1
     polls = (tmp_path / "gh.log").read_text(encoding="utf-8").count("statuses")
-    assert polls >= 2
+    # Exact and deterministic: fake clock 0,1,2 -> 3 polls before "2 < 2" breaks the loop.
+    assert polls == 3
 
 
 @needs_tools

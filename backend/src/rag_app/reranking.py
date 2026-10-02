@@ -11,16 +11,23 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import threading
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
 
+from rag_app import timing
 from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
 from rag_app.retrieval import RetrievedChunk, hybrid_search
 
 if TYPE_CHECKING:
     from sentence_transformers import CrossEncoder
+
+# The cross-encoder caps each (query, chunk) pair's tokenized length (T11.4.1): longer pairs
+# are truncated instead of raising, and a fixed cap keeps CPU inference time bounded and
+# predictable across requests regardless of how long a retrieved chunk happens to be.
+RERANKER_MAX_LENGTH = 512
 
 
 def order_by_scores(
@@ -75,7 +82,11 @@ def load_cross_encoder(model_name: str, revision: str) -> CrossEncoder:
     """
     from sentence_transformers import CrossEncoder
 
-    options: dict[str, Any] = {"revision": revision, "trust_remote_code": False}
+    options: dict[str, Any] = {
+        "revision": revision,
+        "trust_remote_code": False,
+        "max_length": RERANKER_MAX_LENGTH,
+    }
     model: CrossEncoder
     try:
         model = CrossEncoder(model_name, local_files_only=True, **options)
@@ -100,7 +111,10 @@ class CrossEncoderReranker:
 
     def _ensure_model(self) -> CrossEncoder:
         if self._model is None:
-            self._model = load_cross_encoder(self.model_name, self.revision)
+            # Measured separately from inference (T11.3.1): the first request after a cold
+            # start pays this once (warm-up removes it from later requests, T11.4.1).
+            with timing.stage("rerank_load"):
+                self._model = load_cross_encoder(self.model_name, self.revision)
         return self._model
 
     def rerank(
@@ -111,8 +125,49 @@ class CrossEncoderReranker:
             return []
         model = self._ensure_model()
         pairs = [(query, candidate.text) for candidate in candidates]
-        scores = model.predict(pairs)
+        with timing.stage("rerank_inference"):
+            scores = model.predict(pairs)
         return order_by_scores(candidates, [float(score) for score in scores], top_n)
+
+    def warm_up(self) -> None:
+        """Load the model and run one dummy ``predict`` (T11.4.1), so no real request ever
+        pays the first-load/first-inference cost. Call once, from the API lifespan, before
+        serving traffic — never per-request.
+
+        ``_ensure_model()`` wraps the (real, one-time) load in ``timing.stage("rerank_load")``
+        exactly as a normal request does; the dummy ``predict`` below wraps the same way in
+        ``timing.stage("rerank_inference")``. Outside a ``timing.recorder()`` (none is open at
+        startup) both are no-ops (generation.py's own docstring on ``answer_from_chunks``), so
+        warm-up never pollutes a per-answer timing record; every REAL request afterwards finds
+        ``self._model`` already set, so its own ``rerank_load`` is ~0 (T11.4.4 measures this).
+        """
+        model = self._ensure_model()
+        with timing.stage("rerank_inference"):
+            model.predict([("warm-up query", "warm-up passage")])
+
+
+_shared_reranker: CrossEncoderReranker | None = None
+_shared_reranker_lock = threading.Lock()
+
+
+def get_shared_reranker() -> CrossEncoderReranker:
+    """The ONE process-wide reranker instance (T11.4.1): loaded at most once, however many
+    requests ask for it. The API lifespan warms it up before serving traffic; every other
+    caller (both generation paths, the eval runner, ``agentic.py``) gets the SAME instance
+    instead of constructing its own — the ~1 s model construction and any first-call warm-up
+    cost are paid once per process, not once per answer.
+
+    Double-checked locking: cheap on the (overwhelmingly common) already-built path, and
+    still correct if two requests race to build it on a cold process.
+    """
+    global _shared_reranker
+    reranker = _shared_reranker
+    if reranker is None:
+        with _shared_reranker_lock:
+            reranker = _shared_reranker
+            if reranker is None:
+                reranker = _shared_reranker = CrossEncoderReranker()
+    return reranker
 
 
 def retrieve(

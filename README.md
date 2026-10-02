@@ -115,7 +115,7 @@ back; migrations run as a Job before the apps are updated, never at container st
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, pydantic-settings |
 | Database | PostgreSQL 16 + pgvector (HNSW) + full-text search |
 | LLM | Ollama `qwen2.5:7b-instruct` (local) · Azure OpenAI `gpt-4.1-mini` (cloud) |
-| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, loaded offline from the cache when present) |
+| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, baked into the backend image and always loaded offline, ONE shared instance per process) |
 | Security | argon2, JWT, Fernet envelope encryption (crypto-shred), token bucket |
 | Evaluation | Separate retrieval and generation metrics, LLM judge, regression gate |
 | Quality | ruff, mypy `--strict`, pytest, ESLint, `tsc`, pre-commit, gitleaks |
@@ -350,6 +350,70 @@ the backend; the backend image itself never migrates (on Azure the same image ru
 migration Job that CD starts before updating the apps). To build the index, run the
 ingestion and indexing steps from [step 4](#4-build-the-corpus-and-the-index) against the
 same database.
+
+### Latency instrumentation and metrics
+
+Every answer (`/chat` and `/chat/stream`) is timed per pipeline stage — classify, query
+embed, hybrid search, rerank (load vs inference), time to first token, total — and logged as
+one JSON line (`rag_app.timing`, stdout): stage names and durations only, never the question,
+the answer, a user id or an IP.
+
+The same numbers feed Prometheus histograms (label: `stage` only) plus an in-flight chat
+requests gauge, served on a **separate internal metrics port** (`METRICS_PORT`, default
+`9100`) — never the API port, and never published to the host. The `prometheus` service in
+`docker-compose.yml` scrapes it (7-day retention, UI on `http://127.0.0.1:9090`, image pinned
+by digest):
+
+```bash
+docker compose up -d --build backend prometheus   # (needs db/db-roles/migrate already up)
+open http://127.0.0.1:9090                        # Graph: secrag_chat_stage_seconds_bucket
+curl -s http://127.0.0.1:9090/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.95, sum(rate(secrag_chat_stage_seconds_bucket[5m])) by (le, stage))'
+```
+
+**Explicit Ollama context window (`num_ctx`, T11.3.4).** `Settings.num_ctx_answer` /
+`num_ctx_groundedness` (`llm.py`, `generation.py`) are passed on every answer-generation and
+groundedness-check call so a prompt is never silently truncated by Ollama's small built-in
+default (2048 tokens) — a request without an explicit `num_ctx` logs a warning
+(`rag_app.llm`, stderr) instead of failing when the estimated prompt size would not fit.
+**Both settings must stay equal**: Ollama reloads the whole model (~6.3 s, measured) whenever
+a request's `num_ctx` differs from the one it is currently loaded with, and one answer always
+calls generate then groundedness back to back — a mismatch would reload qwen twice per
+answer. Only the Ollama path reads these; Azure OpenAI's context window is fixed by the
+deployment. See `docs/adr/adr_phase11_stability.md` decision 8 for the measured VRAM numbers
+and the full reasoning.
+
+**Latency baseline (T11.3.5).** `python -m rag_app.eval.latency` runs the golden set through
+the real per-request pipeline shape: p50/p95 per stage plus the machine/model details needed
+to compare runs like for like. A routine run (the gate step `latency`, `--full`/`--only
+latency`) writes the git-ignored `eval/latency_results.json`; `--update-baseline` writes the
+git-tracked `eval/latency_baseline.json` instead (same results/baseline split as `eval.gate`)
+— done on purpose, not on every gate run, so ordinary timing jitter never dirties the tree.
+This block only records — `T11.6b.1` adds the pass/fail threshold once the eval-guided
+optimisation (block F) has picked a new baseline to enforce. Note: `eval.latency`'s own
+benchmark loop still builds a FRESH `CrossEncoderReranker()` per golden-set item on purpose
+(the committed "before" baseline, `b77f69f`, is directly comparable only if the "after" run
+uses the exact same shape) — T11.4.1's shared-reranker fix below only applies to the real
+`/chat` and `/chat/stream` paths, `eval.benchmark`/`eval.runner` (the `eval` gate step) and
+`agentic.py`; T11.4.4 (block E) decides how the "after" latency measurement accounts for it.
+
+**Single shared reranker (T11.4.1).** Before this fix, `generation.py` constructed a brand
+new `CrossEncoderReranker()` on every `/chat`/`/chat/stream` call, reloading the ~2.2 GB
+cross-encoder from disk on every answer (`rerank_load`, ADR decision 8/11.3's baseline). Now
+ONE instance (`reranking.get_shared_reranker()`) is loaded and warmed up (one dummy `predict`
+call) in the FastAPI lifespan, before the app starts serving traffic, and reused by every
+request, the `eval` gate step and `agentic.py` — so `rerank_load` is ~0 for every real
+request (the one real load happens once, at start-up). The cross-encoder's `max_length` is
+pinned to 512 tokens per (query, chunk) pair. The purger/backup/migration Jobs (slim `jobs`
+image, no torch) never construct or import it.
+
+**Reranker baked into the backend image (T11.4.2).** `backend/Dockerfile` downloads the
+pinned `reranker_model`@`reranker_revision` (config.py — the SAME Settings the app reads, so
+the baked snapshot can never drift from what is actually requested at runtime) into the
+image's Hugging Face cache at build time, then sets `HF_HUB_OFFLINE=1`. A cold container —
+including the very first start on Azure, with no egress at all — reranks with no network
+call, ever; CI's `backend-image` job proves this with a throwaway `docker run --network
+none` container (no access to any real data/volume).
 
 ### Recovering from a changed master key
 

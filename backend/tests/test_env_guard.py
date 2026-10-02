@@ -160,6 +160,17 @@ def _no_fingerprint_db(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("rag_app.api.app.check_master_key_fingerprint", lambda *_a: "match")
 
 
+@pytest.fixture()
+def _no_reranker_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T11.4.1: the lifespan warms up the real (heavy, downloaded) cross-encoder — unit tests
+    # stub it so a successful lifespan here never loads it.
+    class _Stub:
+        def warm_up(self) -> None:
+            return None
+
+    monkeypatch.setattr("rag_app.api.app.reranking.get_shared_reranker", lambda: _Stub())
+
+
 @pytest.mark.usefixtures("_no_fingerprint_db")
 def test_api_lifespan_refuses_to_start_with_a_dev_flag_in_prod(
     monkeypatch: pytest.MonkeyPatch,
@@ -172,7 +183,7 @@ def test_api_lifespan_refuses_to_start_with_a_dev_flag_in_prod(
         pass
 
 
-@pytest.mark.usefixtures("_no_fingerprint_db")
+@pytest.mark.usefixtures("_no_fingerprint_db", "_no_reranker_warmup")
 def test_api_lifespan_starts_with_the_real_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _valid(Settings)
     monkeypatch.setattr("rag_app.api.app.get_settings", lambda: settings)

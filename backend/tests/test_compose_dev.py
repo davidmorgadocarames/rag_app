@@ -31,6 +31,31 @@ def test_every_published_port_is_loopback_only(services: dict) -> None:
         assert all(str(p).startswith("127.0.0.1:") for p in ports)
 
 
+def test_metrics_port_is_never_published_to_the_host(services: dict) -> None:
+    """T11.3.2/TF4: the backend's metrics port is compose-network-internal only (reachable
+    by `prometheus`), never published to 127.0.0.1 like the API port is."""
+    backend = services["backend"]
+    assert backend["ports"] == ["127.0.0.1:8000:8000"]  # the API port only
+    assert backend["expose"] == ["${METRICS_PORT:-9100}"]
+    assert backend["environment"]["METRICS_PORT"] == "${METRICS_PORT:-9100}"
+
+
+def test_prometheus_scrapes_the_metrics_port_with_7_day_retention_on_loopback(
+    services: dict,
+) -> None:
+    """T11.3.3: image pinned by digest (X1), 7-day retention, UI on 127.0.0.1 only."""
+    prom = services["prometheus"]
+    assert prom["image"].split("@", 1)[0] == "prom/prometheus"
+    assert prom["image"].split("@", 1)[1].startswith("sha256:")
+    assert "--storage.tsdb.retention.time=7d" in prom["command"]
+    assert prom["ports"] == ["127.0.0.1:9090:9090"]
+    config = yaml.safe_load(
+        (COMPOSE.parent / "deploy" / "prometheus" / "prometheus.yml").read_text(encoding="utf-8")
+    )
+    targets = [t for job in config["scrape_configs"] for t in job["static_configs"][0]["targets"]]
+    assert targets == ["backend:9100"]
+
+
 def test_containerised_ollama_is_only_in_the_ci_profile(services: dict) -> None:
     assert services["ollama"]["profiles"] == ["ci"]
     dep = services["backend"]["depends_on"]["ollama"]

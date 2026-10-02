@@ -15,6 +15,7 @@ or the LLM client; a data key wrapped with another master key → ``InvalidToken
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import uuid
@@ -444,3 +445,101 @@ def test_a_real_disconnect_leaves_an_interrupted_marker(
     _assert_no_orphans(db_engine, user)
     (marker,) = _interrupted_marker(db_engine, user)
     assert marker["error_code"] == "interrupted"
+
+
+# --- DA-11bA-1: timing.recorder() across the real SSE/threadpool boundary -------------------
+
+
+def test_a_real_streamed_answer_logs_every_timing_stage_through_the_threadpool(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: Any
+) -> None:
+    """DA-11bA-1 (block A review, T11.3.1): a `contextvars.ContextVar` set inside
+    `timing.recorder()` and consumed one-`next()`-per-SSE-chunk via Starlette's
+    `iterate_in_threadpool` (each `next()` dispatched through a FRESH
+    `anyio.to_thread.run_sync`/`copy_context()`) could in principle lose its value, or raise
+    on `_current.reset(token)` across that boundary — the DA reproduced exactly that failure
+    in an isolated toy repro, but could not reproduce it against the real app. This test
+    protects that currently-correct behaviour against a future anyio/Starlette upgrade: a
+    real, non-trivial (not chit-chat) `/chat/stream` answer through `TestClient` -> ASGI ->
+    the real worker-thread dispatch in `_pipeline_events`, mocking only the external model
+    calls (Ollama embed/generate, the reranker's model load) — real Postgres hybrid search,
+    the reranker's own `rerank_load`/`rerank_inference` timing wrap and the real SSE/
+    threadpool plumbing all run unmocked. Every stage key must show up in the ONE emitted
+    `answer_timing` JSON record (not just `ttft_ms`/`total_ms`, which a chit-chat-only test
+    would incidentally cover)."""
+    from rag_app import embeddings, generation, reranking
+    from rag_app.db.models import Chunk, Document
+    from rag_app.llm import Usage
+
+    doc = Document(slug="sqli-cs-da11ba1", version="current")
+    with Session(db_engine) as session:
+        session.add(doc)
+        session.flush()
+        session.add(
+            Chunk(
+                document_id=doc.id,
+                chunk_uid="sqli-cs-da11ba1::0",
+                heading="SQL Injection Prevention",
+                ordinal=0,
+                text="Use parameterized queries (prepared statements) to prevent SQL injection.",
+                embedding=[0.1] * 1024,
+                version="current",
+            )
+        )
+        session.commit()
+
+    # Mock only the external model calls (T11.3.1 review note): the embedder's HTTP call to
+    # Ollama and the reranker's (heavy, downloaded) cross-encoder model — real retrieval and
+    # the real `timing.stage("rerank_load")`/`timing.stage("rerank_inference")` wraps in
+    # `reranking.py` still run around them.
+    monkeypatch.setattr(embeddings.OllamaEmbedder, "embed_one", lambda self, text: [0.1] * 1024)
+
+    class _FakeCrossEncoder:
+        def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            return [1.0 for _ in pairs]
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _FakeCrossEncoder())
+
+    class _TwoCallChat:
+        """Generate's answer first, groundedness's verdict second (same chat object, as a
+        real request does: one generate call then one groundedness call)."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat_stream(self, *_a: object, usage: Usage | None = None, **_kw: object) -> Any:
+            self.calls += 1
+            if usage is not None:
+                usage.add(Usage(prompt_tokens=10, completion_tokens=5))
+            if self.calls == 1:
+                yield "Use prepared statements "
+                yield "to stop SQL injection [1]."
+            else:
+                yield "GROUNDED"
+
+    monkeypatch.setattr(generation, "make_chat_client", lambda *_a, **_k: _TwoCallChat())
+
+    caplog.set_level(logging.INFO, logger="rag_app.timing")
+    user = _make_user(db_engine)
+    events = _stream(client, user, "How do I prevent SQL injection?")
+    assert events[-1]["type"] == "done"
+    stages = [e["stage"] for e in events if e["type"] == "stage"]
+    assert stages == ["classifying", "retrieving", "reranking", "generating", "checking"]
+
+    records = [r for r in caplog.records if r.name == "rag_app.timing"]
+    assert len(records) == 1
+    payload = json.loads(records[0].getMessage())
+    expected_stage_keys = {
+        "classify_ms",
+        "embed_ms",
+        "hybrid_search_ms",
+        "rerank_load_ms",
+        "rerank_inference_ms",
+        "generate_ms",
+        "groundedness_ms",
+    }
+    missing = expected_stage_keys - set(payload)
+    assert not missing, f"missing stage keys: {missing}"
+    assert payload["ttft_ms"] is not None
+    assert payload["total_ms"] > 0
+    _assert_no_orphans(db_engine, user)

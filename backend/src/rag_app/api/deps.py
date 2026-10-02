@@ -12,6 +12,7 @@ from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
 from rag_app.generation import Answer, answer_question
 from rag_app.ratelimit import RateLimiter
+from rag_app.reranking import get_shared_reranker
 from rag_app.risk import SignupTracker
 from rag_app.usage_cap import DAILY_CAP_MESSAGE, reserve_answer, seconds_until_utc_midnight
 
@@ -31,8 +32,10 @@ def get_session() -> Iterator[Session]:
 
 
 def get_answerer() -> AnswerFn:
+    # T11.4.1: the ONE process-wide shared reranker (warmed up in the lifespan) — never a
+    # fresh load per request.
     def _answer(session: Session, question: str, version: str | None) -> Answer:
-        return answer_question(session, question, version=version)
+        return answer_question(session, question, version=version, reranker=get_shared_reranker())
 
     return _answer
 

@@ -148,9 +148,15 @@ services:
       # Global daily answer cap (R6-1): high locally; must stay positive with ENV=prod.
       DAILY_ANSWER_CAP: ${DAILY_ANSWER_CAP:-1000}
       FRONTEND_ORIGIN: http://localhost:3000
+      # Per-stage latency histograms + the in-flight gauge (T11.3.2, TF4): a SEPARATE
+      # internal port, never published to the host and never the API port. Only the
+      # `prometheus` service (same compose network) reads it.
+      METRICS_PORT: ${METRICS_PORT:-9100}
     # Built in on Docker Desktop; needed on a plain Linux engine.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    expose:
+      - "${METRICS_PORT:-9100}"
     depends_on:
       db:
         condition: service_healthy
@@ -172,6 +178,23 @@ services:
     depends_on:
       - backend
 
+  # Scrapes the backend's internal metrics port only (T11.3.3); 7-day retention (disk is
+  # throwaway monitoring data, not the protected dev DB volume); image pinned by digest
+  # (X1) so a re-tagged upstream image can never silently change what runs. UI/API on
+  # 127.0.0.1 only — never on the LAN or the internet.
+  prometheus:
+    image: prom/prometheus@sha256:565ee86501224ebbb98fc10b332fa54440b100469924003359edf49cbce374bd
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - backend
+
 volumes:
   # The development database lives in ONE fixed, external volume (T11.2.1). Before, `pgdata`
   # had no name, so Docker prefixed it with the compose project (the checkout folder) and a
@@ -183,3 +206,6 @@ volumes:
     name: rag_ia_pgdata
     external: true
   ollama:
+  # Prometheus's own TSDB (7-day retention, T11.3.3): throwaway monitoring data, not the
+  # protected dev DB volume above — fine to recreate/remove with the rest of the stack.
+  prometheus_data:

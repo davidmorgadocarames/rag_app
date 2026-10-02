@@ -130,6 +130,37 @@ class Settings(JobSettings):
     # ADR 11 "Costs" uses it). The groundedness check has its own bound (generation.py).
     max_tokens: int = 1024
 
+    # --- Ollama context window per call type (T11.3.4) ---
+    # Explicit so a request is never silently truncated by Ollama's small built-in default
+    # (2048): worst case today is rerank_top_n (4) chunks of up to chunk_size + chunk_overlap
+    # (~1350 chars each) plus the system prompt, the question and the output budget
+    # (max_tokens=1024 for the answer, GROUNDEDNESS_MAX_TOKENS=16 for groundedness) comes
+    # close to or over 2048 tokens already. Measured on the development machine (RTX 4060,
+    # qwen2.5:7b-instruct-q4_K_M + bge-m3 both resident): num_ctx 2048/4096/8192 cost
+    # ~4.53/4.64/4.87 GiB VRAM for qwen alone (bge-m3 adds ~0.74 GiB) — comfortably under the
+    # 8 GiB card even at 8192 (~1.8 GiB headroom); see ADR 11 decision 8 for the full table.
+    # **Both values below MUST stay equal.** Ollama reloads the whole model (~6.3 s measured)
+    # whenever a request's `num_ctx` differs from the currently loaded one — including a
+    # request that omits `num_ctx` entirely (it then means Ollama's own default, 2048, which
+    # already differs from either value here). Since one answer always calls generate then
+    # groundedness back to back, a mismatch would reload qwen *twice* per answer (once for
+    # groundedness, once more for the next answer's generate) — a measured ~12.6 s regression
+    # that the quality/functional tests cannot see (they do not pin down wall-clock time).
+    # `test_num_ctx_answer_and_groundedness_must_match` (test_llm_bounds.py) guards this.
+    # Azure OpenAI's context window is fixed by the deployment, not by this setting — these
+    # two are read only on the Ollama path (`LLM_PROVIDER=ollama`; see llm.py). DA-11bB-1
+    # (block C, 11b): the agentic query rewrite (`agentic.reformulate`) and the eval
+    # correctness judge (`eval.judge.judge_correctness`) are NOT a future risk — the `eval`
+    # gate step (`eval.benchmark`/`eval.runner`) already reuses ONE `OllamaChat` across
+    # generate -> groundedness -> judge (and the router's rewrite, when exercised) on every
+    # golden-set item, i.e. the SAME process/keep-alive window as generate/groundedness,
+    # today. Both now pin `num_ctx_answer` too (`test_router_and_judge_calls_now_pin_num_ctx_
+    # to_match_answer_groundedness`, test_llm_bounds.py) so qwen is never reloaded mid-run. A
+    # future conversation-summary call must do the same the moment it can share a process/
+    # keep-alive window with any of these — never assume "CLI/eval only" means "safe to omit".
+    num_ctx_answer: int = 8192
+    num_ctx_groundedness: int = 8192
+
     # --- Agentic router ---
     # Best rerank (cross-encoder) score below this is considered "thin" -> reformulate+retry.
     thin_threshold: float = 0.5
@@ -163,6 +194,13 @@ class Settings(JobSettings):
     # --- Frontend ---
     next_public_api_url: str = Field(default="http://localhost:8000")
     frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
+
+    # --- Metrics (T11.3.2, TF4) ---
+    # Prometheus histograms + the in-flight gauge are served on this SEPARATE internal
+    # port — never the API port (`/metrics` would expose route/volume/error shape to the
+    # browser). Only Prometheus (compose network / Azure, never published to a host port
+    # or the internet) reads it.
+    metrics_port: int = 9100
 
 
 def get_settings() -> Settings:

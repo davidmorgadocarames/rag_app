@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
+from rag_app import timing
 from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
 from rag_app.embeddings import OllamaEmbedder
@@ -107,19 +108,22 @@ def hybrid_search(
     candidate_k = candidate_k or settings.top_k
     embedder = embedder or OllamaEmbedder()
 
-    query_vector = embedder.embed_one(query)
-    vector_uids = _vector_uids(session, query_vector, candidate_k, version)
-    bm25_uids = _bm25_uids(session, query, candidate_k, version)
+    with timing.stage("embed"):
+        query_vector = embedder.embed_one(query)
 
-    fused = reciprocal_rank_fusion([vector_uids, bm25_uids])[:top_k]
-    chunks = _load_chunks(session, [uid for uid, _ in fused])
+    with timing.stage("hybrid_search"):
+        vector_uids = _vector_uids(session, query_vector, candidate_k, version)
+        bm25_uids = _bm25_uids(session, query, candidate_k, version)
 
-    ranked: list[RetrievedChunk] = []
-    for uid, score in fused:
-        chunk = chunks.get(uid)
-        if chunk is not None:
-            chunk.score = score
-            ranked.append(chunk)
+        fused = reciprocal_rank_fusion([vector_uids, bm25_uids])[:top_k]
+        chunks = _load_chunks(session, [uid for uid, _ in fused])
+
+        ranked: list[RetrievedChunk] = []
+        for uid, score in fused:
+            chunk = chunks.get(uid)
+            if chunk is not None:
+                chunk.score = score
+                ranked.append(chunk)
     return ranked
 
 

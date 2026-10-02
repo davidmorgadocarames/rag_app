@@ -81,6 +81,7 @@ backup-drill     db 300
 erasure-scale    db 600
 restart-check    docker 900
 eval             seed 1200
+latency          seed 900
 "
 STACK_BUDGET=300   # up + migrate + seed restore
 
@@ -427,6 +428,14 @@ step_eval() {
   need_venv || return 1
   # The reranker must come from the local cache at its pinned revision (row 37d): offline.
   (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.gate --require-stack)
+}
+
+# T11.3.5: records p50/p95 latency per stage over the golden set into eval/latency_baseline.json
+# — no pass/fail threshold yet in this block (T11.6b.1 adds one, comparing against the baseline
+# an earlier block "adopts"). Same offline-reranker requirement as `eval`.
+step_latency() {
+  need_venv || return 1
+  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.latency --require-stack)
 }
 
 # --- backend venv matching the pins (DA-B-4) --------------------------------------------

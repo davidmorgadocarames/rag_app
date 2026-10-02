@@ -331,6 +331,15 @@ def test_api_lifespan_end_to_end(migrated: Engine, monkeypatch: pytest.MonkeyPat
             _env_file=None, database_url=url, jwt_secret="j" * 40, data_master_key=master
         )
 
+    # T11.4.1: the lifespan now also warms up the real (heavy, downloaded) cross-encoder —
+    # this DB test is about the master-key fingerprint, not the reranker, so stub it.
+    class _NoWarmupReranker:
+        def warm_up(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "rag_app.api.app.reranking.get_shared_reranker", lambda: _NoWarmupReranker()
+    )
     monkeypatch.setattr("rag_app.api.app.get_settings", lambda: settings(key))
     with TestClient(create_app()) as client:
         assert client.get("/health").status_code == 200

@@ -404,6 +404,134 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    groundedness 16), so one answer has a bounded worst-case cost — the table under
    [Costs](#costs) is the basis of the 150 choice.
 8. (11b) One shared reranker, baked model images, latency gate.
+   *Landed in 11.3 (T11.3.1–T11.3.3, block A):* **per-stage timing** — classify, query embed,
+   hybrid search, rerank (load vs inference), generate, groundedness, time to first token,
+   total — one JSON line per answer on both `/chat` and `/chat/stream` (`rag_app.timing`,
+   stdout; never the question, the answer, a user id or an IP). **Prometheus** — histograms
+   labelled only by `stage` (`secrag_chat_stage_seconds`) plus an in-flight chat requests
+   gauge (`secrag_chat_requests_in_flight`, no labels), served on a **separate internal port**
+   (`METRICS_PORT`, default 9100; TF4) — the FastAPI app registers no `/metrics` route at all,
+   so the API port never serves it. A `prometheus` container (`docker-compose.yml`, image
+   pinned by digest per X1) scrapes that port only, 7-day retention, UI on `127.0.0.1:9090`.
+   The reranker still reloads per request here (`rerank_load` dominates the measurements
+   below) — T11.4.1 fixes that. End-to-end proof (throwaway compose project, native Ollama,
+   322 indexed chunks, torn down after): one `/chat` call —
+   `{"embed_ms": 293.0, "hybrid_search_ms": 5.1, "rerank_load_ms": 32079.1,
+   "rerank_inference_ms": 9378.6, "generate_ms": 2943.2, "groundedness_ms": 147.8,
+   "ttft_ms": 44702.3, "total_ms": 44850.3}`; one `/chat/stream` call —
+   `{"classify_ms": 0.0, "embed_ms": 1327.3, "rerank_load_ms": 1071.9,
+   "rerank_inference_ms": 8781.1, "generate_ms": 1878.4, "groundedness_ms": 591.1,
+   "ttft_ms": 11978.5, "total_ms": 13657.0}`; `secrag_chat_stage_seconds_count` visible in
+   Prometheus for every stage above; `GET /metrics` on the API port → 404.
+   *Landed in 11.3 (T11.3.4–T11.3.5, block B):* **explicit `num_ctx` per call type**
+   (`Settings.num_ctx_answer` / `num_ctx_groundedness`, `llm.py`/`generation.py`) — Ollama's
+   built-in default (2048) is already close to or below the worst case today (rerank_top_n=4
+   chunks of up to chunk_size+chunk_overlap ≈ 1350 chars each + the system prompt + the
+   question + the output budget), so a request could be silently truncated with no error; a
+   request whose estimated size (chars/4, a deliberately crude heuristic — no tokenizer
+   dependency added just to warn) would not fit its `num_ctx` now logs a warning
+   (`rag_app.llm`, reaches stderr via `logging.lastResort` without needing `rag_app.timing`'s
+   own-handler workaround, since `.warning()` is at/above its threshold). **Critical measured
+   finding: both settings MUST be equal.** Probing the Ollama API directly (same model,
+   `num_predict` varied — no reload; `num_ctx` varied — full reload every time, confirmed
+   with `load_duration` in the response): switching `num_ctx` on an already-loaded qwen costs
+   **~6.3 s**, and that includes a request that *omits* `num_ctx` entirely (Ollama then uses
+   its own default, 2048, which already differs from either setting) — so generate and
+   groundedness must load the model at the SAME `num_ctx`, else one answer pays the reload
+   twice (once for groundedness, once more for the next answer's generate). Guarded by
+   `test_num_ctx_answer_and_groundedness_must_match`. *Fixed in 11.4 (DA-11bB-1, block C):*
+   block B's own wording ("CLI/eval only — not on the live API path today") was already
+   false for the eval judge — `eval/benchmark.py`/`eval/runner.py` reuse ONE `OllamaChat`
+   across generate -> groundedness -> `judge_correctness` (and the agentic router's query
+   rewrite, when exercised) on every golden-set item, i.e. the SAME process/keep-alive window
+   as generate/groundedness, inside the `eval` gate step itself. Both `agentic.reformulate`
+   and `eval.judge.judge_correctness` now pin `num_ctx_answer` too, so neither forces a reload
+   against the resident qwen; `test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_
+   groundedness` (renamed from the block B version, which asserted the opposite) guards it.
+   **VRAM measured** on the development machine (RTX 4060, 8 GiB; native
+   `ollama serve`; `bge-m3` warmed first, baseline 742 MiB already in use by the desktop/
+   Xwayland): qwen2.5:7b-instruct-q4_K_M alone added ≈4.53 GiB at `num_ctx`=2048, ≈4.64 GiB
+   at 4096, ≈4.87 GiB at 8192 (`ollama ps`: 5.0 GB resident at 8192); `bge-m3` added a further
+   ≈0.74 GiB, 664 MB resident. Total with both models resident at `num_ctx`=8192: **6.35 GiB
+   of 8 GiB** (≈1.8 GiB / 22 % headroom) — chosen value for both settings. The cross-encoder
+   reranker never touches VRAM at all in this repo: `requirements-torch.txt` pins a **CPU-
+   only** torch build (`torch==2.14.0+cpu`, confirmed `torch.cuda.is_available() is False` in
+   the backend venv), so "reranker on GPU" is not possible today regardless of `num_ctx`
+   headroom — T11.5.1's device axis (CPU vs GPU) needs a GPU torch variant added first.
+   **"Before" latency baseline** (`rag_app.eval.latency`, golden set — 14 questions — × N=3
+   runs = 42 answers, reranker forced to CPU via `CUDA_VISIBLE_DEVICES=""` before any model
+   loads, same per-call-site shape `generation.answer_question` uses incl. today's fresh-
+   reranker-per-call reload; `eval/latency_baseline.json`, git commit `b77f69f`):
+   `rerank_load` p50 1063 / p95 1122 ms (n=42), `rerank_inference` p50 7913 / p95 9204 ms
+   (n=42, CPU cross-encoder inference over the `top_k`=20 candidate pool dominates the
+   pipeline far more than the reload itself), `generate` p50 883 / p95 2820 ms (n=42),
+   `groundedness` p50 151 / p95 560 ms (n=30 — 12 of 42 answers correctly abstained before
+   reaching it), `embed` p50 15 / p95 40 ms, `hybrid_search` p50 3 / p95 5 ms, **`ttft` p50
+   9938 / p95 11373 ms, `total` p50 10212 / p95 11812 ms**. Runtime 429 s (≈7.1 min) for the
+   42 answers — recorded by the gate step `latency` (`--full`/`--only latency`, records only
+   in this block; `T11.6b.1` adds the pass/fail floor once T11.4.1/T11.5 pick a new
+   baseline). `rerank_inference` being far larger than `rerank_load` here is a new finding
+   beyond block A's single-call ADR evidence above (which only showed one sample each): T11.4
+   (shared reranker, eliminates the ~1.1 s reload) and T11.5 (CPU-friendlier reranker/top_k)
+   both matter — the reload is real but not the biggest cost at this `top_k`.
+   *Landed in 11.4 (T11.4.1–T11.4.2, block C):* **DA-11bB-1 fixed first** (eval judge/agentic
+   rewrite reload risk, see point 7 above) — `eval.judge.judge_correctness` and
+   `agentic.reformulate` now pin `num_ctx_answer` too, since `eval.benchmark`/`eval.runner`
+   already share ONE `OllamaChat` across generate -> groundedness -> judge (and the router's
+   rewrite) in the same keep-alive window, inside the `eval` gate step itself, not a future
+   risk. **Single shared reranker (T11.4.1):** `reranking.get_shared_reranker()` is the ONE
+   process-wide instance (double-checked locking), loaded and warmed up (one dummy `predict`)
+   in the FastAPI lifespan before the app serves traffic; both `/chat`/`/chat/stream` (via
+   `api/deps.py`/`api/conversations.py`), the `eval` gate step (`eval.benchmark`/
+   `eval.runner`) and `agentic.answer_agentic` default to it instead of constructing their own
+   — proven by a constructor call count (`test_get_shared_reranker_constructs_the_model_
+   only_once_across_many_calls`, `test_chat_reuses_the_shared_reranker_across_requests`: 5 and
+   3 calls respectively, ONE construction each). `max_length=512` pins the cross-encoder's
+   per-pair token cap (`RERANKER_MAX_LENGTH`, `reranking.py`). **Informal before/after**
+   (own micro-benchmark, same backend venv, native Ollama, 20 candidate chunks, `top_n`=4; the
+   formal T11.4.4 "after" baseline is block E's job): 5 back-to-back `rerank()` calls on the
+   shared instance — call 1 pays `rerank_load` **3623 ms** (cold load this run; order-of-
+   magnitude consistent with the 1063–1086 ms baseline measured on a warmer disk cache) +
+   `rerank_inference` 554 ms; calls 2–5 have **NO `rerank_load` stage at all** (`_ensure_model`
+   short-circuits), only `rerank_inference` ≈485–505 ms each — i.e. every request after the
+   first pays **zero** reload cost instead of the ~1.1 s baseline, every time. The committed
+   `eval/latency_baseline.json` is intentionally **untouched** by this block (it is the
+   "before" reference); a routine (non-`--update-baseline`) `latency` gate run on this block's
+   code (`eval/latency_results.json`, git-ignored) shows `rerank_load` p50 **1085.7 ms**
+   essentially unchanged from baseline — **by design, not a regression**: `eval.latency`'s own
+   benchmark loop still constructs a FRESH `CrossEncoderReranker()` per golden-set item on
+   purpose (its own docstring), so it does not exercise T11.4.1 at all; it inlines
+   `reranking.retrieve`/`generation.answer_from_chunks` directly rather than calling
+   `generation.answer_question` (which now defaults to the shared instance). T11.4.4 (block E)
+   must decide how the "after" measurement accounts for this — switching `eval.latency` itself
+   to the shared instance, or adding a second run that does, before the `rerank_inference` ≤
+   50 %/≤ 1.5 s floor can be checked honestly against a methodology that actually reflects
+   production. **Reranker baked into the backend image (T11.4.2):** `backend/Dockerfile`
+   downloads the pinned `reranker_model`@`reranker_revision` (reads `rag_app.config.
+   get_settings()` directly — no separate `ARG`, so the baked snapshot can never drift from
+   what the running app asks for) into the image's Hugging Face cache at build time, then sets
+   `HF_HUB_OFFLINE=1` (only after that layer, which still needs the network). Proven offline
+   with a throwaway container, no access to any real data/volume: `docker run --rm --network
+   none secrag-backend:ci python -c '...'` loads the baked snapshot and reranks a real
+   (query, chunk) pair successfully; a model NOT baked in correctly refuses
+   (`RerankerModelError: ... is not in the local cache and HF_HUB_OFFLINE is set`) — both
+   checks run again in CI (`backend-image` job, ci.yml). **Image size** (`docker build`,
+   same machine, back to back, before this block's Dockerfile change vs after): reported
+   `docker images` SIZE 2.39 GB -> 6.05 GB; the more apples-to-apples on-disk footprint
+   (`docker run --rm <image> du -sh /`, excludes `/proc`) 1.8 GB -> 3.9 GB, a **+~2.1 GB**
+   delta matching the cross-encoder's single safetensors weight file (2.27 GB per `docker
+   history`'s new layer) — `docker images`'/`docker save`'s own size accounting disagreed with
+   each other and with `du` by a wide margin on this Docker Desktop version (containerd
+   snapshotter layer-sharing display quirk, not a real discrepancy in what is actually on
+   disk); `du` is the number to trust. CI's `jobs-image` build is unaffected (slim `jobs`
+   image never installs torch or the reranker; confirmed `import torch` still fails there)
+   and `docker compose config`/`docker compose build backend` both still succeed unchanged
+   (the compose `backend` service's `build: ./backend` needed no edits). **Azure impact**
+   (for the runbook, orchestrator): the first chat after any cold start (scale-to-zero wake,
+   a new revision) no longer downloads the reranker from the Hub — it was already in the
+   image — removing one more cold-start variable before T11.4.3's custom Ollama image and
+   T11.4.4's chained cold-start measurement; no app setting needs to change (`HF_HUB_OFFLINE`
+   is baked into the image itself, not read from an env var today).
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=

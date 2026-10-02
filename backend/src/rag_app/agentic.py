@@ -54,11 +54,24 @@ def is_thin(chunks: list[RetrievedChunk], threshold: float) -> bool:
 
 
 def reformulate(chat: ChatClient, query: str) -> str:
+    """Rewrite ``query`` into more precise security terminology.
+
+    DA-11bB-1 (block C): CLI/eval runs can call this in the same process/keep-alive window
+    as generate/groundedness (same resident qwen), so ``num_ctx`` is pinned to
+    ``num_ctx_answer`` (equal to ``num_ctx_groundedness``, config.py) — never Ollama's own
+    default, which would force a reload before the next generate call.
+    """
     messages: list[Message] = [
         {"role": "system", "content": _REWRITE_SYSTEM},
         {"role": "user", "content": query},
     ]
-    return chat.chat(messages, temperature=0.0, max_tokens=REWRITE_MAX_TOKENS).strip()
+    return chat.chat(
+        messages,
+        temperature=0.0,
+        max_tokens=REWRITE_MAX_TOKENS,
+        num_ctx=get_settings().num_ctx_answer,
+        call_type="rewrite",
+    ).strip()
 
 
 def answer_agentic(
@@ -71,12 +84,13 @@ def answer_agentic(
     version: str | None = None,
 ) -> RoutedAnswer:
     """Retrieve; if thin, reformulate + retry; then generate a grounded answer."""
-    from rag_app.reranking import CrossEncoderReranker, retrieve
+    from rag_app.reranking import get_shared_reranker, retrieve
 
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
     chat = chat or make_chat_client()
-    reranker = reranker or CrossEncoderReranker()
+    # T11.4.1: the ONE process-wide shared instance by default, never a fresh load per call.
+    reranker = reranker or get_shared_reranker()
 
     chunks = retrieve(session, query, reranker=reranker, top_n=top_n, version=version)
     rewrote = False
