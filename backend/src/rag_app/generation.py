@@ -132,7 +132,13 @@ def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[Retrieve
         {"role": "user", "content": user},
     ]
     return parse_groundedness(
-        chat.chat(messages, temperature=0.0, max_tokens=GROUNDEDNESS_MAX_TOKENS)
+        chat.chat(
+            messages,
+            temperature=0.0,
+            max_tokens=GROUNDEDNESS_MAX_TOKENS,
+            num_ctx=get_settings().num_ctx_groundedness,
+            call_type="groundedness",
+        )
     )
 
 
@@ -146,9 +152,16 @@ def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk
     if not chunks:
         return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
 
-    max_tokens = get_settings().max_tokens
+    settings = get_settings()
+    max_tokens = settings.max_tokens
     with timing.stage("generate"):
-        raw = chat.chat(build_messages(query, chunks), temperature=0.0, max_tokens=max_tokens)
+        raw = chat.chat(
+            build_messages(query, chunks),
+            temperature=0.0,
+            max_tokens=max_tokens,
+            num_ctx=settings.num_ctx_answer,
+            call_type="answer",
+        )
     # Non-streaming: the full response arrives at once, so "first token" == "generate done".
     timing.mark_first_token()
     answer = parse_answer(raw, chunks)
@@ -285,9 +298,15 @@ def _stream_answer_tokens(
     buffer = ""
     emitting = False
     full = ""
-    max_tokens = get_settings().max_tokens
+    settings = get_settings()
+    max_tokens = settings.max_tokens
     for delta in chat.chat_stream(
-        build_messages(query, chunks), temperature=0.0, max_tokens=max_tokens, usage=usage
+        build_messages(query, chunks),
+        temperature=0.0,
+        max_tokens=max_tokens,
+        usage=usage,
+        num_ctx=settings.num_ctx_answer,
+        call_type="answer",
     ):
         full += delta
         if emitting:
@@ -401,7 +420,14 @@ def _check_groundedness_counted(
         {"role": "user", "content": user},
     ]
     verdict = "".join(
-        chat.chat_stream(messages, temperature=0.0, max_tokens=GROUNDEDNESS_MAX_TOKENS, usage=usage)
+        chat.chat_stream(
+            messages,
+            temperature=0.0,
+            max_tokens=GROUNDEDNESS_MAX_TOKENS,
+            usage=usage,
+            num_ctx=get_settings().num_ctx_groundedness,
+            call_type="groundedness",
+        )
     )
     return parse_groundedness(verdict)
 
