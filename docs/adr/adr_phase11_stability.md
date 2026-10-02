@@ -474,6 +474,64 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    beyond block A's single-call ADR evidence above (which only showed one sample each): T11.4
    (shared reranker, eliminates the ~1.1 s reload) and T11.5 (CPU-friendlier reranker/top_k)
    both matter — the reload is real but not the biggest cost at this `top_k`.
+   *Landed in 11.4 (T11.4.1–T11.4.2, block C):* **DA-11bB-1 fixed first** (eval judge/agentic
+   rewrite reload risk, see point 7 above) — `eval.judge.judge_correctness` and
+   `agentic.reformulate` now pin `num_ctx_answer` too, since `eval.benchmark`/`eval.runner`
+   already share ONE `OllamaChat` across generate -> groundedness -> judge (and the router's
+   rewrite) in the same keep-alive window, inside the `eval` gate step itself, not a future
+   risk. **Single shared reranker (T11.4.1):** `reranking.get_shared_reranker()` is the ONE
+   process-wide instance (double-checked locking), loaded and warmed up (one dummy `predict`)
+   in the FastAPI lifespan before the app serves traffic; both `/chat`/`/chat/stream` (via
+   `api/deps.py`/`api/conversations.py`), the `eval` gate step (`eval.benchmark`/
+   `eval.runner`) and `agentic.answer_agentic` default to it instead of constructing their own
+   — proven by a constructor call count (`test_get_shared_reranker_constructs_the_model_
+   only_once_across_many_calls`, `test_chat_reuses_the_shared_reranker_across_requests`: 5 and
+   3 calls respectively, ONE construction each). `max_length=512` pins the cross-encoder's
+   per-pair token cap (`RERANKER_MAX_LENGTH`, `reranking.py`). **Informal before/after**
+   (own micro-benchmark, same backend venv, native Ollama, 20 candidate chunks, `top_n`=4; the
+   formal T11.4.4 "after" baseline is block E's job): 5 back-to-back `rerank()` calls on the
+   shared instance — call 1 pays `rerank_load` **3623 ms** (cold load this run; order-of-
+   magnitude consistent with the 1063–1086 ms baseline measured on a warmer disk cache) +
+   `rerank_inference` 554 ms; calls 2–5 have **NO `rerank_load` stage at all** (`_ensure_model`
+   short-circuits), only `rerank_inference` ≈485–505 ms each — i.e. every request after the
+   first pays **zero** reload cost instead of the ~1.1 s baseline, every time. The committed
+   `eval/latency_baseline.json` is intentionally **untouched** by this block (it is the
+   "before" reference); a routine (non-`--update-baseline`) `latency` gate run on this block's
+   code (`eval/latency_results.json`, git-ignored) shows `rerank_load` p50 **1085.7 ms**
+   essentially unchanged from baseline — **by design, not a regression**: `eval.latency`'s own
+   benchmark loop still constructs a FRESH `CrossEncoderReranker()` per golden-set item on
+   purpose (its own docstring), so it does not exercise T11.4.1 at all; it inlines
+   `reranking.retrieve`/`generation.answer_from_chunks` directly rather than calling
+   `generation.answer_question` (which now defaults to the shared instance). T11.4.4 (block E)
+   must decide how the "after" measurement accounts for this — switching `eval.latency` itself
+   to the shared instance, or adding a second run that does, before the `rerank_inference` ≤
+   50 %/≤ 1.5 s floor can be checked honestly against a methodology that actually reflects
+   production. **Reranker baked into the backend image (T11.4.2):** `backend/Dockerfile`
+   downloads the pinned `reranker_model`@`reranker_revision` (reads `rag_app.config.
+   get_settings()` directly — no separate `ARG`, so the baked snapshot can never drift from
+   what the running app asks for) into the image's Hugging Face cache at build time, then sets
+   `HF_HUB_OFFLINE=1` (only after that layer, which still needs the network). Proven offline
+   with a throwaway container, no access to any real data/volume: `docker run --rm --network
+   none secrag-backend:ci python -c '...'` loads the baked snapshot and reranks a real
+   (query, chunk) pair successfully; a model NOT baked in correctly refuses
+   (`RerankerModelError: ... is not in the local cache and HF_HUB_OFFLINE is set`) — both
+   checks run again in CI (`backend-image` job, ci.yml). **Image size** (`docker build`,
+   same machine, back to back, before this block's Dockerfile change vs after): reported
+   `docker images` SIZE 2.39 GB -> 6.05 GB; the more apples-to-apples on-disk footprint
+   (`docker run --rm <image> du -sh /`, excludes `/proc`) 1.8 GB -> 3.9 GB, a **+~2.1 GB**
+   delta matching the cross-encoder's single safetensors weight file (2.27 GB per `docker
+   history`'s new layer) — `docker images`'/`docker save`'s own size accounting disagreed with
+   each other and with `du` by a wide margin on this Docker Desktop version (containerd
+   snapshotter layer-sharing display quirk, not a real discrepancy in what is actually on
+   disk); `du` is the number to trust. CI's `jobs-image` build is unaffected (slim `jobs`
+   image never installs torch or the reranker; confirmed `import torch` still fails there)
+   and `docker compose config`/`docker compose build backend` both still succeed unchanged
+   (the compose `backend` service's `build: ./backend` needed no edits). **Azure impact**
+   (for the runbook, orchestrator): the first chat after any cold start (scale-to-zero wake,
+   a new revision) no longer downloads the reranker from the Hub — it was already in the
+   image — removing one more cold-start variable before T11.4.3's custom Ollama image and
+   T11.4.4's chained cold-start measurement; no app setting needs to change (`HF_HUB_OFFLINE`
+   is baked into the image itself, not read from an env var today).
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=

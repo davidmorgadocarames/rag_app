@@ -115,7 +115,7 @@ back; migrations run as a Job before the apps are updated, never at container st
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, pydantic-settings |
 | Database | PostgreSQL 16 + pgvector (HNSW) + full-text search |
 | LLM | Ollama `qwen2.5:7b-instruct` (local) · Azure OpenAI `gpt-4.1-mini` (cloud) |
-| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, loaded offline from the cache when present) |
+| Embeddings / reranking | `bge-m3` · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, baked into the backend image and always loaded offline, ONE shared instance per process) |
 | Security | argon2, JWT, Fernet envelope encryption (crypto-shred), token bucket |
 | Evaluation | Separate retrieval and generation metrics, LLM judge, regression gate |
 | Quality | ruff, mypy `--strict`, pytest, ESLint, `tsc`, pre-commit, gitleaks |
@@ -384,14 +384,36 @@ deployment. See `docs/adr/adr_phase11_stability.md` decision 8 for the measured 
 and the full reasoning.
 
 **Latency baseline (T11.3.5).** `python -m rag_app.eval.latency` runs the golden set through
-the real per-request pipeline (same fresh-reranker-per-call shape `/chat` uses today): p50/p95
-per stage plus the machine/model details needed to compare runs like for like. A routine run
-(the gate step `latency`, `--full`/`--only latency`) writes the git-ignored
-`eval/latency_results.json`; `--update-baseline` writes the git-tracked
-`eval/latency_baseline.json` instead (same results/baseline split as `eval.gate`) — done on
-purpose, not on every gate run, so ordinary timing jitter never dirties the tree. This block
-only records — `T11.6b.1` adds the pass/fail threshold once a reranker fix (block C) and the
-eval-guided optimisation (block F) have picked a new baseline to enforce.
+the real per-request pipeline shape: p50/p95 per stage plus the machine/model details needed
+to compare runs like for like. A routine run (the gate step `latency`, `--full`/`--only
+latency`) writes the git-ignored `eval/latency_results.json`; `--update-baseline` writes the
+git-tracked `eval/latency_baseline.json` instead (same results/baseline split as `eval.gate`)
+— done on purpose, not on every gate run, so ordinary timing jitter never dirties the tree.
+This block only records — `T11.6b.1` adds the pass/fail threshold once the eval-guided
+optimisation (block F) has picked a new baseline to enforce. Note: `eval.latency`'s own
+benchmark loop still builds a FRESH `CrossEncoderReranker()` per golden-set item on purpose
+(the committed "before" baseline, `b77f69f`, is directly comparable only if the "after" run
+uses the exact same shape) — T11.4.1's shared-reranker fix below only applies to the real
+`/chat` and `/chat/stream` paths, `eval.benchmark`/`eval.runner` (the `eval` gate step) and
+`agentic.py`; T11.4.4 (block E) decides how the "after" latency measurement accounts for it.
+
+**Single shared reranker (T11.4.1).** Before this fix, `generation.py` constructed a brand
+new `CrossEncoderReranker()` on every `/chat`/`/chat/stream` call, reloading the ~2.2 GB
+cross-encoder from disk on every answer (`rerank_load`, ADR decision 8/11.3's baseline). Now
+ONE instance (`reranking.get_shared_reranker()`) is loaded and warmed up (one dummy `predict`
+call) in the FastAPI lifespan, before the app starts serving traffic, and reused by every
+request, the `eval` gate step and `agentic.py` — so `rerank_load` is ~0 for every real
+request (the one real load happens once, at start-up). The cross-encoder's `max_length` is
+pinned to 512 tokens per (query, chunk) pair. The purger/backup/migration Jobs (slim `jobs`
+image, no torch) never construct or import it.
+
+**Reranker baked into the backend image (T11.4.2).** `backend/Dockerfile` downloads the
+pinned `reranker_model`@`reranker_revision` (config.py — the SAME Settings the app reads, so
+the baked snapshot can never drift from what is actually requested at runtime) into the
+image's Hugging Face cache at build time, then sets `HF_HUB_OFFLINE=1`. A cold container —
+including the very first start on Azure, with no egress at all — reranks with no network
+call, ever; CI's `backend-image` job proves this with a throwaway `docker run --network
+none` container (no access to any real data/volume).
 
 ### Recovering from a changed master key
 
