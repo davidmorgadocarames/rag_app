@@ -384,11 +384,14 @@ deployment. See `docs/adr/adr_phase11_stability.md` decision 8 for the measured 
 and the full reasoning.
 
 **Latency baseline (T11.3.5).** `python -m rag_app.eval.latency` runs the golden set through
-the real per-request pipeline (same fresh-reranker-per-call shape `/chat` uses today) and
-writes `eval/latency_baseline.json`: p50/p95 per stage plus the machine/model details needed
-to compare runs like for like. Wired as the gate step `latency` (`--full`/`--only latency`);
-this block only records — `T11.6b.1` adds the pass/fail threshold once a reranker fix (block
-C) and the eval-guided optimisation (block F) have picked a new baseline to enforce.
+the real per-request pipeline (same fresh-reranker-per-call shape `/chat` uses today): p50/p95
+per stage plus the machine/model details needed to compare runs like for like. A routine run
+(the gate step `latency`, `--full`/`--only latency`) writes the git-ignored
+`eval/latency_results.json`; `--update-baseline` writes the git-tracked
+`eval/latency_baseline.json` instead (same results/baseline split as `eval.gate`) — done on
+purpose, not on every gate run, so ordinary timing jitter never dirties the tree. This block
+only records — `T11.6b.1` adds the pass/fail threshold once a reranker fix (block C) and the
+eval-guided optimisation (block F) have picked a new baseline to enforce.
 
 ### Recovering from a changed master key
 

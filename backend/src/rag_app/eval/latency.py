@@ -46,7 +46,14 @@ from rag_app.llm import OllamaChat
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EVAL_DIR = REPO_ROOT / "eval"
+# Same split as eval/gate.py: `latency_baseline.json` is git-tracked (the "before"/"after"
+# reference other blocks compare against) and only updated on purpose, via --update-baseline;
+# a routine `gate.sh --full`/`--only latency` run writes the untracked `latency_results.json`
+# instead, every time — otherwise run-to-run timing jitter would dirty the tree on every gate
+# run and the gate-full commit status could never publish (D-2026-10-02, found running the
+# final --full for this block: the tree had "uncommitted changes" after latency ran).
 BASELINE_PATH = EVAL_DIR / "latency_baseline.json"
+RESULTS_PATH = EVAL_DIR / "latency_results.json"
 
 # N runs over the golden set (14 questions, 2026-10-02): each run pays a FRESH
 # `CrossEncoderReranker()` load per question (today's bug) + a real Ollama generate +
@@ -267,13 +274,26 @@ def main(argv: list[str] | None = None) -> int:
         " (requirements-torch.txt), kept for when T11.5.1's experiment matrix adds a GPU"
         " variant; 'gpu' leaves CUDA visible (local-dev-only number once that lands)",
     )
-    parser.add_argument("--out", type=Path, default=BASELINE_PATH)
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="defaults to latency_results.json, or latency_baseline.json with"
+        " --update-baseline (same split as eval.gate's results.json/baseline_metrics.json)",
+    )
+    parser.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="write/overwrite the git-tracked latency_baseline.json (do this on purpose, not"
+        " on every gate run — otherwise timing jitter would dirty the tree on every --full)",
+    )
     parser.add_argument(
         "--require-stack",
         action="store_true",
         help="fail (instead of skipping) when Postgres/Ollama are not reachable (gate --full)",
     )
     args = parser.parse_args(argv)
+    out_path = args.out or (BASELINE_PATH if args.update_baseline else RESULTS_PATH)
 
     if args.device == "cpu":
         # Must happen before any torch import (lazy, inside reranking.load_cross_encoder) —
@@ -302,8 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     _print_summary(report)
 
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(report.to_json(), indent=2, sort_keys=True), encoding="utf-8")
-    print(f"latency baseline written -> {args.out}")
+    out_path.write_text(json.dumps(report.to_json(), indent=2, sort_keys=True), encoding="utf-8")
+    label = "baseline" if args.update_baseline else "results"
+    print(f"latency {label} written -> {out_path}")
     print("\nLATENCY GATE: RECORDED (no pass/fail threshold yet — T11.6b.1)")
     return 0
 

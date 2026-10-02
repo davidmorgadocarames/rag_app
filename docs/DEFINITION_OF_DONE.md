@@ -121,12 +121,17 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 `latency` (T11.3.5, `rag_app.eval.latency`): runs the golden set (14 questions) `N`=3 times
 through the real per-request pipeline shape (`generation.answer_question`'s own `chat`/fresh
 `CrossEncoderReranker()` per call — today's reload-per-request bug included), records p50/p95
-per stage into `eval/latency_baseline.json` with machine/model details (CPU, GPU, RAM, model
-names/revisions, reranker device, `top_k`/`rerank_top_n`, git commit). Reranker on CPU for
+per stage with machine/model details (CPU, GPU, RAM, model names/revisions, reranker device,
+`top_k`/`rerank_top_n`, git commit). A routine run (this step, no flag) writes the git-ignored
+`eval/latency_results.json`; `--update-baseline` writes the git-tracked
+`eval/latency_baseline.json` instead — same results/baseline split as `eval`
+(`results.json`/`baseline_metrics.json`), so ordinary timing jitter never dirties the tree on
+a routine `--full` (found running this block's own closing gate: the step's unconditional
+overwrite of the tracked file blocked `secrag/gate-full` from publishing). Reranker on CPU for
 the Azure-relevant numbers (today's pinned torch is CPU-only anyway — see ADR 11 decision 8).
 This step only RECORDS in 11.3 — no pass/fail threshold yet (`T11.6b.1`, once a reranker fix
 and the eval-guided optimisation have picked a baseline worth enforcing). Measured on the
-development machine (2026-10-02): 42 answers in 429 s.
+development machine (2026-10-02): 42 answers in 412-429 s across three runs.
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →
@@ -175,7 +180,9 @@ Gate-project setup (up + roles + migrate + seed restore) has its own 300 s budge
 cached venv (below) has 900 s. Measured on the development machine (2026-10-01, end of
 11a): `--fast` ≈ 1 min in the main tree (≈ 2 min from the pre-push worktree), `--full`
 ≈ 6 min (eval ≈ 2.5 min, restart-check ≈ 1 min, db-tests ≈ 40 s, erasure-scale ≈ 17 s,
-backup-drill ≈ 10 s) — well inside the 30-minute target.
+backup-drill ≈ 10 s) — well inside the 30-minute target. Re-measured 2026-10-02 (11b block B,
+after the `latency` step was added): `--full` ≈ 14 min (860 s: eval ≈ 4 min, `latency`
+≈ 7 min, the rest unchanged) — still well inside the 30-minute target.
 
 **Venv matching the pins** (DA-B-4). The gate resolves the backend venv before any step: the
 main tree's `backend/.venv` when the checked tree's requirements hash equals the main tree's

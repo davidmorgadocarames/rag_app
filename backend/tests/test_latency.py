@@ -155,3 +155,36 @@ def test_main_writes_the_baseline_json_with_require_stack_available(
     assert out_path.exists()
     data = json.loads(out_path.read_text(encoding="utf-8"))
     assert data["n_runs"] == 1
+
+
+def test_default_out_path_is_results_not_baseline_unless_update_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A routine run (gate.sh's `step_latency`, no `--update-baseline`) must never touch the
+    git-tracked `latency_baseline.json` — otherwise timing jitter dirties the tree on every
+    `--full` and the gate-full commit status can never publish (found running this block's
+    final gate; same split as eval.gate's results.json/baseline_metrics.json)."""
+    fake_baseline = tmp_path / "latency_baseline.json"
+    fake_results = tmp_path / "latency_results.json"
+    monkeypatch.setattr(latency, "BASELINE_PATH", fake_baseline)
+    monkeypatch.setattr(latency, "RESULTS_PATH", fake_results)
+    monkeypatch.setattr(latency, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(latency, "_stack_available", lambda: True)
+    monkeypatch.setattr(
+        latency,
+        "run_latency_benchmark",
+        lambda *_a, **_k: latency.LatencyReport(
+            machine={}, n_runs=1, n_questions=1, runtime_s=0.1, stages_ms={}
+        ),
+    )
+    monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
+
+    assert latency.main(["--require-stack", "--runs", "1", "--device", "gpu"]) == 0
+    assert fake_results.exists()
+    assert not fake_baseline.exists()
+
+    assert (
+        latency.main(["--update-baseline", "--require-stack", "--runs", "1", "--device", "gpu"])
+        == 0
+    )
+    assert fake_baseline.exists()
