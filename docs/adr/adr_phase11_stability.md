@@ -439,11 +439,16 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    its own default, 2048, which already differs from either setting) — so generate and
    groundedness must load the model at the SAME `num_ctx`, else one answer pays the reload
    twice (once for groundedness, once more for the next answer's generate). Guarded by
-   `test_num_ctx_answer_and_groundedness_must_match`. The agentic router (`agentic.py`,
-   CLI/eval only — not on the live API path today) and the eval judge (`eval/judge.py`) are
-   explicitly left without an explicit `num_ctx` for now (PHASE_TASKS T11.3.4 defers
-   "router/summary"); `test_router_and_judge_calls_do_not_pin_a_num_ctx_yet` guards the
-   deferral itself. **VRAM measured** on the development machine (RTX 4060, 8 GiB; native
+   `test_num_ctx_answer_and_groundedness_must_match`. *Fixed in 11.4 (DA-11bB-1, block C):*
+   block B's own wording ("CLI/eval only — not on the live API path today") was already
+   false for the eval judge — `eval/benchmark.py`/`eval/runner.py` reuse ONE `OllamaChat`
+   across generate -> groundedness -> `judge_correctness` (and the agentic router's query
+   rewrite, when exercised) on every golden-set item, i.e. the SAME process/keep-alive window
+   as generate/groundedness, inside the `eval` gate step itself. Both `agentic.reformulate`
+   and `eval.judge.judge_correctness` now pin `num_ctx_answer` too, so neither forces a reload
+   against the resident qwen; `test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_
+   groundedness` (renamed from the block B version, which asserted the opposite) guards it.
+   **VRAM measured** on the development machine (RTX 4060, 8 GiB; native
    `ollama serve`; `bge-m3` warmed first, baseline 742 MiB already in use by the desktop/
    Xwayland): qwen2.5:7b-instruct-q4_K_M alone added ≈4.53 GiB at `num_ctx`=2048, ≈4.64 GiB
    at 4096, ≈4.87 GiB at 8192 (`ollama ps`: 5.0 GB resident at 8192); `bge-m3` added a further

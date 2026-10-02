@@ -148,12 +148,16 @@ class Settings(JobSettings):
     # that the quality/functional tests cannot see (they do not pin down wall-clock time).
     # `test_num_ctx_answer_and_groundedness_must_match` (test_llm_bounds.py) guards this.
     # Azure OpenAI's context window is fixed by the deployment, not by this setting — these
-    # two are read only on the Ollama path (`LLM_PROVIDER=ollama`; see llm.py). Hooks for
-    # later call types (not wired yet — PHASE_TASKS T11.3.4 defers them): the agentic query
-    # rewrite ("router", agentic.py) and a future conversation-summary call would add
-    # `num_ctx_router` / `num_ctx_summary` here the same way — but only once they run in the
-    # SAME process/keep-alive window as generate/groundedness without reload-safe handling,
-    # since right now neither is on the live API path (CLI/eval only).
+    # two are read only on the Ollama path (`LLM_PROVIDER=ollama`; see llm.py). DA-11bB-1
+    # (block C, 11b): the agentic query rewrite (`agentic.reformulate`) and the eval
+    # correctness judge (`eval.judge.judge_correctness`) are NOT a future risk — the `eval`
+    # gate step (`eval.benchmark`/`eval.runner`) already reuses ONE `OllamaChat` across
+    # generate -> groundedness -> judge (and the router's rewrite, when exercised) on every
+    # golden-set item, i.e. the SAME process/keep-alive window as generate/groundedness,
+    # today. Both now pin `num_ctx_answer` too (`test_router_and_judge_calls_now_pin_num_ctx_
+    # to_match_answer_groundedness`, test_llm_bounds.py) so qwen is never reloaded mid-run. A
+    # future conversation-summary call must do the same the moment it can share a process/
+    # keep-alive window with any of these — never assume "CLI/eval only" means "safe to omit".
     num_ctx_answer: int = 8192
     num_ctx_groundedness: int = 8192
 

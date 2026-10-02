@@ -189,17 +189,52 @@ def test_num_ctx_answer_and_groundedness_must_match() -> None:
     assert settings.num_ctx_answer == settings.num_ctx_groundedness
 
 
-def test_router_and_judge_calls_do_not_pin_a_num_ctx_yet() -> None:
-    """T11.3.4 explicitly defers the agentic router (agentic.py) and the eval judge
-    (eval/judge.py) to a later task ("router/summary... later") — neither is on the live API
-    path today (generation.py docstring), so they still omit ``num_ctx`` (Ollama's default,
-    2048) without the reload risk ``test_num_ctx_answer_and_groundedness_must_match`` guards."""
+def _num_ctx_attr_name(call: ast.Call) -> str | None:
+    """The attribute name of a ``num_ctx=settings.xxx`` keyword, or ``None`` if absent/not a
+    plain attribute access (a static, no-import check of the actual source)."""
+    for kw in call.keywords:
+        if kw.arg == "num_ctx" and isinstance(kw.value, ast.Attribute):
+            return kw.value.attr
+    return None
+
+
+def test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness() -> None:
+    """DA-11bB-1 (block B review, fixed block C): the agentic router's query rewrite
+    (``agentic.reformulate``) and the eval correctness judge (``eval.judge.judge_correctness``)
+    are NOT a future risk, as T11.3.4 assumed ("not on the live API path today") — the ``eval``
+    gate step (``eval.benchmark``/``eval.runner``) already reuses ONE ``OllamaChat`` across
+    generate -> groundedness -> judge (and the router's rewrite, when exercised) in the SAME
+    process/keep-alive window, on every golden-set item, today. Both call sites now pin
+    ``num_ctx_answer`` (== ``num_ctx_groundedness``, guarded above) so qwen is never reloaded
+    mid-run."""
     from rag_app import agentic
     from rag_app.eval import judge
 
     for module in (agentic, judge):
         calls = _llm_calls(Path(module.__file__))
         assert calls, f"{module.__name__}: expected at least one LLM call"
-        assert all(
-            not any(kw.arg == "num_ctx" for kw in call.keywords) for call in calls
-        ), f"{module.__name__}: a call now pins num_ctx — re-check the reload note above"
+        attrs = [_num_ctx_attr_name(call) for call in calls]
+        assert all(attr == "num_ctx_answer" for attr in attrs), (
+            f"{module.__name__}: every LLM call must pin num_ctx=settings.num_ctx_answer"
+            f" (got {attrs})"
+        )
+
+
+def test_eval_judge_passes_num_ctx_answer_and_call_type_judge() -> None:
+    """Behavioural companion to the static check above: a real call records the right value,
+    not just the right attribute name."""
+    from rag_app.eval.judge import JUDGE_MAX_TOKENS, judge_correctness
+
+    chat = _RecordingChat()
+    judge_correctness(chat, "Q?", "reference answer", "candidate answer")
+    settings = get_settings()
+    assert chat.calls == [("chat", JUDGE_MAX_TOKENS, settings.num_ctx_answer, "judge")]
+
+
+def test_agentic_reformulate_passes_num_ctx_answer_and_call_type_rewrite() -> None:
+    from rag_app.agentic import REWRITE_MAX_TOKENS, reformulate
+
+    chat = _RecordingChat()
+    reformulate(chat, "sqli?")  # type: ignore[arg-type]
+    settings = get_settings()
+    assert chat.calls == [("chat", REWRITE_MAX_TOKENS, settings.num_ctx_answer, "rewrite")]
