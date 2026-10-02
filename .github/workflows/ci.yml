@@ -148,13 +148,27 @@ jobs:
   # Face cache at build time (pinned revision, config.py), HF_HUB_OFFLINE=1 set after — so a
   # cold container reranks with NO network at all, even on a first-ever start. `--network
   # none` on a throwaway container is the actual proof, not just "the model imports".
+  #
+  # DA-11bC-1: built through buildx with the GitHub Actions cache (`type=gha`, no secrets —
+  # it is a cache, not a registry) so a re-run or a PR-sync build reuses layers, incl. the
+  # baked model layer when neither the pinned revision nor the two files it depends on
+  # changed (backend/Dockerfile's own ordering is what makes that layer cacheable at all —
+  # see test_backend_image.py).
   backend-image:
     name: Backend image (build, reranker baked in, offline rerank)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
       - name: Build backend/Dockerfile
-        run: docker build -f backend/Dockerfile -t secrag-backend:ci backend
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile
+          tags: secrag-backend:ci
+          load: true
+          cache-from: type=gha,scope=backend-image
+          cache-to: type=gha,mode=max,scope=backend-image
       - name: HF_HUB_OFFLINE is set in the image
         run: |
           docker run --rm secrag-backend:ci python -c \

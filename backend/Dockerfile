@@ -9,10 +9,6 @@ COPY requirements-torch.txt requirements.txt ./
 RUN pip install --no-cache-dir -r requirements-torch.txt \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY src ./src
-COPY alembic.ini ./
-COPY migrations ./migrations
-
 ENV PYTHONPATH=/app/src
 
 # T11.4.2: bake the cross-encoder reranker into this image's Hugging Face cache at build
@@ -24,6 +20,17 @@ ENV PYTHONPATH=/app/src
 # lifespan's warm-up (T11.4.1) and any fallback construction — comes from this cache only,
 # never the network, even on a cold start with no egress: this also removes the Hugging Face
 # Hub as a runtime supply-chain surface (DA-B-7) for the deployed container.
+#
+# DA-11bC-1: this layer COPIES ONLY the two files `get_settings()` actually needs
+# (`rag_app/__init__.py`, `rag_app/config.py` — neither imports any other `rag_app` module,
+# guarded by test_backend_image.py) instead of the whole `src/` tree. Docker's layer cache is
+# sequential: an earlier `COPY src ./src` (which changes on nearly every commit) would have
+# invalidated this ~2.1-2.3 GB download on every ordinary code-only change, in both a local
+# `docker build` and CI's `backend-image` job (no registry/GHA cache is configured there
+# either — see ci.yml). Ordinary commits now reuse this layer from cache; only a
+# `reranker_model`/`reranker_revision` bump (or a change to one of these two files) re-runs
+# the download.
+COPY src/rag_app/__init__.py src/rag_app/config.py ./src/rag_app/
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
 from rag_app.config import get_settings; \
@@ -31,6 +38,12 @@ s = get_settings(); \
 snapshot_download(s.reranker_model, revision=s.reranker_revision)"
 
 ENV HF_HUB_OFFLINE=1
+
+# The rest of the source tree: changes on nearly every commit, but never invalidates the
+# download layer above (already run, from the smaller COPY).
+COPY src ./src
+COPY alembic.ini ./
+COPY migrations ./migrations
 
 EXPOSE 8000
 
