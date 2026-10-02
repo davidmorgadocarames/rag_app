@@ -1,0 +1,10 @@
+# Prometheus scrape config for the local dev stack (T11.3.3). Scrapes ONLY the backend's
+# separate internal metrics port (never the API port, TF4) — see docker-compose.yml.
+# If METRICS_PORT is overridden in the shell/root .env, update the target below to match.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: secrag-backend
+    static_configs:
+      - targets: ["backend:9100"]

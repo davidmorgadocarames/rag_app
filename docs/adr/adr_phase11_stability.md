@@ -404,6 +404,25 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    groundedness 16), so one answer has a bounded worst-case cost — the table under
    [Costs](#costs) is the basis of the 150 choice.
 8. (11b) One shared reranker, baked model images, latency gate.
+   *Landed in 11.3 (T11.3.1–T11.3.3, block A):* **per-stage timing** — classify, query embed,
+   hybrid search, rerank (load vs inference), generate, groundedness, time to first token,
+   total — one JSON line per answer on both `/chat` and `/chat/stream` (`rag_app.timing`,
+   stdout; never the question, the answer, a user id or an IP). **Prometheus** — histograms
+   labelled only by `stage` (`secrag_chat_stage_seconds`) plus an in-flight chat requests
+   gauge (`secrag_chat_requests_in_flight`, no labels), served on a **separate internal port**
+   (`METRICS_PORT`, default 9100; TF4) — the FastAPI app registers no `/metrics` route at all,
+   so the API port never serves it. A `prometheus` container (`docker-compose.yml`, image
+   pinned by digest per X1) scrapes that port only, 7-day retention, UI on `127.0.0.1:9090`.
+   The reranker still reloads per request here (`rerank_load` dominates the measurements
+   below) — T11.4.1 fixes that. End-to-end proof (throwaway compose project, native Ollama,
+   322 indexed chunks, torn down after): one `/chat` call —
+   `{"embed_ms": 293.0, "hybrid_search_ms": 5.1, "rerank_load_ms": 32079.1,
+   "rerank_inference_ms": 9378.6, "generate_ms": 2943.2, "groundedness_ms": 147.8,
+   "ttft_ms": 44702.3, "total_ms": 44850.3}`; one `/chat/stream` call —
+   `{"classify_ms": 0.0, "embed_ms": 1327.3, "rerank_load_ms": 1071.9,
+   "rerank_inference_ms": 8781.1, "generate_ms": 1878.4, "groundedness_ms": 591.1,
+   "ttft_ms": 11978.5, "total_ms": 13657.0}`; `secrag_chat_stage_seconds_count` visible in
+   Prometheus for every stage above; `GET /metrics` on the API port → 404.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=

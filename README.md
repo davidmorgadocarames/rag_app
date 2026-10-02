@@ -351,6 +351,26 @@ migration Job that CD starts before updating the apps). To build the index, run 
 ingestion and indexing steps from [step 4](#4-build-the-corpus-and-the-index) against the
 same database.
 
+### Latency instrumentation and metrics
+
+Every answer (`/chat` and `/chat/stream`) is timed per pipeline stage — classify, query
+embed, hybrid search, rerank (load vs inference), time to first token, total — and logged as
+one JSON line (`rag_app.timing`, stdout): stage names and durations only, never the question,
+the answer, a user id or an IP.
+
+The same numbers feed Prometheus histograms (label: `stage` only) plus an in-flight chat
+requests gauge, served on a **separate internal metrics port** (`METRICS_PORT`, default
+`9100`) — never the API port, and never published to the host. The `prometheus` service in
+`docker-compose.yml` scrapes it (7-day retention, UI on `http://127.0.0.1:9090`, image pinned
+by digest):
+
+```bash
+docker compose up -d --build backend prometheus   # (needs db/db-roles/migrate already up)
+open http://127.0.0.1:9090                        # Graph: secrag_chat_stage_seconds_bucket
+curl -s http://127.0.0.1:9090/api/v1/query --data-urlencode \
+  'query=histogram_quantile(0.95, sum(rate(secrag_chat_stage_seconds_bucket[5m])) by (le, stage))'
+```
+
 ### Recovering from a changed master key
 
 If the API refuses to start because stored user keys do not unwrap with `DATA_MASTER_KEY`
