@@ -29,8 +29,6 @@ DOCKERFILE = REPO_ROOT / "backend" / "Dockerfile"
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 CONFIG_PY = REPO_ROOT / "backend" / "src" / "rag_app" / "config.py"
 INIT_PY = REPO_ROOT / "backend" / "src" / "rag_app" / "__init__.py"
-CONFIG_PY = REPO_ROOT / "backend" / "src" / "rag_app" / "config.py"
-INIT_PY = REPO_ROOT / "backend" / "src" / "rag_app" / "__init__.py"
 
 
 def _lines() -> list[str]:
