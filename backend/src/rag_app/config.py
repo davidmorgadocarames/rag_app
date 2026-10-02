@@ -201,6 +201,16 @@ class Settings(JobSettings):
     # browser). Only Prometheus (compose network / Azure, never published to a host port
     # or the internet) reads it.
     metrics_port: int = 9100
+    # DA-11bA-2 (block D, 11b): default "0.0.0.0" because compose's `prometheus` service is a
+    # SEPARATE container on the same compose network and needs a non-loopback bind to reach
+    # this port at all. Azure does not run a scraper today (R6-1: no managed Prometheus) —
+    # nothing reads this port there yet — so "127.0.0.1" is the SAFER choice once a sidecar
+    # actually needs it (same-pod only); set `METRICS_BIND_ADDR=127.0.0.1` as a backend app
+    # setting on Azure if/when that is confirmed (recommendation only — not applied here;
+    # Container Apps ingress is configured once at `az containerapp create` time and only
+    # ever targets port 8000, so this setting cannot make the metrics port internet-reachable
+    # either way — see the runbook / ADR phase 11 decision 8).
+    metrics_bind_addr: str = "0.0.0.0"  # noqa: S104 - see the comment above
 
 
 def get_settings() -> Settings:

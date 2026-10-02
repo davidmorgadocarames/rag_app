@@ -275,6 +275,17 @@ def test_cd_never_touches_job_schedules_or_job_yaml() -> None:
             assert override not in line, line
 
 
+def test_cd_never_touches_ingress_or_the_metrics_port() -> None:
+    """DA-11bA-2: `az containerapp update` is only ever called with `--image` here — CD can
+    never silently change a Container App's ingress (target port, transport, external/
+    internal) or expose the metrics port (9100). Ingress is configured once, by hand, at `az
+    containerapp create` time (runbook) and is unaffected by every later CD deploy."""
+    commands = _commands(CD_YML)
+    for forbidden in ("--ingress", "--target-port", "--transport", "9100", "METRICS_PORT"):
+        assert forbidden not in commands, forbidden
+    assert commands.count("containerapp update") >= 3  # ollama, backend, frontend
+
+
 JOB_YAMLS = sorted((REPO_ROOT / "deploy" / "azure" / "jobs").glob("*.yaml"))
 
 

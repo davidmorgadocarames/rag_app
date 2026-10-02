@@ -149,6 +149,42 @@ def test_the_api_lifespan_warms_up_the_shared_reranker(monkeypatch: pytest.Monke
     assert calls == [True]
 
 
+def test_metrics_bind_addr_defaults_to_all_interfaces_but_is_configurable() -> None:
+    """DA-11bA-2: compose's separate `prometheus` container needs a non-loopback bind to
+    reach this port at all, so the default stays "0.0.0.0" — but it must be overridable
+    (e.g. to "127.0.0.1" on Azure, where nothing scrapes it remotely today) without a code
+    change, since ingress is configured once at `az containerapp create` time and never by
+    this setting."""
+    assert _settings().metrics_bind_addr == "0.0.0.0"
+    assert _settings(metrics_bind_addr="127.0.0.1").metrics_bind_addr == "127.0.0.1"
+
+
+def test_the_api_lifespan_passes_the_configured_bind_addr_to_the_metrics_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rag_app.api import app as app_module
+
+    calls: list[tuple[int, str]] = []
+
+    class _NoopReranker:
+        def warm_up(self) -> None:
+            pass
+
+    def _fake_start(port: int, addr: str = "0.0.0.0") -> int:
+        calls.append((port, addr))
+        return port
+
+    monkeypatch.setattr(
+        app_module, "get_settings", lambda: _settings(metrics_bind_addr="127.0.0.1")
+    )
+    monkeypatch.setattr(app_module, "check_master_key_fingerprint", lambda *_a: "match")
+    monkeypatch.setattr(app_module.metrics, "start_metrics_server", _fake_start)
+    monkeypatch.setattr(app_module.reranking, "get_shared_reranker", lambda: _NoopReranker())
+    with TestClient(create_app()):
+        pass
+    assert calls == [(9100, "127.0.0.1")]
+
+
 def test_job_settings_have_no_api_secrets() -> None:
     fields = set(JobSettings.model_fields)
     assert fields == {"env", "database_url"}

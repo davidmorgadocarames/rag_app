@@ -59,7 +59,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """
     settings = get_settings()
     startup_checks(settings)
-    metrics.start_metrics_server(settings.metrics_port)
+    metrics.start_metrics_server(settings.metrics_port, addr=settings.metrics_bind_addr)
     reranking.get_shared_reranker().warm_up()
     yield
 
