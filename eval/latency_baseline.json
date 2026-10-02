@@ -1,0 +1,71 @@
+{
+  "machine": {
+    "commit": "b77f69fbf369007a3031e356afc223e73c4ebb65",
+    "cpu": "Intel(R) Core(TM) i7-14700KF",
+    "cpu_count": 28,
+    "embed_model": "bge-m3",
+    "gpu": "NVIDIA GeForce RTX 4060, 8188 MiB",
+    "llm_model": "qwen2.5:7b-instruct-q4_K_M",
+    "num_ctx_answer": 8192,
+    "num_ctx_groundedness": 8192,
+    "ram_gib": 15.5,
+    "rerank_top_n": 4,
+    "reranker_device": "cpu",
+    "reranker_model": "BAAI/bge-reranker-v2-m3",
+    "reranker_revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+    "top_k": 20
+  },
+  "n_questions": 14,
+  "n_runs": 3,
+  "runtime_s": 411.8,
+  "stages_ms": {
+    "embed": {
+      "mean": 13.1,
+      "n": 42,
+      "p50": 12.2,
+      "p95": 18.2
+    },
+    "generate": {
+      "mean": 1350.1,
+      "n": 42,
+      "p50": 851.5,
+      "p95": 2721.7
+    },
+    "groundedness": {
+      "mean": 266.2,
+      "n": 30,
+      "p50": 166.1,
+      "p95": 558.4
+    },
+    "hybrid_search": {
+      "mean": 3.8,
+      "n": 42,
+      "p50": 3.3,
+      "p95": 6.1
+    },
+    "rerank_inference": {
+      "mean": 7113.0,
+      "n": 42,
+      "p50": 7574.0,
+      "p95": 9202.0
+    },
+    "rerank_load": {
+      "mean": 1131.7,
+      "n": 42,
+      "p50": 1083.4,
+      "p95": 1121.2
+    },
+    "total": {
+      "mean": 9804.9,
+      "n": 42,
+      "p50": 9777.8,
+      "p95": 11245.4
+    },
+    "ttft": {
+      "mean": 9614.7,
+      "n": 42,
+      "p50": 9631.8,
+      "p95": 10992.8
+    }
+  }
+}

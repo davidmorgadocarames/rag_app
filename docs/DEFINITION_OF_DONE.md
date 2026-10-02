@@ -116,6 +116,17 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `backup-drill` | gate DB | 300 s |
 | | | | `erasure-scale` | gate DB | 600 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
+| | | | `latency` | gate DB + seed + Ollama | 900 s |
+
+`latency` (T11.3.5, `rag_app.eval.latency`): runs the golden set (14 questions) `N`=3 times
+through the real per-request pipeline shape (`generation.answer_question`'s own `chat`/fresh
+`CrossEncoderReranker()` per call — today's reload-per-request bug included), records p50/p95
+per stage into `eval/latency_baseline.json` with machine/model details (CPU, GPU, RAM, model
+names/revisions, reranker device, `top_k`/`rerank_top_n`, git commit). Reranker on CPU for
+the Azure-relevant numbers (today's pinned torch is CPU-only anyway — see ADR 11 decision 8).
+This step only RECORDS in 11.3 — no pass/fail threshold yet (`T11.6b.1`, once a reranker fix
+and the eval-guided optimisation have picked a baseline worth enforcing). Measured on the
+development machine (2026-10-02): 42 answers in 429 s.
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →

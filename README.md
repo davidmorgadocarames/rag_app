@@ -371,6 +371,25 @@ curl -s http://127.0.0.1:9090/api/v1/query --data-urlencode \
   'query=histogram_quantile(0.95, sum(rate(secrag_chat_stage_seconds_bucket[5m])) by (le, stage))'
 ```
 
+**Explicit Ollama context window (`num_ctx`, T11.3.4).** `Settings.num_ctx_answer` /
+`num_ctx_groundedness` (`llm.py`, `generation.py`) are passed on every answer-generation and
+groundedness-check call so a prompt is never silently truncated by Ollama's small built-in
+default (2048 tokens) — a request without an explicit `num_ctx` logs a warning
+(`rag_app.llm`, stderr) instead of failing when the estimated prompt size would not fit.
+**Both settings must stay equal**: Ollama reloads the whole model (~6.3 s, measured) whenever
+a request's `num_ctx` differs from the one it is currently loaded with, and one answer always
+calls generate then groundedness back to back — a mismatch would reload qwen twice per
+answer. Only the Ollama path reads these; Azure OpenAI's context window is fixed by the
+deployment. See `docs/adr/adr_phase11_stability.md` decision 8 for the measured VRAM numbers
+and the full reasoning.
+
+**Latency baseline (T11.3.5).** `python -m rag_app.eval.latency` runs the golden set through
+the real per-request pipeline (same fresh-reranker-per-call shape `/chat` uses today) and
+writes `eval/latency_baseline.json`: p50/p95 per stage plus the machine/model details needed
+to compare runs like for like. Wired as the gate step `latency` (`--full`/`--only latency`);
+this block only records — `T11.6b.1` adds the pass/fail threshold once a reranker fix (block
+C) and the eval-guided optimisation (block F) have picked a new baseline to enforce.
+
 ### Recovering from a changed master key
 
 If the API refuses to start because stored user keys do not unwrap with `DATA_MASTER_KEY`

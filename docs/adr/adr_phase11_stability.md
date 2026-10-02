@@ -423,6 +423,52 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    "rerank_inference_ms": 8781.1, "generate_ms": 1878.4, "groundedness_ms": 591.1,
    "ttft_ms": 11978.5, "total_ms": 13657.0}`; `secrag_chat_stage_seconds_count` visible in
    Prometheus for every stage above; `GET /metrics` on the API port → 404.
+   *Landed in 11.3 (T11.3.4–T11.3.5, block B):* **explicit `num_ctx` per call type**
+   (`Settings.num_ctx_answer` / `num_ctx_groundedness`, `llm.py`/`generation.py`) — Ollama's
+   built-in default (2048) is already close to or below the worst case today (rerank_top_n=4
+   chunks of up to chunk_size+chunk_overlap ≈ 1350 chars each + the system prompt + the
+   question + the output budget), so a request could be silently truncated with no error; a
+   request whose estimated size (chars/4, a deliberately crude heuristic — no tokenizer
+   dependency added just to warn) would not fit its `num_ctx` now logs a warning
+   (`rag_app.llm`, reaches stderr via `logging.lastResort` without needing `rag_app.timing`'s
+   own-handler workaround, since `.warning()` is at/above its threshold). **Critical measured
+   finding: both settings MUST be equal.** Probing the Ollama API directly (same model,
+   `num_predict` varied — no reload; `num_ctx` varied — full reload every time, confirmed
+   with `load_duration` in the response): switching `num_ctx` on an already-loaded qwen costs
+   **~6.3 s**, and that includes a request that *omits* `num_ctx` entirely (Ollama then uses
+   its own default, 2048, which already differs from either setting) — so generate and
+   groundedness must load the model at the SAME `num_ctx`, else one answer pays the reload
+   twice (once for groundedness, once more for the next answer's generate). Guarded by
+   `test_num_ctx_answer_and_groundedness_must_match`. The agentic router (`agentic.py`,
+   CLI/eval only — not on the live API path today) and the eval judge (`eval/judge.py`) are
+   explicitly left without an explicit `num_ctx` for now (PHASE_TASKS T11.3.4 defers
+   "router/summary"); `test_router_and_judge_calls_do_not_pin_a_num_ctx_yet` guards the
+   deferral itself. **VRAM measured** on the development machine (RTX 4060, 8 GiB; native
+   `ollama serve`; `bge-m3` warmed first, baseline 742 MiB already in use by the desktop/
+   Xwayland): qwen2.5:7b-instruct-q4_K_M alone added ≈4.53 GiB at `num_ctx`=2048, ≈4.64 GiB
+   at 4096, ≈4.87 GiB at 8192 (`ollama ps`: 5.0 GB resident at 8192); `bge-m3` added a further
+   ≈0.74 GiB, 664 MB resident. Total with both models resident at `num_ctx`=8192: **6.35 GiB
+   of 8 GiB** (≈1.8 GiB / 22 % headroom) — chosen value for both settings. The cross-encoder
+   reranker never touches VRAM at all in this repo: `requirements-torch.txt` pins a **CPU-
+   only** torch build (`torch==2.14.0+cpu`, confirmed `torch.cuda.is_available() is False` in
+   the backend venv), so "reranker on GPU" is not possible today regardless of `num_ctx`
+   headroom — T11.5.1's device axis (CPU vs GPU) needs a GPU torch variant added first.
+   **"Before" latency baseline** (`rag_app.eval.latency`, golden set — 14 questions — × N=3
+   runs = 42 answers, reranker forced to CPU via `CUDA_VISIBLE_DEVICES=""` before any model
+   loads, same per-call-site shape `generation.answer_question` uses incl. today's fresh-
+   reranker-per-call reload; `eval/latency_baseline.json`, git commit `b77f69f`):
+   `rerank_load` p50 1063 / p95 1122 ms (n=42), `rerank_inference` p50 7913 / p95 9204 ms
+   (n=42, CPU cross-encoder inference over the `top_k`=20 candidate pool dominates the
+   pipeline far more than the reload itself), `generate` p50 883 / p95 2820 ms (n=42),
+   `groundedness` p50 151 / p95 560 ms (n=30 — 12 of 42 answers correctly abstained before
+   reaching it), `embed` p50 15 / p95 40 ms, `hybrid_search` p50 3 / p95 5 ms, **`ttft` p50
+   9938 / p95 11373 ms, `total` p50 10212 / p95 11812 ms**. Runtime 429 s (≈7.1 min) for the
+   42 answers — recorded by the gate step `latency` (`--full`/`--only latency`, records only
+   in this block; `T11.6b.1` adds the pass/fail floor once T11.4.1/T11.5 pick a new
+   baseline). `rerank_inference` being far larger than `rerank_load` here is a new finding
+   beyond block A's single-call ADR evidence above (which only showed one sample each): T11.4
+   (shared reranker, eliminates the ~1.1 s reload) and T11.5 (CPU-friendlier reranker/top_k)
+   both matter — the reload is real but not the biggest cost at this `top_k`.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=
