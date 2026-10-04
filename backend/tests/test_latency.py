@@ -42,11 +42,13 @@ def test_latency_gate_skips_or_fails_when_the_stack_is_down(
 def test_machine_info_has_the_documented_fields() -> None:
     info = latency.machine_info(reranker_device="cpu")
     assert info["reranker_device"] == "cpu"
+    assert info["reranker_mode"] == "shared"  # default
     for key in (
         "cpu",
         "cpu_count",
         "ram_gib",
         "gpu",
+        "reranker_mode",
         "llm_model",
         "embed_model",
         "reranker_model",
@@ -58,6 +60,11 @@ def test_machine_info_has_the_documented_fields() -> None:
         "commit",
     ):
         assert key in info
+
+
+def test_machine_info_records_an_explicit_reranker_mode() -> None:
+    info = latency.machine_info(reranker_device="cpu", reranker_mode="fresh")
+    assert info["reranker_mode"] == "fresh"
 
 
 def _fake_chunk() -> RetrievedChunk:
@@ -101,6 +108,8 @@ def test_run_latency_benchmark_aggregates_every_stage(monkeypatch: pytest.Monkey
         items=items,  # type: ignore[arg-type]
         n_runs=2,
         reranker_device="cpu",
+        reranker_mode="fresh",  # retrieve() is fully stubbed below; "shared" would warm a
+        # real model via _reranker_factory before ever reaching the stub
     )
 
     assert report.n_runs == 2
@@ -131,7 +140,12 @@ def test_main_writes_the_baseline_json_with_require_stack_available(
     out_path = tmp_path / "latency_baseline.json"
 
     def fake_run(
-        session: object, items: object, *, n_runs: int, reranker_device: str
+        session: object,
+        items: object,
+        *,
+        n_runs: int,
+        reranker_device: str,
+        reranker_mode: str = "shared",
     ) -> latency.LatencyReport:
         return latency.LatencyReport(
             machine={"reranker_device": reranker_device},
@@ -188,3 +202,190 @@ def test_default_out_path_is_results_not_baseline_unless_update_baseline(
         == 0
     )
     assert fake_baseline.exists()
+
+
+# --- T11.4.4 (block E): reranker_mode, warm-vs-cold, concurrency -------------------------
+
+
+class _FakeCrossEncoder:
+    """Records every construction; a constant score (ordering is not under test here)."""
+
+    calls: list[int] = []
+
+    def __init__(self, *_a: object, **_k: object) -> None:
+        type(self).calls.append(1)
+
+    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        return [0.5 for _ in pairs]
+
+
+@pytest.fixture()
+def fake_cross_encoder(monkeypatch: pytest.MonkeyPatch) -> type[_FakeCrossEncoder]:
+    import sentence_transformers
+
+    _FakeCrossEncoder.calls = []
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _FakeCrossEncoder)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    return _FakeCrossEncoder
+
+
+def test_reranker_factory_fresh_constructs_a_new_model_per_question(
+    fake_cross_encoder: type[_FakeCrossEncoder],
+) -> None:
+    factory = latency._reranker_factory("fresh")
+    for _ in range(3):
+        factory().rerank("q", [_fake_chunk()], top_n=1)  # type: ignore[attr-defined]
+    assert len(fake_cross_encoder.calls) == 3  # one brand-new instance every time
+
+
+def test_reranker_factory_shared_builds_once_and_is_the_process_singleton(
+    monkeypatch: pytest.MonkeyPatch, fake_cross_encoder: type[_FakeCrossEncoder]
+) -> None:
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    factory = latency._reranker_factory("shared")
+    for _ in range(3):
+        factory().rerank("q", [_fake_chunk()], top_n=1)  # type: ignore[attr-defined]
+    assert len(fake_cross_encoder.calls) == 1  # warmed once, reused — matches T11.4.1
+    assert factory() is reranking.get_shared_reranker()
+
+
+def test_reranker_factory_warm_single_builds_once_but_is_not_the_shared_singleton(
+    monkeypatch: pytest.MonkeyPatch, fake_cross_encoder: type[_FakeCrossEncoder]
+) -> None:
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    factory = latency._reranker_factory("warm-single")
+    for _ in range(3):
+        factory().rerank("q", [_fake_chunk()], top_n=1)  # type: ignore[attr-defined]
+    assert len(fake_cross_encoder.calls) == 1  # one throwaway instance, warmed once
+    assert reranking._shared_reranker is None  # never touched the production singleton
+
+
+def test_reranker_factory_rejects_an_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="unknown reranker_mode"):
+        latency._reranker_factory("bogus")
+
+
+def test_measure_warm_vs_cold_first_call_pays_load_later_calls_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA review of block C (checks 2 + 4): the first `.rerank()` on a fresh instance pays
+    `rerank_load` (model construction); later calls on the SAME instance never do."""
+    import time as real_time
+
+    import sentence_transformers
+
+    from rag_app import retrieval
+
+    class _SlowInitCrossEncoder:
+        instances = 0
+
+        def __init__(self, *_a: object, **_k: object) -> None:
+            type(self).instances += 1
+            real_time.sleep(0.02)  # makes rerank_load clearly > 0 for the first call only
+
+        def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            return [0.5 for _ in pairs]
+
+    _SlowInitCrossEncoder.instances = 0
+    monkeypatch.setattr(sentence_transformers, "CrossEncoder", _SlowInitCrossEncoder)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(retrieval, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
+
+    item = type("Item", (), {"id": "q1", "question": "q?", "version": None})()
+    result = latency.measure_warm_vs_cold(session=None, item=item, n_calls=3)  # type: ignore[arg-type]
+
+    assert _SlowInitCrossEncoder.instances == 1  # one instance for the whole check
+    assert result["n_candidates"] == 1
+    assert result["first_call"]["rerank_load_ms"] > 10.0
+    assert len(result["later_calls"]) == 2
+    assert all(c["rerank_load_ms"] == 0.0 for c in result["later_calls"])
+
+
+class _NullCtx:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_measure_concurrency_pools_rerank_inference_across_threads(
+    monkeypatch: pytest.MonkeyPatch, fake_cross_encoder: type[_FakeCrossEncoder]
+) -> None:
+    """DA-11bC-2: N threads sharing the warmed reranker each contribute their own
+    `rerank_inference` samples into one pooled p50/p95 — proves the plumbing (thread-safe
+    aggregation, no lost/duplicated samples), not the real model's CPU contention number
+    (measured separately, by hand, against the real model for the ADR)."""
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+    monkeypatch.setattr(reranking, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
+
+    items = [
+        type("Item", (), {"id": f"q{i}", "question": f"question {i}", "version": None})()
+        for i in range(2)
+    ]
+
+    result = latency.measure_concurrency(lambda: _NullCtx(), items, concurrency=4)  # type: ignore[arg-type]
+
+    assert result["concurrency"] == 4
+    assert result["n"] == 8  # 4 threads x 2 items
+    assert result["p50"] >= 0.0
+    assert result["p95"] >= result["p50"]
+    assert result["wall_s"] >= 0.0
+
+
+def test_measure_concurrency_surfaces_a_worker_exception(
+    monkeypatch: pytest.MonkeyPatch, fake_cross_encoder: type[_FakeCrossEncoder]
+) -> None:
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+
+    def _boom(*_a: object, **_k: object) -> list[RetrievedChunk]:
+        raise RuntimeError("retrieval exploded")
+
+    monkeypatch.setattr(reranking, "hybrid_search", _boom)
+    items = [type("Item", (), {"id": "q1", "question": "q?", "version": None})()]
+
+    with pytest.raises(RuntimeError, match="retrieval exploded"):
+        latency.measure_concurrency(lambda: _NullCtx(), items, concurrency=2)  # type: ignore[arg-type]
+
+
+def test_main_concurrency_flag_writes_its_own_file_instead_of_the_normal_benchmark(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    concurrency_path = tmp_path / "latency_concurrency.json"
+    monkeypatch.setattr(latency, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(latency, "CONCURRENCY_PATH", concurrency_path)
+    monkeypatch.setattr(latency, "_stack_available", lambda: True)
+    monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
+    recorded: dict[str, object] = {"concurrency": 3, "n": 6, "p50": 1.0, "p95": 2.0, "wall_s": 0.1}
+    monkeypatch.setattr(latency, "measure_concurrency", lambda *_a, **_k: recorded)
+
+    assert latency.main(["--require-stack", "--concurrency", "3"]) == 0
+    assert json.loads(concurrency_path.read_text(encoding="utf-8")) == recorded
+
+
+def test_main_warm_vs_cold_flag_writes_its_own_file_instead_of_the_normal_benchmark(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    out_path = tmp_path / "latency_warm_vs_cold.json"
+    monkeypatch.setattr(latency, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(latency, "WARM_VS_COLD_PATH", out_path)
+    monkeypatch.setattr(latency, "_stack_available", lambda: True)
+    monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
+    recorded = {
+        "n_candidates": 5,
+        "first_call": {"call": 1, "rerank_load_ms": 12.0, "rerank_inference_ms": 3.0},
+        "later_calls": [],
+        "later_mean_inference_ms": 0.0,
+    }
+    monkeypatch.setattr(latency, "measure_warm_vs_cold", lambda *_a, **_k: recorded)
+
+    assert latency.main(["--require-stack", "--warm-vs-cold"]) == 0
+    assert json.loads(out_path.read_text(encoding="utf-8")) == recorded
