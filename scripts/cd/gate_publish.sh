@@ -31,12 +31,24 @@ set -uo pipefail
 # run's own stdout (so it is seen) and appended to the log.
 _warn_stale_publishers() {
   local log="$1" repo="$2" current_sha="$3"
-  local gate_status_copy="${log%/*}/gate_status.sh" stale_sha stale_pid msg
+  local gate_status_copy="${log%/*}/gate_status.sh" stale_sha stale_pid msg seen=""
   [ -f "$log" ] || return 0
   while IFS=' ' read -r stale_sha stale_pid; do
     [ -n "$stale_sha" ] || continue
     [ "$stale_sha" = "$current_sha" ] && continue
-    [ "$(grep -c -F "$stale_sha" "$log")" -gt 1 ] && continue
+    # One decision per sha per run, even if it has several "waiting" lines (e.g. a
+    # --full retried on the same still-unresolved commit).
+    case " $seen " in *" $stale_sha "*) continue ;; esac
+    seen="$seen $stale_sha"
+    # DA-11bD-1: "resolved" must come from a RESOLUTION-shaped line for this sha — a
+    # successful publish, or the --wait timeout's "not on GitHub (yet)" line — never
+    # from a raw occurrence count. Two unresolved "waiting for <sha>" lines (both
+    # publishers dead without posting) must NOT be read as "resolved" just because the
+    # sha appears twice — that was the exact bug the old `grep -c ... -gt 1` check had.
+    if grep -qF "published secrag/gate-full=success for $stale_sha" "$log" \
+      || grep -qF "$stale_sha is not on GitHub (yet)" "$log"; then
+      continue # resolved
+    fi
     if [ -n "$stale_pid" ] && kill -0 "$stale_pid" 2>/dev/null; then
       continue # still polling — not stale
     fi

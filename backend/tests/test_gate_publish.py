@@ -285,6 +285,44 @@ def test_a_prior_publisher_still_polling_is_not_a_warning(repo: Path, tmp_path) 
     assert "WARNING" not in proc.stdout
 
 
+def test_two_unresolved_waiting_lines_for_the_same_sha_still_warn(repo: Path, tmp_path) -> None:
+    """DA-11bD-1: the old check treated ANY sha appearing more than once in the log as
+    "resolved" (occurrence count), so two unresolved "waiting" lines for the SAME sha
+    (e.g. --full retried on the same still-unpushed commit, both detached publishers
+    dying without posting) silently suppressed the warning it exists to produce. Two
+    "waiting" lines, no resolution line at all, both pids dead → still a warning."""
+    sha = _git(repo, "rev-parse", "HEAD")
+    old_sha = "5" * 40
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "publish-status.log").write_text(
+        f"2020-01-01T00:00:00Z waiting for {old_sha} on owner/repo (up to 900s) [pid=999999991]\n"
+        f"2020-01-01T00:05:00Z waiting for {old_sha} on owner/repo (up to 900s) [pid=999999992]\n",
+        encoding="utf-8",
+    )
+    proc = _publish(repo, tmp_path, env=_env(tmp_path, land_after=1))
+    assert proc.returncode == 0, proc.stderr
+    assert f"WARNING — an earlier detached publisher for {old_sha}" in proc.stdout
+    assert (
+        f"WARNING — an earlier detached publisher for {old_sha}"
+        in (state / "publish-status.log").read_text()
+    )
+    # the warning fires exactly once for this sha, not once per "waiting" line
+    assert proc.stdout.count(f"WARNING — an earlier detached publisher for {old_sha}") == 1
+    # the current sha's own publish still proceeds normally afterward
+    deadline = time.monotonic() + 30
+    while (
+        time.monotonic() < deadline
+        and f"published secrag/gate-full=success for {sha}"
+        not in (state / "publish-status.log").read_text()
+    ):
+        time.sleep(0.2)
+    assert (
+        f"published secrag/gate-full=success for {sha}"
+        in (state / "publish-status.log").read_text()
+    )
+
+
 def test_a_prior_publisher_already_resolved_locally_is_not_a_warning(repo: Path, tmp_path) -> None:
     """A "published" line already in the log for the stale sha is resolution enough — no
     live check is even needed (and none happens: FAKE_GH has no route configured for it)."""
