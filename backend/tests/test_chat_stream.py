@@ -543,3 +543,154 @@ def test_a_real_streamed_answer_logs_every_timing_stage_through_the_threadpool(
     assert payload["ttft_ms"] is not None
     assert payload["total_ms"] > 0
     _assert_no_orphans(db_engine, user)
+
+
+# --- DA-11bC-2: concurrent /chat + /chat/stream on the shared reranker, real paths ----------
+
+
+def test_concurrent_chat_and_chat_stream_requests_use_the_shared_reranker_correctly(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``get_shared_reranker()`` is ONE process-wide instance (T11.4.1); ``/chat`` (FastAPI's
+    sync-route threadpool) and ``/chat/stream`` (its own worker thread, T11.2.16/DA-G2-2) both
+    call its ``.rerank()``/``.predict()``. A real ``/chat`` request and a real
+    ``/chat/stream`` request, about two different documents, fired at the same time (real
+    threads, through the actual API — only the external Ollama embed/LLM calls and the heavy
+    cross-encoder model are mocked): each must get back its own correct, uncorrupted answer —
+    no cross-talk between the two concurrent requests sharing the one reranker instance."""
+    import threading
+    import time
+
+    from rag_app import embeddings, generation, reranking
+    from rag_app.db.models import Chunk, Document
+    from rag_app.llm import Usage
+
+    monkeypatch.setenv("RERANK_TOP_N", "1")  # isolates exactly the one matching chunk
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+
+    scenarios = [
+        (
+            "sql",
+            "SQL Injection Prevention",
+            "Use parameterized queries to stop SQL injection.",
+            "How do I prevent SQL injection?",
+            "parameterized queries",
+        ),
+        (
+            "csrf",
+            "CSRF Prevention",
+            "Use a CSRF token on every state-changing request.",
+            "How do I prevent CSRF?",
+            "CSRF token",
+        ),
+    ]
+    with Session(db_engine) as session:
+        for slug, heading, text_, _question, _expect in scenarios:
+            doc = Document(slug=f"da11bc2-{slug}", version="current")
+            session.add(doc)
+            session.flush()
+            session.add(
+                Chunk(
+                    document_id=doc.id,
+                    chunk_uid=f"da11bc2-{slug}::0",
+                    heading=heading,
+                    ordinal=0,
+                    text=text_,
+                    embedding=[0.1] * 1024,
+                    version="current",
+                )
+            )
+        session.commit()
+
+    monkeypatch.setattr(embeddings.OllamaEmbedder, "embed_one", lambda self, text: [0.1] * 1024)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class _SlowFakeCrossEncoder:
+        def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)  # releases the GIL, same technique as test_reranking.py
+                scores = []
+                for query_text, candidate_text in pairs:
+                    matched = any(
+                        key in query_text and key in candidate_text for key in ("SQL", "CSRF")
+                    )
+                    scores.append(1.0 if matched else 0.0)
+                return scores
+            finally:
+                with lock:
+                    active -= 1
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _SlowFakeCrossEncoder())
+
+    class _ContentAwareChat:
+        """A fresh instance per pipeline run; answers from the ACTUAL retrieved content, not
+        from which thread/question it happens to run in — a cross-contaminated reranker
+        result would show up here as the wrong answer."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _reply(self, messages: Any) -> str:
+            self.calls += 1
+            if self.calls > 1:
+                return "GROUNDED"
+            content = " ".join(str(m.get("content", "")) for m in messages)
+            if "SQL" in content:
+                return "Use parameterized queries [1]."
+            if "CSRF" in content:
+                return "Use a CSRF token [1]."
+            return "I don't know [1]."
+
+        def chat(self, messages: Any, **_kw: object) -> str:
+            return self._reply(messages)
+
+        def chat_stream(self, messages: Any, *, usage: Usage | None = None, **_kw: object) -> Any:
+            if usage is not None:
+                usage.add(Usage(prompt_tokens=10, completion_tokens=5))
+            yield self._reply(messages)
+
+    monkeypatch.setattr(generation, "make_chat_client", lambda *_a, **_k: _ContentAwareChat())
+
+    answers: dict[str, str] = {}
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2, timeout=10)
+
+    def ask_stream(slug: str, question: str) -> None:
+        try:
+            barrier.wait()
+            user = _make_user(db_engine)
+            events = _stream(client, user, question)
+            assert events[-1]["type"] == "done"
+            answers[slug] = events[-1]["answer"]
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def ask_sync(slug: str, question: str) -> None:
+        try:
+            barrier.wait()
+            user = _make_user(db_engine)
+            res = client.post("/chat", json={"question": question}, headers=_auth(user))
+            assert res.status_code == 200, res.text
+            answers[slug] = res.json()["answer"]
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    (sql_slug, _h1, _t1, sql_q, sql_expect), (csrf_slug, _h2, _t2, csrf_q, csrf_expect) = scenarios
+    t1 = threading.Thread(target=ask_stream, args=(sql_slug, sql_q))
+    t2 = threading.Thread(target=ask_sync, args=(csrf_slug, csrf_q))
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+
+    assert not errors, errors
+    assert max_active >= 2, "the two concurrent requests never actually overlapped"
+    assert sql_expect in answers[sql_slug] and csrf_expect not in answers[sql_slug]
+    assert csrf_expect in answers[csrf_slug] and sql_expect not in answers[csrf_slug]

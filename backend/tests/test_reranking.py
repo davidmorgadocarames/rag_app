@@ -178,3 +178,79 @@ def test_get_shared_reranker_constructs_the_model_only_once_across_many_calls(
         shared = reranking.get_shared_reranker()
         shared.rerank("q", [_chunk("a"), _chunk("b")], top_n=1)
     assert len(fake_st.calls) == 1
+
+
+# --- DA-11bC-2: concurrent predict() on the shared reranker -----------------------------
+
+
+def test_two_concurrent_rerank_calls_on_the_shared_instance_give_correct_independent_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``get_shared_reranker()``'s double-checked locking only guarantees the model is
+    CONSTRUCTED once (T11.4.1) — ``CrossEncoder.predict()`` itself has no lock, and both
+    ``/chat`` (FastAPI's threadpool) and ``/chat/stream`` (its own worker thread,
+    T11.2.16/DA-G2-2) call it on the exact same instance, so two real requests can enter
+    ``predict()`` at once. Two threads call ``.rerank()`` on the SAME shared instance with
+    two DIFFERENT queries/candidate pools at the same time: each must get back its own
+    correct ranking (no cross-talk), and the fake model's own in-flight counter proves the
+    two calls genuinely overlapped — not serialized one after another by some hidden lock
+    this test would otherwise not catch."""
+    import threading
+    import time
+
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "_shared_reranker", None)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class _SlowFakeCrossEncoder:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)  # releases the GIL — long enough for the other thread to join
+                # Score derived from BOTH the query and the candidate text, so a thread
+                # that received the OTHER thread's pairs (cross-talk) would score wrong.
+                return [1.0 if query[-1] == candidate[-1] else 0.0 for query, candidate in pairs]
+            finally:
+                with lock:
+                    active -= 1
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _SlowFakeCrossEncoder())
+
+    results: dict[str, list[str]] = {}
+    errors: list[BaseException] = []
+
+    def ask(label: str) -> None:
+        try:
+            shared = reranking.get_shared_reranker()
+            candidates = [_chunk(f"{label}-match"), _chunk(f"{label}-other")]
+            # tag each candidate's text so predict() can tell a correct pair from a
+            # cross-contaminated one (candidate text ends in the SAME label as the query)
+            candidates[0].text = f"text ends in {label}"
+            candidates[1].text = "text ends in z"
+            query = f"question ends in {label}"
+            ranked = shared.rerank(query, candidates, top_n=2)
+            results[label] = [c.chunk_uid for c in ranked]
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=ask, args=(label,)) for label in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    assert max_active >= 2, "the two predict() calls never actually overlapped"
+    # each thread's OWN matching candidate must rank first — no cross-talk between threads
+    assert results["a"][0] == "a-match"
+    assert results["b"][0] == "b-match"
