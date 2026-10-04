@@ -1214,7 +1214,7 @@ def test_deploy_inline_script_stops_after_the_first_app_if_az_fails(
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "fake_az.py").write_text(
         "import sys, os\n"
-        'args = sys.argv[1:]\n'
+        "args = sys.argv[1:]\n"
         'with open(os.environ["FAKE_AZ_LOG"], "a") as log:\n'
         '    log.write(" ".join(args) + "\\n")\n'
         "sys.exit(1)\n",
