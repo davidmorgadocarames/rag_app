@@ -125,11 +125,11 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 
-`latency` (T11.3.5, `rag_app.eval.latency`): runs the golden set (14 questions) `N`=3 times
-through its own inlined per-call-site shape (`reranking.retrieve` + `generation.
+`latency` (T11.3.5/T11.4.4, `rag_app.eval.latency`): runs the golden set (14 questions) `N`=3
+times through its own inlined per-call-site shape (`reranking.retrieve` + `generation.
 answer_from_chunks`), records p50/p95 per stage with machine/model details (CPU, GPU, RAM,
-model names/revisions, reranker device, `top_k`/`rerank_top_n`, git commit). A routine run
-(this step, no flag) writes the git-ignored `eval/latency_results.json`;
+model names/revisions, reranker device, `reranker_mode`, `top_k`/`rerank_top_n`, git commit).
+A routine run (this step, no flag) writes the git-ignored `eval/latency_results.json`;
 `--update-baseline` writes the git-tracked `eval/latency_baseline.json` instead — same
 results/baseline split as `eval` (`results.json`/`baseline_metrics.json`), so ordinary timing
 jitter never dirties the tree on a routine `--full` (found running block B's own closing
@@ -138,13 +138,20 @@ publishing). Reranker on CPU for the Azure-relevant numbers (today's pinned torc
 CPU-only anyway — see ADR 11 decision 8). This step only RECORDS — no pass/fail threshold yet
 (`T11.6b.1`, once the eval-guided optimisation has picked a baseline worth enforcing).
 Measured on the development machine (2026-10-02, 11.3 block B): 42 answers in 412-429 s
-across three runs. **Note (T11.4.1, block C):** this module still builds a FRESH
-`CrossEncoderReranker()` per golden-set item ON PURPOSE (so the committed "before" baseline
-stays comparable); it does NOT exercise the single-shared-reranker fix that `/chat`,
-`/chat/stream`, the `eval` gate step and `agentic.py` now use by default
-(`reranking.get_shared_reranker()`) — confirmed by re-running this step after T11.4.1:
-`rerank_load` is unchanged (p50 ~1086 ms). T11.4.4 (block E) decides how the "after"
-measurement accounts for this before checking the rerank floor below.
+across three runs. **Methodology (T11.4.1 block C → T11.4.4 block E):** this module built a
+FRESH `CrossEncoderReranker()` per golden-set item ON PURPOSE for the committed "before"
+baseline (kept available as `--reranker-mode fresh`, never run by this step by default); the
+`fresh`-per-item shape does NOT exercise the single-shared-reranker fix that `/chat`,
+`/chat/stream`, the `eval` gate step and `agentic.py` use by default
+(`reranking.get_shared_reranker()`) — confirmed: re-running this module in `fresh` mode after
+T11.4.1 shows `rerank_load` unchanged (p50 ~1086 ms), by design. **T11.4.4 (block E)** adds
+`reranker_mode` (default **`shared`**, what this gate step now measures): the real warmed
+singleton, so `rerank_inference` is the genuine production steady-state cost — this is the
+"after" number the rerank floor is checked against. `warm-single` (a throwaway warmed
+instance, never the production singleton) is the "before, warm" reference; `--warm-vs-cold`
+and `--concurrency N` are two further one-off modes (`LATENCY_EXTRA_ARGS` passes flags to this
+step for ad-hoc runs against the isolated gate project) — see ADR 11 decision 8 for the full
+measurement table and the rerank floor result.
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →

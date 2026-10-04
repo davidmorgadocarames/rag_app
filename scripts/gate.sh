@@ -430,12 +430,20 @@ step_eval() {
   (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.gate --require-stack)
 }
 
-# T11.3.5: records p50/p95 latency per stage over the golden set into eval/latency_baseline.json
-# — no pass/fail threshold yet in this block (T11.6b.1 adds one, comparing against the baseline
-# an earlier block "adopts"). Same offline-reranker requirement as `eval`.
+# T11.3.5/T11.4.4: records p50/p95 latency per stage over the golden set into
+# eval/latency_results.json (eval/latency_baseline.json only with --update-baseline, never
+# from here) — no pass/fail threshold yet in this block (T11.6b.1 adds one, comparing against
+# the baseline an earlier block "adopts"). Same offline-reranker requirement as `eval`.
+# LATENCY_EXTRA_ARGS (opt-in, unset by default — a routine run is unaffected): extra flags for
+# ad-hoc one-off measurements against the isolated gate stack (T11.4.4's --reranker-mode
+# warm-single "before, warm" reference, --warm-vs-cold, --concurrency N), never used by a
+# routine `--fast`/`--full`/CI run.
 step_latency() {
   need_venv || return 1
-  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.latency --require-stack)
+  local extra=()
+  # shellcheck disable=SC2206 # our own space-separated flag list (ad-hoc T11.4.4 runs only)
+  [ -n "${LATENCY_EXTRA_ARGS:-}" ] && extra=($LATENCY_EXTRA_ARGS)
+  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.latency --require-stack "${extra[@]}")
 }
 
 # --- backend venv matching the pins (DA-B-4) --------------------------------------------

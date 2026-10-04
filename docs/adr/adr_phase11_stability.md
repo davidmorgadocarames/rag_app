@@ -608,6 +608,129 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    `gate_publish.sh` run detects a dead, still-unresolved prior entry (double-checked live, in
    case it was published some other way since) and prints a clear warning in its own attended
    output instead of leaving it silently buried in a log file nobody checks automatically.
+   *Landed in 11.4 (T11.4.4, block E) — measurements, methodology, floor result.*
+   **Methodology (per the DA review of block C).** `eval/latency_baseline.json` ("before",
+   `b77f69f`) is **untouched** — frozen exactly as committed. `rag_app.eval.latency` gained
+   `reranker_mode` (`fresh`/`shared`/`warm-single`): a routine run (gate step `latency`, no
+   flag) now defaults to **`shared`** — the real `reranking.get_shared_reranker()`, warmed
+   once before the golden-set loop exactly like the FastAPI lifespan does — instead of the
+   old fresh-per-item shape, so `rerank_inference` reflects genuine production steady-state
+   cost ("after"). `warm-single` (a throwaway instance of the same class, warmed the same way
+   but never the production singleton) gives an honest "before, warm" reference, isolated
+   from the DI wiring. Two new one-off CLI modes: `--warm-vs-cold` (first `.rerank()` on a
+   fresh instance vs later already-warm calls, same instance, same real candidates) and
+   `--concurrency N` (N threads sharing the warmed instance, pooling `rerank_inference`
+   latency — DA-11bC-2's contention number). `scripts/gate.sh` gained an opt-in
+   `LATENCY_EXTRA_ARGS` env hook (unset by default) so these one-off runs reuse the isolated
+   gate project instead of reimplementing its stack setup.
+
+   **Concurrency correctness (DA-11bC-2), before the contention numbers below.**
+   `get_shared_reranker()`'s double-checked locking only proved one-time *construction*
+   (T11.4.1); `CrossEncoder.predict()` itself has no lock, and both `/chat`'s threadpool and
+   `/chat/stream`'s worker thread call it on the same instance. Two new tests prove correct,
+   independent results under REAL overlap (a fake model sleeps inside `predict()`, releasing
+   the GIL, with an in-flight counter proving `max_active >= 2` — not an accidentally-
+   serialized pair of calls): `test_reranking.py` (two threads, `.rerank()` directly, two
+   different queries/candidate sets, no cross-talk) and `test_chat_stream.py` (a REAL `/chat`
+   and a REAL `/chat/stream` request, through the actual API and DB harness, about two
+   different documents, fired at the same time — only the external Ollama/cross-encoder
+   calls mocked — each gets back its own correct answer).
+
+   **Measurements (development machine, CPU reranker — Azure-relevant per the plan; native
+   Ollama; isolated gate project, real 322-chunk corpus; `top_k`=20, `rerank_top_n`=4,
+   unchanged from the baseline).** All times ms unless noted.
+
+   | Stage | Before (fresh, frozen baseline) p50 / p95 | Before, warm (`warm-single`) p50 / p95 | After (`shared`, routine run) p50 / p95 |
+   |---|---:|---:|---:|
+   | `rerank_load` | 1085.9 / 1137.5 | 0 (after call 1) | 0 (never recorded — warmed before the loop) |
+   | `rerank_inference` | 7902.3 / **9191.2** | 8006.5 / 9450.9 | 7881.9 / **9059.0** |
+   | `generate` | 802.3 / 2759.8 | 824.6 / 2699.6 | 817.5 / 2633.8 |
+   | `ttft` | 9959.9 / 11244.8 | 8772.5 / 10173.1 | 8562.0 / 9993.9 |
+   | `total` | 10117.0 / 11456.3 | 8945.8 / 10188.5 | 8674.9 / 10140.5 |
+
+   (n=42 for every stage above — 14 golden questions × 3 runs; `groundedness` n=30, unchanged
+   shape, not reproduced here — see `eval/latency_results.json`/`latency_before_warm.json`.)
+
+   **Reading the table honestly.** `rerank_load` is fully eliminated (every real request after
+   the first pays zero reload cost, as T11.4.1 already proved informally in block C) — this
+   alone accounts for essentially all of the ~1.1–1.4 s drop in `total`/`ttft` p50 between
+   "before" and "after"/"before, warm". **`rerank_inference` itself barely moves**
+   (9191.2 → 9059.0 ms p95, a 1.4 % drop) **and "before, warm" is statistically
+   indistinguishable from "after"** (9450.9 vs 9059.0 ms p95, within run-to-run noise) — i.e.
+   sharing/warming the reranker removes the *reload* tax but does essentially nothing for
+   `rerank_inference`'s own cost, because that cost was never a warm-up artifact to begin
+   with. Confirmed directly by the **warm-vs-cold sanity check** (one real golden item, 20
+   real candidates, a fresh un-warmed instance): call 1 (cold) — `rerank_load` 3362.8 ms +
+   `rerank_inference` **5903.4 ms**; calls 2–5 (same instance, now warm) — `rerank_load` 0,
+   `rerank_inference` mean **5824.1 ms** (range 5732.5–5926.2) — essentially the SAME number,
+   confirming `rerank_inference` is genuine CPU compute over `top_k`=20 candidates near the
+   512-token cap (bge-reranker-v2-m3, ~568 M params, fp32, no GPU), not a repeated warm-up
+   artifact. (Block C's own informal "485–505 ms steady-state" number used short placeholder
+   pairs, not real candidate-length text at this `top_k`/`max_length` — not comparable to the
+   figures here; this block's number is the one the floor below is checked against.)
+
+   **Floor (T11.4.4 Done-when): rerank p95 ≤ 50 % of baseline AND ≤ 1.5 s, on CPU.**
+   `rerank_inference` p95 "after" = **9059.0 ms**: 98.6 % of baseline (9191.2 ms, needs
+   ≤ 4595.6 ms) and 6× the 1.5 s absolute ceiling. **FLOOR: FAIL, on both the relative and the
+   absolute test.** Per the task: not tuned here (T11.5/block F's job — the reranker/`top_k`
+   experiment matrix is exactly the lever this floor needs); recorded honestly as a hard
+   finding for block F, not swept into "T11.4.1 already fixed it" — T11.4.1 fixed the reload,
+   it did not and could not fix the CPU inference cost itself.
+
+   **Concurrency contention (DA-11bC-2's number; `--concurrency N`, N threads sharing the one
+   warmed instance, pooling `rerank_inference` across the full golden set once per thread):**
+
+   | Concurrency | n | p50 | p95 | wall time |
+   |---|---:|---:|---:|---:|
+   | 1 (the "after" row above) | 42 | 7881.9 | 9059.0 | 362.2 s (×3 runs) |
+   | 2 | 28 | 10609.3 | 12209.6 | 138.5 s |
+   | 4 | 56 | 25196.1 | 28829.5 | 333.4 s |
+
+   CPU cross-encoder inference contends hard under concurrent load: p95 is +35 % at 2
+   concurrent requests and +218 % at 4 (≈29 s per answer's rerank stage) — no effective
+   parallel speed-up on this 28-thread CPU once PyTorch's own intra-op threads are already
+   saturated by one call, consistent with the single-threaded cost already being CPU-bound.
+   Relevant for Azure concurrency sizing (not tuned here — T11.5 chooses the reranker/`top_k`,
+   16.3 sizes the deployment against the result).
+
+   **Backend RSS** (development machine, `secrag-backend:e5` built from this block's code,
+   throwaway gate-project DB with the real corpus, native Ollama; `/proc/1/status` VmRSS of
+   the single uvicorn process — `docker stats`' cgroup-based number reads far lower, 756 MiB,
+   the same containerd/cgroup accounting gap already flagged for image sizes in blocks C/D,
+   most likely mmap'd model-weight pages counted as reclaimable file cache rather than
+   resident anonymous memory; VmRSS is the number to trust):
+   idle after warm-up **2.02 GiB** (2,064,448 KB); after a 4-concurrent-request `/chat` burst
+   **2.32 GiB** resident (2,432,160 KB), peak (`VmHWM`) **3.72 GiB** (3,903,408 KB) during the
+   burst. The ~2 GiB floor is essentially the reranker's own fp32 weights (~2.2 GB on disk,
+   T11.4.2); concurrent requests add real activation memory on top (confirmed by the VmHWM
+   jump), consistent with the contention numbers above.
+
+   **Local cold start** (container start → first successful readiness response; same
+   throwaway gate-project DB + native Ollama for the backend; `secrag-ollama:e5`/
+   `secrag-frontend:e5` built from this block's `ollama/Dockerfile`/`frontend/Dockerfile`):
+   **backend** (`/health` 200, includes DB connectivity checks + the reranker's full
+   load-and-warm-up) 7.36 s on a cold OS page/disk cache (first run), 4.70–4.82 s once the
+   image's layers are already cached in RAM (two subsequent runs) — both numbers are "local
+   cold start", Azure's own node-level disk-cache state is unknown and not assumed either
+   way; **Ollama** (`/api/embed` succeeds for `bge-m3`, already baked in, T11.4.3) 1.61 s end
+   to end (server ready in 0.44 s + first real embed ~1.2 s; a later, warm embed call: 25 ms);
+   **frontend** (first successful `GET /`) 0.39–0.44 s (Next.js standalone server start).
+
+   **Chained cold-start estimate vs the Azure ingress timeout.** The real dependency chain on
+   a cold wake is sequential, not parallel: the backend only calls Ollama once it is already
+   serving and reaches the embed step of its first real request (not during its own startup),
+   so worst case ≈ frontend + backend + Ollama summed: **cold-disk-cache worst case
+   ≈ 0.44 + 7.36 + 1.61 ≈ 9.4 s**; **warm-disk-cache ≈ 0.4 + 4.8 + 1.6 ≈ 6.8 s**. Both are
+   roughly **25–35× under** the Azure Container Apps ingress timeout (**~240 s**, PHASE_TASKS
+   row 42 / DA-G3-4) — the baked images (T11.4.2/T11.4.3) remove essentially all cold-start
+   risk of hitting that cut; the real risk this phase found is `rerank_inference`'s own
+   per-request CPU cost under concurrent load (above), not cold start.
+
+   **Data safety:** every measurement ran against the isolated `secrag-gate` project (its own
+   `secrag_gate_pgdata` volume, torn down with `down -v` afterwards) or a throwaway,
+   unpublished image tag (`secrag-backend:e5`/`secrag-ollama:e5`/`secrag-frontend:e5`, removed
+   at the end); `rag_ia_pgdata`'s `CreatedAt` was unchanged throughout (confirmed before and
+   after); no Azure command.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=

@@ -395,19 +395,31 @@ answer. Only the Ollama path reads these; Azure OpenAI's context window is fixed
 deployment. See `docs/adr/adr_phase11_stability.md` decision 8 for the measured VRAM numbers
 and the full reasoning.
 
-**Latency baseline (T11.3.5).** `python -m rag_app.eval.latency` runs the golden set through
-the real per-request pipeline shape: p50/p95 per stage plus the machine/model details needed
-to compare runs like for like. A routine run (the gate step `latency`, `--full`/`--only
-latency`) writes the git-ignored `eval/latency_results.json`; `--update-baseline` writes the
-git-tracked `eval/latency_baseline.json` instead (same results/baseline split as `eval.gate`)
-— done on purpose, not on every gate run, so ordinary timing jitter never dirties the tree.
-This block only records — `T11.6b.1` adds the pass/fail threshold once the eval-guided
-optimisation (block F) has picked a new baseline to enforce. Note: `eval.latency`'s own
-benchmark loop still builds a FRESH `CrossEncoderReranker()` per golden-set item on purpose
-(the committed "before" baseline, `b77f69f`, is directly comparable only if the "after" run
-uses the exact same shape) — T11.4.1's shared-reranker fix below only applies to the real
-`/chat` and `/chat/stream` paths, `eval.benchmark`/`eval.runner` (the `eval` gate step) and
-`agentic.py`; T11.4.4 (block E) decides how the "after" latency measurement accounts for it.
+**Latency baseline (T11.3.5) and methodology (T11.4.4).** `python -m rag_app.eval.latency`
+runs the golden set through the real per-request pipeline shape: p50/p95 per stage plus the
+machine/model details needed to compare runs like for like. A routine run (the gate step
+`latency`, `--full`/`--only latency`) writes the git-ignored `eval/latency_results.json`;
+`--update-baseline` writes the git-tracked `eval/latency_baseline.json` instead (same results/
+baseline split as `eval.gate`) — done on purpose, not on every gate run, so ordinary timing
+jitter never dirties the tree. This block only records — `T11.6b.1` adds the pass/fail
+threshold once the eval-guided optimisation (block F) has picked a new baseline to enforce.
+`--reranker-mode` (default `shared`) picks which reranker instance(s) the benchmark loop uses:
+`fresh` builds a brand-new `CrossEncoderReranker()` per golden-set item — exactly how the
+committed, frozen `eval/latency_baseline.json` ("before", `b77f69f`) was produced, kept
+available only to reproduce that methodology on request, never to regenerate the file itself;
+`shared` (the default, what a routine run now measures — the "after" number) uses the real
+`reranking.get_shared_reranker()`, warmed once before the loop exactly like the FastAPI
+lifespan does, so `rerank_inference` reflects genuine production steady-state cost instead of
+a fresh-instance warm-up artifact repeated on every sample; `warm-single` is a throwaway
+instance of the same class, warmed the same way but never the production singleton — the
+"before, warm" reference for the ADR (isolates "reload tax removed" from "T11.5's actual
+algorithmic choice"). `--warm-vs-cold` and `--concurrency N` are two further one-off modes
+(own git-ignored output files): the first isolates a fresh instance's cold first call from its
+own later, already-warm calls; the second pools `rerank_inference` latency across N threads
+sharing the one warmed instance (DA-11bC-2's contention number). `scripts/gate.sh`'s
+`LATENCY_EXTRA_ARGS` env var (unset by default) passes extra flags to the gate's `latency`
+step for these ad-hoc runs, against the isolated gate project. See `docs/adr/
+adr_phase11_stability.md` decision 8 for the full T11.4.4 measurement table.
 
 **Single shared reranker (T11.4.1).** Before this fix, `generation.py` constructed a brand
 new `CrossEncoderReranker()` on every `/chat`/`/chat/stream` call, reloading the ~2.2 GB

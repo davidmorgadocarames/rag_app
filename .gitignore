@@ -56,7 +56,7 @@ eval/benchmark.json
 eval/latency_results.json
 eval/latency_before_warm.json
 eval/latency_warm_vs_cold.json
-eval/latency_concurrency.json
+eval/latency_concurrency*.json
 
 # --- Vector store / caches / models ---
 *.sqlite
