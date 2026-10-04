@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1083,3 +1084,154 @@ def test_dry_run_echoes_the_health_check_step(cd: dict) -> None:
     names = [s.get("name", "") for s in cd["jobs"]["dry-run"]["steps"] if "name" in s]
     assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5"]
     assert "health" in names[4].lower()
+
+
+# --- DA-11bD-2: the 3-app deploy inlineScript must not partially deploy on a failure -----
+
+
+def _deploy_inline_script(cd: dict) -> str:
+    deploy = cd["jobs"]["deploy"]
+    return next(
+        s["with"]["inlineScript"]
+        for s in deploy["steps"]
+        if "with" in s and "inlineScript" in s["with"]
+    )
+
+
+_RENDER_DEFAULTS = {
+    "vars.AZURE_OLLAMA_APP": "ollama-app",
+    "vars.AZURE_BACKEND_APP": "backend-app",
+    "vars.AZURE_FRONTEND_APP": "frontend-app",
+    "vars.AZURE_RESOURCE_GROUP": "rg",
+    "github.repository": "o/r",
+    "needs.images.outputs.ollama_digest": "sha256:" + "a" * 64,
+    "needs.images.outputs.backend_digest": "sha256:" + "b" * 64,
+    "needs.images.outputs.frontend_digest": "sha256:" + "c" * 64,
+}
+
+
+def _render_inline_script(script: str, **overrides: str) -> str:
+    """Substitutes the `${{ … }}` GitHub Actions expressions in an inlineScript with
+    plain values, the same way the Actions runner would template them before handing the
+    script to the shell — so the real script text can be executed by a real bash."""
+    mapping = {**_RENDER_DEFAULTS, **overrides}
+
+    def repl(m: re.Match[str]) -> str:
+        return mapping[m.group(1).strip()]
+
+    return re.sub(r"\$\{\{(.+?)\}\}", repl, script)
+
+
+FAKE_AZ_CONTAINERAPP_UPDATE = """\
+import sys, os
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_LOG"], "a") as log:
+    log.write(" ".join(args) + "\\n")
+sys.exit(0)
+"""
+
+
+def _fake_az_containerapp_update(tmp_path: Path) -> dict[str, str]:
+    bin_dir = tmp_path / "azbin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "fake_az.py").write_text(FAKE_AZ_CONTAINERAPP_UPDATE, encoding="utf-8")
+    az = bin_dir / "az"
+    az.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{bin_dir / "fake_az.py"}" "$@"\n')
+    az.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_AZ_LOG": str(tmp_path / "az.log"),
+    }
+
+
+def _az_update_log(tmp_path: Path) -> list[str]:
+    log = tmp_path / "az.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_deploy_inline_script_starts_with_an_explicit_pipefail(cd: dict) -> None:
+    """DA-11bD-2: no longer relying on azure/cli@v2's own (undocumented) default — a
+    failed `az containerapp update` must stop this script before the next app is
+    touched, now that it deploys three apps (ollama, backend, frontend) in sequence."""
+    script = _deploy_inline_script(cd)
+    assert script.strip().splitlines()[0] == "set -euo pipefail"
+
+
+@needs_tools
+def test_deploy_inline_script_fails_before_touching_any_app_when_ollama_app_is_missing(
+    cd: dict, tmp_path: Path
+) -> None:
+    """A missing/empty AZURE_OLLAMA_APP repo var (e.g. not yet created before the first
+    real CD run deploys three apps through this step) must fail BEFORE any
+    `az containerapp update` call — never silently skip ollama and still update
+    backend/frontend (a worse partial-deploy state than touching nothing)."""
+    script = _deploy_inline_script(cd)
+    rendered = _render_inline_script(script, **{"vars.AZURE_OLLAMA_APP": ""})
+    script_path = tmp_path / "deploy.sh"
+    script_path.write_text(rendered, encoding="utf-8")
+    env = _fake_az_containerapp_update(tmp_path)
+    proc = subprocess.run(
+        ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode != 0
+    assert "AZURE_OLLAMA_APP" in (proc.stdout + proc.stderr)
+    assert _az_update_log(tmp_path) == []  # not even ollama's own update ran
+
+
+@needs_tools
+def test_deploy_inline_script_updates_all_three_apps_in_order_when_vars_are_set(
+    cd: dict, tmp_path: Path
+) -> None:
+    script = _deploy_inline_script(cd)
+    rendered = _render_inline_script(script)
+    script_path = tmp_path / "deploy.sh"
+    script_path.write_text(rendered, encoding="utf-8")
+    env = _fake_az_containerapp_update(tmp_path)
+    proc = subprocess.run(
+        ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    log = _az_update_log(tmp_path)
+    assert len(log) == 3
+    assert "--name ollama-app" in log[0] and "sha256:" + "a" * 64 in log[0]
+    assert "--name backend-app" in log[1] and "sha256:" + "b" * 64 in log[1]
+    assert "--name frontend-app" in log[2] and "sha256:" + "c" * 64 in log[2]
+
+
+@needs_tools
+def test_deploy_inline_script_stops_after_the_first_app_if_az_fails(
+    cd: dict, tmp_path: Path
+) -> None:
+    """Proves `set -euo pipefail` actually stops the sequence: with a fake `az` that
+    fails every call, only the FIRST `containerapp update` (ollama) must run — backend
+    and frontend must never be touched after ollama's own update failed."""
+    script = _deploy_inline_script(cd)
+    rendered = _render_inline_script(script)
+    script_path = tmp_path / "deploy.sh"
+    script_path.write_text(rendered, encoding="utf-8")
+    bin_dir = tmp_path / "azbin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "fake_az.py").write_text(
+        "import sys, os\n"
+        'args = sys.argv[1:]\n'
+        'with open(os.environ["FAKE_AZ_LOG"], "a") as log:\n'
+        '    log.write(" ".join(args) + "\\n")\n'
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    az = bin_dir / "az"
+    az.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{bin_dir / "fake_az.py"}" "$@"\n')
+    az.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_AZ_LOG": str(tmp_path / "az.log"),
+    }
+    proc = subprocess.run(
+        ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode != 0
+    log = _az_update_log(tmp_path)
+    assert len(log) == 1  # only ollama's own update ran before the script stopped
+    assert "--name ollama-app" in log[0]

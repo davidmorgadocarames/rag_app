@@ -485,7 +485,18 @@ jobs:
         uses: azure/cli@v2
         with:
           azcliversion: latest
+          # DA-11bD-2: explicit, not relied on from azure/cli@v2's own (undocumented)
+          # default — a failed `az containerapp update` (e.g. a missing/stale
+          # AZURE_OLLAMA_APP, now that this step deploys three apps instead of two) must
+          # stop this script before the NEXT app is touched, never leave a partial
+          # deploy. The repo-var check below fails the same way, before any app is
+          # touched at all, if a var was never set.
           inlineScript: |
+            set -euo pipefail
+            [ -n "${{ vars.AZURE_OLLAMA_APP }}" ] || { echo "::error::AZURE_OLLAMA_APP repo variable is not set"; exit 1; }
+            [ -n "${{ vars.AZURE_BACKEND_APP }}" ] || { echo "::error::AZURE_BACKEND_APP repo variable is not set"; exit 1; }
+            [ -n "${{ vars.AZURE_FRONTEND_APP }}" ] || { echo "::error::AZURE_FRONTEND_APP repo variable is not set"; exit 1; }
+            [ -n "${{ vars.AZURE_RESOURCE_GROUP }}" ] || { echo "::error::AZURE_RESOURCE_GROUP repo variable is not set"; exit 1; }
             az containerapp update \
               --name "${{ vars.AZURE_OLLAMA_APP }}" \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
