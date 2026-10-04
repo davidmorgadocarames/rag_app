@@ -222,10 +222,7 @@ jobs:
           load: true
           cache-from: type=gha,scope=ollama-image
           cache-to: type=gha,mode=max,scope=ollama-image
-      - name: bge-m3 is already pulled (ollama list, no server needed)
-        run: |
-          docker run --rm --entrypoint ollama secrag-ollama:ci list | grep -q bge-m3
-      - name: Embeds with networking disabled (throwaway container, no volumes)
+      - name: bge-m3 is already pulled + embeds with networking disabled (throwaway container, no volumes)
         run: |
           docker rm -f secrag-ollama-ci-embed 2>/dev/null || true
           docker run -d --name secrag-ollama-ci-embed --network none secrag-ollama:ci
@@ -233,6 +230,10 @@ jobs:
             docker exec secrag-ollama-ci-embed ollama list >/dev/null 2>&1 && break
             sleep 1
           done
+          # `ollama list` is a CLIENT command (talks to the server over HTTP) — it only
+          # works once the container's own `ollama serve` (the default CMD) has answered
+          # the wait loop above, never standalone with a bare `--entrypoint ollama` run.
+          docker exec secrag-ollama-ci-embed ollama list | grep -q bge-m3
           docker exec secrag-ollama-ci-embed bash -c '
           body="{\"model\":\"bge-m3\",\"input\":\"hello world\"}"
           len=${#body}
