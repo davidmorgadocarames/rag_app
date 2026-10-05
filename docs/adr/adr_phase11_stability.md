@@ -643,20 +643,26 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    | Stage | Before (fresh, frozen baseline) p50 / p95 | Before, warm (`warm-single`) p50 / p95 | After (`shared`, routine run) p50 / p95 |
    |---|---:|---:|---:|
    | `rerank_load` | 1085.9 / 1137.5 | 0 (after call 1) | 0 (never recorded — warmed before the loop) |
-   | `rerank_inference` | 7902.3 / **9191.2** | 8006.5 / 9450.9 | 7881.9 / **9059.0** |
-   | `generate` | 802.3 / 2759.8 | 824.6 / 2699.6 | 817.5 / 2633.8 |
-   | `ttft` | 9959.9 / 11244.8 | 8772.5 / 10173.1 | 8562.0 / 9993.9 |
-   | `total` | 10117.0 / 11456.3 | 8945.8 / 10188.5 | 8674.9 / 10140.5 |
+   | `rerank_inference` | 7902.3 / **9191.2** | 8006.5 / 9450.9 | 8355.9 / **9579.9** |
+   | `generate` | 802.3 / 2759.8 | 824.6 / 2699.6 | 783.0 / 2610.2 |
+   | `ttft` | 9959.9 / 11244.8 | 8772.5 / 10173.1 | 8971.5 / 10398.7 |
+   | `total` | 10117.0 / 11456.3 | 8945.8 / 10188.5 | 9147.1 / 10545.2 |
 
    (n=42 for every stage above — 14 golden questions × 3 runs; `groundedness` n=30, unchanged
-   shape, not reproduced here — see `eval/latency_results.json`/`latency_before_warm.json`.)
+   shape, not reproduced here. The "after" column is `eval/latency_results.json` as written by
+   the `latency` gate step of the final `gate.sh --full` run on this block's head commit — the
+   exact, reproducible run this ADR entry closes on; an earlier standalone `--only latency` run
+   on the same code gave `rerank_inference` p50/p95 7881.9/9059.0 ms, a ~5–6 % difference that
+   is ordinary run-to-run CPU-timing noise on a shared development machine, not a code change —
+   the conclusions below are unaffected either way. `eval/latency_before_warm.json` is from a
+   separate, dedicated `--reranker-mode warm-single` run, not overwritten by a routine run.)
 
    **Reading the table honestly.** `rerank_load` is fully eliminated (every real request after
    the first pays zero reload cost, as T11.4.1 already proved informally in block C) — this
-   alone accounts for essentially all of the ~1.1–1.4 s drop in `total`/`ttft` p50 between
-   "before" and "after"/"before, warm". **`rerank_inference` itself barely moves**
-   (9191.2 → 9059.0 ms p95, a 1.4 % drop) **and "before, warm" is statistically
-   indistinguishable from "after"** (9450.9 vs 9059.0 ms p95, within run-to-run noise) — i.e.
+   alone accounts for essentially all of the ~1.0–1.2 s drop in `total`/`ttft` p50 between
+   "before" and "after"/"before, warm". **`rerank_inference` itself does not improve** (9191.2
+   → 9579.9 ms p95 — actually slightly higher, within the noise band above) **and "before,
+   warm" is statistically indistinguishable from "after"** (9450.9 vs 9579.9 ms p95) — i.e.
    sharing/warming the reranker removes the *reload* tax but does essentially nothing for
    `rerank_inference`'s own cost, because that cost was never a warm-up artifact to begin
    with. Confirmed directly by the **warm-vs-cold sanity check** (one real golden item, 20
@@ -670,19 +676,21 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    figures here; this block's number is the one the floor below is checked against.)
 
    **Floor (T11.4.4 Done-when): rerank p95 ≤ 50 % of baseline AND ≤ 1.5 s, on CPU.**
-   `rerank_inference` p95 "after" = **9059.0 ms**: 98.6 % of baseline (9191.2 ms, needs
-   ≤ 4595.6 ms) and 6× the 1.5 s absolute ceiling. **FLOOR: FAIL, on both the relative and the
-   absolute test.** Per the task: not tuned here (T11.5/block F's job — the reranker/`top_k`
-   experiment matrix is exactly the lever this floor needs); recorded honestly as a hard
-   finding for block F, not swept into "T11.4.1 already fixed it" — T11.4.1 fixed the reload,
-   it did not and could not fix the CPU inference cost itself.
+   `rerank_inference` p95 "after" = **9579.9 ms**: 104 % of baseline (9191.2 ms, needs
+   ≤ 4595.6 ms) and 6.4× the 1.5 s absolute ceiling (the standalone run gave 9059.0 ms, 98.6 %/
+   6×  — either way). **FLOOR: FAIL, on both the relative and the absolute test.** Per the
+   task: not tuned here (T11.5/block F's job — the reranker/`top_k` experiment matrix is
+   exactly the lever this floor needs); recorded honestly as a hard finding for block F, not
+   swept into "T11.4.1 already fixed it" — T11.4.1 fixed the reload, it did not and could not
+   fix the CPU inference cost itself.
 
    **Concurrency contention (DA-11bC-2's number; `--concurrency N`, N threads sharing the one
-   warmed instance, pooling `rerank_inference` across the full golden set once per thread):**
+   warmed instance, pooling `rerank_inference` across the full golden set once per thread —
+   from a dedicated run, same code, not overwritten by the routine `latency` step):**
 
    | Concurrency | n | p50 | p95 | wall time |
    |---|---:|---:|---:|---:|
-   | 1 (the "after" row above) | 42 | 7881.9 | 9059.0 | 362.2 s (×3 runs) |
+   | 1 (standalone single-threaded run) | 42 | 7881.9 | 9059.0 | 362.2 s (×3 runs) |
    | 2 | 28 | 10609.3 | 12209.6 | 138.5 s |
    | 4 | 56 | 25196.1 | 28829.5 | 333.4 s |
 
