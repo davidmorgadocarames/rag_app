@@ -226,6 +226,11 @@ def fake_cross_encoder(monkeypatch: pytest.MonkeyPatch) -> type[_FakeCrossEncode
     _FakeCrossEncoder.calls = []
     monkeypatch.setattr(sentence_transformers, "CrossEncoder", _FakeCrossEncoder)
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    # These tests prove the load-once/warm-up MECHANISM (T11.4.1), independent of whichever
+    # model/precision T11.5.3 currently adopts as the Settings default -- force the
+    # sentence_transformers.CrossEncoder path (quantize=True, the adopted default since 11b
+    # block F, would bypass this fake entirely).
+    monkeypatch.setenv("RERANKER_QUANTIZE", "false")
     return _FakeCrossEncoder
 
 
@@ -293,6 +298,8 @@ def test_measure_warm_vs_cold_first_call_pays_load_later_calls_do_not(
     _SlowInitCrossEncoder.instances = 0
     monkeypatch.setattr(sentence_transformers, "CrossEncoder", _SlowInitCrossEncoder)
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    # Force the sentence_transformers.CrossEncoder path -- see fake_cross_encoder's comment.
+    monkeypatch.setenv("RERANKER_QUANTIZE", "false")
     monkeypatch.setattr(retrieval, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
 
     item = type("Item", (), {"id": "q1", "question": "q?", "version": None})()

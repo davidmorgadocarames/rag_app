@@ -470,12 +470,22 @@ def main(argv: list[str] | None = None) -> int:
         " (DA-11bC-2): N threads call the shared, warmed reranker at once; writes"
         " latency_concurrency.json (git-ignored)",
     )
+    parser.add_argument(
+        "--rerank-matrix",
+        action="store_true",
+        help="run the T11.5.1 experiment matrix instead of the normal benchmark (11b block"
+        " F): cheap rerank_inference-only screening across model/precision/top_k/max_length"
+        " cells, 2 threads pinned (DA-11bE-2) -- writes/resumes the COMMITTED"
+        " eval/rerank_matrix_results.json (one cell at a time, see rag_app.eval.rerank_matrix)",
+    )
     args = parser.parse_args(argv)
     out_path = args.out or (BASELINE_PATH if args.update_baseline else RESULTS_PATH)
 
-    if args.device == "cpu":
+    if args.device == "cpu" or args.rerank_matrix:
         # Must happen before any torch import (lazy, inside reranking.load_cross_encoder) —
-        # argparse runs first, so this is still early enough.
+        # argparse runs first, so this is still early enough. The matrix is a CPU-only,
+        # 2-thread-pinned experiment regardless of --device (OMP_NUM_THREADS/MKL_NUM_THREADS
+        # must ALSO be set by the caller before this process starts -- see the ADR).
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     if not _stack_available():
@@ -492,6 +502,16 @@ def main(argv: list[str] | None = None) -> int:
 
     items = load_golden_set(args.golden)
     session_factory = make_session_factory()
+
+    if args.rerank_matrix:
+        import torch
+
+        from rag_app.eval import rerank_matrix
+
+        torch.set_num_threads(2)  # defensive -- OMP_NUM_THREADS/MKL_NUM_THREADS (caller env)
+        # do the real BLAS-level pinning; this covers torch's own intra-op pool either way.
+        with session_factory() as session:
+            return rerank_matrix.main(session, items)
 
     if args.concurrency:
         result = measure_concurrency(session_factory, items, concurrency=args.concurrency)

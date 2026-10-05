@@ -426,8 +426,12 @@ step_restart-check() {
 
 step_eval() {
   need_venv || return 1
+  local extra=()
+  # shellcheck disable=SC2206 # our own space-separated flag list (one-off runs only, e.g.
+  # EVAL_EXTRA_ARGS="--update-baseline" after T11.5.3 adopts a new reranker config)
+  [ -n "${EVAL_EXTRA_ARGS:-}" ] && extra=($EVAL_EXTRA_ARGS)
   # The reranker must come from the local cache at its pinned revision (row 37d): offline.
-  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.gate --require-stack)
+  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.gate --require-stack "${extra[@]}")
 }
 
 # T11.3.5/T11.4.4: records p50/p95 latency per stage over the golden set into
