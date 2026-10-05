@@ -100,11 +100,31 @@ class Settings(JobSettings):
     ollama_host: str = "http://localhost:11434"
     llm_model: str = "qwen2.5:7b-instruct-q4_K_M"
     embed_model: str = "bge-m3"
-    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    # T11.5.1/T11.5.3 (11b block F): adopted winner. v2-m3 fp32 (any top_k/max_length)
+    # could not clear the 1.5s/2-thread floor -- see the ADR (decision 8) for the full
+    # matrix. bge-reranker-base, dynamically int8-quantized, is the ONLY family with a
+    # passing cell; eval on the winning cell matched or BEAT the v2-m3 baseline on every
+    # metric (recall 1.0, faithfulness 1.0, correctness 1.0 vs 0.9, correct_abstention 1.0).
+    reranker_model: str = "BAAI/bge-reranker-base"
     # Hugging Face commit of reranker_model (a full 40-hex commit hash, never a branch/tag):
     # the loader reads exactly this snapshot — from the local cache first, offline — so a
-    # changed or compromised Hub repo cannot change the code/config that runs (DA-B-7).
-    reranker_revision: str = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+    # changed or compromised Hub repo cannot change the code/config that runs (DA-B-7). MIT
+    # licence (checked via the HF Hub API, 2026-10-05) -- portfolio use allowed.
+    reranker_revision: str = "2cfc18c9415c912f9d8155881c133215df768a70"
+    # Token cap fed to the cross-encoder (T11.5.1, 11b block F): a Settings field (rather
+    # than only the module constant in reranking.py) so the experiment matrix can override
+    # it per run without touching code, and so a future winner can be adopted by changing
+    # one value here. 256 is the winning cell's value (reranking.RERANKER_MAX_LENGTH, the
+    # module constant, stays 512 -- the sentence_transformers/non-quantized DEFAULT).
+    reranker_max_length: int = 256
+    # Dynamic int8 quantization of the reranker's Linear layers (T11.5.1, 11b block F).
+    # sentence_transformers.CrossEncoder's OWN dynamic-quantization integration is broken
+    # (reassigning a quantized module back onto the wrapper corrupts its forward-kwargs
+    # introspection, reproduced in block F -- see the ADR); when true, reranking.py loads a
+    # raw transformers model/tokenizer instead of the sentence_transformers wrapper for this
+    # ONE path. True is the adopted winner: fp32 bge-reranker-base alone still missed the
+    # floor (p95 1595.8ms at top_k=10/max_length=256); only int8 clears it (p95 1024.5ms).
+    reranker_quantize: bool = True
     # Keep the model resident in VRAM between requests (avoids a cold ~5 GB reload
     # per idle window). Ollama accepts a duration ("30m") or -1 to keep forever.
     ollama_keep_alive: str = "30m"
@@ -123,9 +143,23 @@ class Settings(JobSettings):
     chunk_overlap: int = 150
 
     # --- Retrieval / agent limits ---
-    top_k: int = 20
+    # T11.5.1/T11.5.3 (11b block F): 10 is the winning cell's candidate-pool size -- the
+    # cross-encoder's input batch size, and the dominant lever on its own CPU cost; eval
+    # confirmed recall still 1.0 at this smaller pool against the real corpus (see the ADR).
+    top_k: int = 10
     rerank_top_n: int = 4
     max_agent_steps: int = 6
+
+    # --- Reranker concurrency cap (T11.5.1b, DA-11bE-3) ---
+    # CPU cross-encoder inference does not parallelize: block E measured +35% p95 at 2
+    # concurrent /chat requests and +218% at 4, on the same shared instance, no throughput
+    # gain. Azure's secrag-backend/secrag-ollama run with --cpu 2 and
+    # --scale-rule-http-concurrency 10 with ONE replica until KEDA autoscaling (16.3) — so
+    # today, up to 10 concurrent chat requests can reach the same process. Bounding how many
+    # may call CrossEncoder.predict() at once keeps the rest waiting (never failing) instead
+    # of all contending for the same 2 vCPUs simultaneously. 2 matches the container's vCPU
+    # count; raise only once 16.3 scales replicas instead of trusting a bigger local bound.
+    rerank_concurrency: int = 2
     # Output bound of the answer generation call (DA-31b-3; the worst-case cost per answer in
     # ADR 11 "Costs" uses it). The groundedness check has its own bound (generation.py).
     max_tokens: int = 1024

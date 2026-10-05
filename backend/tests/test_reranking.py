@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from rag_app.reranking import order_by_scores
@@ -42,11 +44,17 @@ PINNED = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
 
 
 def test_the_configured_reranker_is_pinned_to_a_commit() -> None:
+    """The DEFAULT (Settings-driven) reranker is pinned to a real 40-hex commit -- whatever
+    model T11.5.3 currently adopts (not hardcoded here: that would break every time the
+    adopted model/revision changes, which is exactly what 11b block F just did)."""
     from rag_app.config import get_settings
-    from rag_app.reranking import CrossEncoderReranker
+    from rag_app.reranking import _COMMIT, CrossEncoderReranker
 
+    settings = get_settings()
     reranker = CrossEncoderReranker()
-    assert reranker.revision == get_settings().reranker_revision == PINNED
+    assert reranker.model_name == settings.reranker_model
+    assert reranker.revision == settings.reranker_revision
+    assert _COMMIT.match(reranker.revision)  # a real commit hash, never a branch/tag
 
 
 @pytest.mark.parametrize("revision", ["main", "v1.0", PINNED[:12], PINNED.upper()])
@@ -139,13 +147,102 @@ def test_the_cross_encoder_max_length_is_512(fake_st: type[_FakeCrossEncoder]) -
     assert fake_st.calls[0]["max_length"] == 512
 
 
+# --- T11.5.1: max_length override + int8-quantized path (11b block F) ----------------------
+
+
+def test_load_cross_encoder_max_length_is_overridable(fake_st: type[_FakeCrossEncoder]) -> None:
+    from rag_app.reranking import load_cross_encoder
+
+    fake_st.cached = True
+    load_cross_encoder("BAAI/bge-reranker-v2-m3", PINNED, max_length=256)
+    assert fake_st.calls[0]["max_length"] == 256
+
+
+def test_cross_encoder_reranker_passes_its_max_length_and_quantize_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``CrossEncoderReranker(max_length=..., quantize=...)`` overrides the Settings
+    defaults for ONE instance -- the experiment matrix builds several in the same process."""
+    import rag_app.reranking as reranking
+
+    seen: dict[str, object] = {}
+
+    def fake_load(model_name: str, revision: str, *, max_length: int, quantize: bool) -> object:
+        seen.update(
+            model_name=model_name, revision=revision, max_length=max_length, quantize=quantize
+        )
+
+        class _Fake:
+            def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+                return [0.5 for _ in pairs]
+
+        return _Fake()
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", fake_load)
+    reranker = reranking.CrossEncoderReranker(
+        model_name="BAAI/bge-reranker-v2-m3", revision=PINNED, max_length=256, quantize=True
+    )
+    reranker.rerank("q", [_chunk("a")], top_n=1)
+    assert seen == {
+        "model_name": "BAAI/bge-reranker-v2-m3",
+        "revision": PINNED,
+        "max_length": 256,
+        "quantize": True,
+    }
+
+
+def test_quantized_cross_encoder_adapter_applies_sigmoid_and_respects_max_length() -> None:
+    """``_QuantizedCrossEncoder`` must report scores on the SAME 0..1 scale as
+    ``sentence_transformers.CrossEncoder.predict()`` (``Settings.thin_threshold`` compares
+    against it regardless of which path produced the score), and must truncate at its own
+    configured ``max_length`` rather than the model's default."""
+    from rag_app.reranking import _QuantizedCrossEncoder
+
+    class _FakeTokenizer:
+        def __call__(
+            self,
+            queries: list[str],
+            texts: list[str],
+            *,
+            padding: bool,
+            truncation: bool,
+            max_length: int,
+            return_tensors: str,
+        ) -> dict[str, object]:
+            assert return_tensors == "pt"
+            _FakeTokenizer.last_max_length = max_length
+            return {"queries": queries, "texts": texts}
+
+    class _FakeOutput:
+        def __init__(self, logits: object) -> None:
+            self.logits = logits
+
+    class _FakeModel:
+        def __call__(self, **_kwargs: object) -> _FakeOutput:
+            import torch
+
+            # Two pairs: a strongly-relevant logit and a strongly-irrelevant one.
+            return _FakeOutput(torch.tensor([[8.0], [-8.0]]))
+
+    adapter = _QuantizedCrossEncoder(_FakeTokenizer(), _FakeModel(), max_length=256)
+    scores = adapter.predict([("q", "relevant"), ("q", "irrelevant")])
+
+    assert _FakeTokenizer.last_max_length == 256
+    assert len(scores) == 2
+    assert 0.0 <= scores[1] < 0.5 < scores[0] <= 1.0  # sigmoid-bounded, correctly ordered
+
+
 def test_warm_up_loads_the_model_and_runs_one_dummy_predict(
     fake_st: type[_FakeCrossEncoder],
 ) -> None:
     from rag_app.reranking import CrossEncoderReranker
 
     fake_st.cached = True
-    reranker = CrossEncoderReranker()
+    # quantize=False: this test proves the LOAD-ONCE mechanism (T11.4.1), independent of
+    # whichever model/precision T11.5.3 currently adopts as the Settings default.
+    reranker = CrossEncoderReranker(
+        model_name="BAAI/bge-reranker-v2-m3", revision=PINNED, quantize=False
+    )
     assert reranker._model is None
     reranker.warm_up()
     assert reranker._model is not None
@@ -166,18 +263,30 @@ def test_get_shared_reranker_is_a_singleton(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_get_shared_reranker_constructs_the_model_only_once_across_many_calls(
-    monkeypatch: pytest.MonkeyPatch, fake_st: type[_FakeCrossEncoder]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Done-when (T11.4.1): one load across N requests, proven by the ``CrossEncoder``
-    constructor call count — not just object identity."""
+    """Done-when (T11.4.1): one load across N requests, proven by the ``load_cross_encoder``
+    call count — not just object identity. Patches ``load_cross_encoder`` directly (not
+    ``sentence_transformers.CrossEncoder``): ``get_shared_reranker()`` always uses the
+    Settings-driven defaults, whatever model/precision T11.5.3 currently adopts."""
     import rag_app.reranking as reranking
 
-    fake_st.cached = True
+    calls: list[tuple[str, str]] = []
+
+    class _Fake:
+        def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            return [0.5 for _ in pairs]
+
+    def fake_load(model_name: str, revision: str, *, max_length: int, quantize: bool) -> object:
+        calls.append((model_name, revision))
+        return _Fake()
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", fake_load)
     monkeypatch.setattr(reranking, "_shared_reranker", None)
     for _ in range(5):
         shared = reranking.get_shared_reranker()
         shared.rerank("q", [_chunk("a"), _chunk("b")], top_n=1)
-    assert len(fake_st.calls) == 1
+    assert len(calls) == 1
 
 
 # --- DA-11bC-2: concurrent predict() on the shared reranker -----------------------------
@@ -254,3 +363,159 @@ def test_two_concurrent_rerank_calls_on_the_shared_instance_give_correct_indepen
     # each thread's OWN matching candidate must rank first — no cross-talk between threads
     assert results["a"][0] == "a-match"
     assert results["b"][0] == "b-match"
+
+
+# --- T11.5.1b: rerank concurrency cap (DA-11bE-3) -------------------------------------------
+
+
+class _SlowCountingFake:
+    """A fake cross-encoder whose ``predict()`` sleeps (releases the GIL) and tracks the
+    high-water mark of simultaneously-active calls across ALL instances of one test's run,
+    for proving a concurrency bound. Reset ``max_active``/``active`` per test."""
+
+    sleep_s: float = 0.08
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def __init__(self, *_a: object, **_k: object) -> None:
+        pass
+
+    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        import time
+
+        cls = type(self)
+        with cls.lock:
+            cls.active += 1
+            cls.max_active = max(cls.max_active, cls.active)
+        try:
+            time.sleep(cls.sleep_s)
+            return [0.5 for _ in pairs]
+        finally:
+            with cls.lock:
+                cls.active -= 1
+
+
+def test_concurrency_cap_bounds_simultaneous_predict_calls_but_still_allows_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5 callers, default cap (2, Settings.rerank_concurrency): at most 2 ``predict()``
+    calls run at once, but more than 1 — proven bounded, not accidentally serialized to 1."""
+    import threading
+
+    import rag_app.reranking as reranking
+
+    monkeypatch.delenv("RERANK_CONCURRENCY", raising=False)
+    monkeypatch.setattr(reranking, "_predict_semaphore", None)
+    _SlowCountingFake.active = 0
+    _SlowCountingFake.max_active = 0
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _SlowCountingFake())
+
+    errors: list[BaseException] = []
+
+    def ask() -> None:
+        try:
+            r = reranking.CrossEncoderReranker()
+            r.rerank("q", [_chunk("a"), _chunk("b")], top_n=1)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=ask) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive(), "a caller never returned -- deadlock"
+
+    assert not errors, errors
+    assert _SlowCountingFake.max_active >= 2, "predict() calls never overlapped at all"
+    assert _SlowCountingFake.max_active <= 2, "more callers ran at once than the configured cap"
+
+
+def test_concurrency_cap_is_configurable_and_actually_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``RERANK_CONCURRENCY=1`` fully serializes ``predict()`` — proves the bound comes
+    from the setting, not a hardcoded 2."""
+    import threading
+
+    import rag_app.reranking as reranking
+
+    monkeypatch.setenv("RERANK_CONCURRENCY", "1")
+    monkeypatch.setattr(reranking, "_predict_semaphore", None)
+    _SlowCountingFake.active = 0
+    _SlowCountingFake.max_active = 0
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _SlowCountingFake())
+
+    errors: list[BaseException] = []
+
+    def ask() -> None:
+        try:
+            r = reranking.CrossEncoderReranker()
+            r.rerank("q", [_chunk("a")], top_n=1)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=ask) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive(), "a caller never returned -- deadlock"
+
+    assert not errors, errors
+    assert (
+        _SlowCountingFake.max_active == 1
+    ), "RERANK_CONCURRENCY=1 did not fully serialize predict()"
+
+
+def test_concurrency_cap_does_not_corrupt_per_caller_timing_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller forced to wait behind the cap still gets its OWN correct
+    ``rerank_inference`` duration (includes its queueing wait, same as a real request would
+    experience it) — the shared semaphore must not pollute another thread's timing."""
+    import threading
+    import time
+
+    import rag_app.reranking as reranking
+    from rag_app import timing
+
+    monkeypatch.setenv("RERANK_CONCURRENCY", "1")  # forces full serialization => real waits
+    monkeypatch.setattr(reranking, "_predict_semaphore", None)
+    _SlowCountingFake.sleep_s = 0.1
+    _SlowCountingFake.active = 0
+    _SlowCountingFake.max_active = 0
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _SlowCountingFake())
+
+    recorded: dict[str, float] = {}
+    lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def ask(label: str) -> None:
+        try:
+            r = reranking.CrossEncoderReranker()
+
+            def on_stage(name: str, elapsed_s: float) -> None:
+                if name == "rerank_inference":
+                    with lock:
+                        recorded[label] = elapsed_s
+
+            with timing.recorder(streaming=False, on_stage=on_stage):
+                r.rerank("q", [_chunk("a")], top_n=1)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=ask, args=(label,)) for label in ("first", "second")]
+    # start "first" slightly before "second" so "second" is the one forced to queue
+    threads[0].start()
+    time.sleep(0.02)
+    threads[1].start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    # the queued caller's own recorded duration includes its wait: with cap=1 and both
+    # predict() calls sleeping 0.1s, "second" cannot finish before ~0.1s (its own wait) +
+    # 0.1s (its own predict) have both elapsed.
+    assert recorded["second"] >= 0.15, recorded

@@ -9,6 +9,7 @@ pure ordering logic is unit-testable without loading torch.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import re
 import threading
@@ -26,8 +27,50 @@ if TYPE_CHECKING:
 
 # The cross-encoder caps each (query, chunk) pair's tokenized length (T11.4.1): longer pairs
 # are truncated instead of raising, and a fixed cap keeps CPU inference time bounded and
-# predictable across requests regardless of how long a retrieved chunk happens to be.
+# predictable across requests regardless of how long a retrieved chunk happens to be. Mirrors
+# Settings.reranker_max_length's default (T11.5.1, 11b block F) -- kept here too since this
+# module must stay importable (and this constant usable) without constructing Settings.
 RERANKER_MAX_LENGTH = 512
+
+
+class _QuantizedCrossEncoder:
+    """A ``predict(pairs) -> list[float]`` adapter around a raw, dynamically int8-quantized
+    ``transformers`` model (T11.5.1, 11b block F quantization note).
+
+    ``sentence_transformers.CrossEncoder``'s own dynamic-quantization integration is broken:
+    reassigning a ``torch.quantization.quantize_dynamic(...)`` result back onto
+    ``CrossEncoder.model`` corrupts the wrapper's forward-kwargs introspection (reproduced
+    while measuring the T11.5.1 matrix -- a ``BatchEncoding`` ends up passed positionally as
+    ``input_ids`` deep inside the HF model, raising ``AttributeError``). This bypasses the
+    wrapper entirely instead: tokenize and call the quantized model directly, then apply the
+    SAME sigmoid activation ``CrossEncoder.predict()`` uses for a single-logit (``num_labels
+    == 1``) reranker model, so a score here means the same thing as a score from the normal
+    (non-quantized) path -- ``order_by_scores`` and ``Settings.thin_threshold`` both only
+    ever see a plain float, never which path produced it.
+    """
+
+    def __init__(self, tokenizer: Any, model: Any, max_length: int) -> None:
+        self._tokenizer = tokenizer
+        self._model = model
+        self._max_length = max_length
+
+    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        import torch
+
+        queries = [pair[0] for pair in pairs]
+        texts = [pair[1] for pair in pairs]
+        encoded = self._tokenizer(
+            queries,
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self._max_length,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            logits = self._model(**encoded).logits.squeeze(-1)
+            scores = torch.sigmoid(logits)
+        return [float(score) for score in scores.reshape(-1)]
 
 
 def order_by_scores(
@@ -71,21 +114,72 @@ def hub_offline() -> bool:
     return os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in _TRUTHY
 
 
-def load_cross_encoder(model_name: str, revision: str) -> CrossEncoder:
+def _load_quantized_cross_encoder(
+    model_name: str, revision: str, max_length: int
+) -> _QuantizedCrossEncoder:
+    """The ``quantize=True`` path of :func:`load_cross_encoder` (T11.5.1): same pinned-
+    revision/offline/trust rules, but via raw ``transformers`` + a dynamic int8 quantization
+    pass instead of ``sentence_transformers.CrossEncoder`` (see ``_QuantizedCrossEncoder``)."""
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    kwargs: dict[str, Any] = {"revision": revision, "trust_remote_code": False}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, **kwargs)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, local_files_only=True, **kwargs
+        )
+    except (OSError, ValueError) as exc:  # not in the cache (or an incomplete snapshot)
+        if hub_offline():
+            raise RerankerModelError(
+                f"reranker {model_name}@{revision[:12]} is not in the local cache and"
+                " HF_HUB_OFFLINE is set"
+            ) from exc
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, **kwargs)
+    model.eval()
+    # torch's own type stubs do not cover this function (DA-11bE-2 territory: torch's CPU/
+    # quantization surface is only partially typed).
+    quantized = torch.quantization.quantize_dynamic(  # type: ignore[attr-defined]
+        model, {torch.nn.Linear}, dtype=torch.qint8
+    )
+    quantized.eval()
+    # quantize_dynamic() builds the int8 copy while the original fp32 model is still alive,
+    # so peak RSS during THIS call is fp32 + int8 size combined; dropping the fp32 reference
+    # and collecting immediately (rather than waiting for the next GC cycle, which may be a
+    # while on a long-running server process) lets the allocator reclaim it as early as
+    # possible (RSS measured in the ADR, decision 8, 11b block F).
+    del model
+    gc.collect()
+    return _QuantizedCrossEncoder(tokenizer, quantized, max_length)
+
+
+def load_cross_encoder(
+    model_name: str,
+    revision: str,
+    *,
+    max_length: int = RERANKER_MAX_LENGTH,
+    quantize: bool = False,
+) -> CrossEncoder | _QuantizedCrossEncoder:
     """Load the cross-encoder at exactly ``revision``, never running Hub code.
 
     1. From the local Hugging Face cache (or a model baked into the image), offline
        (``local_files_only``): no network call at all once the snapshot is present.
     2. Only if it is not cached, and ``HF_HUB_OFFLINE`` is not set: download that same commit.
        With ``HF_HUB_OFFLINE=1`` a missing snapshot is an error, never a download.
-    ``trust_remote_code`` is always False.
+    ``trust_remote_code`` is always False. ``quantize=True`` (T11.5.1) loads via
+    :func:`_load_quantized_cross_encoder` instead -- a different object, but one with the
+    SAME ``predict(pairs) -> list[float]`` interface, so every caller stays unchanged.
     """
+    if quantize:
+        return _load_quantized_cross_encoder(model_name, revision, max_length)
+
     from sentence_transformers import CrossEncoder
 
     options: dict[str, Any] = {
         "revision": revision,
         "trust_remote_code": False,
-        "max_length": RERANKER_MAX_LENGTH,
+        "max_length": max_length,
     }
     model: CrossEncoder
     try:
@@ -104,28 +198,55 @@ def load_cross_encoder(model_name: str, revision: str) -> CrossEncoder:
 class CrossEncoderReranker:
     """Reranks retrieved chunks with a bge-reranker cross-encoder (pinned revision)."""
 
-    def __init__(self, model_name: str | None = None, revision: str | None = None) -> None:
-        self.model_name = model_name or get_settings().reranker_model
+    def __init__(
+        self,
+        model_name: str | None = None,
+        revision: str | None = None,
+        *,
+        max_length: int | None = None,
+        quantize: bool | None = None,
+    ) -> None:
+        settings = get_settings()
+        self.model_name = model_name or settings.reranker_model
         self.revision = pinned_revision(self.model_name, revision)
-        self._model: CrossEncoder | None = None
+        # Both default to the production Settings values but accept an override (T11.5.1's
+        # experiment matrix constructs several instances with different values in the SAME
+        # process without touching the environment).
+        self.max_length = max_length if max_length is not None else settings.reranker_max_length
+        self.quantize = quantize if quantize is not None else settings.reranker_quantize
+        self._model: CrossEncoder | _QuantizedCrossEncoder | None = None
 
-    def _ensure_model(self) -> CrossEncoder:
+    def _ensure_model(self) -> CrossEncoder | _QuantizedCrossEncoder:
         if self._model is None:
             # Measured separately from inference (T11.3.1): the first request after a cold
             # start pays this once (warm-up removes it from later requests, T11.4.1).
             with timing.stage("rerank_load"):
-                self._model = load_cross_encoder(self.model_name, self.revision)
+                self._model = load_cross_encoder(
+                    self.model_name,
+                    self.revision,
+                    max_length=self.max_length,
+                    quantize=self.quantize,
+                )
         return self._model
 
     def rerank(
         self, query: str, candidates: list[RetrievedChunk], top_n: int
     ) -> list[RetrievedChunk]:
-        """Re-score candidates against the query and return the best ``top_n``."""
+        """Re-score candidates against the query and return the best ``top_n``.
+
+        ``model.predict()`` itself is bounded by the process-wide concurrency cap
+        (T11.5.1b, DA-11bE-3): a caller beyond the cap waits here — never fails — until a
+        slot frees up. The wait is measured as part of ``rerank_inference``: from a caller's
+        point of view, queueing behind the same CPU bottleneck IS the cost of reranking
+        under load, exactly what a real ``/chat`` request experiences; the in-flight
+        chat-requests gauge (TF4) is unaffected, since a queued request is still genuinely
+        in flight for the whole wait.
+        """
         if not candidates:
             return []
         model = self._ensure_model()
         pairs = [(query, candidate.text) for candidate in candidates]
-        with timing.stage("rerank_inference"):
+        with timing.stage("rerank_inference"), _get_predict_semaphore():
             scores = model.predict(pairs)
         return order_by_scores(candidates, [float(score) for score in scores], top_n)
 
@@ -148,6 +269,28 @@ class CrossEncoderReranker:
 
 _shared_reranker: CrossEncoderReranker | None = None
 _shared_reranker_lock = threading.Lock()
+
+_predict_semaphore: threading.Semaphore | None = None
+_predict_semaphore_lock = threading.Lock()
+
+
+def _get_predict_semaphore() -> threading.Semaphore:
+    """The process-wide bound on concurrent ``CrossEncoder.predict()`` calls (T11.5.1b).
+
+    Built lazily from ``Settings.rerank_concurrency`` (default 2) the first time it is
+    needed, then reused — same double-checked-locking shape as ``get_shared_reranker()``.
+    Tests reset it the same way (``monkeypatch.setattr(reranking, "_predict_semaphore",
+    None)``) to pick up a changed setting.
+    """
+    global _predict_semaphore
+    semaphore = _predict_semaphore
+    if semaphore is None:
+        with _predict_semaphore_lock:
+            semaphore = _predict_semaphore
+            if semaphore is None:
+                limit = max(1, get_settings().rerank_concurrency)
+                semaphore = _predict_semaphore = threading.Semaphore(limit)
+    return semaphore
 
 
 def get_shared_reranker() -> CrossEncoderReranker:
