@@ -31,11 +31,18 @@ ENV PYTHONPATH=/app/src
 # `reranker_model`/`reranker_revision` bump (or a change to one of these two files) re-runs
 # the download.
 COPY src/rag_app/__init__.py src/rag_app/config.py ./src/rag_app/
+# ignore_patterns (T11.5.3, 11b block F) excludes redundant weight formats some Hub repos
+# ship alongside safetensors (bge-reranker-base's own repo carries BOTH a 1.1 GB
+# pytorch_model.bin AND a 1.1 GB model.safetensors for the SAME weights, plus an onnx/
+# export this repo never uses, per decision 8 -- transformers/sentence_transformers already
+# prefer safetensors automatically when both exist) -- found by actually inspecting this
+# image's baked HF cache after adopting a new model, not assumed; v2-m3's own repo only ever
+# shipped safetensors, so this was invisible before.
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
 from rag_app.config import get_settings; \
 s = get_settings(); \
-snapshot_download(s.reranker_model, revision=s.reranker_revision)"
+snapshot_download(s.reranker_model, revision=s.reranker_revision, ignore_patterns=['*.bin', '*.h5', '*.ot', '*.msgpack', 'onnx/*', '*.onnx'])"
 
 ENV HF_HUB_OFFLINE=1
 

@@ -122,7 +122,7 @@ either never comes up (`scripts/cd/health_check.sh`).
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2, Alembic, pydantic-settings |
 | Database | PostgreSQL 16 + pgvector (HNSW) + full-text search |
 | LLM | Ollama `qwen2.5:7b-instruct` (local) · Azure OpenAI `gpt-4.1-mini` (cloud) |
-| Embeddings / reranking | `bge-m3` (baked into a custom Ollama image on Azure, T11.4.3 — no pull on cold start) · `BAAI/bge-reranker-v2-m3` (cross-encoder, pinned Hub commit `RERANKER_REVISION`, baked into the backend image and always loaded offline, ONE shared instance per process) |
+| Embeddings / reranking | `bge-m3` (baked into a custom Ollama image on Azure, T11.4.3 — no pull on cold start) · `BAAI/bge-reranker-base` (cross-encoder, dynamically int8-quantized for CPU, pinned Hub commit `RERANKER_REVISION`, baked into the backend image and always loaded offline, ONE shared instance per process, concurrency-capped — T11.5.1/T11.5.3, 11b block F) |
 | Security | argon2, JWT, Fernet envelope encryption (crypto-shred), token bucket |
 | Evaluation | Separate retrieval and generation metrics, LLM judge, regression gate |
 | Quality | ruff, mypy `--strict`, pytest, ESLint, `tsc`, pre-commit, gitleaks |
@@ -428,8 +428,10 @@ ONE instance (`reranking.get_shared_reranker()`) is loaded and warmed up (one du
 call) in the FastAPI lifespan, before the app starts serving traffic, and reused by every
 request, the `eval` gate step and `agentic.py` — so `rerank_load` is ~0 for every real
 request (the one real load happens once, at start-up). The cross-encoder's `max_length` is
-pinned to 512 tokens per (query, chunk) pair. The purger/backup/migration Jobs (slim `jobs`
-image, no torch) never construct or import it.
+pinned to 512 tokens per (query, chunk) pair (256 since T11.5.3 — see below). The purger/
+backup/migration Jobs (slim `jobs` image, no torch) never construct or import it. A
+process-wide concurrency cap (`Settings.rerank_concurrency`, default 2) bounds how many
+`predict()` calls run at once — the rest wait, never fail (T11.5.1b).
 
 **Reranker baked into the backend image (T11.4.2).** `backend/Dockerfile` downloads the
 pinned `reranker_model`@`reranker_revision` (config.py — the SAME Settings the app reads, so

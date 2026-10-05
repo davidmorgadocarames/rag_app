@@ -41,7 +41,7 @@ Next.js (React/TS)  ──REST/JSON──▶  FastAPI backend
 |------|-------|-------|
 | Router, generation, groundedness check, LLM-judge | one **`qwen` Q4** (e.g. `qwen2.5:7b-instruct-q4_K_M`) | Shared across all LLM tasks; Q4 fits 8 GB VRAM |
 | Embeddings (chunks + query) | **`bge-m3`** | Multilingual, strong retrieval; fixed early (changing it forces re-embedding) |
-| Reranking | **`bge-reranker`** (`bge-reranker-v2-m3`) | Cross-encoder; can run on CPU |
+| Reranking | **`bge-reranker`** (`bge-reranker-base`, int8-quantized for CPU — T11.5.3) | Cross-encoder; CPU only (torch is a CPU-only build in this repo) |
 
 Configured via env: `LLM_MODEL`, `EMBED_MODEL`, `RERANKER_MODEL` (see `.env.example`).
 
