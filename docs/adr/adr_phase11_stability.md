@@ -739,6 +739,195 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    unpublished image tag (`secrag-backend:e5`/`secrag-ollama:e5`/`secrag-frontend:e5`, removed
    at the end); `rag_ia_pgdata`'s `CreatedAt` was unchanged throughout (confirmed before and
    after); no Azure command.
+
+   *Landed in 11.5 (T11.5.1 extended, T11.5.1b, T11.5.2, T11.5.3, block F) — the floor PASSES,
+   with a new adopted reranker.* Block E's FAIL (28-thread p95 9579.9 ms, 104 % of the 9191.2
+   ms frozen baseline, 6.4× the 1.5 s cap) is the number block F started from. DA-11bE-2's
+   fix: every CPU cell below is measured with threads pinned to 2 (`torch.set_num_threads(2)`
+   + `OMP_NUM_THREADS=2`/`MKL_NUM_THREADS=2`, set in the environment before the interpreter
+   starts) — this is the number the floor is judged on, not the 28-thread figure.
+
+   **Methodology.** A new, resumable, committed matrix runner (`rag_app.eval.rerank_matrix`;
+   results in `eval/rerank_matrix_results.json`) measures ONLY `rerank_inference` (one pass
+   over the real golden-set candidates via `hybrid_search`, not the full generate+judge
+   pipeline — the cheap screening step the task asks for before any full eval). Cells are
+   grouped into families (same model+precision, `top_k` ∈ {10, 12, 20} × `max_length` ∈
+   {256, 512}, cheapest-first); the moment a family's cheapest-processed cell fails the
+   floor, every other not-yet-measured cell in that family is marked `pruned` and never run
+   — EXCEPT the single most expensive cell (`top_k=20, max_length=512`, today's production
+   shape), always measured regardless, as the table's reference point. Invoked via
+   `scripts/gate.sh --only latency` with the existing `LATENCY_EXTRA_ARGS="--rerank-matrix"`
+   hook (no `gate.sh` step added) against the isolated gate stack; writes to disk after EVERY
+   cell, so an interrupted run (API limit, restart) resumes instead of re-measuring.
+
+   **Quantization note.** The task allows "int8 via ONNX Runtime, or dynamic-quantised torch
+   if ONNX export is impractical — document". `onnxruntime` is already present in the backend
+   venv (a transitive dependency) but `optimum` (needed for `sentence_transformers.
+   CrossEncoder(backend="onnx")` to export a checkpoint) is not, and neither candidate
+   model's Hub repo ships a pre-exported ONNX graph — adding `optimum[onnxruntime]` plus an
+   export step is new, untested surface for a one-block experiment, so dynamic-quantised
+   torch was used instead. `torch.quantization.quantize_dynamic(model, {torch.nn.Linear},
+   dtype=torch.qint8)` applied directly to `sentence_transformers.CrossEncoder.model` and
+   reassigned back onto the wrapper **reproducibly breaks inference**: `self(features,
+   **kwargs)` ends up passing the whole tokenizer `BatchEncoding` as `input_ids` deep inside
+   `XLMRobertaModel.forward`, raising `AttributeError` on `input_ids.ne(...)` — a
+   `sentence_transformers`-internal forward-kwargs-introspection mismatch after swapping the
+   module, not a torch bug. **Fix:** the int8 path bypasses the wrapper entirely — a small
+   adapter (`reranking._QuantizedCrossEncoder`) tokenizes and calls the quantized raw
+   `transformers.AutoModelForSequenceClassification` directly, then applies `torch.sigmoid`
+   to the logit — confirmed **exact numeric parity** against `sentence_transformers.
+   CrossEncoder.predict()` for the same inputs (`bge-reranker-base`, fp32, 2 real sentence
+   pairs: `0.9978866`/`3.7318e-05` both paths, float32 precision), so `Settings.
+   thin_threshold`'s 0.5 comparison (`agentic.is_thin`) means the same thing regardless of
+   which path produced the score (moot for the mandatory eval gate itself: `eval.runner.
+   evaluate()` never calls `agentic.py` at all — only the separate `eval.benchmark` A/B tool
+   does, which is out of scope here and may need `thin_threshold` recalibrated separately if
+   it is ever rerun against the new model).
+
+   **The experiment grid has a 4th family beyond the task's literal three variants.** A
+   quick ad-hoc probe (synthetic ~1200-char text, 2-thread) before building the full runner
+   already suggested fp32 `bge-reranker-base` alone does not clear 1.5 s at any `top_k`/
+   `max_length` in the grid (best case ≈1.9–3.2 s per call). Rather than discover "no cell
+   passes" only after the full real run, `base_int8` (int8-quantized `bge-reranker-base`) was
+   added up front, per the user's own recommendation to exhaust cheap levers before relaxing
+   the floor.
+
+   **Full matrix (2-thread pinned, real 322-chunk corpus + real golden-set candidates;
+   floor: p95 ≤ 1500 ms AND ≤ 4595.6 ms [50 % of 9191.2 ms]):**
+
+   | Family | Cell | p95 ms | Floor |
+   |---|---|---:|---|
+   | `v2m3_fp32` (today's model) | top_k=10, max_length=256 (cheapest) | 5631.1 | FAIL |
+   | `v2m3_fp32` | top_k=20, max_length=512 (today's prod, reference) | **21384.8** | FAIL |
+   | `v2m3_fp32` | top_k∈{12,20}×max_length∈{256,512} minus above (3 cells) | — | pruned |
+   | `v2m3_int8` | top_k=10, max_length=256 (cheapest) | 3508.1 | FAIL |
+   | `v2m3_int8` | top_k=20, max_length=512 (reference) | 14382.1 | FAIL |
+   | `v2m3_int8` | 3 middle cells | — | pruned |
+   | `base_fp32` | top_k=10, max_length=256 (cheapest) | 1595.8 | FAIL (by 96 ms) |
+   | `base_fp32` | top_k=20, max_length=512 (reference) | 5952.4 | FAIL |
+   | `base_fp32` | 3 middle cells | — | pruned |
+   | `base_int8` | **top_k=10, max_length=256 (cheapest)** | **1024.5** | **PASS** |
+   | `base_int8` | top_k=10, max_length=512 | 1933.1 | FAIL |
+   | `base_int8` | top_k=20, max_length=512 (reference) | 4163.6 | FAIL |
+   | `base_int8` | top_k∈{12,20}×max_length=256, top_k=12×max_length=512 (3 cells) | — | pruned (see the cost-ordering caveat below) |
+
+   Exactly ONE cell in the entire 24-cell grid passes both the absolute (≤1.5 s) and relative
+   (≤50 % of baseline) floor: `base_int8` at `top_k=10, max_length=256` — **1024.5 ms, 31.7 %
+   under the absolute cap and 77.7 % under the relative one.** The single most informative
+   reference number: today's EXACT production config, measured honestly at Azure's real
+   2-vCPU thread count, is **21384.8 ms — 2.2× WORSE than block E's own 28-thread number**
+   (9579.9 ms) for the identical model/config/corpus, confirming DA-11bE-2's concern that
+   every block-E number understated what Azure itself would see.
+
+   **Cost-ordering caveat (honest methodology note, no effect on the outcome here).** The
+   matrix's pruning order sorts cells by `(top_k, max_length)` lexicographically, which is
+   only a partial proxy for real cost (≈ `top_k × max_length`): e.g. `(top_k=12,
+   max_length=256)` sorts AFTER `(top_k=10, max_length=512)` even though 12×256=3072 <
+   10×512=5120 and would likely be cheaper in practice. This means a handful of `base_int8`
+   cells were pruned slightly too early. It changed nothing about the adopted winner: the
+   measured cheapest cell already reached `retrieval_recall=1.0` (the maximum possible), so
+   no skipped cell could have improved quality further. Documented in `rerank_matrix.py`'s
+   `Cell.cost_key` for any future reuse of this runner.
+
+   **Eval on the winning cell (T11.5.2, mandatory gate: recall 1.0, faithfulness 1.0,
+   correctness 0.9, correct_abstention 1.0 — none may regress):**
+
+   | Metric | v2-m3 fp32 (old baseline) | `base_int8` top_k=10/max_length=256 (new) |
+   |---|---:|---:|
+   | `retrieval_recall` | 1.0 | 1.0 |
+   | `faithfulness` | 1.0 | 1.0 |
+   | `correctness` | 0.9 | **1.0** |
+   | `correct_abstention` | 1.0 | 1.0 |
+
+   Meets or BEATS the old baseline on every metric (`eval/baseline_metrics.json` updated to
+   this run via `--update-baseline`, the new reference for future regression checks).
+   `Settings.top_k` also drops 20 → 10 (the winning cell's own candidate-pool size, the
+   dominant lever on the cross-encoder's own cost) — recall stayed 1.0 at this smaller pool
+   against the real corpus, confirmed by the SAME eval run (not assumed).
+
+   **T11.5.3 adoption.** New `config.py` defaults: `reranker_model=BAAI/bge-reranker-base`,
+   `reranker_revision=2cfc18c9415c912f9d8155881c133215df768a70` (MIT licence, checked via the
+   HF Hub API — portfolio use allowed; the Hub HEAD at measurement time, pinned per DA-B-7),
+   `reranker_max_length=256` (new `Settings` field; `reranking.RERANKER_MAX_LENGTH` stays 512
+   as the module-level, non-quantized default), `reranker_quantize=True` (new `Settings`
+   field), `top_k=10`. `backend/Dockerfile` needed NO change — its download step already
+   reads `get_settings().reranker_model`/`reranker_revision` generically (T11.4.2's own
+   design goal); it now bakes `bge-reranker-base` automatically. One real fix it DID need:
+   `ignore_patterns` on `snapshot_download` — `bge-reranker-base`'s Hub repo (unlike
+   `v2-m3`'s, which only ever shipped `model.safetensors`) also ships a redundant 1.1 GB
+   `pytorch_model.bin` (identical weights, different format) and an unused `onnx/` export;
+   without excluding them the baked image would carry an extra ~1.1 GB for nothing
+   (`transformers`/`sentence_transformers` already prefer `safetensors` automatically when
+   both exist) — found by actually inspecting the baked image's HF cache after the first
+   build, not assumed.
+
+   **Image size** (`docker build`, same machine, before this fix vs after, `docker run --rm
+   <image> du -sh /`, the number block D/E established as trustworthy over `docker images`'
+   own containerd-snapshotter-skewed figure): without the fix, 5.5 GB (the redundant
+   `pytorch_model.bin` baked in); with the fix, **2.8 GB** — DOWN from v2-m3's own 3.9 GB
+   (`bge-reranker-base`'s safetensors alone is ~1.1 GB vs v2-m3's ~2.27 GB, consistent with
+   roughly half the parameters). CI's `backend-image` job re-proves the offline-rerank check
+   against whichever model `config.py` names, unchanged (T11.4.2's design goal) — re-run
+   locally for this block: `docker run --rm --network none <image> python -c '...'` reranks
+   successfully with the new baked model; HF_HUB_OFFLINE refusal still works when deliberately
+   un-baked.
+
+   **RSS (honest finding, and a real limitation of dynamic quantization).** A bare warmed
+   reranker process (no FastAPI/SQLAlchemy — isolates the model's own footprint; not directly
+   comparable to block E's full-app number, noted below) measured **1.99 GiB VmRSS**, peak
+   (`VmHWM`) **2.88–3.08 GiB** during load+quantize — a bare `python+torch` baseline process
+   with no model loaded is only ~222 MiB, so the reranker itself accounts for essentially all
+   of it. This is comparable to, not smaller than, v2-m3's OLD full-app idle RSS (2.02 GiB) —
+   **quantization's latency win does NOT translate into a proportional RSS win**: `torch.
+   quantization.quantize_dynamic()` builds the int8 copy while the original fp32 model (≈1.1
+   GB) is still resident, and freeing the Python reference afterwards (`del model; gc.
+   collect()`, added defensively in `reranking.py`) measurably did **not** reduce RSS in a
+   repeat test (1.99 → 2.00 GiB, within noise) — glibc's allocator retains freed heap arenas
+   rather than returning them to the OS via `munmap`, a well-known CPython/glibc interaction,
+   not a Python-level leak. **Consequence for PHASE_PLANNING §2b cost lever 2** ("~1 vCPU/
+   2 GiB" once 11.5 lands): still NOT viable on memory grounds with this adopted config —
+   the reranker alone floors around 2 GiB resident, before the rest of the FastAPI/
+   SQLAlchemy/uvicorn app or any concurrent-request activation memory; revisit at the Azure
+   right-size with a full equivalent (containerized, under real `/chat` load, matching block
+   E's own methodology exactly) RSS re-measurement, not assumed equal to this one.
+
+   **Concurrency re-measurement with the adopted config (T11.5.1b; `rerank_concurrency=2`,
+   `--concurrency N` against the shared, warmed `base_int8` reranker, 2-thread pinned):**
+
+   | Concurrency | n | p50 ms | p95 ms | wall time |
+   |---|---:|---:|---:|---:|
+   | 1 (this block's own matrix cell) | 14 | 1003.5 | 1024.5 | — |
+   | 4 | 56 | 2198.8 | 2431.7 | 32.1 s |
+   | 10 | 140 | 5724.4 | 6122.8 | 81.3 s |
+
+   Both 4× and 10× exceed the single-caller floor under load — expected and BY DESIGN: the
+   concurrency cap (default 2) makes extra callers queue rather than all contending for the
+   same 2 vCPUs at once (T11.5.1b), so wall-clock latency under load rises predictably
+   instead of the uncapped +218 %/no-throughput-gain collapse block E measured at just 4
+   concurrent callers on the OLD config (28829.5 ms p95). **Still, 6.1 s at 10 concurrent
+   callers is a real, user-visible stall** — Azure's `secrag-backend` scale rule already
+   allows up to 10 concurrent requests to one replica before KEDA (16.3) adds more replicas;
+   this remains the accepted, documented gap DA-11bE-3 named, now with concrete numbers
+   against the ADOPTED config rather than the old one.
+
+   **Rerank concurrency cap implementation (T11.5.1b).** `Settings.rerank_concurrency`
+   (default 2, configurable); `reranking._get_predict_semaphore()` wraps every `CrossEncoder.
+   predict()` call process-wide (same double-checked-locking shape as `get_shared_reranker()`)
+   inside the existing `timing.stage("rerank_inference")` block, so a queued caller's own
+   recorded duration honestly includes its wait (that wait IS the real cost under load) — the
+   in-flight chat-requests gauge (TF4) is unaffected, a queued request is still genuinely in
+   flight. 4 new tests prove: bounded-but-overlapping (5 callers, default cap 2: `max_active`
+   is both `>= 2` and `<= 2`); configurable-and-enforced (`RERANK_CONCURRENCY=1` fully
+   serializes 4 callers, `max_active == 1`); no deadlock (every caller's `.join()` returns);
+   per-caller timing stays correct under forced queueing.
+
+   **Data safety:** every real measurement ran against the isolated `secrag-gate` project
+   (its own `secrag_gate_pgdata` volume, `down -v` after every run) or throwaway, unpublished
+   image tags (`secrag-backend:f1`/`f2`/`f3`, all removed; bare one-off containers for the
+   RSS check, all removed); `rag_ia_pgdata`'s `CreatedAt` unchanged throughout; native Ollama
+   started only to satisfy the gate's reachability check (no generate/judge calls in the
+   matrix run itself; real generate/judge calls only in the eval-gate runs), stopped at the
+   end; no Azure command.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=
