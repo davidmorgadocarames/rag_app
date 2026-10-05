@@ -125,20 +125,29 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 
-`latency` (T11.3.5/T11.4.4, `rag_app.eval.latency`): runs the golden set (14 questions) `N`=3
-times through its own inlined per-call-site shape (`reranking.retrieve` + `generation.
-answer_from_chunks`), records p50/p95 per stage with machine/model details (CPU, GPU, RAM,
-model names/revisions, reranker device, `reranker_mode`, `top_k`/`rerank_top_n`, git commit).
-A routine run (this step, no flag) writes the git-ignored `eval/latency_results.json`;
-`--update-baseline` writes the git-tracked `eval/latency_baseline.json` instead — same
-results/baseline split as `eval` (`results.json`/`baseline_metrics.json`), so ordinary timing
-jitter never dirties the tree on a routine `--full` (found running block B's own closing
-gate: the step's unconditional overwrite of the tracked file blocked `secrag/gate-full` from
-publishing). Reranker on CPU for the Azure-relevant numbers (today's pinned torch is
-CPU-only anyway — see ADR 11 decision 8). This step only RECORDS — no pass/fail threshold yet
-(`T11.6b.1`, once the eval-guided optimisation has picked a baseline worth enforcing).
-Measured on the development machine (2026-10-02, 11.3 block B): 42 answers in 412-429 s
-across three runs. **Methodology (T11.4.1 block C → T11.4.4 block E):** this module built a
+`latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
+questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +
+`generation.answer_from_chunks`), records p50/p95 per stage with machine/model details (CPU,
+GPU, RAM, model names/revisions, reranker device, `reranker_mode`, `top_k`/`rerank_top_n`,
+git commit), **always 2-thread pinned** (`OMP_NUM_THREADS`/`MKL_NUM_THREADS=2` exported by
+`gate.sh`'s `step_latency`, `torch.set_num_threads(2)` defensive inside `main()` — matches
+Azure's 2-vCPU container and the number the absolute rerank floor is judged on, DA-11bE-2).
+A routine run (this step, no flag) writes the git-ignored `eval/latency_results.json` **and
+is now a real pass/fail check**: it compares its own p95 per stage against the git-tracked,
+ADOPTED baseline `eval/latency_adopted_baseline.json` (+50% relative tolerance + a flat 25 ms
+margin, documented in `latency.py`'s module docstring) and fails if `rerank_inference` p95
+exceeds the absolute **1.5 s** floor regardless of tolerance, or if the live reranker config
+no longer matches what the adopted baseline was measured with. `--update-baseline` writes the
+FROZEN, never-regenerated "before" file (`eval/latency_baseline.json`) instead;
+`--update-adopted-baseline` writes the adopted one — three separate, explicit-flag-only
+targets, so ordinary timing jitter never dirties the tree on a routine `--full` (found
+running block B's own closing gate: the step's unconditional overwrite of the tracked file
+blocked `secrag/gate-full` from publishing; re-confirmed never dirtying the tree after
+T11.6b.1 added the comparison). Reranker on CPU for the Azure-relevant numbers (today's
+pinned torch is CPU-only anyway — see ADR 11 decision 8). Measured on the development
+machine (2026-10-02, 11.3 block B): 42 answers in 412-429 s across three runs; the adopted
+baseline itself (2026-10-05, block G): `rerank_inference` p50/p95 1072.9/1117.5 ms, 25.5%
+under the floor. **Methodology (T11.4.1 block C → T11.4.4 block E):** this module built a
 FRESH `CrossEncoderReranker()` per golden-set item ON PURPOSE for the committed "before"
 baseline (kept available as `--reranker-mode fresh`, never run by this step by default); the
 `fresh`-per-item shape does NOT exercise the single-shared-reranker fix that `/chat`,

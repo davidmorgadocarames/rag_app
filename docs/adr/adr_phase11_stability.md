@@ -1,8 +1,10 @@
 # ADR phase 11 — Stability: data persistence and rerank latency
 
-- **Status:** 11a **Accepted** locally (2026-10-01: every 11a decision below has landed on
-  the phase branch, `gate.sh --full` PASS); Azure evidence (promotion, smoke, cost) is added
-  at the 11a promotion; 11b is still open.
+- **Status:** 11a **Accepted** (Azure-promoted 2026-10-02, tag `phase-11a`). 11b **Accepted**
+  locally (2026-10-05: every 11b decision below — T11.5, T11.6b.1–3 — has landed on the phase
+  branch, `gate.sh --full` PASS); Azure evidence (promotion, smoke, cost) is added at the
+  11b promotion (T11.6b.4/5) — the ["Costs"](#costs) section below has a marked placeholder
+  for it until then.
 - **Parts:** **11a** — persistence, migrations Job, asynchronous erasure (branch
   `phase-11a-persistence`); **11b** — rerank latency and baked model images (branch
   `phase-11b-latency`).
@@ -10,7 +12,26 @@
   [ADR phase 9](adr_phase09_deployment.md) (migrations at container start, superseded by
   11a), [ADR phase 10](adr_phase10_azure.md) (Azure deployment).
 - **Phase report:** [Phase 11a report](../phases/phase-11a.md) — Azure promotion, smoke,
-  restore rehearsal and cost evidence.
+  restore rehearsal and cost evidence. The 11b report is written at its own promotion.
+- **Successor note on migrations (for Phase 12, `phase-12a-sessions-bff`).** 11b adds **no**
+  migration — `0005_persistence_erasure` (11a) is still the latest revision; nothing here
+  changes the expand/contract discipline or the Rollback principles above ("images roll back,
+  the schema does not"). The **next** migration is **`0006`** (T12.1.1: `sessions` table +
+  `users.role`), expand-only like 0005, and must follow the same discipline: additive columns/
+  tables only, a downgrade that is not relied upon as a real rollback path once any row
+  depends on the new shape, and a rollback plan written *before* the 12a promotion (mirroring
+  this ADR's own ["Rollback"](#rollback) section) rather than improvised after the fact.
+- **Accepted gaps carried past 11b** (not fixed by this block, not silently forgotten):
+  concurrency/OOM under real load stays an accepted gap until KEDA-based autoscaling
+  (**16.3**) replaces today's fixed replica count — see the concurrency re-measurement in
+  decision 8 above; **PHASE_PLANNING §2b cost lever 2** ("~1 vCPU/2 GiB" backend) is **not
+  viable** with the adopted reranker config — RSS stayed ~2 GiB even after quantization
+  (decision 8) — and should be treated as still open, not assumed solved, until a right-sized
+  Azure measurement says otherwise; **Azure-core microarchitecture** (the dev machine's
+  i7-14700KF vs whatever Azure's 2-vCPU container actually schedules onto) is a real,
+  un-closed gap this block's 2-thread *pinning* does not close — thread **count** now matches,
+  but clock speed/IPC do not — the real-hardware number is **T11.6b.5**'s job (Azure smoke),
+  not this block's.
 
 ## Context
 
@@ -936,6 +957,73 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    started only to satisfy the gate's reachability check (no generate/judge calls in the
    matrix run itself; real generate/judge calls only in the eval-gate runs), stopped at the
    end; no Azure command.
+
+   *Landed in 11.6b (T11.6b.1, block G) — the `latency` gate step becomes a real pass/fail
+   check.* Block F left `rag_app.eval.latency` recording only (no threshold). This block adds
+   a second, git-tracked file, `eval/latency_adopted_baseline.json` — the ADOPTED baseline
+   (today's config: `bge-reranker-base` int8, `top_k=10`, `max_length=256`), produced by a
+   real 2-thread-pinned, `reranker_mode="shared"` run against the isolated `secrag-gate`
+   stack: `rerank_inference` p50/p95 **1072.9/1117.5 ms** (25.5 % under the 1.5 s absolute
+   floor). This is **separate from, and never overwrites,** the frozen `eval/
+   latency_baseline.json` above (the "before", old v2-m3 fp32 config, reload-per-request bug,
+   28-thread) — that file stays the historical "how bad it was" reference forever. Both are
+   written only via their own explicit `--update-*` flag; a routine `gate.sh --full`/`--only
+   latency` run writes neither, only the git-ignored `latency_results.json` (confirmed: ran
+   `--full` twice in a row, tree clean both times).
+
+   **The check (`check_against_adopted_baseline`).** Three independent failures, any one
+   fails the step: (1) **config mismatch** — the live `reranker_model`/`reranker_revision`/
+   `top_k`/`rerank_top_n` must match what the adopted baseline was itself measured with, else
+   the numbers are not comparable; (2) **per-stage relative tolerance** — a run's own p95 must
+   not exceed the baseline's p95 by more than **+50 % + a flat 25 ms margin**; (3) **absolute
+   rerank floor** — `rerank_inference` p95 must stay `<= 1.5 s` regardless of what the
+   baseline itself says, never loosened by the tolerance. **Why +50 %/+25 ms:** both runs are
+   now 2-thread pinned (next paragraph), which removes the single biggest source of variance
+   this gate had — block F found a 2.2× gap between the 28-thread and 2-thread numbers for
+   the *same* config. What is left is ordinary host jitter (OS scheduling, whatever else
+   shares the dev machine); 50 % is deliberately generous relative to the jitter actually
+   observed across this block's own re-measurements (within ~8–10 % of each other) — it
+   exists to catch a real regression (losing the quantized code path, `top_k` creeping back
+   up, the reload-per-request bug returning), not to flag ordinary noise. The flat margin
+   covers near-zero-ms stages (`embed`, `hybrid_search`) a percentage alone would not. Proven
+   with unit tests (a pure `check_against_adopted_baseline` artificial-slowdown case, a
+   config-mismatch case, an absolute-floor case independent of tolerance) and manually against
+   the real stack: a deliberately corrupted adopted baseline (`rerank_inference` p95 dropped
+   to 50 ms) made a real `--only latency` run FAIL with `rerank_inference: p95 1114.7 ms >
+   100.0 ms allowed`; restoring the real file made the same run PASS again.
+
+   **Thread pinning, applied everywhere (not just `--rerank-matrix`).** `scripts/gate.sh`'s
+   `step_latency` now always exports `OMP_NUM_THREADS=2`/`MKL_NUM_THREADS=2` (native libraries
+   read these at load time, before the interpreter starts), and `rag_app.eval.latency.main()`
+   now always calls `torch.set_num_threads(2)` defensively on top, for every mode (the normal
+   benchmark, `--concurrency`, `--warm-vs-cold`), not only the matrix screening. This is a
+   deliberate decision, not an accident: the absolute floor is judged on the 2-thread number
+   (DA-11bE-2), so pinning the step itself — rather than relying on an operator to export the
+   right environment by hand — makes every run of this step (dev box with 28 real cores, a CI
+   runner with far fewer, a future Azure smoke) measure the *same*, comparable number. The
+   other stages (`embed`, `hybrid_search`, `generate`, `groundedness`) call out to Ollama or
+   Postgres in a separate process and are not materially affected by this process's own
+   thread count.
+
+   **DA-11bF-1 (reranker input truncation — documented side-effect, deferred).** `max_length
+   =256` is a *joint* query+chunk token budget; HF's default pair-truncation strategy
+   truncates the longer sequence (the chunk) when the pair does not fit. A 1200-char chunk
+   (`chunk_size`) is roughly 230–300 English tokens before the query's own tokens are even
+   added, so truncation of the chunk's *tail* is the common case for this adopted config, not
+   an edge case — only the reranker's *scoring* input is affected (the LLM still sees the
+   full, untruncated chunk text once selected), but a chunk whose only relevant sentence sits
+   near the end can be scored on a prefix that does not contain it, mis-ranked below
+   `rerank_top_n=4`, and never reach the LLM: a silent recall loss the current 14-item golden
+   set cannot detect (too small to exercise this specific failure mode with any statistical
+   confidence). **Decision (user, 2026-10-05):** not a blocker for 11b — the ADR's quality
+   claim already holds, honestly, on the golden set that exists today. 1–2 synthetic golden-
+   set items specifically designed so the only supporting sentence sits past char ~1000 of a
+   long chunk are **deferred to Phase 14.0** (golden-set expansion), not added now.
+
+   **Data safety:** the adopted-baseline measurement and every verification run above used
+   the isolated `secrag-gate` project (`down -v` after each run); `rag_ia_pgdata`'s
+   `CreatedAt` unchanged throughout; native Ollama started only to satisfy the reachability
+   check, stopped at the end; no Azure command.
 9. Promotion hardening found while building 11a (R6-5 and the stream findings).
    *Landed in 11.2 (T11.2.15–17):* **log hygiene** — the emailer logs neither the address
    nor the link; the uvicorn access log redacts every query value (`/auth/verify?token=
@@ -1308,6 +1396,69 @@ hand from the migration Job's digest (step 3 below, without the delete) and cont
 `pg_dump` or PITR (≤ 14 days) into a **new** server/database, never over the live one;
 roles, grants and Storage are additive and need no rollback.
 
+### 11b (T11.6b.3) — written 2026-10-05, before the 11b promotion
+
+**Simpler than 11a's: no migration.** 11.6b adds no schema change (`0005` is still the latest
+revision; see the successor note above), so there is no "migrate OK, apps failed" case to
+reason about and no migration Job to delete/recreate — a rollback here is **only** the three
+app images (+ the Ollama image) going back to what main `c8b4e9e` (the 11a-promoted commit,
+still running today) deployed. The same principles as 11a's rollback apply: **CD never rolls
+back** (a forward-fix commit through the gate is the lasting fix); **images roll back, data
+does not** — nothing in 11.6b touches the database.
+
+**Previous images (backend/frontend/jobs).** Read read-only from GHCR (`gh api
+…/packages/container/<pkg>/versions`, no Azure command), confirmed against the commit `gh api
+…/commits/c8b4e9e.../status` still shows `secrag/gate-full` success for — these are exactly
+the digests the 11a promotion deployed and that are still running as of this block:
+
+```bash
+RG=rg-secrag
+OLD_BACKEND=ghcr.io/davidmorgadocarames/rag_app-backend@sha256:04faf7f2ad0b1132aedd588905f881aae004641a5606c596a1347b0bc9fa679e
+OLD_FRONTEND=ghcr.io/davidmorgadocarames/rag_app-frontend@sha256:522c81d7ef2b6d474266f05c34e20f02d1a807d45f81dc1f4271d7036023367d
+OLD_JOBS=ghcr.io/davidmorgadocarames/rag_app-jobs@sha256:7ca7f272cea56f2f0e8f3208e860d13d99bfcb4be725ea6dda6b6b55c44dd514
+```
+
+**Previous Ollama image.** Unlike backend/frontend/jobs, today's `secrag-ollama` app does
+**not** run a GHCR-built image — it runs the plain upstream `docker.io/ollama/ollama:latest`
+(RUNBOOK_AZURE.md §4; this is exactly the un-baked image that loses `bge-m3` on scale-to-zero,
+the gotcha 11b's baked `rag_app-ollama` image is built to fix). `:latest` is a floating tag,
+not safe to roll back to by name alone — the **exact digest currently running** must be read
+once, read-only, right before the 11b pre-merge (not assumed, not guessed):
+
+```bash
+# PLACEHOLDER — orchestrator fills this in at the pre-merge pre-check (read-only):
+az containerapp show -g rg-secrag -n secrag-ollama \
+  --query "properties.template.containers[0].image" -o tsv
+# then pin it:
+OLD_OLLAMA=docker.io/ollama/ollama@sha256:<orchestrator fills from the query above>
+```
+
+**Rollback commands** (apps only; no Job to delete — see "no migration" above):
+
+```bash
+az containerapp update -g $RG -n secrag-ollama --image "$OLD_OLLAMA"
+az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND"
+az containerapp update -g $RG -n secrag-frontend --image "$OLD_FRONTEND"
+# Ollama first (T11.4.3/CD order note): the backend calls it, so it must already be serving
+# bge-m3 before the backend takes traffic. After a rollback to the un-baked image, bge-m3 is
+# NOT pre-loaded -- immediately re-run the existing wake-up step (RUNBOOK_AZURE.md §4):
+az containerapp exec -g $RG -n secrag-ollama --command "ollama pull bge-m3"
+FQDN=$(az containerapp show -g $RG -n secrag-backend --query properties.configuration.ingress.fqdn -o tsv)
+curl -fsS "https://$FQDN/health"   # wake-up; then a chat question exercises embeddings + rerank
+```
+
+If the purge/backup Jobs were updated by this promotion's CD run (they carry the `rag_app-jobs`
+image, not `rag_app-backend`/`-ollama`), roll them back the same way 11a's rollback does
+(step 3 there): read the deployed jobs digest and `az containerapp job update --image
+"$OLD_JOBS"` for both `$AZURE_PURGE_JOB`/`$AZURE_BACKUP_JOB`.
+
+**By design, not a regression.** Rolling back to the pre-11.5/11.6b images restores the OLD
+reranker config (`bge-reranker-v2-m3` fp32, `top_k=20`) and therefore the OLD, **FAILING**
+latency floor this whole phase exists to fix (block F: 28-thread p95 ~9.6 s / 2-thread p95
+~21.4 s, both far over the 1.5 s cap) — a future reader of a rollback incident must not mistake
+the floor failing again, right after a rollback, for a new regression: it is the expected,
+accepted cost of reverting to pre-11.5 code, exactly as DA-11bF review's own note anticipated.
+
 ## Costs
 
 *Measured the day after each promotion* (Cost Management query) and compared with the caps:
@@ -1315,6 +1466,15 @@ roles, grants and Storage are additive and need no rollback.
 €0.13/month, daily backup ≈ €0.03/month, slim image, scale to zero between runs) and one
 Storage account (a few MB of encrypted dumps, 12-day lifecycle); the migration Job runs only
 during a deploy. The measured value is added after the promotion.
+
+> **PLACEHOLDER — orchestrator fills after the Azure Cost Management read (PHASE_STATUS.md
+> "Now", open item 1).** (1) **11a row 43:** the actual €-figure for 2026-10-01/02, to replace
+> the estimate above and in `docs/phases/phase-11a.md`. (2) **11b Azure numbers** (T11.6b.5):
+> cold-start measurement, the ≤20-question Azure latency baseline, scale 0/1 confirmation, and
+> next-day cost vs the ≈€0.15 (cap €1) estimate above. Neither figure is filled by this block
+> (senior agent, block G, no Azure commands) — do not remove this marker until both are in.
+
+
 
 ### Worst-case LLM cost per answer and the daily answer cap (R6-1, DA-31b-3)
 

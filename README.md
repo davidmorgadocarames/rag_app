@@ -395,15 +395,24 @@ answer. Only the Ollama path reads these; Azure OpenAI's context window is fixed
 deployment. See `docs/adr/adr_phase11_stability.md` decision 8 for the measured VRAM numbers
 and the full reasoning.
 
-**Latency baseline (T11.3.5) and methodology (T11.4.4).** `python -m rag_app.eval.latency`
-runs the golden set through the real per-request pipeline shape: p50/p95 per stage plus the
-machine/model details needed to compare runs like for like. A routine run (the gate step
-`latency`, `--full`/`--only latency`) writes the git-ignored `eval/latency_results.json`;
-`--update-baseline` writes the git-tracked `eval/latency_baseline.json` instead (same results/
-baseline split as `eval.gate`) — done on purpose, not on every gate run, so ordinary timing
-jitter never dirties the tree. This block only records — `T11.6b.1` adds the pass/fail
-threshold once the eval-guided optimisation (block F) has picked a new baseline to enforce.
-`--reranker-mode` (default `shared`) picks which reranker instance(s) the benchmark loop uses:
+**Latency baseline (T11.3.5), methodology (T11.4.4) and the real gate check (T11.6b.1).**
+`python -m rag_app.eval.latency` runs the golden set through the real per-request pipeline
+shape: p50/p95 per stage plus the machine/model details needed to compare runs like for like,
+ALWAYS 2-thread pinned (`OMP_NUM_THREADS`/`MKL_NUM_THREADS=2`, exported by `gate.sh`'s
+`step_latency` before the interpreter starts, plus a defensive `torch.set_num_threads(2)`
+inside `main()`) — matches Azure's 2-vCPU container and the number the absolute rerank floor
+is judged on (DA-11bE-2), so dev box/CI/Azure all measure the same thing. A routine run (the
+gate step `latency`, `--full`/`--only latency`) writes the git-ignored `eval/
+latency_results.json` **and is a real pass/fail check**: it compares its own p95 per stage
+against the git-tracked ADOPTED baseline `eval/latency_adopted_baseline.json` (+50% relative
+tolerance + a flat 25 ms margin — rationale in `latency.py`'s module docstring), enforces the
+absolute `rerank_inference` floor (≤ 1.5 s) regardless of tolerance, and fails on a config
+mismatch between the live Settings and what the baseline was measured with.
+`--update-baseline` writes the FROZEN "before" file instead (`eval/latency_baseline.json`,
+never regenerated); `--update-adopted-baseline` writes the adopted one (done on purpose, by
+an operator, after a reranker config is actually adopted — never on a routine gate run, so
+ordinary timing jitter never dirties the tree either way). `--reranker-mode` (default
+`shared`) picks which reranker instance(s) the benchmark loop uses:
 `fresh` builds a brand-new `CrossEncoderReranker()` per golden-set item — exactly how the
 committed, frozen `eval/latency_baseline.json` ("before", `b77f69f`) was produced, kept
 available only to reproduce that methodology on request, never to regenerate the file itself;
@@ -596,7 +605,7 @@ bound, so the worst-case cost of a day at the cap is known in advance
 - [ADR phase 6 — Data erasure (GDPR): crypto-shred + tombstones](docs/adr/adr_phase06_gdpr_erasure.md)
 - [ADR phase 9 — Containerization and delivery](docs/adr/adr_phase09_deployment.md)
 - [ADR phase 10 — Cloud deployment on Azure](docs/adr/adr_phase10_azure.md)
-- [ADR phase 11 — Stability: data persistence and rerank latency](docs/adr/adr_phase11_stability.md) (11a landed: persistence, migrations Job, asynchronous erasure, backups, daily cap; 11b open)
+- [ADR phase 11 — Stability: data persistence and rerank latency](docs/adr/adr_phase11_stability.md) (11a Azure-promoted: persistence, migrations Job, asynchronous erasure, backups, daily cap; 11b landed locally: adopted reranker, concurrency cap, baked images, real `latency` gate check — Azure promotion pending)
 
 ## License
 

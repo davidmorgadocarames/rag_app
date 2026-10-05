@@ -45,6 +45,22 @@ Next.js (React/TS)  ──REST/JSON──▶  FastAPI backend
 
 Configured via env: `LLM_MODEL`, `EMBED_MODEL`, `RERANKER_MODEL` (see `.env.example`).
 
+**Reranker operational parameters (T11.5.3, the adopted config; full detail/measurements in
+[ADR 11](adr/adr_phase11_stability.md), decision 8):** `top_k=10`, `RERANKER_MAX_LENGTH=256`
+(the tokenizer's joint query+chunk token budget), `RERANKER_QUANTIZE=true` (dynamic int8),
+`RERANK_CONCURRENCY=2` (a process-wide semaphore around every `CrossEncoder.predict()` call —
+extra concurrent callers queue instead of all contending for the same CPU at once; an
+accepted gap until KEDA-based autoscaling, Phase 16.3, adds replicas under load instead).
+**Known side-effect:** `max_length=256` truncates the *chunk* (not the query) when a
+query+chunk pair does not fit, under HF's default pair-truncation strategy — a 1200-char
+chunk (`chunk_size`) is routinely ~230–300 tokens before the query is even added, so this is
+the common case, not an edge case, for this config. Only the reranker's *scoring* input is
+truncated (the LLM still sees the full chunk once selected), but a chunk whose only relevant
+sentence sits near the end can be scored on a prefix that omits it and never reach the LLM —
+a silent recall loss the current 14-item golden set cannot detect. Golden-set items that
+specifically exercise this ("late sentence in a long chunk") are **deferred to Phase 14.0**
+(golden-set expansion), not added now (user decision, 2026-10-05).
+
 ## 4. Ingestion pipeline
 
 ```
@@ -91,6 +107,19 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
 - **Benchmark harness** sweeps configs (chunk size, k, rerank on/off, router on/off) and reports
   faithfulness / correctness / p95 latency / cost per query — so complexity is added by **evidence**.
 - Semantic caching (invalidated on corpus change); parallelize independent tool calls.
+- **`num_ctx`**: `NUM_CTX_ANSWER`/`NUM_CTX_GROUNDEDNESS` (default 8192) bound the Ollama context
+  window per call — large enough for the retrieved chunks + prompt, small enough to bound
+  per-call latency/memory; changing either is a latency-relevant config change (re-run the
+  `latency` gate step, T11.6b.1).
+- **Baked model images** (T11.4.2 backend reranker, T11.4.3 Ollama `bge-m3`): the reranker/
+  embedding model weights are downloaded at **image build time**, not on first request/cold
+  start, removing the old "wait for a multi-GB download" cold-start risk entirely (measured
+  cold-start numbers: ADR 11 decision 8).
+- **The `latency` gate step** (T11.6b.1) is a real pass/fail check: a routine run's p50/p95
+  per stage is compared against a committed, 2-thread-pinned *adopted* baseline
+  (`eval/latency_adopted_baseline.json`, distinct from the frozen "before" baseline) with a
+  documented tolerance, plus a hard absolute `rerank_inference` floor (≤ 1.5 s) that is never
+  loosened by the baseline. Full rule and rationale: ADR 11 decision 8, "Landed in 11.6b".
 
 ## 8. Security & abuse
 
