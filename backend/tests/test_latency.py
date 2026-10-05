@@ -55,6 +55,8 @@ def test_machine_info_has_the_documented_fields() -> None:
         "reranker_revision",
         "top_k",
         "rerank_top_n",
+        "reranker_max_length",
+        "reranker_quantize",
         "num_ctx_answer",
         "num_ctx_groundedness",
         "commit",
@@ -518,6 +520,73 @@ def test_check_against_adopted_baseline_fails_on_a_config_mismatch() -> None:
 
     assert not result.ok
     assert any("config mismatch" in f and "top_k" in f for f in result.failures)
+
+
+def test_check_against_adopted_baseline_fails_on_a_reranker_max_length_mismatch() -> None:
+    """DA-11bG-2: ``reranker_max_length`` (chunk-tail truncation knob) must be part of the
+    config-mismatch guard -- a change here can silently change recall/quality without moving
+    ``rerank_inference``'s p95 outside tolerance, so it must fail loudly on its own, not rely
+    on the empirical latency check to happen to catch it."""
+    baseline = _adopted_baseline(
+        {},
+        machine={
+            "reranker_model": "BAAI/bge-reranker-base",
+            "reranker_revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+            "top_k": 10,
+            "rerank_top_n": 4,
+            "reranker_max_length": 256,
+            "reranker_quantize": True,
+        },
+    )
+    report = _report(
+        {},
+        machine={
+            "reranker_model": "BAAI/bge-reranker-base",
+            "reranker_revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+            "top_k": 10,
+            "rerank_top_n": 4,
+            "reranker_max_length": 128,
+            "reranker_quantize": True,
+        },
+    )
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert not result.ok
+    assert any("config mismatch" in f and "reranker_max_length" in f for f in result.failures)
+
+
+def test_check_against_adopted_baseline_fails_on_a_reranker_quantize_mismatch() -> None:
+    """DA-11bG-2: ``reranker_quantize`` flipping back to ``False`` would likely also move the
+    latency numbers, but it must still be caught as an explicit config mismatch rather than
+    relying only on the empirical p95 comparison."""
+    baseline = _adopted_baseline(
+        {},
+        machine={
+            "reranker_model": "BAAI/bge-reranker-base",
+            "reranker_revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+            "top_k": 10,
+            "rerank_top_n": 4,
+            "reranker_max_length": 256,
+            "reranker_quantize": True,
+        },
+    )
+    report = _report(
+        {},
+        machine={
+            "reranker_model": "BAAI/bge-reranker-base",
+            "reranker_revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+            "top_k": 10,
+            "rerank_top_n": 4,
+            "reranker_max_length": 256,
+            "reranker_quantize": False,
+        },
+    )
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert not result.ok
+    assert any("config mismatch" in f and "reranker_quantize" in f for f in result.failures)
 
 
 def test_main_fails_without_an_adopted_baseline_file(

@@ -192,6 +192,8 @@ _ADOPTED_CONFIG_KEYS = (
     "reranker_revision",
     "top_k",
     "rerank_top_n",
+    "reranker_max_length",
+    "reranker_quantize",
 )
 
 
@@ -330,6 +332,8 @@ def machine_info(*, reranker_device: str, reranker_mode: str = "shared") -> dict
         "reranker_revision": settings.reranker_revision,
         "top_k": settings.top_k,
         "rerank_top_n": settings.rerank_top_n,
+        "reranker_max_length": settings.reranker_max_length,
+        "reranker_quantize": settings.reranker_quantize,
         "num_ctx_answer": settings.num_ctx_answer,
         "num_ctx_groundedness": settings.num_ctx_groundedness,
         "commit": _git_sha(),
