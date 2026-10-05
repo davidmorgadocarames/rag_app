@@ -891,6 +891,14 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
    right-size with a full equivalent (containerized, under real `/chat` load, matching block
    E's own methodology exactly) RSS re-measurement, not assumed equal to this one.
 
+   **Confirmation from the routine, unconstrained (28-thread) gate run itself** (the FINAL
+   `gate.sh --full` run on this block's head commit, `reranker_mode=shared`, the exact
+   methodology block E used — `eval/latency_results.json`, n=42, 14 golden questions × 3
+   runs): `rerank_inference` p50/p95 **709.1/768.5 ms** — not just the 2-thread number passes,
+   the ordinary unconstrained one does too, and by more (768.5 ms is 8.4 % of block E's old
+   9579.9 ms figure). `total` p50/p95 1343.3/3816.8 ms (was 9147.1/10545.2 ms) — the whole
+   answer pipeline, not just the reranker stage, is dramatically faster end to end.
+
    **Concurrency re-measurement with the adopted config (T11.5.1b; `rerank_concurrency=2`,
    `--concurrency N` against the shared, warmed `base_int8` reranker, 2-thread pinned):**
 
