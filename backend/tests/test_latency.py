@@ -158,6 +158,11 @@ def test_main_writes_the_baseline_json_with_require_stack_available(
     monkeypatch.setattr(latency, "_stack_available", lambda: True)
     monkeypatch.setattr(latency, "run_latency_benchmark", fake_run)
     monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
+    # No adopted baseline for this test (T11.6b.1): the routine comparison then FAILS (exit 1)
+    # but the JSON-writing plumbing under test still ran first -- see the assertions below.
+    monkeypatch.setattr(
+        latency, "ADOPTED_BASELINE_PATH", tmp_path / "latency_adopted_baseline.json"
+    )
 
     # --device gpu: avoids this process's CUDA_VISIBLE_DEVICES being mutated as a side
     # effect of the (CPU-labelled) default — irrelevant here, this test only checks the
@@ -165,7 +170,7 @@ def test_main_writes_the_baseline_json_with_require_stack_available(
     exit_code = latency.main(
         ["--out", str(out_path), "--require-stack", "--runs", "1", "--device", "gpu"]
     )
-    assert exit_code == 0
+    assert exit_code == 1
     assert out_path.exists()
     data = json.loads(out_path.read_text(encoding="utf-8"))
     assert data["n_runs"] == 1
@@ -180,8 +185,10 @@ def test_default_out_path_is_results_not_baseline_unless_update_baseline(
     final gate; same split as eval.gate's results.json/baseline_metrics.json)."""
     fake_baseline = tmp_path / "latency_baseline.json"
     fake_results = tmp_path / "latency_results.json"
+    fake_adopted = tmp_path / "latency_adopted_baseline.json"
     monkeypatch.setattr(latency, "BASELINE_PATH", fake_baseline)
     monkeypatch.setattr(latency, "RESULTS_PATH", fake_results)
+    monkeypatch.setattr(latency, "ADOPTED_BASELINE_PATH", fake_adopted)
     monkeypatch.setattr(latency, "EVAL_DIR", tmp_path)
     monkeypatch.setattr(latency, "_stack_available", lambda: True)
     monkeypatch.setattr(
@@ -193,7 +200,9 @@ def test_default_out_path_is_results_not_baseline_unless_update_baseline(
     )
     monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
 
-    assert latency.main(["--require-stack", "--runs", "1", "--device", "gpu"]) == 0
+    # No adopted baseline yet -> the routine run FAILS loudly (T11.6b.1: never silently
+    # "RECORDED", never silently skipped), but still writes RESULTS_PATH, never BASELINE_PATH.
+    assert latency.main(["--require-stack", "--runs", "1", "--device", "gpu"]) == 1
     assert fake_results.exists()
     assert not fake_baseline.exists()
 
@@ -202,6 +211,20 @@ def test_default_out_path_is_results_not_baseline_unless_update_baseline(
         == 0
     )
     assert fake_baseline.exists()
+
+    # --update-adopted-baseline writes ADOPTED_BASELINE_PATH, not BASELINE_PATH/RESULTS_PATH,
+    # and skips the comparison (this run IS the new reference).
+    assert (
+        latency.main(
+            ["--update-adopted-baseline", "--require-stack", "--runs", "1", "--device", "gpu"]
+        )
+        == 0
+    )
+    assert fake_adopted.exists()
+
+    # Now that an adopted baseline exists and matches this fake report's (empty) machine/
+    # stages, the routine run passes.
+    assert latency.main(["--require-stack", "--runs", "1", "--device", "gpu"]) == 0
 
 
 # --- T11.4.4 (block E): reranker_mode, warm-vs-cold, concurrency -------------------------
@@ -396,3 +419,154 @@ def test_main_warm_vs_cold_flag_writes_its_own_file_instead_of_the_normal_benchm
 
     assert latency.main(["--require-stack", "--warm-vs-cold"]) == 0
     assert json.loads(out_path.read_text(encoding="utf-8")) == recorded
+
+
+# --- T11.6b.1 (block G): the real pass/fail check against the adopted baseline -----------
+
+
+def _report(
+    stages_ms: dict[str, dict[str, float]], machine: dict[str, object] | None = None
+) -> latency.LatencyReport:
+    return latency.LatencyReport(
+        machine=machine or {}, n_runs=1, n_questions=1, runtime_s=0.1, stages_ms=stages_ms
+    )
+
+
+def _adopted_baseline(
+    stages_ms: dict[str, dict[str, float]], machine: dict[str, object] | None = None
+) -> dict[str, object]:
+    return {"machine": machine or {}, "stages_ms": stages_ms}
+
+
+def test_check_against_adopted_baseline_passes_within_tolerance() -> None:
+    baseline = _adopted_baseline(
+        {"rerank_inference": {"n": 1, "mean": 1000.0, "p50": 1000.0, "p95": 1024.5}}
+    )
+    report = _report({"rerank_inference": {"n": 1, "mean": 1100.0, "p50": 1100.0, "p95": 1100.0}})
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert result.ok
+    assert result.failures == []
+
+
+def test_check_against_adopted_baseline_fails_on_an_artificial_slowdown() -> None:
+    """Proves the step actually catches a regression: a stage whose p95 blows well past the
+    adopted baseline's own tolerance fails, with a human-readable reason naming the stage."""
+    baseline = _adopted_baseline(
+        {"rerank_inference": {"n": 1, "mean": 1000.0, "p50": 1000.0, "p95": 1024.5}}
+    )
+    # An artificial slowdown: ~10x the adopted baseline's p95, far outside the +50%/+25ms
+    # tolerance.
+    report = _report(
+        {"rerank_inference": {"n": 1, "mean": 10000.0, "p50": 10000.0, "p95": 10245.0}}
+    )
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert not result.ok
+    assert any("rerank_inference" in f for f in result.failures)
+
+
+def test_check_against_adopted_baseline_enforces_the_absolute_rerank_floor_regardless_of_tolerance() -> (  # noqa: E501
+    None
+):
+    """Even a stage that stays WITHIN the relative tolerance of a (hypothetically loose)
+    adopted baseline must still fail if rerank_inference's own p95 crosses the absolute 1.5s
+    floor (DA-11bE-2) -- the floor is a hard ceiling, never loosened by the baseline."""
+    from rag_app.eval.rerank_matrix import FLOOR_ABSOLUTE_MS
+
+    loose_p95 = FLOOR_ABSOLUTE_MS * 1.2  # the baseline itself is already above the floor
+    baseline = _adopted_baseline(
+        {"rerank_inference": {"n": 1, "mean": loose_p95, "p50": loose_p95, "p95": loose_p95}}
+    )
+    # Within +50%/+25ms of the (loose) baseline, but still over the absolute floor.
+    report = _report(
+        {"rerank_inference": {"n": 1, "mean": loose_p95, "p50": loose_p95, "p95": loose_p95}}
+    )
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert not result.ok
+    assert any("absolute" in f for f in result.failures)
+
+
+def test_check_against_adopted_baseline_fails_on_a_config_mismatch() -> None:
+    """A live config that no longer matches what the adopted baseline was measured with
+    (e.g. top_k changed without re-adopting a baseline) must fail loudly, not silently compare
+    incompatible numbers."""
+    baseline = _adopted_baseline(
+        {},
+        machine={
+            "reranker_model": "BAAI/bge-reranker-base",
+            "reranker_revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+            "top_k": 10,
+            "rerank_top_n": 4,
+        },
+    )
+    report = _report(
+        {},
+        machine={
+            "reranker_model": "BAAI/bge-reranker-base",
+            "reranker_revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+            "top_k": 20,
+            "rerank_top_n": 4,
+        },
+    )
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert not result.ok
+    assert any("config mismatch" in f and "top_k" in f for f in result.failures)
+
+
+def test_main_fails_without_an_adopted_baseline_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The step must FAIL (not silently pass/skip) when it has nothing to compare against."""
+    monkeypatch.setattr(latency, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(latency, "RESULTS_PATH", tmp_path / "latency_results.json")
+    monkeypatch.setattr(
+        latency, "ADOPTED_BASELINE_PATH", tmp_path / "latency_adopted_baseline.json"
+    )
+    monkeypatch.setattr(latency, "_stack_available", lambda: True)
+    monkeypatch.setattr(
+        latency,
+        "run_latency_benchmark",
+        lambda *_a, **_k: _report(
+            {"rerank_inference": {"n": 1, "mean": 1.0, "p50": 1.0, "p95": 1.0}}
+        ),
+    )
+    monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
+
+    assert latency.main(["--require-stack", "--runs", "1", "--device", "gpu"]) == 1
+
+
+def test_main_fails_when_the_run_itself_is_an_artificial_slowdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end (through main(), as gate.sh calls it): a fast, committed adopted baseline
+    plus a run that comes back 10x slower on rerank_inference fails the whole step."""
+    adopted_path = tmp_path / "latency_adopted_baseline.json"
+    adopted_path.write_text(
+        json.dumps(
+            _adopted_baseline(
+                {"rerank_inference": {"n": 1, "mean": 1000.0, "p50": 1000.0, "p95": 1024.5}}
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(latency, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(latency, "RESULTS_PATH", tmp_path / "latency_results.json")
+    monkeypatch.setattr(latency, "ADOPTED_BASELINE_PATH", adopted_path)
+    monkeypatch.setattr(latency, "_stack_available", lambda: True)
+    monkeypatch.setattr(
+        latency,
+        "run_latency_benchmark",
+        lambda *_a, **_k: _report(
+            {"rerank_inference": {"n": 1, "mean": 10000.0, "p50": 10000.0, "p95": 10245.0}}
+        ),
+    )
+    monkeypatch.setattr(latency, "make_session_factory", lambda: (lambda: _NullSessionCtx()))
+
+    assert latency.main(["--require-stack", "--runs", "1", "--device", "gpu"]) == 1

@@ -434,20 +434,29 @@ step_eval() {
   (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.gate --require-stack "${extra[@]}")
 }
 
-# T11.3.5/T11.4.4: records p50/p95 latency per stage over the golden set into
-# eval/latency_results.json (eval/latency_baseline.json only with --update-baseline, never
-# from here) — no pass/fail threshold yet in this block (T11.6b.1 adds one, comparing against
-# the baseline an earlier block "adopts"). Same offline-reranker requirement as `eval`.
+# T11.3.5/T11.4.4/T11.6b.1: records p50/p95 latency per stage over the golden set and compares
+# it against the ADOPTED baseline (eval/latency_adopted_baseline.json, git-tracked, written
+# only via --update-adopted-baseline) -- a real pass/fail step. Writes the git-ignored
+# eval/latency_results.json every run (eval/latency_baseline.json, the FROZEN "before", is
+# untouched unless --update-baseline is passed explicitly via LATENCY_EXTRA_ARGS). Same
+# offline-reranker requirement as `eval`.
+# OMP_NUM_THREADS/MKL_NUM_THREADS=2 (T11.6b.1): pins every invocation of this module to 2
+# threads, matching Azure's 2-vCPU container and the number the absolute rerank floor (<=1.5s,
+# DA-11bE-2) is judged on -- must be set in the environment before the interpreter starts
+# (native libs read these at load time); rag_app.eval.latency.main() ALSO calls
+# torch.set_num_threads(2) defensively. This makes the step's own numbers host-independent
+# (dev box, CI runner, Azure all measure the SAME thing), not just the matrix screening.
 # LATENCY_EXTRA_ARGS (opt-in, unset by default — a routine run is unaffected): extra flags for
 # ad-hoc one-off measurements against the isolated gate stack (T11.4.4's --reranker-mode
-# warm-single "before, warm" reference, --warm-vs-cold, --concurrency N), never used by a
-# routine `--fast`/`--full`/CI run.
+# warm-single "before, warm" reference, --warm-vs-cold, --concurrency N, or T11.6b.1's
+# --update-adopted-baseline), never used by a routine `--fast`/`--full`/CI run.
 step_latency() {
   need_venv || return 1
   local extra=()
-  # shellcheck disable=SC2206 # our own space-separated flag list (ad-hoc T11.4.4 runs only)
+  # shellcheck disable=SC2206 # our own space-separated flag list (ad-hoc one-off runs only)
   [ -n "${LATENCY_EXTRA_ARGS:-}" ] && extra=($LATENCY_EXTRA_ARGS)
-  (cd backend && HF_HUB_OFFLINE=1 "$PY" -m rag_app.eval.latency --require-stack "${extra[@]}")
+  (cd backend && HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+    "$PY" -m rag_app.eval.latency --require-stack "${extra[@]}")
 }
 
 # --- backend venv matching the pins (DA-B-4) --------------------------------------------
