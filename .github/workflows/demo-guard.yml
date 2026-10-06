@@ -1,0 +1,79 @@
+name: Demo guard
+
+# Hourly safety net for demo mode (scripts/azure/demo-mode.sh, T11.6b.7). Scales ANY of the
+# 3 apps (backend, Ollama, frontend) whose `secrag-demo-until` tag has passed, or that has
+# min-replicas=1 with no tag at all, back to min-replicas 0 (scripts/azure/demo-guard.sh).
+# It can ONLY scale DOWN — demo-guard.sh has no code path that raises min-replicas, and
+# never touches max-replicas, env vars or secrets. Runs on GitHub (not the user's machine),
+# so a forgotten demo still switches itself off even with the PC off.
+#
+# OIDC (runbook gotcha 8, immutable federated-credential subject): a `schedule` trigger
+# only ever fires off the DEFAULT branch, so the GitHub Actions OIDC token's `sub` claim is
+# `repo:<owner>/<repo>:ref:refs/heads/main` — the exact same subject the existing federated
+# credential already allows for cd.yml's push-to-main deploys. No federated-credential
+# change needed (verified against cd.yml's own working OIDC login; re-confirmed by the
+# orchestrator on the first real run per the block H report). No job uses `environment:`
+# either, so the subject never becomes `environment:<name>` instead.
+on:
+  schedule:
+    - cron: "7 * * * *" # hourly, offset 7 minutes past the hour (avoid the GitHub top-of-hour spike)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report only; never call az (and skip the Azure login entirely)"
+        type: boolean
+        default: true
+
+# Real guard runs are serialised (never two scale-down passes in flight at once); dry runs
+# never touch Azure, so they do not need to wait on anything.
+concurrency:
+  group: demo-guard
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Scale down an expired demo (never up)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC (skipped entirely on a dry run — see the login step's `if`)
+      contents: read
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
+      AZURE_OLLAMA_APP: ${{ vars.AZURE_OLLAMA_APP }}
+      AZURE_FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/azure
+
+      - name: Dry run?
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Skipped entirely on a dry run: a workflow_dispatch dry run never talks to Azure, not
+      # even to log in (no OIDC token is even requested).
+      - name: Azure login (OIDC federated credentials)
+        if: steps.mode.outputs.dry_run == 'false'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Guard (scale down only)
+        run: |
+          if [ "${{ steps.mode.outputs.dry_run }}" = "true" ]; then
+            bash scripts/azure/demo-guard.sh --dry-run
+          else
+            az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+            bash scripts/azure/demo-guard.sh
+          fi
