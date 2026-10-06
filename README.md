@@ -453,19 +453,27 @@ files (`rag_app/__init__.py`, `rag_app/config.py`) `get_settings()` needs, befor
 `src/` — so an ordinary code-only commit reuses the cached layer instead of re-downloading the
 snapshot (DA-11bC-1; CI also caches it, `type=gha`).
 
-**Custom Ollama image (T11.4.3).** `ollama/Dockerfile`: `FROM ollama/ollama@sha256:…` (a
-specific, digest-pinned release — never `:latest`, which floats) with `bge-m3` pulled into the
-image's model store at build time (start the server, wait, pull, stop — the only way to bake
-an Ollama model). Fixes the Azure `secrag-ollama` ephemeral-storage loss (today's container
-runs `docker.io/ollama/ollama:latest` and drops the pulled model on every scale-to-zero /
+**Custom Ollama image (T11.4.3, slimmed in T11.6b.6b).** `ollama/Dockerfile` is two-stage:
+`builder` is `FROM ollama/ollama@sha256:…` (a specific, digest-pinned release — never
+`:latest`, which floats) with `bge-m3` pulled into the image's model store at build time
+(start the server, wait, pull, stop — the only way to bake an Ollama model); `final` is
+`FROM ubuntu:24.04@sha256:…` (the EXACT base the upstream release itself ships, same glibc
+ABI) with only the CPU `libggml-cpu-*.so` backends + the model store copied in — the GPU-only
+backends (`cuda_v12`, `cuda_v13`, `mlx_cuda_v13`, `vulkan`) are dropped, shrinking the image
+from 4.83 GB to 1.12 GB (`docker image inspect`). Fixes the Azure `secrag-ollama` ephemeral-
+storage loss (a bare `ollama/ollama:latest` drops the pulled model on every scale-to-zero /
 replica restart — runbook gotcha 4): a fresh container embeds with **no** `ollama pull` ever
-needed again. Proven offline the same way as the reranker — a throwaway `docker run --network
-none` container's `/api/embed` returns a real embedding vector (CI's `ollama-image` job,
-`ci.yml`). CD builds, pushes and deploys this image to `secrag-ollama` **before**
+needed again, and a much smaller image to pull on a cold start (block H: the fat image's pull
+time was the actual root cause of the first promotion's cold-start failure, fixed together
+with a longer embed-wait timeout — `EMBED_TIMEOUT_SECONDS`, see
+[Architecture decision records](#architecture-decision-records)). Proven offline the same way
+as the reranker — a throwaway `docker run --network none` container's `/api/embed` returns a
+real embedding vector, bit-identical to the fat image's (CI's `ollama-image` job, `ci.yml`).
+CD builds, pushes and deploys this image to `secrag-ollama` **before**
 `secrag-backend`/`secrag-frontend` (the backend calls Ollama synchronously for embeddings, so
 it must already be serving the baked-in model before the backend's new revision takes
-traffic). See `docs/adr/adr_phase11_stability.md` decision 8 for the pinned digests, image
-size and the full reasoning.
+traffic). See `docs/adr/adr_phase11_stability.md` decisions 8 and 11 for the pinned digests,
+image size and the full reasoning.
 
 ### Recovering from a changed master key
 
@@ -575,6 +583,34 @@ The gate step `erasure-scale` erases synthetic users with 100,000 messages each 
 concurrent login and listing load and checks the request stays under 200 ms (measured:
 35-74 ms), the connection pool is never exhausted, no lock error reaches another request and
 a purger killed mid-way is completed by the next run.
+
+### Demo mode
+
+Azure runs all three apps (backend, Ollama, frontend) at **min-replicas 0** by default — no
+traffic, no cost, but a cold start (a fresh replica + the Ollama model it needs) takes long
+enough that the very first question after a while can be slow. Demo mode trades that off for
+a few hours when someone actually wants to try the app live (an interview, a quick demo):
+
+```bash
+export AZURE_RESOURCE_GROUP=rg-secrag AZURE_BACKEND_APP=secrag-backend \
+       AZURE_OLLAMA_APP=secrag-ollama AZURE_FRONTEND_APP=secrag-frontend
+scripts/azure/demo-mode.sh on       # wakes the 3 apps, waits for them, checks /health
+scripts/azure/demo-mode.sh status   # state, end time, approximate cost so far
+scripts/azure/demo-mode.sh off      # back to min-replicas 0 right away
+```
+
+- `on` sets **min-replicas 1** (max stays pinned at **1** — this never scales the app wider,
+  only keeps one replica warm) and tags every app `secrag-demo-until=<now + 3h>` — a
+  **fixed** 3 hours, not configurable. Running `on` again while a demo is already active only
+  **extends** that tag to a new `now + 3h`; an app that is already awake is never restarted.
+  `on` never touches an app's environment variables or secrets.
+- `off` sets min-replicas back to 0 and removes the tag.
+- An hourly GitHub Actions workflow (`.github/workflows/demo-guard.yml`,
+  `scripts/azure/demo-guard.sh`) is the safety net: it scales any app whose tag has expired
+  (or that is awake with no tag at all — e.g. changed by hand) back to 0, even if the
+  machine that ran `demo-mode.sh on` is off. It can only ever scale **down**.
+- Running Ollama 24/7 instead (no cold start, ever) was costed and **not approved** — see
+  ADR 11, decision 11 — it is a future budget decision, not the default.
 
 ## API at a glance
 

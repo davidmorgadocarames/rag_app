@@ -206,7 +206,7 @@ fingerprint"). With the fingerprint check mutated away, that step FAILS with
 
 ## Decisions
 
-Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8 is 11b.
+Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 8 and 11 are 11b.
 
 1. Fixed development volume and an isolated gate project. *Landed in 11.0 (gate part):*
    `compose.gate.yml` (project `secrag-gate`, volume `secrag_gate_pgdata`, DB on
@@ -1071,6 +1071,81 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decision 8
     scale-to-zero billing, so the cost model under [Costs](#costs) is unchanged. Every
     `az containerapp update` in this ADR is written without a revision suffix — the form that
     was tested.
+11. (11b block H, 2026-10-06) Cold-start fix: configurable embed wait, slim Ollama image,
+    demo mode.
+    **Why:** the first 11b promotion smoke (T11.6b.5, `main` = `5a4dc91`) passed every warm
+    check (p50/p95 3.8/6.0 s, rerank p95 981 ms, 3+3 concurrent OK) but the cold-start
+    question answered **HTTP 500 at 183 s**: the backend woke in ~60 s, then Azure pulled the
+    6.3 GB `secrag-ollama` image (fat, T11.4.3) in ~130 s, and `embeddings.py`'s hard-coded
+    120 s timeout fired before the pull even finished — the backend never got a chance to
+    reach the now-ready Ollama.
+    **T11.6b.6 — configurable embed wait.** `OllamaEmbedder`'s httpx timeout now comes from
+    `Settings.embed_timeout_seconds` (`EMBED_TIMEOUT_SECONDS`, default **170 s**, was the
+    module constant `_TIMEOUT_SECONDS = 120`) — the SAME value for `/chat` and
+    `/chat/stream`, since both reach it only through the one `rag_app.retrieval` path
+    (neither endpoint builds its own embedder with an override; guarded by an AST scan over
+    `retrieval.py` and `api/*.py`). Budget: backend cold ~60 s + embed wait ≤170 s + answer
+    ~5 s ≈ 235 s, under Azure's own ingress cutoff (~240 s) — waiting any longer would be cut
+    by the ingress first, not by this setting. `validate_api_settings` now rejects a
+    non-positive value (fail-closed).
+    **T11.6b.6b — slim Ollama image.** The single-stage `ollama/Dockerfile` became
+    two-stage: `builder` is still the pinned fat `ollama/ollama@sha256:292ee794…` release
+    (v0.35.1), used only to `ollama pull bge-m3` into its model store (unchanged from
+    T11.4.3); `final` is `ubuntu:24.04` pinned by digest
+    (`sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55`) — confirmed
+    (`/etc/os-release`, `ldd --version`) to be the **exact** base image the upstream
+    `ollama/ollama` release itself ships (Ubuntu 24.04.5 LTS, glibc 2.39), so the copied
+    `/bin/ollama` binary and its CPU-backend `.so` files need no ABI shim and carry no
+    Debian/distroless `GLIBC_x not found` risk. Only the CPU runtime is copied into `final`:
+    every `libggml-cpu-*.so` variant (one glob — `alderlake`, `cannonlake`, `cascadelake`,
+    `cooperlake`, `haswell`, `icelake`, `ivybridge`, `piledriver`, `sandybridge`,
+    `sapphirerapids`, `skylakex`, `sse42`, `x64`, `zen4` today), the shared
+    `libggml-base`/`libggml`/`libllama*`/`libmtmd` libraries, `libgomp`, the
+    `llama-quantize`/`llama-server` CLI helpers, the upstream licence/notice files, and the
+    model store (`/root/.ollama`, including the already-pulled `bge-m3`); `ca-certificates`
+    is installed fresh (a bare `ubuntu:24.04` ships none). The GPU-only backend directories
+    (`cuda_v12`, `cuda_v13`, `mlx_cuda_v13`, `vulkan` — measured at 1.3 + 0.817 + 2.7 +
+    0.042 = 4.86 GB of the fat image's `/usr/lib/ollama`) are never copied. Measured locally
+    (`docker image inspect --format '{{.Size}}'`, the accurate on-disk size — plain
+    `docker images` over-counts a buildx-attested local image by roughly 2×): **fat 4.83 GB
+    → slim 1.12 GB** (image: `secrag-ollama:slim-test`, built from this ADR's final
+    Dockerfile). Offline (`--network none`) embed still works; the baked `bge-m3` digest is
+    unchanged
+    (`7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`); embeddings are
+    **bit-identical** to the pre-block-H fat image
+    (`ghcr.io/…/rag_app-ollama@sha256:b42072fd32731e0456cce1128f878b6f98aaf048538e3be55a757f7da131cf03`,
+    the digest actually deployed for the first 11b smoke) on 5 fixed texts: cosine
+    `1.000000000000`, byte-for-byte equal 1024-dim vectors, both containers run with
+    `--network none`. `test_ollama_image.py` pins both stages by digest and guards the
+    final stage's file layout (every `libggml-cpu-*.so` + the model store kept, no GPU
+    directory ever referenced by a `COPY`) — all new assertions fail on the old
+    single-stage Dockerfile.
+    **T11.6b.7/8 — demo mode + guard.** `scripts/azure/demo-mode.sh on|off|status` wakes the
+    3 apps (backend, Ollama, frontend) to min-replicas **1** (max stays pinned at 1) for a
+    **fixed 3 h** window tagged `secrag-demo-until` on each app (`az tag update --operation
+    merge`, never touching any other tag, env var or secret); re-running `on` while a demo
+    is active only extends the tag — an app already at min=1 is never re-updated, so there
+    is no restart. `off` returns every app to min 0 and removes the tag. `status` reports
+    each app's state and an approximate running cost from the tag's start time
+    (`DEMO_MODE_HOURLY_COST_EUR`, default 0.17 EUR/h for the 3 apps together — PHASE_PLANNING
+    §2.2 estimate: ≈0.15–0.17 EUR/h, ≤ ~0.65 EUR per 3 h+guard-lag activation).
+    `.github/workflows/demo-guard.yml` runs `scripts/azure/demo-guard.sh` **hourly** (cron)
+    and on `workflow_dispatch` (a `dry_run` input, default true, that skips the Azure login
+    step — and therefore the OIDC token request — entirely): it scales any app with
+    min-replicas=1 whose tag has passed, or that has no tag at all, back to 0; there is no
+    code path in it that raises min-replicas, and its fake-`az` tests include one that
+    refuses outright if the script ever asked for anything but `--min-replicas 0`. **OIDC
+    risk, checked before writing the workflow (the task's explicit gate):** a GitHub Actions
+    `schedule` trigger only ever fires off the repository's default branch, so its OIDC
+    token's `sub` claim is `repo:<owner>/<repo>:ref:refs/heads/main` — the exact subject the
+    existing federated credential already allows for `cd.yml`'s push-to-main deploys (no
+    `environment:` key is used in `demo-guard.yml` either, so the subject can never become
+    `environment:<name>` instead). No federated-credential change was needed; the
+    orchestrator re-confirms this on the workflow's first real scheduled/dispatched run.
+    **Not done here:** Ollama running 24/7 (no demo mode, no scale-to-zero) was **not
+    approved** — at Azure Container Apps' price per vCPU-second/GiB-second this is
+    ≈1.8 EUR/day (≈54 EUR/month) for the Ollama app alone, against a 40 EUR/year budget; left
+    as an explicit future budget decision, not a default.
 
 ## Key recovery (D-2026-09-29-2)
 
