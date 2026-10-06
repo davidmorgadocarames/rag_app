@@ -201,10 +201,16 @@ jobs:
         run: docker images secrag-backend:ci --format "{{.Size}}"
 
   # Custom Ollama image (T11.4.3): `bge-m3` baked in at build time (fixes the Azure
-  # `secrag-ollama` ephemeral-storage loss — ADR phase 11, runbook gotcha 4). Measured
-  # locally: ~6.3 GB on-disk (`du`), build ~40s (base image layers cached after the first
-  # pull); fits a GH-hosted runner's disk/time budget the same way backend-image (~3.9 GB)
-  # already does — `df -h` below records the real runner numbers for the record.
+  # `secrag-ollama` ephemeral-storage loss — ADR phase 11, runbook gotcha 4). T11.6b.6b
+  # (block H) made the final stage slim: `ubuntu:24.04` pinned by digest (the exact base
+  # `ollama/ollama` itself ships, same glibc 2.39 ABI) with only the CPU `libggml-cpu-*.so`
+  # backends + the model store copied in, GPU backends (`cuda_v12`, `cuda_v13`,
+  # `mlx_cuda_v13`, `vulkan`) dropped. Measured locally (`docker image inspect
+  # --format '{{.Size}}'`, the accurate on-disk size — `docker images`' own `Size` column
+  # over-counts a buildx-attested local image): fat baseline 4.83 GB -> slim 1.12 GB;
+  # build ~50s (base image layers cached after the first pull); fits a GH-hosted runner's
+  # disk/time budget the same way backend-image (~3.9 GB) already does — `df -h` below
+  # records the real runner numbers for the record.
   ollama-image:
     name: Ollama image (build, bge-m3 baked in, offline embed)
     runs-on: ubuntu-latest
@@ -246,7 +252,9 @@ jobs:
           docker rm -f secrag-ollama-ci-embed
       - name: Image size (informational; ADR records a local before/after) and disk space after
         run: |
-          docker images secrag-ollama:ci --format "{{.Size}}"
+          # `docker image inspect .Size` is the accurate on-disk size; `docker images`'
+          # own `Size` column over-counts a buildx-attested local image (block H finding).
+          docker image inspect secrag-ollama:ci --format "{{.Size}} bytes"
           df -h /
 
   gitleaks:
