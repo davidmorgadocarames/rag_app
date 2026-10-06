@@ -222,9 +222,9 @@ def test_workflow_calls_demo_guard_sh_and_skips_azure_login_on_a_dry_run() -> No
     assert "demo-guard.sh" in text
     assert "--dry-run" in text
     login_step = next(s for s in job["steps"] if "azure/login" in str(s.get("uses", "")))
-    assert login_step.get("if") == "steps.mode.outputs.dry_run == 'false'", (
-        "a dry run must skip the Azure login step entirely (no OIDC token requested)"
-    )
+    assert (
+        login_step.get("if") == "steps.mode.outputs.dry_run == 'false'"
+    ), "a dry run must skip the Azure login step entirely (no OIDC token requested)"
 
 
 def test_workflow_never_uses_the_environment_key() -> None:
@@ -242,6 +242,6 @@ def test_workflow_never_grants_write_permissions_beyond_id_token() -> None:
     workflow = _workflow()
     for job in workflow["jobs"].values():
         for scope, level in job.get("permissions", {}).items():
-            assert level == "read" or scope == "id-token", (
-                f"unexpected write permission: {scope}={level}"
-            )
+            assert (
+                level == "read" or scope == "id-token"
+            ), f"unexpected write permission: {scope}={level}"

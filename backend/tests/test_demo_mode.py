@@ -19,9 +19,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEMO_MODE = REPO_ROOT / "scripts" / "azure" / "demo-mode.sh"
 
-needs_tools = pytest.mark.skipif(
-    shutil.which("bash") is None, reason="needs bash"
-)
+needs_tools = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 APPS = {"backend": "b", "ollama": "o", "frontend": "f"}
 TAG_KEY = "secrag-demo-until"
@@ -162,7 +160,9 @@ def test_on_never_restarts_an_already_active_app_only_extends_the_tag(tmp_path: 
     assert second.returncode == 0, second.stderr
     updates_after = sum(1 for line in _log(tmp_path) if line.startswith("containerapp update"))
 
-    assert updates_after == updates_before, "an already min-replicas=1 app must not be updated again"
+    assert (
+        updates_after == updates_before
+    ), "an already min-replicas=1 app must not be updated again"
     state = _state(tmp_path)
     for app in APPS.values():
         assert state[app]["tag"] >= first_tag[app]

@@ -76,22 +76,20 @@ def test_final_stage_copies_every_cpu_backend_but_no_gpu_backend() -> None:
     store (`/root/.ollama`) is copied in, and none of the GPU-only backend directories are
     ever referenced by a COPY instruction."""
     (_, _builder_text), (_, final_text) = _stages(_text())
-    assert re.search(r"COPY --from=builder\s+/usr/lib/ollama/libggml-cpu-\*\.so\b", final_text), (
-        "the final stage must copy every libggml-cpu-*.so variant via one glob"
-    )
-    assert re.search(r"COPY --from=builder\s+/root/\.ollama\b", final_text), (
-        "the final stage must copy the model store (/root/.ollama) from the builder"
-    )
-    assert re.search(r"COPY --from=builder\s+/bin/ollama\b", final_text), (
-        "the final stage must copy the /bin/ollama binary from the builder"
-    )
-    copy_lines = [
-        line for line in final_text.splitlines() if line.strip().startswith("COPY")
-    ]
+    assert re.search(
+        r"COPY --from=builder\s+/usr/lib/ollama/libggml-cpu-\*\.so\b", final_text
+    ), "the final stage must copy every libggml-cpu-*.so variant via one glob"
+    assert re.search(
+        r"COPY --from=builder\s+/root/\.ollama\b", final_text
+    ), "the final stage must copy the model store (/root/.ollama) from the builder"
+    assert re.search(
+        r"COPY --from=builder\s+/bin/ollama\b", final_text
+    ), "the final stage must copy the /bin/ollama binary from the builder"
+    copy_lines = [line for line in final_text.splitlines() if line.strip().startswith("COPY")]
     for gpu_dir in _DROPPED_GPU_DIRS:
-        assert not any(gpu_dir in line for line in copy_lines), (
-            f"the final stage must never COPY the GPU-only '{gpu_dir}' directory"
-        )
+        assert not any(
+            gpu_dir in line for line in copy_lines
+        ), f"the final stage must never COPY the GPU-only '{gpu_dir}' directory"
 
 
 def test_embed_model_matches_the_app_settings() -> None:
