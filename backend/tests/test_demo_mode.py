@@ -78,6 +78,9 @@ elif args[:2] == ["tag", "update"]:
     tags = val("--tags")
     st = app_state(app)
     if op == "merge":
+        fail_for = os.environ.get("FAKE_AZ_FAIL_TAG_MERGE_FOR", "").split(",")
+        if app in fail_for:
+            sys.exit(1)
         key, _, value = tags.partition("=")
         assert key == "secrag-demo-until"
         st["tag"] = value
@@ -90,7 +93,8 @@ else:
 json.dump(state, open(state_path, "w"))
 """
 
-FAKE_CURL = "#!/bin/sh\nprintf '200'\n"
+# FAKE_CURL_STATUS lets a test make the final /health check fail (default: 200, healthy).
+FAKE_CURL = "#!/bin/sh\nprintf '%s' \"${FAKE_CURL_STATUS:-200}\"\n"
 
 
 def _env(tmp_path: Path, **extra: str) -> dict[str, str]:
@@ -260,3 +264,127 @@ def test_missing_required_flags_are_refused(tmp_path: Path) -> None:
     proc = _run("on", env=env)
     assert proc.returncode != 0
     assert "--rg is required" in proc.stderr
+
+
+# --- DA-11bH-1: `status` must aggregate across ALL THREE apps, not latch on the first
+# app that looks awake. Red on the pre-fix code: it only ever set overall="on" once and
+# never downgraded it for a later app with min=0, so a mixed state (e.g. Ollama asleep
+# while backend/frontend are awake) was misreported as "on". ---
+
+
+@needs_tools
+def test_status_reports_partial_when_one_app_is_asleep_and_the_others_are_on(
+    tmp_path: Path,
+) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    # put Ollama back to sleep by hand (e.g. demo-guard.sh scaled it, or a manual edit),
+    # leaving backend/frontend awake with a still-future tag.
+    state_path = tmp_path / "az.json"
+    state = json.loads(state_path.read_text())
+    state[APPS["ollama"]]["min"] = "0"
+    state[APPS["ollama"]]["tag"] = ""
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: partial" in proc.stdout
+    assert "state: on" not in proc.stdout
+
+
+@needs_tools
+def test_status_reports_partial_not_on_for_any_mix_of_awake_and_asleep_apps(
+    tmp_path: Path,
+) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    state_path = tmp_path / "az.json"
+    state = json.loads(state_path.read_text())
+    # two apps asleep, only the backend awake.
+    for app in (APPS["ollama"], APPS["frontend"]):
+        state[app]["min"] = "0"
+        state[app]["tag"] = ""
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: partial" in proc.stdout
+    assert "state: on" not in proc.stdout
+
+
+@needs_tools
+def test_status_reports_expired_even_when_other_apps_are_cleanly_off(tmp_path: Path) -> None:
+    """A min=1 app with a bad tag must force "expired", even if every other app is
+    cleanly asleep (min=0) — a bad tag is a problem demo-guard.sh needs to clean up, not
+    a "partial"/"off" mix."""
+    env = _env(tmp_path)
+    state_path = tmp_path / "az.json"
+    state = {
+        APPS["backend"]: {"min": "1", "tag": "", "running": "Running"},
+        APPS["ollama"]: {"min": "0", "tag": "", "running": "Running"},
+        APPS["frontend"]: {"min": "0", "tag": "", "running": "Running"},
+    }
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: expired" in proc.stdout
+
+
+# --- DA-11bH-2: `on` must not leave apps up with a valid future tag if the wait/Running
+# check or the final /health check fails: on such a failure it must roll back (every app
+# it touched back to min-replicas 0, every tag it wrote removed) and exit non-zero. ---
+
+
+@needs_tools
+def test_on_rolls_back_when_the_running_check_fails_after_tagging(tmp_path: Path) -> None:
+    env = _env(tmp_path, AZURE_DEMO_RUNNING_TIMEOUT_SECONDS="0", FAKE_AZ_RUNNING_SEQ="Waiting")
+    proc = _run("on", env=env)
+    assert proc.returncode != 0
+    assert "did not reach Running" in proc.stderr
+    assert "rolled back" in proc.stderr or "rolling back" in proc.stdout
+    state = _state(tmp_path)
+    for app in APPS.values():
+        assert state[app]["min"] == "0", f"{app} must be rolled back to min-replicas 0"
+        assert state[app]["tag"] == "", f"{app} must not keep a tag after a rolled-back 'on'"
+
+
+@needs_tools
+def test_on_rolls_back_when_the_final_health_check_fails(tmp_path: Path) -> None:
+    env = _env(tmp_path, AZURE_DEMO_HEALTH_TIMEOUT_SECONDS="0", FAKE_CURL_STATUS="500")
+    proc = _run("on", env=env)
+    assert proc.returncode != 0
+    assert "rolled back" in proc.stderr or "rolling back" in proc.stdout
+    state = _state(tmp_path)
+    for app in APPS.values():
+        assert state[app]["min"] == "0", f"{app} must be rolled back to min-replicas 0"
+        assert state[app]["tag"] == "", f"{app} must not keep a tag after a rolled-back 'on'"
+
+
+@needs_tools
+def test_on_rolls_back_the_apps_already_scaled_when_tagging_fails(tmp_path: Path) -> None:
+    """Failure "after scaling": every app is already at min-replicas 1 (the scale loop
+    ran to completion) when the FIRST tag write fails -- the two already-scaled apps must
+    still be rolled back, even though no tag was ever written for any of them."""
+    env = _env(tmp_path, FAKE_AZ_FAIL_TAG_MERGE_FOR=APPS["ollama"])
+    proc = _run("on", env=env)
+    assert proc.returncode != 0
+    assert "rolled back" in proc.stderr or "rolling back" in proc.stdout
+    state = _state(tmp_path)
+    for app in APPS.values():
+        assert state[app]["min"] == "0", f"{app} must be rolled back to min-replicas 0"
+        assert state[app]["tag"] == "", f"{app} must not keep a tag after a rolled-back 'on'"
+
+
+@needs_tools
+def test_on_never_restarts_an_already_active_app_only_extends_the_tag_still_holds_after_h2(
+    tmp_path: Path,
+) -> None:
+    """Guard against a regression where the rollback/do_on refactor (block H2) would make
+    `on` re-scale an already min-replicas=1 app."""
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    updates_before = sum(1 for line in _log(tmp_path) if line.startswith("containerapp update"))
+    assert _run("on", env=env).returncode == 0
+    updates_after = sum(1 for line in _log(tmp_path) if line.startswith("containerapp update"))
+    assert updates_after == updates_before
