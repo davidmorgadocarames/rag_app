@@ -603,8 +603,19 @@ scripts/azure/demo-mode.sh off      # back to min-replicas 0 right away
   only keeps one replica warm) and tags every app `secrag-demo-until=<now + 3h>` — a
   **fixed** 3 hours, not configurable. Running `on` again while a demo is already active only
   **extends** that tag to a new `now + 3h`; an app that is already awake is never restarted.
-  `on` never touches an app's environment variables or secrets.
+  `on` never touches an app's environment variables or secrets. If waiting for the apps to
+  report `Running` or the final `/health` check fails, `on` rolls back everything it changed
+  (every app it scaled goes back to min-replicas 0, every tag it wrote is removed) before
+  exiting non-zero — it never leaves apps up with a future tag but no working demo
+  (DA-11bH-2).
 - `off` sets min-replicas back to 0 and removes the tag.
+- `status` reports one of four states, by checking **every** app individually: **`on`** only
+  if all three apps have min-replicas 1 AND a future `secrag-demo-until` tag; **`expired`** if
+  any app has min-replicas 1 with a missing, expired or malformed tag (demo-guard will scale
+  it down within the hour); **`off`** only if all three apps have min-replicas 0; **`partial`**
+  for any other mix (e.g. Ollama asleep while backend/frontend are awake) — a state that is
+  deliberately never reported as `on`, since a demo is not actually ready if even one app
+  could still cold-start-fail the first question (DA-11bH-1).
 - An hourly GitHub Actions workflow (`.github/workflows/demo-guard.yml`,
   `scripts/azure/demo-guard.sh`) is the safety net: it scales any app whose tag has expired
   (or that is awake with no tag at all — e.g. changed by hand) back to 0, even if the

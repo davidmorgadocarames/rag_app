@@ -1146,6 +1146,27 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
     approved** — at Azure Container Apps' price per vCPU-second/GiB-second this is
     ≈1.8 EUR/day (≈54 EUR/month) for the Ollama app alone, against a 40 EUR/year budget; left
     as an explicit future budget decision, not a default.
+    **Fix block H2 (2026-10-06, DA review follow-up).** `demo-mode.sh status` now computes
+    the overall state as a per-app aggregation rather than a one-way latch: `on` only if
+    **all three** apps are min-replicas 1 with a future `secrag-demo-until` tag; `expired` if
+    **any** app is min-replicas 1 with a missing/expired/malformed tag; `off` only if **all
+    three** are min-replicas 0; a mixed case (e.g. Ollama asleep while the other two are
+    awake) now reports a distinct `partial` state instead of a false `on` (DA-11bH-1 — the
+    old code never downgraded `on` once set, so one asleep app could be hidden). `on` also
+    now rolls back (scales every app it touched back to 0, removes every tag it wrote) and
+    exits non-zero if the post-scale `Running` wait or the final `/health` check fails,
+    instead of leaving apps up with a valid future tag but no actually-ready demo
+    (DA-11bH-2). `EMBED_TIMEOUT_SECONDS` now has an upper bound, `EMBED_TIMEOUT_MAX_SECONDS
+    = 230`, enforced fail-closed by `validate_api_settings` alongside the existing `> 0`
+    check (DA-11bH-4) — above it the ~240 s Azure ingress cutoff always wins the race,
+    turning a clear timeout error into a confusing generic ingress one. **Accepted, not
+    fixed (DA-11bH-3, DA-11bH-5):** GitHub disables a repository's `schedule` trigger after
+    60 days with no commits/pushes, which would silently stop `demo-guard.yml`; and the
+    guard's only failure signal is GitHub's default "email the actor on a failed scheduled
+    run" behaviour, with no extra alert added. Both are accepted as-is: the fixed 3 h window
+    in `demo-mode.sh on` does not depend on the guard running at all (it is a backstop for a
+    forgotten `off`, not the mechanism that bounds cost), so neither gap changes the actual
+    cost ceiling per activation.
 
 ## Key recovery (D-2026-09-29-2)
 
