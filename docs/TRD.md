@@ -115,6 +115,24 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
   embedding model weights are downloaded at **image build time**, not on first request/cold
   start, removing the old "wait for a multi-GB download" cold-start risk entirely (measured
   cold-start numbers: ADR 11 decision 8).
+- **Cold start, block H (T11.6b.6-6b, 11b):** the model being baked in does not remove the
+  cold-start **image pull** itself — a fresh Container Apps replica still has to pull the
+  (large) Ollama image from GHCR before it can serve. The 2026-10-06 smoke measured this at
+  130s for the pre-block-H fat image (6.3 GB on GHCR) vs. a hard-coded 120s embed-wait
+  timeout in the backend, so the backend answered HTTP 500 before Ollama had even finished
+  waking up. Two independent fixes: (1) `EMBED_TIMEOUT_SECONDS` (default **170s**, was a
+  module constant) is the SAME setting for `/chat` and `/chat/stream` — backend cold ~60s +
+  embed wait ≤170s + answer ~5s ≈ 235s, under Azure ingress's ~240s cutoff (waiting longer
+  is useless: the ingress cuts the request first); (2) the Ollama image's **final stage is
+  now slim** — `ubuntu:24.04` pinned by digest (the exact base `ollama/ollama` itself ships,
+  so no ABI shim) with only the CPU `libggml-cpu-*.so` backends + the `bge-m3` model store
+  copied in, dropping the GPU-only backends (`cuda_v12`, `cuda_v13`, `mlx_cuda_v13`,
+  `vulkan`) this CPU-only Azure instance never loads — measured locally at 1.12 GB vs. the
+  fat image's 4.83 GB (`docker image inspect .Size`), so the GHCR pull itself is much
+  faster. Embeddings are bit-identical (cosine 1.0 on fixed texts) and the baked `bge-m3`
+  digest is unchanged (`7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`).
+  Demo mode (README "Demo mode") sidesteps the cold start entirely for a bounded window.
+  Full numbers: ADR 11 decision 9.
 - **The `latency` gate step** (T11.6b.1) is a real pass/fail check: a routine run's p50/p95
   per stage is compared against a committed, 2-thread-pinned *adopted* baseline
   (`eval/latency_adopted_baseline.json`, distinct from the frozen "before" baseline) with a

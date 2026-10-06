@@ -100,6 +100,18 @@ class Settings(JobSettings):
     ollama_host: str = "http://localhost:11434"
     llm_model: str = "qwen2.5:7b-instruct-q4_K_M"
     embed_model: str = "bge-m3"
+    # T11.6b.6 (block H, 11b): how long `OllamaEmbedder.embed()` waits for a response —
+    # the SAME setting for both `/chat` and `/chat/stream` (retrieval calls one shared
+    # embedder either way; see rag_app.retrieval). 170s (was a hard-coded 120s in
+    # embeddings.py): the 2026-10-06 cold-start smoke failed at 183s because the Ollama
+    # image pull (130s for the pre-block-H fat image) took longer than the old 120s embed
+    # wait, so the backend answered HTTP 500 before Ollama ever finished waking up.
+    # Budget: backend cold ~60s + embed wait <=170s + answer ~5s ~= 235s, under Azure
+    # ingress's ~240s hard cutoff -- waiting any longer is useless (the ingress cuts the
+    # request first). Once the slim Ollama image's own cold-start is measured on Azure,
+    # this may be lowered towards ~100-120s (so a genuinely stuck warm Ollama fails
+    # faster) -- a deliberate follow-up, not done here.
+    embed_timeout_seconds: int = 170
     # T11.5.1/T11.5.3 (11b block F): adopted winner. v2-m3 fp32 (any top_k/max_length)
     # could not clear the 1.5s/2-thread floor -- see the ADR (decision 8) for the full
     # matrix. bge-reranker-base, dynamically int8-quantized, is the ONLY family with a
@@ -282,8 +294,9 @@ def validate_api_settings(settings: Settings) -> None:
 
     Checks ``DATABASE_URL`` (a PostgreSQL URL; explicitly set when ``ENV=prod``),
     ``JWT_SECRET`` (at least 32 characters), ``DATA_MASTER_KEY`` (a valid Fernet key) and
-    ``ENV`` (``dev``/``prod``) and ``DAILY_ANSWER_CAP`` (never negative; positive with
-    ``ENV=prod``). Every problem is reported at once, by setting name only.
+    ``ENV`` (``dev``/``prod``), ``DAILY_ANSWER_CAP`` (never negative; positive with
+    ``ENV=prod``) and ``EMBED_TIMEOUT_SECONDS`` (always positive). Every problem is
+    reported at once, by setting name only.
     """
     from cryptography.fernet import Fernet
 
@@ -305,6 +318,8 @@ def validate_api_settings(settings: Settings) -> None:
         problems.append("DAILY_ANSWER_CAP must be 0 (off, ENV=dev only) or a positive number")
     elif settings.env == "prod" and settings.daily_answer_cap == 0:
         problems.append("DAILY_ANSWER_CAP must be positive with ENV=prod (0 = off is dev only)")
+    if settings.embed_timeout_seconds <= 0:
+        problems.append("EMBED_TIMEOUT_SECONDS must be positive")
     if problems:
         raise SettingsValidationError(
             "refusing to start — invalid settings: " + "; ".join(problems)

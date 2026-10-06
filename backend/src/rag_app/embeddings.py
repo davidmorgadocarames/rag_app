@@ -12,8 +12,6 @@ import httpx
 
 from rag_app.config import get_settings
 
-_TIMEOUT_SECONDS = 120
-
 
 def parse_embed_response(data: dict[str, Any]) -> list[list[float]]:
     """Extract the list of embedding vectors from an Ollama /api/embed response."""
@@ -24,12 +22,26 @@ def parse_embed_response(data: dict[str, Any]) -> list[list[float]]:
 
 
 class OllamaEmbedder:
-    """Minimal client for the Ollama embeddings endpoint."""
+    """Minimal client for the Ollama embeddings endpoint.
 
-    def __init__(self, host: str | None = None, model: str | None = None) -> None:
+    T11.6b.6 (block H, 11b): the request timeout comes from
+    ``Settings.embed_timeout_seconds`` (``EMBED_TIMEOUT_SECONDS``, default 170s) unless an
+    explicit ``timeout`` is passed (e.g. a test). Both ``/chat`` and ``/chat/stream`` share
+    the SAME setting: neither endpoint builds its own ``OllamaEmbedder`` with an override —
+    they reach it through the one retrieval path (``rag_app.retrieval``), which never
+    passes a timeout either.
+    """
+
+    def __init__(
+        self,
+        host: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
         settings = get_settings()
         self.host = (host or settings.ollama_host).rstrip("/")
         self.model = model or settings.embed_model
+        self.timeout = settings.embed_timeout_seconds if timeout is None else timeout
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Return one embedding vector per input text."""
@@ -38,7 +50,7 @@ class OllamaEmbedder:
         response = httpx.post(
             f"{self.host}/api/embed",
             json={"model": self.model, "input": texts},
-            timeout=_TIMEOUT_SECONDS,
+            timeout=self.timeout,
         )
         response.raise_for_status()
         return parse_embed_response(response.json())
