@@ -16,7 +16,12 @@ import pytest
 from cryptography.fernet import Fernet
 
 from rag_app import embeddings as embeddings_module
-from rag_app.config import Settings, SettingsValidationError, validate_api_settings
+from rag_app.config import (
+    EMBED_TIMEOUT_MAX_SECONDS,
+    Settings,
+    SettingsValidationError,
+    validate_api_settings,
+)
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -39,6 +44,17 @@ def test_validate_api_settings_rejects_non_positive_embed_timeout() -> None:
         validate_api_settings(_settings(embed_timeout_seconds=0))
     with pytest.raises(SettingsValidationError, match="EMBED_TIMEOUT_SECONDS must be positive"):
         validate_api_settings(_settings(embed_timeout_seconds=-1))
+
+
+def test_validate_api_settings_rejects_embed_timeout_above_the_ingress_budget() -> None:
+    """DA-11bH-4: above EMBED_TIMEOUT_MAX_SECONDS, the Azure ~240s ingress cutoff always
+    fires before the configured wait, so the setting must be rejected fail-closed (like the
+    existing > 0 check) rather than silently accepted and quietly useless."""
+    validate_api_settings(_settings(embed_timeout_seconds=EMBED_TIMEOUT_MAX_SECONDS))  # ok
+    with pytest.raises(SettingsValidationError, match="EMBED_TIMEOUT_SECONDS must be at most"):
+        validate_api_settings(_settings(embed_timeout_seconds=EMBED_TIMEOUT_MAX_SECONDS + 1))
+    with pytest.raises(SettingsValidationError, match="ingress"):
+        validate_api_settings(_settings(embed_timeout_seconds=235))
 
 
 class _FakeResponse:

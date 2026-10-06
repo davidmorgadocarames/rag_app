@@ -123,7 +123,10 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
   waking up. Two independent fixes: (1) `EMBED_TIMEOUT_SECONDS` (default **170s**, was a
   module constant) is the SAME setting for `/chat` and `/chat/stream` — backend cold ~60s +
   embed wait ≤170s + answer ~5s ≈ 235s, under Azure ingress's ~240s cutoff (waiting longer
-  is useless: the ingress cuts the request first); (2) the Ollama image's **final stage is
+  is useless: the ingress cuts the request first) — `validate_api_settings` fail-closed
+  rejects any `EMBED_TIMEOUT_SECONDS` above 230s for the same reason (DA-11bH-4: past that
+  bound the ingress always wins the race, turning a clear timeout error into a confusing
+  generic ingress one); (2) the Ollama image's **final stage is
   now slim** — `ubuntu:24.04` pinned by digest (the exact base `ollama/ollama` itself ships,
   so no ABI shim) with only the CPU `libggml-cpu-*.so` backends + the `bge-m3` model store
   copied in, dropping the GPU-only backends (`cuda_v12`, `cuda_v13`, `mlx_cuda_v13`,

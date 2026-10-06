@@ -48,6 +48,12 @@ class SettingsValidationError(RuntimeError):
 # refuses to start on it: production must say where its database is.
 DEV_DATABASE_URL = "postgresql+psycopg://rag:rag@localhost:5432/rag"
 JWT_SECRET_MIN_LENGTH = 32
+# DA-11bH-4 (block H fix, 11b): upper bound for EMBED_TIMEOUT_SECONDS. Budget: backend cold
+# ~60s + embed wait + answer ~5s must stay under Azure ingress's ~240s hard cutoff, so any
+# value that leaves less than ~10s of margin always loses the race to the ingress -- the
+# request gets cut by Azure with a generic ingress-timeout error instead of the intended
+# clear EMBED_TIMEOUT_SECONDS-driven one. 230s keeps that margin.
+EMBED_TIMEOUT_MAX_SECONDS = 230
 
 
 class JobSettings(BaseSettings):
@@ -110,7 +116,8 @@ class Settings(JobSettings):
     # ingress's ~240s hard cutoff -- waiting any longer is useless (the ingress cuts the
     # request first). Once the slim Ollama image's own cold-start is measured on Azure,
     # this may be lowered towards ~100-120s (so a genuinely stuck warm Ollama fails
-    # faster) -- a deliberate follow-up, not done here.
+    # faster) -- a deliberate follow-up, not done here. Must stay <= EMBED_TIMEOUT_MAX_SECONDS
+    # (DA-11bH-4): above it the Azure ~240s ingress cutoff always wins the race first.
     embed_timeout_seconds: int = 170
     # T11.5.1/T11.5.3 (11b block F): adopted winner. v2-m3 fp32 (any top_k/max_length)
     # could not clear the 1.5s/2-thread floor -- see the ADR (decision 8) for the full
@@ -295,8 +302,9 @@ def validate_api_settings(settings: Settings) -> None:
     Checks ``DATABASE_URL`` (a PostgreSQL URL; explicitly set when ``ENV=prod``),
     ``JWT_SECRET`` (at least 32 characters), ``DATA_MASTER_KEY`` (a valid Fernet key) and
     ``ENV`` (``dev``/``prod``), ``DAILY_ANSWER_CAP`` (never negative; positive with
-    ``ENV=prod``) and ``EMBED_TIMEOUT_SECONDS`` (always positive). Every problem is
-    reported at once, by setting name only.
+    ``ENV=prod``) and ``EMBED_TIMEOUT_SECONDS`` (always positive, and at most
+    ``EMBED_TIMEOUT_MAX_SECONDS`` -- DA-11bH-4). Every problem is reported at once, by
+    setting name only.
     """
     from cryptography.fernet import Fernet
 
@@ -320,6 +328,11 @@ def validate_api_settings(settings: Settings) -> None:
         problems.append("DAILY_ANSWER_CAP must be positive with ENV=prod (0 = off is dev only)")
     if settings.embed_timeout_seconds <= 0:
         problems.append("EMBED_TIMEOUT_SECONDS must be positive")
+    elif settings.embed_timeout_seconds > EMBED_TIMEOUT_MAX_SECONDS:
+        problems.append(
+            f"EMBED_TIMEOUT_SECONDS must be at most {EMBED_TIMEOUT_MAX_SECONDS} "
+            "(above it, the Azure ingress's ~240s cutoff always fires first)"
+        )
     if problems:
         raise SettingsValidationError(
             "refusing to start — invalid settings: " + "; ".join(problems)
