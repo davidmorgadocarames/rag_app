@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -388,3 +389,104 @@ def test_on_never_restarts_an_already_active_app_only_extends_the_tag_still_hold
     assert _run("on", env=env).returncode == 0
     updates_after = sum(1 for line in _log(tmp_path) if line.startswith("containerapp update"))
     assert updates_after == updates_before
+
+
+# --- F-H-1: `status`'s "approximate cost so far" assumed start = tag - 3h, which is only
+# true while the window is genuinely open. A hand-edited or long-expired tag made that
+# assumption produce a nonsense figure (e.g. EUR 1142.30 for a tag set to 2026-01-01). The
+# estimate must be capped at the 3h window and shown only for a reliably-open ("on") demo;
+# any other state (expired/partial/off) or a malformed tag must print "n/a" instead. ---
+
+
+@needs_tools
+def test_status_cost_is_approximately_zero_right_after_on(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: on" in proc.stdout
+    assert "approximate cost so far: EUR 0.00" in proc.stdout
+
+
+@needs_tools
+def test_status_cost_is_sane_for_a_future_tag_partway_through_the_window(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    state_path = tmp_path / "az.json"
+    state = json.loads(state_path.read_text())
+    # 1h left on the 3h window => ~2h elapsed => cost ~= 2 * HOURLY_COST_EUR.
+    one_hour_from_now = datetime.now(UTC) + timedelta(hours=1)
+    tag_value = one_hour_from_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for app in APPS.values():
+        state[app]["tag"] = tag_value
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: on" in proc.stdout
+    expected = 2 * float(os.environ.get("DEMO_MODE_HOURLY_COST_EUR", "0.17"))
+    assert f"approximate cost so far: EUR {expected:.2f}" in proc.stdout
+
+
+@needs_tools
+def test_status_cost_is_na_for_a_tag_expired_far_in_the_past(tmp_path: Path) -> None:
+    """Red on the pre-fix code: a tag hand-edited (or left) far in the past made
+    `elapsed = now - (tag - 3h)` huge, printing a nonsense cost like EUR 1142.30 instead of
+    a capped or "n/a" figure."""
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    state_path = tmp_path / "az.json"
+    state = json.loads(state_path.read_text())
+    for app in APPS.values():
+        state[app]["tag"] = "2026-01-01T00:00:00Z"
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: expired" in proc.stdout
+    assert "approximate cost so far: n/a" in proc.stdout
+    assert "EUR" not in proc.stdout
+
+
+@needs_tools
+def test_status_cost_is_na_for_a_malformed_tag(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    state_path = tmp_path / "az.json"
+    state = json.loads(state_path.read_text())
+    for app in APPS.values():
+        state[app]["tag"] = "not-a-date"
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: expired" in proc.stdout
+    assert "approximate cost so far: n/a" in proc.stdout
+    assert "EUR" not in proc.stdout
+
+
+@needs_tools
+def test_status_cost_is_na_for_partial_state(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    state_path = tmp_path / "az.json"
+    state = json.loads(state_path.read_text())
+    state[APPS["ollama"]]["min"] = "0"
+    state[APPS["ollama"]]["tag"] = ""
+    state_path.write_text(json.dumps(state))
+
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: partial" in proc.stdout
+    assert "approximate cost so far: n/a" in proc.stdout
+    assert "EUR" not in proc.stdout
+
+
+@needs_tools
+def test_status_cost_is_na_before_any_activation(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    proc = _run("status", env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "state: off" in proc.stdout
+    assert "approximate cost so far: n/a" in proc.stdout
+    assert "EUR" not in proc.stdout

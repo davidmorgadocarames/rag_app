@@ -615,7 +615,11 @@ scripts/azure/demo-mode.sh off      # back to min-replicas 0 right away
   it down within the hour); **`off`** only if all three apps have min-replicas 0; **`partial`**
   for any other mix (e.g. Ollama asleep while backend/frontend are awake) — a state that is
   deliberately never reported as `on`, since a demo is not actually ready if even one app
-  could still cold-start-fail the first question (DA-11bH-1).
+  could still cold-start-fail the first question (DA-11bH-1). The "approximate cost so far"
+  figure is only meaningful while the window is genuinely open: it is shown as a number
+  (capped at the fixed 3h window) only for `on`, and as `n/a (<reason>)` for `expired`/
+  `partial`/`off` or a malformed tag — a hand-edited or long-expired tag used to be read as
+  if the window had just opened, printing a nonsense figure (F-H-1).
 - An hourly GitHub Actions workflow (`.github/workflows/demo-guard.yml`,
   `scripts/azure/demo-guard.sh`) is the safety net: it scales any app whose tag has expired
   (or that is awake with no tag at all — e.g. changed by hand) back to 0, even if the
