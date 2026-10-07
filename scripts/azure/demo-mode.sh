@@ -37,9 +37,14 @@
 #         `expired` if any app is min-replicas 1 with a missing/expired/malformed tag
 #         (demo-guard.yml will scale it down within the hour); `off` only if every app is
 #         min-replicas 0; `partial` for any other mix (e.g. one app asleep while the other
-#         two are awake) — deliberately never reported as `on`. Prints the end time and an
+#         two are awake) — deliberately never reported as `on`. Prints the end time; the
 #         approximate cost so far (`DEMO_MODE_HOURLY_COST_EUR`, default 0.17 EUR/h for the 3
-#         apps together — see PHASE_PLANNING §2.2 cost budget) for the `on`/`expired` cases.
+#         apps together — see PHASE_PLANNING §2.2 cost budget) is only meaningful while the
+#         window is actually open, so it is shown as a number (clamped to the fixed 3h
+#         window) only for the `on` state; for `expired`/`partial`/`off`, or any malformed
+#         tag, it is printed as `n/a (<reason>)` instead (F-H-1 — a hand-edited or expired
+#         tag used to be read as if the window had just opened, producing a nonsense figure
+#         like "EUR 1142.30").
 #
 # --dry-run prints the exact `az` calls instead of running them (no `az` needed), like
 # `scripts/cd/azure_jobs.sh`.
@@ -210,7 +215,7 @@ rollback_on() {
 # (DA-11bH-2) before dying. Because it is called as `do_on || …`, bash suspends `set -e`
 # for its body: a failing command inside it returns normally instead of aborting the script.
 do_on() {
-  local app current end
+  local app current end backend_fqdn
   end="$(plus_3h_iso)"
   for app in "${apps[@]}"; do
     current="$(min_replicas_of "$app")" || { echo "::error::cannot read min-replicas of $app" >&2; return 1; }
@@ -284,14 +289,31 @@ case "$action" in
     if [ "$overall" = "partial" ]; then
       say "apps do not agree on state — demo is NOT reliably ready (an asleep app could still cold-start-fail the first question)"
     fi
-    if { [ "$overall" = "on" ] || [ "$overall" = "expired" ]; } && [ -n "$end" ] && [ "$end" != "none" ]; then
+    # F-H-1: the cost estimate is only meaningful while the 3h window is actually open
+    # (overall "on" — every app shares a tag that `is_future` already accepted above), so
+    # only that case prints a number, and even then elapsed time is clamped to [0, 3h]: a
+    # future tag can never make `now` land before the window opened or after it closes, but
+    # the clamp is kept as a second line of defense so the figure can never run away.
+    # `expired` (missing/expired/malformed tag), `partial` and `off` print "n/a" with a
+    # reason instead of computing a number from a tag that is not a reliable window start.
+    if [ "$overall" = "on" ]; then
       end_epoch="$(to_epoch "$end")"
-      start_epoch=$((end_epoch - DEMO_HOURS * 3600))
+      window_start_epoch=$((end_epoch - DEMO_HOURS * 3600))
+      max_s=$((DEMO_HOURS * 3600))
       now_epoch="$(date -u +%s)"
-      elapsed_s=$((now_epoch - start_epoch))
+      elapsed_s=$((now_epoch - window_start_epoch))
       [ "$elapsed_s" -ge 0 ] || elapsed_s=0
+      [ "$elapsed_s" -le "$max_s" ] || elapsed_s="$max_s"
       cost="$(awk -v s="$elapsed_s" -v rate="$HOURLY_COST_EUR" 'BEGIN { printf "%.2f", (s / 3600.0) * rate }')"
       say "ends: $end — approximate cost so far: EUR $cost"
+    else
+      case "$overall" in
+        expired) reason="a min-replicas=1 app has a missing, expired or malformed $TAG_KEY tag" ;;
+        partial) reason="apps do not agree on state" ;;
+        off) reason="demo mode is off, no window is open" ;;
+        *) reason="state is $overall" ;;
+      esac
+      say "approximate cost so far: n/a ($reason)"
     fi
     ;;
 esac
