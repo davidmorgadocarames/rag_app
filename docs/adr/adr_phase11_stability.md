@@ -1,10 +1,10 @@
 # ADR phase 11 — Stability: data persistence and rerank latency
 
 - **Status:** 11a **Accepted** (Azure-promoted 2026-10-02, tag `phase-11a`). 11b **Accepted**
-  locally (2026-10-05: every 11b decision below — T11.5, T11.6b.1–3 — has landed on the phase
-  branch, `gate.sh --full` PASS); Azure evidence (promotion, smoke, cost) is added at the
-  11b promotion (T11.6b.4/5) — the ["Costs"](#costs) section below has a marked placeholder
-  for it until then.
+  and Azure-promoted (first promotion 2026-10-06, main `5a4dc91`; block H promotion
+  2026-10-07, main `e45f250`; closing fixes 2026-10-14, main `69a35f7`) — Azure evidence
+  (promotion, smoke, cost) is in the ["Costs"](#costs) section and decision 11 below; see the
+  [phase 11b report](../phases/phase-11b.md) for the full numbers.
 - **Parts:** **11a** — persistence, migrations Job, asynchronous erasure (branch
   `phase-11a-persistence`); **11b** — rerank latency and baked model images (branch
   `phase-11b-latency`).
@@ -12,7 +12,9 @@
   [ADR phase 9](adr_phase09_deployment.md) (migrations at container start, superseded by
   11a), [ADR phase 10](adr_phase10_azure.md) (Azure deployment).
 - **Phase report:** [Phase 11a report](../phases/phase-11a.md) — Azure promotion, smoke,
-  restore rehearsal and cost evidence. The 11b report is written at its own promotion.
+  restore rehearsal and cost evidence. [Phase 11b report](../phases/phase-11b.md) — rerank
+  latency fix, baked model images, cold-start fix, demo mode, and the Azure promotion/cost
+  evidence.
 - **Successor note on migrations (for Phase 12, `phase-12a-sessions-bff`).** 11b adds **no**
   migration — `0005_persistence_erasure` (11a) is still the latest revision; nothing here
   changes the expand/contract discipline or the Rollback principles above ("images roll back,
@@ -1522,12 +1524,37 @@ not safe to roll back to by name alone — the **exact digest currently running*
 once, read-only, right before the 11b pre-merge (not assumed, not guessed):
 
 ```bash
-# PLACEHOLDER — orchestrator fills this in at the pre-merge pre-check (read-only):
+# Read read-only at the 11b pre-merge pre-check (orchestrator, 2026-10-05/06):
 az containerapp show -g rg-secrag -n secrag-ollama \
   --query "properties.template.containers[0].image" -o tsv
-# then pin it:
-OLD_OLLAMA=docker.io/ollama/ollama@sha256:<orchestrator fills from the query above>
 ```
+
+**Recorded (previous Ollama image before 11b):**
+
+```bash
+OLD_OLLAMA=docker.io/ollama/ollama@sha256:2a6e883b917fc543389599dae79918f5cac9e1438890506982f44aa4f5625d01
+```
+
+**Intermediate rollback point — pre-block-H digests (2026-10-06, after PR #8's promotion,
+before block H).** Between the first 11b promotion (main `5a4dc91`, PR #8) and block H's
+promotion (main `e45f250`, PR #10) the apps briefly ran these GHCR digests — the target if a
+rollback only needs to undo block H's cold-start/demo-mode changes while keeping the T11.4–
+T11.5 reranker work:
+
+```bash
+PRE_BLOCK_H_OLLAMA=ghcr.io/davidmorgadocarames/rag_app-ollama@sha256:b42072fd32731e0456cce1128f878b6f98aaf048538e3be55a757f7da131cf03
+PRE_BLOCK_H_BACKEND=ghcr.io/davidmorgadocarames/rag_app-backend@sha256:8e7697be0347a7a18b5730dda57bd9019ac3fd5d5115e890ba771796d41d80e2
+PRE_BLOCK_H_FRONTEND=ghcr.io/davidmorgadocarames/rag_app-frontend@sha256:2b1bb0f24905c2335a040e110df43558978804c1b55ebcd71166a3e1498a2e8f
+```
+
+Rolling back to these digests restores the fat (6.3 GB) Ollama image — scale-to-zero cold
+starts fail again exactly as block H's own motivation describes (HTTP 500 at 183 s); that is
+the expected cost of this intermediate point, not a new regression.
+
+**Right-sizing note (decision 8, carried forward).** The backend's RSS stayed ~2 GiB warm even
+after the winning quantized reranker config (base int8), so PHASE_PLANNING §2b cost lever 2
+("~1 vCPU / 2 GiB" backend) is confirmed **not viable** as sized today; a real Azure
+right-size measurement, not this laptop figure, decides whether any lever on that axis is safe.
 
 **Rollback commands** (apps only; no Job to delete — see "no migration" above):
 
@@ -1561,14 +1588,20 @@ accepted cost of reverting to pre-11.5 code, exactly as DA-11bF review's own not
 11a ≈ €0.20 (cap €1), 11b ≈ €0.15 (cap €1). 11a adds recurring Jobs (hourly purge ≈
 €0.13/month, daily backup ≈ €0.03/month, slim image, scale to zero between runs) and one
 Storage account (a few MB of encrypted dumps, 12-day lifecycle); the migration Job runs only
-during a deploy. The measured value is added after the promotion.
+during a deploy.
 
-> **PLACEHOLDER — orchestrator fills after the Azure Cost Management read (PHASE_STATUS.md
-> "Now", open item 1).** (1) **11a row 43:** the actual €-figure for 2026-10-01/02, to replace
-> the estimate above and in `docs/phases/phase-11a.md`. (2) **11b Azure numbers** (T11.6b.5):
-> cold-start measurement, the ≤20-question Azure latency baseline, scale 0/1 confirmation, and
-> next-day cost vs the ≈€0.15 (cap €1) estimate above. Neither figure is filled by this block
-> (senior agent, block G, no Azure commands) — do not remove this marker until both are in.
+**Measured (Azure Cost Management, read-only, whole subscription).** **11a row 43: €0.0534 on
+2026-10-01** (promotion, block I and the smoke) — now also reflected in
+[`docs/phases/phase-11a.md`](../phases/phase-11a.md#cost). **11b, daily:** 2026-10-01
+€0.0534 · 2026-10-02…05 €0.00 · **2026-10-06 €0.0106** (first promotion + smoke) ·
+**2026-10-07 €0.0137** (block H promotion + T11.6b.10 smoke) · 2026-10-08…13 €0.00 ·
+2026-10-14 not yet posted at close (re-checked the next day, per the pattern above). By
+resource for 2026-10-06…14: Azure OpenAI €0.0243, everything else (Container Apps, Postgres
+Flexible Server, Storage, Log Analytics) **€0.00** — Container Apps itself shows €0 in the
+standard `secrag-cae` environment, most likely the monthly free grant now covering this
+subscription's usage; left as an open question, not assumed permanent. **11b total ≈ €0.025**
+against the ≈€0.15 estimate and the €1 cap. Subscription total since 2026-09-01: **€6.17 of
+the €40** budget.
 
 
 

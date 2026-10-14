@@ -92,9 +92,8 @@
 
 Phase estimate ≈ €0.20 (cap €1). Measured (Azure Cost Management, whole subscription,
 read-only): budget used **€6.10 of €40** up to 2026-10-01; daily **€0.37** on 2026-09-27,
-**€0.03** on 2026-09-29, **€0.01** on 2026-10-01 (partial). The final figures for
-2026-10-01/10-02 (promotion, block I and the smoke) are added at the next cost check, since
-Cost Management lags by up to a day.
+**€0.03** on 2026-09-29, **€0.01** on 2026-10-01 (partial). **2026-10-01 (promotion, block I
+and the smoke), confirmed figure: €0.0534** — well under the €1 cap.
 
 ## Changed docs
 
