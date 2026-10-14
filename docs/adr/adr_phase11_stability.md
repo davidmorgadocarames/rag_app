@@ -26,7 +26,7 @@
 - **Accepted gaps carried past 11b** (not fixed by this block, not silently forgotten):
   concurrency/OOM under real load stays an accepted gap until KEDA-based autoscaling
   (**16.3**) replaces today's fixed replica count — see the concurrency re-measurement in
-  decision 8 above; **PHASE_PLANNING §2b cost lever 2** ("~1 vCPU/2 GiB" backend) is **not
+  decision 8 above; **the internal cost-planning notes' lever 2** ("~1 vCPU/2 GiB" backend) is **not
   viable** with the adopted reranker config — RSS stayed ~2 GiB even after quantization
   (decision 8) — and should be treated as still open, not assumed solved, until a right-sized
   Azure measurement says otherwise; **Azure-core microarchitecture** (the dev machine's
@@ -50,7 +50,7 @@
 
 ## Diagnosis
 
-Classes (PHASE_PLANNING 11.1): **(a)** data gone, **(b)** unreadable because the master key
+Classes (internal diagnosis planning notes, 11.1): **(a)** data gone, **(b)** unreadable because the master key
 changed, **(c)** session only (the data is there and readable; only the login/JWT broke).
 Evidence is counts only — no row contents, emails, hashes or keys.
 
@@ -596,7 +596,7 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
    dependent" reasoning as the migration Job running before the apps, decision 3). Always
    built and deployed on every real CD run, same as the other three images (no extra
    change-detection logic was added just for this one, for consistency). **Runbook/promotion
-   items** (not applied here — orchestrator-owned, see PHASE_STATUS "Block D results" for the
+   items** (not applied here — orchestrator-owned, see the internal block-D results notes for the
    full list): the new GHCR package must be public before the first pull; the Azure
    `secrag-ollama` app's image reference switches from `docker.io/ollama/ollama:latest` to the
    GHCR digest; rollback = the previous Ollama digest, alongside the backend's (T11.6b.3).
@@ -752,8 +752,8 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
    serving and reaches the embed step of its first real request (not during its own startup),
    so worst case ≈ frontend + backend + Ollama summed: **cold-disk-cache worst case
    ≈ 0.44 + 7.36 + 1.61 ≈ 9.4 s**; **warm-disk-cache ≈ 0.4 + 4.8 + 1.6 ≈ 6.8 s**. Both are
-   roughly **25–35× under** the Azure Container Apps ingress timeout (**~240 s**, PHASE_TASKS
-   row 42 / DA-G3-4) — the baked images (T11.4.2/T11.4.3) remove essentially all cold-start
+   roughly **25–35× under** the Azure Container Apps ingress timeout (**~240 s**, the internal
+   promotion checklist / DA-G3-4) — the baked images (T11.4.2/T11.4.3) remove essentially all cold-start
    risk of hitting that cut; the real risk this phase found is `rerank_inference`'s own
    per-request CPU cost under concurrent load (above), not cold start.
 
@@ -907,7 +907,7 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
    collect()`, added defensively in `reranking.py`) measurably did **not** reduce RSS in a
    repeat test (1.99 → 2.00 GiB, within noise) — glibc's allocator retains freed heap arenas
    rather than returning them to the OS via `munmap`, a well-known CPython/glibc interaction,
-   not a Python-level leak. **Consequence for PHASE_PLANNING §2b cost lever 2** ("~1 vCPU/
+   not a Python-level leak. **Consequence for the internal cost-planning notes' lever 2** ("~1 vCPU/
    2 GiB" once 11.5 lands): still NOT viable on memory grounds with this adopted config —
    the reranker alone floors around 2 GiB resident, before the rest of the FastAPI/
    SQLAlchemy/uvicorn app or any concurrent-request activation memory; revisit at the Azure
@@ -1133,8 +1133,8 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
     is active only extends the tag — an app already at min=1 is never re-updated, so there
     is no restart. `off` returns every app to min 0 and removes the tag. `status` reports
     each app's state and an approximate running cost from the tag's start time
-    (`DEMO_MODE_HOURLY_COST_EUR`, default 0.17 EUR/h for the 3 apps together — PHASE_PLANNING
-    §2.2 estimate: ≈0.15–0.17 EUR/h, ≤ ~0.65 EUR per 3 h+guard-lag activation).
+    (`DEMO_MODE_HOURLY_COST_EUR`, default 0.17 EUR/h for the 3 apps together — the internal
+    cost-planning notes' §2.2 estimate: ≈0.15–0.17 EUR/h, ≤ ~0.65 EUR per 3 h+guard-lag activation).
     `.github/workflows/demo-guard.yml` runs `scripts/azure/demo-guard.sh` **hourly** (cron)
     and on `workflow_dispatch` (a `dry_run` input, default true, that skips the Azure login
     step — and therefore the OIDC token request — entirely): it scales any app with
@@ -1522,7 +1522,7 @@ OLD_JOBS=ghcr.io/davidmorgadocarames/rag_app-jobs@sha256:7ca7f272cea56f2f0e8f320
 
 **Previous Ollama image.** Unlike backend/frontend/jobs, today's `secrag-ollama` app does
 **not** run a GHCR-built image — it runs the plain upstream `docker.io/ollama/ollama:latest`
-(RUNBOOK_AZURE.md §4; this is exactly the un-baked image that loses `bge-m3` on scale-to-zero,
+(the internal Azure runbook §4; this is exactly the un-baked image that loses `bge-m3` on scale-to-zero,
 the gotcha 11b's baked `rag_app-ollama` image is built to fix). `:latest` is a floating tag,
 not safe to roll back to by name alone — the **exact digest currently running** must be read
 once, read-only, right before the 11b pre-merge (not assumed, not guessed):
@@ -1568,7 +1568,7 @@ az containerapp update -g $RG -n secrag-backend --image "$OLD_BACKEND"
 az containerapp update -g $RG -n secrag-frontend --image "$OLD_FRONTEND"
 # Ollama first (T11.4.3/CD order note): the backend calls it, so it must already be serving
 # bge-m3 before the backend takes traffic. After a rollback to the un-baked image, bge-m3 is
-# NOT pre-loaded -- immediately re-run the existing wake-up step (RUNBOOK_AZURE.md §4):
+# NOT pre-loaded -- immediately re-run the existing wake-up step (the internal Azure runbook §4):
 az containerapp exec -g $RG -n secrag-ollama --command "ollama pull bge-m3"
 FQDN=$(az containerapp show -g $RG -n secrag-backend --query properties.configuration.ingress.fqdn -o tsv)
 curl -fsS "https://$FQDN/health"   # wake-up; then a chat question exercises embeddings + rerank

@@ -312,7 +312,8 @@ git config core.hooksPath .githooks            # phase gate on every push (WSL2/
 
 ```bash
 bash scripts/gate.sh --fast          # default: lint, types, unit tests, gitleaks, shellcheck,
-                                     # schema-check, adr-links, frontend, dependency-audit
+                                     # schema-check, adr-links, private-names, frontend,
+                                     # dependency-audit
 bash scripts/gate.sh --make-seed     # once (and when the corpus changes): build the gate seed
 bash scripts/gate.sh --full          # fast + DB tests, migrations round trip, restart check
                                      # and eval, in isolated throwaway projects

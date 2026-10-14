@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 import yaml
 
-from rag_app.devtools import adr_links, dependency_audit, gate_compose, schema_check
+from rag_app.devtools import adr_links, dependency_audit, gate_compose, private_names, schema_check
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -76,6 +76,49 @@ def test_repository_links_resolve() -> None:
         b for path in adr_links.tracked_markdown(REPO_ROOT) for b in adr_links.check_file(path)
     ]
     assert broken == []
+
+
+# --- private-names (DEBT-026) ----------------------------------------------------------
+
+
+def test_a_public_doc_naming_a_private_file_fails(tmp_path: Path) -> None:
+    """Reproduces DEBT-026: the pre-fix ADR text would have failed exactly like this."""
+    doc = _write(
+        tmp_path / "docs/adr/example.md",
+        'See PHASE_STATUS "Block D results" and RUNBOOK_AZURE.md §4 for the rest.\n',
+    )
+    hits = private_names.check_file(doc)
+    assert [h.line for h in hits] == [1]
+    assert private_names.main([str(doc)]) == 1
+
+
+def test_a_status_archive_path_fails_even_without_the_bare_word(tmp_path: Path) -> None:
+    doc = _write(
+        tmp_path / "doc.md", "The verbatim history moved to status/phase-11a.md at phase close.\n"
+    )
+    assert private_names.check_file(doc) != []
+
+
+def test_reworded_public_text_passes(tmp_path: Path) -> None:
+    """Rewording keeps the reasoning, drops only the private file's literal name (the fix
+    applied to docs/adr/adr_phase11_stability.md and docs/DEFINITION_OF_DONE.md)."""
+    doc = _write(
+        tmp_path / "doc.md",
+        "See the internal block-D results notes and the internal Azure runbook §4.\n"
+        "Our product roadmap is public; ROADMAP is just a word here.\n",
+    )
+    assert private_names.check_file(doc) == []
+
+
+def test_repository_docs_never_name_a_private_file() -> None:
+    if shutil.which("git") is None or not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    hits = [
+        h
+        for path in private_names.tracked_markdown(REPO_ROOT)
+        for h in private_names.check_file(path)
+    ]
+    assert hits == []
 
 
 # --- dependency-audit -----------------------------------------------------------------

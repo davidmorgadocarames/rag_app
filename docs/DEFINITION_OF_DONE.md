@@ -27,6 +27,7 @@ are a human/agent checklist.
 | 13 | No known vulnerable dependency without a dated, justified exception | `dependency-audit` |
 | 14 | Evaluation data well-formed (golden set, judge labels, thresholds, baseline) | `schema-check` |
 | 15 | The gate cannot be skipped silently: tracked scripts `100755` in git and executable on disk; the pushing clone has `core.hooksPath = .githooks` and an executable `.githooks/pre-push` | `git-modes` (+ `scripts/prereqs/check.sh`; CI job `cheap-checks` for the modes) |
+| 16 | Public, tracked Markdown never names a private planning file (DEBT-026) | `private-names` |
 
 ## Phase-specific norms
 
@@ -59,15 +60,18 @@ are a human/agent checklist.
   Job started by CD), never at container start. A downgrade is only guaranteed on a database
   without data for that migration and may refuse (0005 refuses while erased users exist); it
   is **never a rollback path** — roll back images instead. Each migration that grants checks
-  that its roles exist and its `downgrade` revokes (PHASE_PLANNING migration map, X4).
+  that its roles exist and its `downgrade` revokes (internal migration map, X4).
   Applies from 0005; rationale in the
   [ADR phase 11](adr/adr_phase11_stability.md#decisions) (decision 3).
 - **Promotion evidence (Phase 11+, D-2026-09-27-7 a)** — the pre-push hook can be bypassed
   (`--no-verify`, a lost exec bit, an unset `core.hooksPath`), so a promotion to `main`
-  (PHASE_TASKS rows 40/41) needs the **`--full` PASS log for the exact SHA pushed**: the
+  (internal checklist) needs the **`--full` PASS log for the exact SHA pushed**: the
   gate's summary prints `total … @ <full SHA>` and `GATE: PASS`; the log is attached to the
-  phase report / PR. CI's `cheap-checks` job is the server-side backstop for the cheap steps
-  (git modes, shellcheck, venv, dependency-audit, adr-links). **Right after the promotion
+  phase report / PR. `scripts/gate.sh` writes every real run's full output to a file under
+  `~/secrag-gate-logs` (override with `GATE_LOG_DIR`; T11c.E1) — never under `/tmp`, which is
+  `tmpfs` in WSL2 and is wiped on a WSL stop, which would otherwise lose exactly this
+  evidence. CI's `cheap-checks` job is the server-side backstop for the cheap steps
+  (git modes, shellcheck, venv, dependency-audit, adr-links, private-names). **Right after the promotion
   push** (DA-C-4), check locally that the status really exists for the pushed SHA:
   `bash scripts/cd/gate_status.sh verify <sha> --wait 300 --creator <owner>` → `deploy
   allowed`. **Recovery** when it is missing (the detached background publisher was killed
@@ -120,7 +124,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `ruff-format` | - | 60 s | `db-tests` | gate DB | 300 s |
 | `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
-| | | | `backup-drill` | gate DB | 300 s |
+| `private-names` | - | 30 s | `backup-drill` | gate DB | 300 s |
 | | | | `erasure-scale` | gate DB | 600 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
@@ -259,6 +263,13 @@ same step in the `cheap-checks` job.
 
 **Links.** `adr-links` checks every relative link and heading anchor in tracked Markdown;
 with `RUNBOOK_PATH=<private runbook>` it also checks the runbook (unset → explicit SKIP).
+
+**Private names (DEBT-026).** `private-names` scans the same tracked Markdown files for the
+bare names of the private, git-excluded planning files (the internal cost/task-planning
+notes, status log, task list, runbook, etc.) and for a path shaped like the private
+per-phase archive (a folder named `status`, holding files named `phase-<id>.md`); a hit
+fails. Rewording keeps the reasoning in public docs; it never carries the private file's
+name.
 
 **Pre-push hook.** `.githooks/pre-push` reads the pushed refs from stdin: only deletions →
 exit 0; any ref to `refs/heads/main` → `--full`, otherwise `--fast`. It runs the gate from a

@@ -75,12 +75,13 @@ jobs:
         run: pytest -rs -m "not db"
       - name: Pytest (DB tests through the harness — must run, never skip)
         run: pytest -rs -m db
-      - name: Links (adr-links) and eval data (schema-check)
+      - name: Links (adr-links), eval data (schema-check), private names (DEBT-026)
         env:
           PYTHONPATH: src
         run: |
           python -m rag_app.devtools.adr_links --root ..
           python -m rag_app.devtools.schema_check --root ..
+          python -m rag_app.devtools.private_names --root ..
 
   frontend:
     name: Frontend (lint, types, build)
@@ -273,7 +274,7 @@ jobs:
   # the same gate.sh steps, so a push that skipped the hook still shows these results.
   # Under --only a missing tool fails (never skips). Hook activation is local-only.
   cheap-checks:
-    name: Gate cheap checks (git modes, shellcheck, venv, dependency-audit, adr-links)
+    name: Gate cheap checks (git modes, shellcheck, venv, dependency-audit, adr-links, private-names)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -329,7 +330,7 @@ jobs:
         run: |
           shellcheck --version | grep -x "version: 0.11.0"
           node --version && npm --version
-      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links
+      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names
         env:
           GATE_VENV: ${{ github.workspace }}/backend/.venv
-        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links
+        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names
