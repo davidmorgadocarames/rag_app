@@ -143,6 +143,45 @@ def test_only_fails_in_the_main_tree_when_the_venv_drifted_from_the_pins(tmp_pat
     assert "GATE: FAIL" in proc.stdout
 
 
+@needs_tools
+def test_a_real_run_logs_outside_tmp_under_home_by_default(tmp_path: Path) -> None:
+    """C8c / T11c.E1: evidence must survive a WSL stop (/tmp is tmpfs); it never lives there."""
+    repo = _make_repo(tmp_path)
+    home = tmp_path / "home"
+    proc = _gate(repo, "--only", "environment", HOME=str(home))
+    assert proc.returncode == 0, proc.stdout
+    assert "GATE: PASS" in proc.stdout  # still printed to the terminal, not only to the file
+    log_dir = home / "secrag-gate-logs"
+    logs = list(log_dir.glob("gate-*.log"))
+    assert len(logs) == 1, logs
+    # The default is derived from HOME, never a literal /tmp path (which is tmpfs under WSL).
+    assert str(logs[0]).startswith(str(home))
+    content = logs[0].read_text(encoding="utf-8")
+    assert "GATE: PASS" in content
+    assert f"gate log: {logs[0]}" in proc.stderr
+
+
+@needs_tools
+def test_gate_log_dir_is_configurable(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    home = tmp_path / "home"
+    custom = tmp_path / "custom-gate-logs"
+    proc = _gate(repo, "--only", "environment", HOME=str(home), GATE_LOG_DIR=str(custom))
+    assert proc.returncode == 0, proc.stdout
+    assert not home.exists()  # the default directory is never created when overridden
+    assert list(custom.glob("gate-*.log"))
+
+
+@needs_tools
+def test_informational_flags_never_open_a_log_file(tmp_path: Path) -> None:
+    """--list is not a gate run: it must not leave a log file (or create the directory)."""
+    repo = _make_repo(tmp_path)
+    home = tmp_path / "home"
+    proc = _gate(repo, "--list", HOME=str(home))
+    assert proc.returncode == 0, proc.stdout
+    assert not (home / "secrag-gate-logs").exists()
+
+
 def test_the_real_hook_and_gate_are_executable_in_git() -> None:
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("needs a git checkout")

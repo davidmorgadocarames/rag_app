@@ -329,6 +329,12 @@ from a temporary worktree at the pushed commit; deleting a remote branch runs no
 A `--full` PASS on a clean tree publishes the commit status `secrag/gate-full` for that
 commit; CD deploys `main` only after CI succeeded **and** that status is present.
 
+Every real run's full output is also written to a log file under `~/secrag-gate-logs`
+(override with `GATE_LOG_DIR`) — never under `/tmp`, which is `tmpfs` in WSL2 and is wiped on
+every WSL stop, so the "`--full` PASS log for the exact SHA" a promotion needs (Definition of
+Done, "Promotion evidence") would otherwise be lost across a reboot. `--list`/`--help` and
+the script's own re-entrant calls never write a log file; nothing prunes the directory.
+
 ### Run everything with Docker
 
 The containers use a **native** Ollama (GPU, `ollama serve` in WSL2) by default:

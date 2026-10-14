@@ -14,6 +14,13 @@
 #                                     migrations changed)
 #   scripts/gate.sh --list            step names, modes and time budgets
 #
+# Gate log (C8c, T11c.E1): every real run's full output is also written to a file under
+# GATE_LOG_DIR (default ~/secrag-gate-logs) -- never under /tmp, which is tmpfs and is wiped
+# when WSL stops, losing the "--full PASS log for the exact SHA" a promotion needs
+# (docs/DEFINITION_OF_DONE.md "Promotion evidence"). The directory is not pruned here; it is
+# plain evidence the developer can clean up any time. --list/-h/--help and the script's own
+# re-entrant calls (--run-step, --build-venv) never open a log file.
+#
 # Every step runs in its own process under `timeout <budget>`; exceeding the budget fails.
 # Native steps always see the GATE's DATABASE_URL / OLLAMA_HOST (exported below), never the
 # development database: in --fast the DB URL points at the (stopped) gate port (GATE_DB_PORT, default 15432).
@@ -73,6 +80,7 @@ gitleaks         - 180
 shellcheck       - 60
 schema-check     - 30
 adr-links        - 30
+private-names    - 30
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
@@ -228,6 +236,9 @@ step_schema-check() {
 
 # RUNBOOK_PATH (private runbook outside the repo) is optional: unset → explicit SKIP line.
 step_adr-links() { need_venv && "$PY" -m rag_app.devtools.adr_links --root "$REPO_ROOT"; }
+
+# DEBT-026: no public, tracked Markdown file names a private planning file.
+step_private-names() { need_venv && "$PY" -m rag_app.devtools.private_names --root "$REPO_ROOT"; }
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
@@ -774,7 +785,7 @@ run_step() {
   RESULTS+=("$(printf '%-20s %-5s %5ss / %ss' "$name" "$status" "$elapsed" "$budget")")
 }
 
-usage() { sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local mode=fast only="" arg
@@ -891,4 +902,25 @@ main() {
   return "$fail"
 }
 
+# --- gate log (C8c, T11c.E1) -------------------------------------------------------------
+
+# Re-entrant self-invocations (a step, the cached-venv builder) and purely informational
+# flags never open their own log file: their output already lands in the top-level run's
+# log (steps) or there is no run to record (--list/-h/--help).
+case "${1:-}" in
+  --run-step | --build-venv | --list | -h | --help)
+    main "$@"
+    exit $?
+    ;;
+esac
+
+GATE_LOG_DIR="${GATE_LOG_DIR:-$HOME/secrag-gate-logs}"
+if mkdir -p "$GATE_LOG_DIR" 2>/dev/null && [ -w "$GATE_LOG_DIR" ]; then
+  GATE_LOG_FILE="$GATE_LOG_DIR/gate-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+  main "$@" 2>&1 | tee "$GATE_LOG_FILE"
+  gate_rc="${PIPESTATUS[0]}"
+  echo "gate log: $GATE_LOG_FILE" >&2
+  exit "$gate_rc"
+fi
+echo "gate log: $GATE_LOG_DIR is not writable -- continuing without a log file" >&2
 main "$@"
