@@ -786,16 +786,65 @@ def test_keep_newest_prunes_nothing_while_a_name_cannot_be_judged(tmp_path: Path
     assert {p.name for p in folder.iterdir()} == {real[0]}  # newest valid kept, even if old
 
 
+def _tomb_at(now: dt.datetime, days_ago: float) -> str:
+    """Like ``_tomb``, but every name is derived from one already-known ``now`` instead of a
+    fresh ``dt.datetime.now(dt.UTC)`` call (DEBT-025: the wall clock is read exactly once, by
+    the caller, and injected here — never read twice inside the same test)."""
+    return f"tombstones-{now - dt.timedelta(days=days_ago):%Y%m%dT%H%M%SZ}.jsonl"
+
+
 def test_exports_to_prune_keeps_the_newest_and_refuses_to_guess() -> None:
+    """DEBT-025: the previous version built every name with the module-level ``_tomb()``
+    helper, which calls ``dt.datetime.now(dt.UTC)`` afresh on every single invocation —
+    including inside the assertions (``sorted([_tomb(40), _tomb(35)])`` calls it twice more).
+    A real second ticking over between any two of those calls made two names meant to be
+    "the same 40-days-ago stamp" differ by one second, flaking the assertion (see the
+    reproduction below). Here every name comes from one ``now`` read once by the test and
+    threaded through explicitly — the gate's own clock is the only one that matters."""
     now = dt.datetime.now(dt.UTC)
-    names = [_tomb(40), _tomb(35), _tomb(10), _tomb(1), "notes.txt"]
+
+    def tomb(days_ago: float) -> str:
+        return _tomb_at(now, days_ago)
+
+    names = [tomb(40), tomb(35), tomb(10), tomb(1), "notes.txt"]
     remove, problems = tombstones.exports_to_prune(names, now)
-    assert remove == sorted([_tomb(40), _tomb(35)]) and problems == []
-    only_old = [_tomb(40), _tomb(35)]
-    assert tombstones.exports_to_prune(only_old, now)[0] == [_tomb(40)]  # newest always kept
+    assert remove == sorted([tomb(40), tomb(35)]) and problems == []
+    only_old = [tomb(40), tomb(35)]
+    assert tombstones.exports_to_prune(only_old, now)[0] == [tomb(40)]  # newest always kept
     for stray in ("tombstones-20990101T000000Z.jsonl", "tombstones-20261399T000000Z.jsonl"):
         remove, problems = tombstones.exports_to_prune([*names, stray], now)
         assert remove == [] and len(problems) == 1 and stray in problems[0]
+
+
+def test_a_wall_clock_read_twice_for_the_same_days_ago_can_disagree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the DEBT-025 race directly: two calls to the OLD per-call stamp helper for
+    the exact same ``days_ago``, with a real second ticking over between them, must NOT be
+    assumed equal — which is exactly what the previous ``test_exports_to_prune_keeps_the_newest
+    …`` assertions did (build the expected list with a second, independent round of
+    ``_tomb()`` calls). This is why the fixed test above reads the clock only once."""
+    ticks = iter(
+        [
+            dt.datetime(2026, 3, 1, 12, 0, 0, 999000, tzinfo=dt.UTC),
+            dt.datetime(2026, 3, 1, 12, 0, 1, 1000, tzinfo=dt.UTC),  # one second later
+        ]
+    )
+
+    class _TickingDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz: dt.tzinfo | None = None) -> dt.datetime:  # type: ignore[override]
+            return next(ticks)
+
+    monkeypatch.setattr(dt, "datetime", _TickingDatetime)
+
+    def old_style_tomb(days_ago: float) -> str:
+        moment = dt.datetime.now(dt.UTC) - dt.timedelta(days=days_ago)
+        return f"tombstones-{moment:%Y%m%dT%H%M%SZ}.jsonl"
+
+    first_call = old_style_tomb(40)
+    second_call = old_style_tomb(40)  # same days_ago, a fresh (later) wall-clock read
+    assert first_call != second_call  # the exact flake DEBT-025 reports
 
 
 def test_local_export_prune(tmp_path: Path) -> None:

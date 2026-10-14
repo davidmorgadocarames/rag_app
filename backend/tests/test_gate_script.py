@@ -263,3 +263,23 @@ def test_ci_pins_the_same_shellcheck_as_the_local_installer() -> None:
     assert "sha256sum -c -" in pin["run"] and "GITHUB_PATH" in pin["run"]
     gate = next(i for i, s in enumerate(steps) if "gate.sh --only" in s.get("run", ""))
     assert steps.index(pin) < gate
+
+
+def test_ci_caches_and_retries_the_shellcheck_download() -> None:
+    """DEBT-025: a transient HTTP 500 from the releases CDN once failed this job outright.
+    A cache hit must skip the download entirely; a miss must retry on any failure, not just
+    curl's default transient-error list; the checksum check must still run unconditionally."""
+    import yaml
+
+    ci = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = ci["jobs"]["cheap-checks"]["steps"]
+    cache = next(s for s in steps if s.get("uses", "").startswith("actions/cache@"))
+    assert "shellcheck" in cache["with"]["key"]
+    download = next(s for s in steps if s.get("env", {}).get("SHELLCHECK_SHA256"))
+    assert steps.index(cache) < steps.index(download)
+    # The cached path and the downloaded tarball must be the exact same file.
+    tarball_var = "shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+    assert cache["with"]["path"].endswith(tarball_var.replace("${SHELLCHECK_VERSION}", "0.11.0"))
+    assert '[ ! -f "$RUNNER_TEMP/$tarball" ]' in download["run"]  # skip the download on a hit
+    assert "--retry-all-errors" in download["run"]
+    assert "sha256sum -c -" in download["run"]  # verified whether cached or freshly downloaded
