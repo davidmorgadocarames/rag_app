@@ -637,6 +637,156 @@ def test_code_change_deploys(tmp_path: Path, history) -> None:
     assert "backend/app.py" in out["reason"]
 
 
+# --- plan.sh skippable() (DEBT-023, T11c.E5 option B) ------------------------------------
+
+
+@pytest.fixture
+def base_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A fresh repo with just one commit, so a second commit's diff is exactly one path."""
+    repo = tmp_path / "base_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    base = _commit(repo, {"backend/app.py": "1", "README.md": "a"}, "base")
+    return repo, base
+
+
+NEW_SKIPPABLE_PATHS = [
+    "deploy/prometheus/prometheus.yml",
+    "eval/golden_set.jsonl",
+    "data/chunks/x.jsonl",
+    "backend/tests/test_x.py",
+    "backend/requirements-dev.txt",
+    "backend/pyproject.toml",
+    "scripts/azure/demo-mode.sh",
+    "scripts/dev/create_dev_volume.sh",
+    "scripts/prereqs/install.sh",
+    "scripts/gate.sh",
+    "scripts/fetch_corpus.py",
+    "scripts/restart_check.sh",
+    "scripts/restart_check.compose.yml",
+    "frontend/lib/chatStream.test.ts",
+]
+
+# Never widened into the skip list, even though most changes there are harmless too (see the
+# plan.sh header comment for why each one stays a deploy trigger).
+EXCLUDED_RISKY_PATHS = [
+    "scripts/db/backup.sh",  # baked into the jobs image via the dbscripts build context
+    "scripts/db/apply_roles.sh",  # same directory as backup.sh — never widened as a whole
+    "scripts/cd/plan.sh",  # this script's own logic — self-referential risk
+    "db/roles.sql",  # not read by CD, but a human must still re-apply it by hand
+    "deploy/azure/jobs/migrate.yaml",  # same: never read by CD, a human acts on it
+]
+
+
+@needs_tools
+@pytest.mark.parametrize("path", NEW_SKIPPABLE_PATHS)
+def test_each_new_skippable_path_alone_skips_build_and_deploy(
+    tmp_path: Path, base_repo: tuple[Path, str], path: str
+) -> None:
+    repo, base = base_repo
+    sha = _commit(repo, {path: "x"}, f"touch {path}")
+    proc, out = _plan(tmp_path, repo, "--sha", sha, "--base", base)
+    assert proc.returncode == 0, proc.stderr
+    assert out["deploy"] == "false", proc.stdout
+
+
+@needs_tools
+def test_a_skippable_path_mixed_with_a_real_image_input_still_deploys(
+    tmp_path: Path, base_repo: tuple[Path, str]
+) -> None:
+    repo, base = base_repo
+    sha = _commit(
+        repo,
+        {"backend/tests/test_x.py": "x", "backend/src/rag_app/config.py": "2"},
+        "mixed change",
+    )
+    proc, out = _plan(tmp_path, repo, "--sha", sha, "--base", base)
+    assert out["deploy"] == "true", proc.stdout
+    assert "backend/src/rag_app/config.py" in out["reason"]
+
+
+@needs_tools
+@pytest.mark.parametrize("path", EXCLUDED_RISKY_PATHS)
+def test_each_excluded_risky_path_alone_still_deploys(
+    tmp_path: Path, base_repo: tuple[Path, str], path: str
+) -> None:
+    repo, base = base_repo
+    sha = _commit(repo, {path: "x"}, f"touch {path}")
+    proc, out = _plan(tmp_path, repo, "--sha", sha, "--base", base)
+    assert out["deploy"] == "true", proc.stdout
+    assert path in out["reason"]
+
+
+def _skippable_patterns() -> list[str]:
+    """The literal case patterns of plan.sh's skippable(), parsed from its own source so this
+    guard test can never drift from what the script actually runs."""
+    text = PLAN.read_text(encoding="utf-8")
+    body = re.search(r"skippable\(\)\s*\{.*?case \"\$1\" in(.*?)\)\s*return 0", text, re.S)
+    assert body, "could not find skippable()'s case patterns in plan.sh"
+    raw = body.group(1).replace("\\\n", " ")
+    return [p.strip() for p in raw.split("|") if p.strip()]
+
+
+def _dockerfile_copy_sources(dockerfile: Path, context: Path) -> set[str]:
+    """Host-relative paths a Dockerfile's plain ``COPY`` (never ``--from=<stage>``, which
+    copies from a previous build STAGE, not the host) instructions actually copy, resolved
+    against its build ``context`` (as in cd.yml). ``COPY --from=dbscripts`` is the one named
+    (non-stage) build context this repo uses (``scripts/db``, see Dockerfile.jobs/cd.yml) and
+    is resolved against it explicitly."""
+    sources: set[str] = set()
+    for line in dockerfile.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"\s*COPY\s+(.*)", line)
+        if not match:
+            continue
+        parts = match.group(1).split()
+        base = context
+        if parts and parts[0].startswith("--from="):
+            stage = parts[0].removeprefix("--from=")
+            if stage != "dbscripts":
+                continue  # from a previous build STAGE, not the host — nothing to resolve
+            base = REPO_ROOT / "scripts" / "db"
+            parts = parts[1:]
+        parts = [p for p in parts if not p.startswith("--")]
+        for src in parts[:-1]:  # the last argument is always the destination
+            rel = os.path.relpath(base / src, REPO_ROOT)
+            sources.add(rel.replace(os.sep, "/"))
+    return sources
+
+
+def test_the_skip_list_never_matches_a_real_dockerfile_copy_source() -> None:
+    """DEBT-023, T11c.E5 option B: if a future Dockerfile change starts COPYing a path this
+    skip list treats as harmless, THIS test fails — not CD silently skipping a real change."""
+    import fnmatch
+
+    patterns = _skippable_patterns()
+    sources: set[str] = set()
+    sources |= _dockerfile_copy_sources(REPO_ROOT / "backend" / "Dockerfile", REPO_ROOT / "backend")
+    sources |= _dockerfile_copy_sources(
+        REPO_ROOT / "backend" / "Dockerfile.jobs", REPO_ROOT / "backend"
+    )
+    sources |= _dockerfile_copy_sources(REPO_ROOT / "ollama" / "Dockerfile", REPO_ROOT / "ollama")
+    # frontend/Dockerfile's builder stage COPYs the whole context ("COPY . .") on purpose
+    # (T11c.E5 analysis: *.test.ts never reaches the FINAL image); checked separately below.
+    assert sources, "expected at least one real COPY source to check against"
+    for source in sources:
+        for pattern in patterns:
+            assert not fnmatch.fnmatch(source, pattern), (
+                f"{source} is COPYed into an image but matches skip pattern {pattern!r} "
+                "— widen it out of skippable() in plan.sh"
+            )
+
+
+def test_frontend_final_image_never_copies_raw_source_only_the_next_build_output() -> None:
+    """Backs the T11c.E5 analysis that frontend/**/*.test.ts (copied into the builder stage,
+    never bundled) is safe to skip: the FINAL stage must only take .next/standalone and
+    .next/static from the builder, never the raw context."""
+    text = (REPO_ROOT / "frontend" / "Dockerfile").read_text(encoding="utf-8")
+    runner = text.split("AS runner", 1)[1]
+    copies = re.findall(r"COPY --from=builder (\S+)", runner)
+    assert copies, "expected the runner stage to COPY --from=builder"
+    assert all(src.startswith("/app/.next/") for src in copies), copies
+
+
 @needs_tools
 def test_no_recorded_deployment_deploys_everything(tmp_path: Path, history) -> None:
     repo, shas = history

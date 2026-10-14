@@ -11,8 +11,23 @@
 #      → skip: a newer commit landed and its own CD run deploys it. A malformed --tip fails.
 #   2. <sha> equals the base, or is an ANCESTOR of it → skip: not newer than what is deployed.
 #   3. No base (nothing deployed yet), or a base unknown to this clone → deploy everything.
-#   4. Only `docs/**`, `**/*.md` and `deploy/k8s/**` changed → build and deploy are skipped
-#      (`workflow_run` cannot use `paths-ignore`).
+#   4. Only paths that never enter any of the 4 images changed → build and deploy are skipped
+#      (`workflow_run` cannot use `paths-ignore`): `docs/**`, `**/*.md`, `deploy/k8s/**` (not
+#      used yet), `deploy/prometheus/**` (dev compose only, never deployed), `eval/**`,
+#      `data/**` (not read by any Dockerfile), `backend/tests/**`, `backend/requirements-
+#      dev.txt`, `backend/pyproject.toml` (dev/lint-only, never `COPY`-ed), `scripts/azure/**`,
+#      `scripts/dev/**`, `scripts/prereqs/**`, `scripts/gate.sh`, `scripts/fetch_corpus.py`,
+#      `scripts/restart_check.*` (host-only ops/dev tooling) and `frontend/**/*.test.ts` (never
+#      bundled into `.next/standalone`, DEBT-023, T11c.E5 option B — the inventory of what
+#      each Dockerfile actually copies is in the PR). Deliberately NOT skipped, even though
+#      most changes there are also harmless: `scripts/db/**` (2 of its 6 files ARE baked into
+#      the jobs image — `backup.sh`/`backup_lib.sh` via the `dbscripts` build context),
+#      `scripts/cd/**` (this script's own logic — self-referential risk), `db/roles.sql` and
+#      `deploy/azure/jobs/*.yaml` (never read by CD, but a human must still re-apply them by
+#      hand; silently skipping would remove that signal), the Dockerfiles/`.dockerignore`
+#      themselves, and every GitHub Actions workflow. `test_cd_pipeline.py` cross-checks this
+#      list against the Dockerfiles' actual `COPY` sources so a future Dockerfile change that
+#      starts copying a listed path fails that test, not CD silently skipping a real change.
 #
 # Needs a full clone (fetch-depth: 0) and, without --base, `gh` + GH_REPO. Writes
 # sha/base/deploy/reason to $GITHUB_OUTPUT when set. Exit 0 whatever the verdict; exit 1 when
@@ -63,10 +78,16 @@ if [ -z "$base" ]; then
   fi
 fi
 
-# skippable <path>: changes that never need a new image.
+# skippable <path>: changes that never need a new image (DEBT-023, T11c.E5 option B — every
+# pattern below was verified against the 4 Dockerfiles' actual COPY sources; see the header
+# comment for the full reasoning and what was deliberately left out).
 skippable() {
   case "$1" in
-    docs/* | deploy/k8s/* | *.md) return 0 ;;
+    docs/* | *.md | deploy/k8s/* | deploy/prometheus/* | eval/* | data/* \
+      | backend/tests/* | backend/requirements-dev.txt | backend/pyproject.toml \
+      | scripts/azure/* | scripts/dev/* | scripts/prereqs/* \
+      | scripts/gate.sh | scripts/fetch_corpus.py | scripts/restart_check.* \
+      | frontend/*.test.ts) return 0 ;;
     *) return 1 ;;
   esac
 }
