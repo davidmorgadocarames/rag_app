@@ -148,7 +148,7 @@ def test_a_real_run_logs_outside_tmp_under_home_by_default(tmp_path: Path) -> No
     """C8c / T11c.E1: evidence must survive a WSL stop (/tmp is tmpfs); it never lives there."""
     repo = _make_repo(tmp_path)
     home = tmp_path / "home"
-    proc = _gate(repo, "--only", "environment", HOME=str(home))
+    proc = _gate(repo, "--only", "git-modes", HOME=str(home))
     assert proc.returncode == 0, proc.stdout
     assert "GATE: PASS" in proc.stdout  # still printed to the terminal, not only to the file
     log_dir = home / "secrag-gate-logs"
@@ -166,7 +166,7 @@ def test_gate_log_dir_is_configurable(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     home = tmp_path / "home"
     custom = tmp_path / "custom-gate-logs"
-    proc = _gate(repo, "--only", "environment", HOME=str(home), GATE_LOG_DIR=str(custom))
+    proc = _gate(repo, "--only", "git-modes", HOME=str(home), GATE_LOG_DIR=str(custom))
     assert proc.returncode == 0, proc.stdout
     assert not home.exists()  # the default directory is never created when overridden
     assert list(custom.glob("gate-*.log"))
