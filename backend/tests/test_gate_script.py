@@ -54,10 +54,16 @@ def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str
         for k, v in os.environ.items()
         if not k.startswith("GATE_") and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE"}
     }
+    # DA-E-1: every call gets its own scratch HOME by default, so gate.sh's default
+    # GATE_LOG_DIR=$HOME/secrag-gate-logs (T11c.E1) never writes a test-generated log into
+    # the REAL ~/secrag-gate-logs -- which also holds the orchestrator's own promotion
+    # evidence. A test that exercises the logging behaviour itself passes its own HOME (or
+    # GATE_LOG_DIR) in **env, which wins (dict union below keeps the last value).
+    scratch_home = {"HOME": str(repo.parent / "scratch-home")}
     return subprocess.run(
         ["bash", str(repo / "scripts" / "gate.sh"), *args],
         cwd=repo,
-        env={**base, "GATE_VENV": str(repo / "no-venv"), **env},
+        env={**base, "GATE_VENV": str(repo / "no-venv"), **scratch_home, **env},
         capture_output=True,
         text=True,
         timeout=120,
@@ -144,6 +150,23 @@ def test_only_fails_in_the_main_tree_when_the_venv_drifted_from_the_pins(tmp_pat
 
 
 @needs_tools
+def test_a_normal_gate_call_never_touches_the_real_home_log_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-E-1: every other test in this file calls _gate() without passing HOME/GATE_LOG_DIR
+    -- they must never write into the real ~/secrag-gate-logs just because the enclosing
+    pytest process's own HOME leaked through. Simulates that real HOME with a sentinel dir
+    standing in for it and asserts _gate() never touches it."""
+    pretend_real_home = tmp_path / "pretend-real-home"
+    sentinel = pretend_real_home / "secrag-gate-logs"
+    sentinel.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(pretend_real_home))
+    proc = _gate(_make_repo(tmp_path), "--only", "git-modes")
+    assert proc.returncode == 0, proc.stdout
+    assert list(sentinel.iterdir()) == []  # untouched: no gate-*.log landed here
+
+
+@needs_tools
 def test_a_real_run_logs_outside_tmp_under_home_by_default(tmp_path: Path) -> None:
     """C8c / T11c.E1: evidence must survive a WSL stop (/tmp is tmpfs); it never lives there."""
     repo = _make_repo(tmp_path)
@@ -159,6 +182,36 @@ def test_a_real_run_logs_outside_tmp_under_home_by_default(tmp_path: Path) -> No
     content = logs[0].read_text(encoding="utf-8")
     assert "GATE: PASS" in content
     assert f"gate log: {logs[0]}" in proc.stderr
+
+
+@needs_tools
+def test_the_log_dir_and_file_are_private(tmp_path: Path) -> None:
+    """DA-E-2: the directory is 0700 and every log file 0600, even though $HOME (and
+    anything under it) may default to the much looser 0755/0644 a plain mkdir/touch would
+    use -- a local umask, not the caller's, decides this."""
+    repo = _make_repo(tmp_path)
+    home = tmp_path / "home"
+    proc = _gate(repo, "--only", "git-modes", HOME=str(home))
+    assert proc.returncode == 0, proc.stdout
+    log_dir = home / "secrag-gate-logs"
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+    logs = list(log_dir.glob("gate-*.log"))
+    assert len(logs) == 1, logs
+    assert stat.S_IMODE(logs[0].stat().st_mode) == 0o600
+
+
+@needs_tools
+def test_a_pre_existing_looser_log_dir_is_tightened(tmp_path: Path) -> None:
+    """DA-E-2: a directory from before this check existed (or created some other way) is
+    tightened on the very next run, not left at whatever it had."""
+    repo = _make_repo(tmp_path)
+    home = tmp_path / "home"
+    log_dir = home / "secrag-gate-logs"
+    log_dir.mkdir(parents=True)
+    log_dir.chmod(0o755)
+    proc = _gate(repo, "--only", "git-modes", HOME=str(home))
+    assert proc.returncode == 0, proc.stdout
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
 
 
 @needs_tools

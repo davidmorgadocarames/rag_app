@@ -915,8 +915,16 @@ case "${1:-}" in
 esac
 
 GATE_LOG_DIR="${GATE_LOG_DIR:-$HOME/secrag-gate-logs}"
-if mkdir -p "$GATE_LOG_DIR" 2>/dev/null && [ -w "$GATE_LOG_DIR" ]; then
+# DA-E-2: the directory and every log file are private (0700 / 0600) -- a local umask for
+# just these two creations, never changing the umask `main "$@"` itself runs under. A
+# pre-existing, looser-permissioned directory/file (e.g. from before this check existed) is
+# tightened defensively on every run too.
+(umask 077 && mkdir -p "$GATE_LOG_DIR") 2>/dev/null
+chmod 700 "$GATE_LOG_DIR" 2>/dev/null || true
+if [ -w "$GATE_LOG_DIR" ]; then
   GATE_LOG_FILE="$GATE_LOG_DIR/gate-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+  (umask 077 && : >"$GATE_LOG_FILE") 2>/dev/null
+  chmod 600 "$GATE_LOG_FILE" 2>/dev/null || true
   main "$@" 2>&1 | tee "$GATE_LOG_FILE"
   gate_rc="${PIPESTATUS[0]}"
   echo "gate log: $GATE_LOG_FILE" >&2
