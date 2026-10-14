@@ -120,7 +120,7 @@ jobs:
 
       # The workflow's own revision (for scripts/cd) with full history: the SHAs to compare
       # are read from git, never checked out (an older head_sha has no scripts/cd).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -179,7 +179,7 @@ jobs:
       contents: read
       statuses: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: scripts/cd
       - name: Refuse a SHA without a local --full PASS
@@ -208,7 +208,7 @@ jobs:
       # Placeholder digest: a dry run builds nothing.
       JOBS_IMAGE: ghcr.io/${{ github.repository }}-jobs@sha256:<digest-of-the-jobs-image>
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: scripts/cd
       - name: 0. Plan and gate status
@@ -296,13 +296,13 @@ jobs:
       jobs_digest: ${{ steps.jobs.outputs.digest }}
       ollama_digest: ${{ steps.ollama.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.plan.outputs.sha }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -310,7 +310,7 @@ jobs:
 
       - name: Build & push backend
         id: backend
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           push: true
@@ -322,7 +322,7 @@ jobs:
 
       - name: Build & push frontend
         id: frontend
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           # NEXT_PUBLIC_* is baked at build time, so the public backend URL must be set
@@ -340,7 +340,7 @@ jobs:
       # Slim jobs image (T11.2.12): migration, purge and backup Jobs.
       - name: Build & push jobs image
         id: jobs
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           file: ./backend/Dockerfile.jobs
@@ -356,7 +356,7 @@ jobs:
       # Custom Ollama image (T11.4.3): `bge-m3` baked in at build time — see ollama/Dockerfile.
       - name: Build & push ollama image
         id: ollama
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./ollama
           file: ./ollama/Dockerfile
@@ -398,7 +398,7 @@ jobs:
       RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
       MIGRATE_JOB: ${{ vars.AZURE_MIGRATE_JOB }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: scripts/cd
 
@@ -409,7 +409,7 @@ jobs:
         run: bash scripts/cd/gate_status.sh verify "$SHA" --creator "$CREATOR"
 
       - name: Azure login (OIDC federated credentials)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -439,7 +439,7 @@ jobs:
       FRONTEND_IMAGE: ghcr.io/${{ github.repository }}-frontend@${{ needs.images.outputs.frontend_digest }}
       OLLAMA_IMAGE: ghcr.io/${{ github.repository }}-ollama@${{ needs.images.outputs.ollama_digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: scripts/cd
 
@@ -472,7 +472,7 @@ jobs:
           gh api -X POST "repos/$REPO/deployments/$id/statuses" -f state=in_progress > /dev/null
 
       - name: Azure login (OIDC federated credentials)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -482,10 +482,10 @@ jobs:
       # (the backend calls Ollama synchronously for embeddings, so it must already be
       # serving the baked-in model before backend's new revision can take traffic).
       - name: Deploy new images to the Container Apps (by digest; ollama before backend/frontend)
-        uses: azure/cli@v2
+        uses: azure/cli@v3
         with:
           azcliversion: latest
-          # DA-11bD-2: explicit, not relied on from azure/cli@v2's own (undocumented)
+          # DA-11bD-2: explicit, not relied on from azure/cli@v3's own (undocumented)
           # default — a failed `az containerapp update` (e.g. a missing/stale
           # AZURE_OLLAMA_APP, now that this step deploys three apps instead of two) must
           # stop this script before the NEXT app is touched, never leave a partial

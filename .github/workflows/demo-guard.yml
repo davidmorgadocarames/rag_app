@@ -46,7 +46,7 @@ jobs:
       AZURE_OLLAMA_APP: ${{ vars.AZURE_OLLAMA_APP }}
       AZURE_FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           sparse-checkout: scripts/azure
 
@@ -63,7 +63,7 @@ jobs:
       # even to log in (no OIDC token is even requested).
       - name: Azure login (OIDC federated credentials)
         if: steps.mode.outputs.dry_run == 'false'
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}

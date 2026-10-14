@@ -265,6 +265,48 @@ def test_ci_pins_the_same_shellcheck_as_the_local_installer() -> None:
     assert steps.index(pin) < gate
 
 
+def test_github_actions_are_pinned_to_a_release_on_the_node24_runtime() -> None:
+    """DEBT-018: GitHub is removing the Node 20 runtime from hosted runners (Actions started
+    refusing node20 actions once the opt-out flag window closed), so every action pinned in
+    any workflow must be on a release confirmed (against its own action.yml at the time of
+    this fix) to run on node24 -- not just "the next major", in case a future major regresses."""
+    import re
+
+    import yaml
+
+    # action -> earliest major confirmed on node24 (checked via each action's action.yml).
+    min_node24_major = {
+        "actions/checkout": 5,
+        "actions/setup-node": 5,
+        "actions/setup-python": 6,
+        "actions/cache": 5,
+        "docker/build-push-action": 7,
+        "docker/login-action": 4,
+        "docker/setup-buildx-action": 4,
+        "azure/login": 3,
+        "azure/cli": 3,
+        "gitleaks/gitleaks-action": 3,
+    }
+    found: set[str] = set()
+    for wf in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
+        doc = yaml.safe_load(wf.read_text(encoding="utf-8"))
+        for job in doc.get("jobs", {}).values():
+            for step in job.get("steps", []):
+                uses = step.get("uses", "")
+                name, _, version = uses.partition("@")
+                if name not in min_node24_major:
+                    continue
+                found.add(name)
+                match = re.match(r"v?(\d+)", version)
+                assert match, f"{wf.name}: {uses} is not pinned to a major version"
+                major = int(match.group(1))
+                assert (
+                    major >= min_node24_major[name]
+                ), f"{wf.name}: {uses} predates node24 (need >= v{min_node24_major[name]})"
+    missing = set(min_node24_major) - found
+    assert not missing, f"missing from the workflows: {missing}"
+
+
 def test_ci_caches_and_retries_the_shellcheck_download() -> None:
     """DEBT-025: a transient HTTP 500 from the releases CDN once failed this job outright.
     A cache hit must skip the download entirely; a miss must retry on any failure, not just
