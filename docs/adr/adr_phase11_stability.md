@@ -1134,13 +1134,22 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
     is no restart. `off` returns every app to min 0 and removes the tag. `status` reports
     each app's state and an approximate running cost from the tag's start time
     (`DEMO_MODE_HOURLY_COST_EUR`, default 0.17 EUR/h for the 3 apps together — the internal
-    cost-planning notes' §2.2 estimate: ≈0.15–0.17 EUR/h, ≤ ~0.65 EUR per 3 h+guard-lag activation).
-    `.github/workflows/demo-guard.yml` runs `scripts/azure/demo-guard.sh` **hourly** (cron)
-    and on `workflow_dispatch` (a `dry_run` input, default true, that skips the Azure login
-    step — and therefore the OIDC token request — entirely): it scales any app with
-    min-replicas=1 whose tag has passed, or that has no tag at all, back to 0; there is no
-    code path in it that raises min-replicas, and its fake-`az` tests include one that
-    refuses outright if the script ever asked for anything but `--min-replicas 0`. **OIDC
+    cost-planning notes' §2.2 estimate: ≈0.15–0.17 EUR/h; actual Container Apps billing is
+    under review, see [Costs](#costs)). A demo switched `off` on time (the fixed 3 h window)
+    costs ≈0.50 EUR; a forgotten demo left running until the guard (see below) catches it can
+    cost up to ≈1.30 EUR before it is scaled back down.
+    `.github/workflows/demo-guard.yml` runs `scripts/azure/demo-guard.sh` on an **hourly
+    `schedule` trigger** (cron) and on `workflow_dispatch` (a `dry_run` input, default true,
+    that skips the Azure login step — and therefore the OIDC token request — entirely): it
+    scales any app with min-replicas=1 whose tag has passed, or that has no tag at all, back
+    to 0; there is no code path in it that raises min-replicas, and its fake-`az` tests
+    include one that refuses outright if the script ever asked for anything but
+    `--min-replicas 0`. The guard is a **backstop**, not the cost ceiling: on this
+    low-activity repository GitHub does not fire the `schedule` trigger every hour as
+    configured — observed real gaps of several hours between runs (2026-10-14/15), and once
+    an expired demo stayed up for nearly 3 extra hours before a manual `off`. The fixed 3 h
+    window in `demo-mode.sh on`, plus the operator switching the demo `off` right after use,
+    is what actually bounds the cost — not the guard's cadence. **OIDC
     risk, checked before writing the workflow (the task's explicit gate):** a GitHub Actions
     `schedule` trigger only ever fires off the repository's default branch, so its OIDC
     token's `sub` claim is `repo:<owner>/<repo>:ref:refs/heads/main` — the exact subject the

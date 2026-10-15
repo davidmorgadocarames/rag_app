@@ -618,8 +618,9 @@ scripts/azure/demo-mode.sh off      # back to min-replicas 0 right away
 - `off` sets min-replicas back to 0 and removes the tag.
 - `status` reports one of four states, by checking **every** app individually: **`on`** only
   if all three apps have min-replicas 1 AND a future `secrag-demo-until` tag; **`expired`** if
-  any app has min-replicas 1 with a missing, expired or malformed tag (demo-guard will scale
-  it down within the hour); **`off`** only if all three apps have min-replicas 0; **`partial`**
+  any app has min-replicas 1 with a missing, expired or malformed tag (demo-guard is a
+  backstop and scales it down eventually — see the guard note below for real observed delays,
+  not within an hour); **`off`** only if all three apps have min-replicas 0; **`partial`**
   for any other mix (e.g. Ollama asleep while backend/frontend are awake) — a state that is
   deliberately never reported as `on`, since a demo is not actually ready if even one app
   could still cold-start-fail the first question (DA-11bH-1). The "approximate cost so far"
@@ -627,10 +628,15 @@ scripts/azure/demo-mode.sh off      # back to min-replicas 0 right away
   (capped at the fixed 3h window) only for `on`, and as `n/a (<reason>)` for `expired`/
   `partial`/`off` or a malformed tag — a hand-edited or long-expired tag used to be read as
   if the window had just opened, printing a nonsense figure (F-H-1).
-- An hourly GitHub Actions workflow (`.github/workflows/demo-guard.yml`,
-  `scripts/azure/demo-guard.sh`) is the safety net: it scales any app whose tag has expired
-  (or that is awake with no tag at all — e.g. changed by hand) back to 0, even if the
-  machine that ran `demo-mode.sh on` is off. It can only ever scale **down**.
+- A GitHub Actions workflow on an hourly `schedule` trigger (`.github/workflows/demo-guard.yml`,
+  `scripts/azure/demo-guard.sh`) is a **backstop**, not the cost ceiling: it scales any app
+  whose tag has expired (or that is awake with no tag at all — e.g. changed by hand) back to
+  0, even if the machine that ran `demo-mode.sh on` is off. It can only ever scale **down**.
+  In practice, on a low-activity repository GitHub does not fire an hourly `schedule` every
+  hour — observed real gaps of several hours between runs, and in one case an expired demo
+  stayed up for nearly 3 extra hours before a manual `off`. Treat the guard as "eventually
+  off, likely within a few hours", not "within the hour"; the operator switching the demo
+  `off` right after use is what actually bounds the cost, not the guard.
 - Running Ollama 24/7 instead (no cold start, ever) was costed and **not approved** — see
   ADR 11, decision 11 — it is a future budget decision, not the default.
 
