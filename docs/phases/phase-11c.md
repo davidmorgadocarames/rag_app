@@ -3,7 +3,8 @@
 - **Closing:** 2026-10-15 · **Tag:** `phase-11c` (orchestrator creates it on the final deployed
   commit at close).
 - **Promoted to Azure:** 2026-10-15 (block E, `main` → `80180e0`, PR #13).
-- **Cost:** to be filled at close (Cost Management, 2026-10-16).
+- **Cost:** ≈ €0.004 so far (cap €0.50); 2026-10-15 activity not yet posted at close — see
+  Cost below.
 
 ## Why this phase existed
 
@@ -51,9 +52,6 @@ clear a batch of small repo-hygiene debts so Phase 12 starts clean.
   on time costs roughly €0.50 for a 3 h activation; one left running until the guard catches it
   can cost up to roughly €1.30 (at an estimated €0.15–0.17/h for the three apps together — the
   actual Container Apps billing for this usage is still under review, see Cost below).
-- **A stray container registry test tag was left over from an earlier phase and a related cost
-  figure was still pending at the time of writing.** Both are administrative follow-ups tracked
-  separately; see Known follow-ups.
 
 ## Gate evidence
 
@@ -69,7 +67,16 @@ clear a batch of small repo-hygiene debts so Phase 12 starts clean.
 
 ## Cost
 
-Cost: to be filled at close (Cost Management, 2026-10-16).
+Phase estimate ≈ €0.05 (cap €0.50). Measured (Azure Cost Management, `ActualCost`, read-only,
+whole subscription, queried 2026-10-15 20:45): daily 2026-10-14 **€0.0044**. By resource for
+2026-10-06…14: Azure OpenAI €0.0287, Log Analytics / Storage / PostgreSQL Flexible Server
+**€0.0000**, and **no Container Apps cost rows at all** — including 2026-10-14, a day with a
+CD deploy and a ~7-minute demo activation. Most likely the Container Apps environment's
+monthly free grant now covers this subscription's usage in the standard environment, as in
+11b (not guaranteed; watched monthly, not assumed permanent). **11c total ≈ €0.004 so far**
+against the ≈€0.05 estimate and the €0.50 cap. 2026-10-15 activity (the interview demo, ~5 h
+45 min on, plus the PR #14 CI/CD run) is not posted yet at close — tracked as a follow-up, see
+Known follow-ups. Subscription total since 2026-09-01: **€6.18 of the €40** student budget.
 
 ## Changed docs
 
@@ -80,10 +87,10 @@ reworded to generic terms).
 
 ## Known follow-ups
 
-- A stray container registry tag from an earlier phase's bootstrap step is pending administrative
-  cleanup (registry permissions/UI action, not a code change).
-- The 2026-10-14/15 cost figures were still pending at the time of writing (Azure's Cost
-  Management data lags by up to a day); see Cost above.
+- A stray container registry tag from an earlier phase's bootstrap step is pending
+  administrative cleanup (deletion needs the account owner's package-delete permission, not a
+  code change); the 2026-10-15 cost figure (interview demo + CI/CD run) was still pending at
+  the time of writing (Azure's Cost Management data lags by up to a day) — see Cost above.
 - The demo-guard's `schedule` trigger firing far less often than configured is accepted as a
   known gap: the demo window itself is fixed and self-bounding, and the operator switches demo
   mode `off` right after use, but the guard is a looser backstop than its hourly configuration
