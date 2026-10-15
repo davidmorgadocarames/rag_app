@@ -273,8 +273,16 @@ jobs:
   # Server-side backstop for the local pre-push gate (DA-B-1, DA-B-5, D-2026-09-27-7 a):
   # the same gate.sh steps, so a push that skipped the hook still shows these results.
   # Under --only a missing tool fails (never skips). Hook activation is local-only.
+  # The job's `name:` below is a REQUIRED STATUS CHECK CONTEXT in the `main-ci` branch
+  # ruleset (GitHub matches required checks by this exact string) -- it must stay
+  # "Gate cheap checks (git modes, shellcheck, venv, dependency-audit, adr-links)" verbatim.
+  # T11c.E3 renamed it to add ", private-names)" and the renamed context no longer satisfied
+  # the ruleset, blocking the orchestrator's merge to main; the private-names step itself
+  # stays in this job (see the gate.sh --only line below) -- only the job's displayed name
+  # reverted. Changing this string again needs a matching update to the ruleset first
+  # (orchestrator + user, GitHub settings), never the other way round.
   cheap-checks:
-    name: Gate cheap checks (git modes, shellcheck, venv, dependency-audit, adr-links, private-names)
+    name: Gate cheap checks (git modes, shellcheck, venv, dependency-audit, adr-links)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

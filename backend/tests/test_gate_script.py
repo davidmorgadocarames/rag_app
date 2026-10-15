@@ -378,3 +378,30 @@ def test_ci_caches_and_retries_the_shellcheck_download() -> None:
     assert '[ ! -f "$RUNNER_TEMP/$tarball" ]' in download["run"]  # skip the download on a hit
     assert "--retry-all-errors" in download["run"]
     assert "sha256sum -c -" in download["run"]  # verified whether cached or freshly downloaded
+
+
+# GitHub matches a branch ruleset's required status check by this EXACT job `name:` string
+# (main-ci, orchestrator-owned). Renaming any of these five breaks every future merge to
+# main until the ruleset is updated too (it was, once: T11c.E3 appended ", private-names)"
+# to cheap-checks' name and the orchestrator's merge was rejected — fixed by reverting the
+# name, not the ruleset, since nothing here may touch GitHub settings).
+REQUIRED_CI_JOB_NAMES = (
+    "Backend (lint, types, tests incl. DB)",
+    "Frontend (lint, types, build)",
+    "Jobs image (build, no torch, pg_dump 16, audit)",
+    "Secret scan",
+    "Gate cheap checks (git modes, shellcheck, venv, dependency-audit, adr-links)",
+)
+
+
+def test_the_five_required_ci_job_names_exist_verbatim() -> None:
+    import yaml
+
+    ci = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    names = {job.get("name") for job in ci["jobs"].values()}
+    missing = [name for name in REQUIRED_CI_JOB_NAMES if name not in names]
+    assert not missing, (
+        f"required CI job name(s) missing or renamed: {missing} — this breaks the main-ci"
+        " branch ruleset's required status checks; update the ruleset FIRST (orchestrator +"
+        " user, GitHub settings) before renaming a job here"
+    )

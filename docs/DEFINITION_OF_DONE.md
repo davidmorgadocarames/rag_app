@@ -70,8 +70,10 @@ are a human/agent checklist.
   phase report / PR. `scripts/gate.sh` writes every real run's full output to a file under
   `~/secrag-gate-logs` (override with `GATE_LOG_DIR`; T11c.E1) — never under `/tmp`, which is
   `tmpfs` in WSL2 and is wiped on a WSL stop, which would otherwise lose exactly this
-  evidence. CI's `cheap-checks` job is the server-side backstop for the cheap steps
-  (git modes, shellcheck, venv, dependency-audit, adr-links, private-names). **Right after the promotion
+  evidence. CI's `cheap-checks` job (`name:` is a required status check context in the
+  `main-ci` ruleset — never renamed without updating the ruleset first) is the server-side
+  backstop for the cheap steps, git modes through adr-links, **plus `private-names`** (added
+  in T11c.E3 without renaming the job). **Right after the promotion
   push** (DA-C-4), check locally that the status really exists for the pushed SHA:
   `bash scripts/cd/gate_status.sh verify <sha> --wait 300 --creator <owner>` → `deploy
   allowed`. **Recovery** when it is missing (the detached background publisher was killed
