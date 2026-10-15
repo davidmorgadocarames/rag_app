@@ -12,7 +12,14 @@ from typing import Any
 import pytest
 import yaml
 
-from rag_app.devtools import adr_links, dependency_audit, gate_compose, private_names, schema_check
+from rag_app.devtools import (
+    adr_links,
+    dependency_audit,
+    gate_compose,
+    private_names,
+    schema_check,
+    threat_catalogue,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -119,6 +126,150 @@ def test_repository_docs_never_name_a_private_file() -> None:
         for h in private_names.check_file(path)
     ]
     assert hits == []
+
+
+# --- threat-catalogue (T12.0.5) ---------------------------------------------------------
+
+_CATALOGUE_HEADER = (
+    "| ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |\n"
+    "|---|---|---|---|---|---|---|---|\n"
+)
+
+
+def _catalogue_doc(tmp_path: Path, *rows: str) -> Path:
+    body = "# Threat model\n\n<!-- threat-catalogue:begin -->\n\n" + _CATALOGUE_HEADER
+    body += "".join(rows)
+    body += "\n<!-- threat-catalogue:end -->\n"
+    return _write(tmp_path / "THREAT_MODEL.md", body)
+
+
+def test_extract_rows_reads_a_table_between_the_markers(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned | low | low | 15.1 | T15.1.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert [r.entry_id for r in rows] == ["X-1"]
+    assert rows[0].status == "planned"
+    assert rows[0].phase == "15.1"
+    assert rows[0].test_id == "T15.1.1"
+
+
+def test_rows_outside_the_markers_are_ignored(tmp_path: Path) -> None:
+    doc = _write(
+        tmp_path / "doc.md",
+        "| ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |\n"
+        "|---|---|---|---|---|---|---|---|\n"
+        "| X-1 | Outside | planned | low | low | 1 | T1 | n/a |\n",
+    )
+    assert threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc) == []
+
+
+def test_a_row_missing_a_phase_fails(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned | low | low |  | T15.1.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("missing phase" in str(p) for p in problems)
+
+
+def test_a_row_missing_a_test_id_fails(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned | low | low | 15.1 |  | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("missing test ID" in str(p) for p in problems)
+
+
+def test_an_unknown_status_fails(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | someday | low | low | 15.1 | T15.1.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("not one of" in str(p) for p in problems)
+
+
+def test_a_planned_entry_with_a_future_task_id_passes(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned | low | low | 15.1 | T15.1.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert threat_catalogue.check(tmp_path, rows) == []
+
+
+def test_an_accepted_entry_with_a_debt_id_passes(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | accepted | n/a | n/a | accepted | DEBT-020 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert threat_catalogue.check(tmp_path, rows) == []
+
+
+def test_a_mitigated_entry_pointing_at_a_real_test_passes(tmp_path: Path) -> None:
+    _write(tmp_path / "backend/tests/test_example.py", "def test_real_one() -> None:\n    pass\n")
+    test_id = "backend/tests/test_example.py::test_real_one"
+    doc = _catalogue_doc(
+        tmp_path,
+        f"| X-1 | Example | mitigated | low | low | 1 | {test_id} | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert threat_catalogue.check(tmp_path, rows) == []
+
+
+def test_a_mitigated_entry_pointing_at_a_missing_test_fails(tmp_path: Path) -> None:
+    """A catalogue entry claiming 'mitigated' must point at a test that actually exists —
+    this reproduces a catalogue that drifted from a renamed/deleted test (regression guard
+    for T12.0.5's Done-when: an entry without a real test fails)."""
+    _write(tmp_path / "backend/tests/test_example.py", "def test_real_one() -> None:\n    pass\n")
+    test_id = "backend/tests/test_example.py::test_renamed_away"
+    doc = _catalogue_doc(
+        tmp_path,
+        f"| X-1 | Example | mitigated | low | low | 1 | {test_id} | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("does not resolve" in str(p) for p in problems)
+
+
+def test_a_mitigated_entry_pointing_at_a_non_test_id_fails(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | mitigated | low | low | 1 | T1.2.3 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("does not resolve" in str(p) for p in problems)
+
+
+def test_main_fails_without_any_catalogue_rows(tmp_path: Path) -> None:
+    doc = _write(tmp_path / "empty.md", "# nothing here\n")
+    assert threat_catalogue.main([str(doc)]) == 1
+
+
+def test_main_passes_on_a_well_formed_catalogue(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned | low | low | 15.1 | T15.1.1 | note |\n",
+    )
+    assert threat_catalogue.main([str(doc)]) == 0
+
+
+def test_the_repository_catalogue_is_valid() -> None:
+    """The real docs/security/THREAT_MODEL.md: every entry well-formed, every mitigated
+    entry's test ID resolving to a real test — this is the gate step's own regression test
+    against the live catalogue, not just the parser."""
+    target = REPO_ROOT / "docs" / "security" / "THREAT_MODEL.md"
+    rows = threat_catalogue.extract_rows(target.read_text(encoding="utf-8"), target)
+    assert rows, "expected at least one catalogue row in THREAT_MODEL.md"
+    assert threat_catalogue.check(REPO_ROOT, rows) == []
 
 
 # --- dependency-audit -----------------------------------------------------------------

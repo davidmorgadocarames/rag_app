@@ -75,13 +75,14 @@ jobs:
         run: pytest -rs -m "not db"
       - name: Pytest (DB tests through the harness — must run, never skip)
         run: pytest -rs -m db
-      - name: Links (adr-links), eval data (schema-check), private names (DEBT-026)
+      - name: Links (adr-links), eval data (schema-check), private names (DEBT-026), threat catalogue (T12.0.5)
         env:
           PYTHONPATH: src
         run: |
           python -m rag_app.devtools.adr_links --root ..
           python -m rag_app.devtools.schema_check --root ..
           python -m rag_app.devtools.private_names --root ..
+          python -m rag_app.devtools.threat_catalogue --root ..
 
   frontend:
     name: Frontend (lint, types, build)
@@ -338,7 +339,7 @@ jobs:
         run: |
           shellcheck --version | grep -x "version: 0.11.0"
           node --version && npm --version
-      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names
+      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue
         env:
           GATE_VENV: ${{ github.workspace }}/backend/.venv
-        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names
+        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue

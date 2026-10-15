@@ -81,6 +81,7 @@ shellcheck       - 60
 schema-check     - 30
 adr-links        - 30
 private-names    - 30
+threat-catalogue - 30
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
@@ -239,6 +240,10 @@ step_adr-links() { need_venv && "$PY" -m rag_app.devtools.adr_links --root "$REP
 
 # DEBT-026: no public, tracked Markdown file names a private planning file.
 step_private-names() { need_venv && "$PY" -m rag_app.devtools.private_names --root "$REPO_ROOT"; }
+
+# T12.0.5: every THREAT_MODEL.md catalogue entry has a phase + test ID; mitigated entries
+# point at a test that exists.
+step_threat-catalogue() { need_venv && "$PY" -m rag_app.devtools.threat_catalogue --root "$REPO_ROOT"; }
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 

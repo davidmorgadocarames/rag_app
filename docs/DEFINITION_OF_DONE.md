@@ -49,6 +49,14 @@ are a human/agent checklist.
   does **not** conflict with a container that *runs in production* on Azure.
 - **Phase 11+ (gate hygiene, X5)** — `--full` runs only in the isolated gate project; every
   sub-phase closes with `--full` or `--only <the steps it adds>`; target `--full` ≤ 30 min.
+- **Phase 12+ (threat catalogue, T12.0.4/T12.0.5)** — every vulnerability-catalogue entry in
+  [`docs/security/THREAT_MODEL.md`](security/THREAT_MODEL.md) carries a status (`mitigated` /
+  `planned` / `accepted`), a defence difficulty, an attack level, an assigned phase and a test
+  ID; a row missing a phase or test ID fails; a `mitigated` row's test ID must resolve to a
+  real, tracked test. Enforced by the gate step `threat-catalogue`
+  (`rag_app.devtools.threat_catalogue`). A new route, store or trust boundary added by a later
+  phase either closes an existing catalogue entry (test ID filled in, status flipped to
+  `mitigated`) or adds a new one.
 - **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
   it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
   image that is still running (and the previous image in a rollback) keeps working on the
@@ -127,7 +135,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
 | `private-names` | - | 30 s | `backup-drill` | gate DB | 300 s |
-| | | | `erasure-scale` | gate DB | 600 s |
+| `threat-catalogue` | - | 30 s | `erasure-scale` | gate DB | 600 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 
