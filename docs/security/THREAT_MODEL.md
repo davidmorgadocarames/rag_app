@@ -182,8 +182,8 @@ under Azure's ingress limit) is not silently shortened by the new frontend hop.
 ## 5. Vulnerability catalogue
 
 Columns: **ID**, **Entry**, **Status** (`mitigated` / `planned` / `accepted`), **Defence
-difficulty**, **Attack level**, **Phase**, **Test ID**, **Notes** (folds in F1–F11 and
-`DEBT_REGISTER` row numbers as plain IDs, never the file name — `private-names`).
+difficulty**, **Attack level**, **Phase**, **Test ID**, **Notes** (folds in F1–F11 and plain
+tracking IDs like `DEBT-020`, never a private file name — `private-names`).
 
 <!-- threat-catalogue:begin -->
 
@@ -200,7 +200,7 @@ difficulty**, **Attack level**, **Phase**, **Test ID**, **Notes** (folds in F1�
 | OWASP-A07 | Authentication Failures | planned | medium | medium | 12a | T12.1.2 | F1 (JWT in `localStorage`, no server-side logout), F3 (user enumeration via 409 + timing), F10 (weak password policy) close across 12a (sessions) and 12b (12.4). |
 | OWASP-A08 | Software or Data Integrity Failures | planned | high | low | 15.5 | T15.5.5 | Keyless signing + digest verification; corpus integrity hash manifest (15.4.5). |
 | OWASP-A09 | Logging & Alerting Failures | mitigated | low | medium | 11a | backend/tests/test_log_hygiene.py::test_the_whole_auth_flow_logs_no_email_or_token | No PII/secrets in logs across the whole auth flow. F9 (verification link logged) already removed (11a). Dashboard banner alerts (the "alerting" half) planned 13.5.2. |
-| OWASP-A10 | Mishandling of Exceptional Conditions | mitigated | medium | medium | 11a | backend/tests/test_daily_cap.py::test_stream_fails_closed_when_the_counter_cannot_be_written | Fail-closed on counter/storage failures rather than granting a free answer; same pattern reviewed per new data store (PHASE_PLANNING §1 rule 10). |
+| OWASP-A10 | Mishandling of Exceptional Conditions | mitigated | medium | medium | 11a | backend/tests/test_daily_cap.py::test_stream_fails_closed_when_the_counter_cannot_be_written | Fail-closed on counter/storage failures rather than granting a free answer; the same pattern is reviewed for every new data store the project adds. |
 
 ### 5.2 OWASP API Security Top 10:2023
 
