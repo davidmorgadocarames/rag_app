@@ -255,6 +255,26 @@ def test_someone_elses_conversation_is_a_404_before_streaming(
     assert _turns(db_engine, owner) == {conv: (1, 1)}
 
 
+def test_a_hostile_title_round_trips_through_postgres_unexecuted(
+    client: Any, db_engine: Engine
+) -> None:
+    """DA-12aA-2: the THREAT_MODEL catalogue's injection entry needs a real database test,
+    not just the Fernet round-trip in test_conversations.py. This writes an attacker-looking
+    title through the real rename endpoint — ORM, bound parameter, real Postgres — and reads
+    it back unchanged; the `conversations` table (and its row for this user) still exists
+    afterwards, which it would not if the payload had ever reached raw SQL."""
+    user = _make_user(db_engine)
+    conv = _stream(client, user, "hello")[0]["conversation_id"]
+    evil = "'; DROP TABLE conversations;-- \" OR 1=1"
+
+    res = client.patch(f"/conversations/{conv}", json={"title": evil}, headers=_auth(user))
+    assert res.status_code == 200
+
+    detail = client.get(f"/conversations/{conv}", headers=_auth(user)).json()
+    assert detail["title"] == evil
+    assert _turns(db_engine, user) == {conv: (1, 1)}  # the table (and this row) still exist
+
+
 # --- listing never 500s on one bad row -----------------------------------------------------
 
 

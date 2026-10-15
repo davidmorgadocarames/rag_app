@@ -165,6 +165,37 @@ def test_rows_outside_the_markers_are_ignored(tmp_path: Path) -> None:
     assert threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc) == []
 
 
+def test_a_row_with_too_few_cells_is_a_catalogue_problem_not_a_silent_skip(
+    tmp_path: Path,
+) -> None:
+    """DA-12aA-1: a short row used to be dropped with no trace — now it is a row (flagged
+    'malformed') that main() fails on, red on the pre-fix code (which returned 0 rows and
+    exit 0 for this file)."""
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert len(rows) == 1
+    assert rows[0].status == "malformed"
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("malformed row" in str(p) for p in problems)
+    assert threat_catalogue.main([str(doc)]) == 1
+
+
+def test_a_row_with_an_unescaped_pipe_is_a_catalogue_problem(tmp_path: Path) -> None:
+    """An un-escaped '|' inside a cell splits it into extra cells — also a column-count
+    mismatch against the header, so it must fail rather than be silently absorbed."""
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example | planned | low | low | 15.1 | T|15.1.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert len(rows) == 1
+    assert rows[0].status == "malformed"
+    assert threat_catalogue.main([str(doc)]) == 1
+
+
 def test_a_row_missing_a_phase_fails(tmp_path: Path) -> None:
     doc = _catalogue_doc(
         tmp_path,

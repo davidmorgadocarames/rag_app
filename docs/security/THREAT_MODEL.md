@@ -110,7 +110,7 @@ adds them. `DEC-005/006/007` are the three Phase-12 decisions the user ratified 
 | Tampering | CSRF on state-changing routes | — | Signed double-submit token, `Origin` check (T12.1.4) |
 | Repudiation | No record of who acted when sessions aren't server-tracked | — | Server-side `sessions` table (migration 0006, T12.1.1); `audit_events` (15.3) |
 | Information disclosure | `/docs`, `/redoc`, `/openapi.json` public (F7); CORS `*` methods/headers (F8) | — | Docs gated to `ENV=dev` (T12.2.4), CORS narrowed (T12.2.4) then removed (12b T12.5.3) |
-| Denial of service | Anonymous chat cost (daily cap already mitigates, §5.5) | Daily answer cap (`test_the_default_cap_is_on_and_valid_in_prod`) | Per-IP/account rate limits keyed by signed client IP (T12.1.6) |
+| Denial of service | Anonymous chat cost (daily cap already mitigates, §5.5); on Azure every request arrives from the same internal address today, so per-IP limiting is defeated (F4) | Daily answer cap (`test_the_default_cap_is_on_and_valid_in_prod`) | Per-IP/account rate limits keyed by the signed client IP (F4, T12.1.6) |
 | Elevation of privilege | No roles today (F6) | — | `users.role`, `require_role` (12a/12b, T12.3.2) |
 
 **Planned, decision-driven (DEC-005/DEC-006):** `/api/health` added to the BFF allow-list
@@ -123,7 +123,7 @@ under Azure's ingress limit) is not silently shortened by the new frontend hop.
 
 | STRIDE | Threat | Existing control | Planned control |
 |---|---|---|---|
-| Spoofing | Backend trusting a forged client-IP header | — | HMAC-signed `X-SecRAG-Client-IP`, 30 s window, fallback + security event on failure (T12.1.6) |
+| Spoofing | Backend trusting a forged client-IP header, or every request on Azure sharing the same internal address (F4) | — | HMAC-signed `X-SecRAG-Client-IP`, 30 s window, fallback + security event on failure (T12.1.6) |
 | Tampering | BFF silently mutating or dropping the SSE stream | — | Explicit allow-list route handlers, unbuffered SSE (T12.1.5); `e2e` Playwright proof |
 | Information disclosure | BFF exposing `/metrics` or `/docs` by accident | — | Allow-list never includes them (T12.1.5 Done-when) |
 | Denial of service | Slow/blocked upstream cut early by a short BFF timeout, defeating the 11b cold-start fix | — | BFF timeouts ≥ 240 s, keep-alive pings pass through (T12.1.5, DEC-006); 1 fully-cold chat question smoke (T12.6a.5) |
@@ -195,7 +195,7 @@ tracking IDs like `DEBT-020`, never a private file name — `private-names`).
 | OWASP-A02 | Security Misconfiguration | planned | low | low | 12a | T12.2.5 | F2 (no security headers), F7 (`/docs` public), F8 (CORS `*` methods/headers) all close in 12.2. |
 | OWASP-A03 | Software Supply Chain Failures | mitigated | medium | medium | 11a | backend/tests/test_devtools.py::test_the_repository_exceptions_file_is_valid | `dependency-audit` gate step + gitleaks baseline; hardened further with SBOM/signing/Trivy/CodeQL in 15.5. |
 | OWASP-A04 | Cryptographic Failures | mitigated | medium | high | 11a | backend/tests/test_crypto.py::test_wrong_key_cannot_decrypt | At-rest encryption + key wrap/unwrap; TLS required to Postgres (reachability is a separate accepted risk, DEBT-016). |
-| OWASP-A05 | Injection | mitigated | low | high | 1 | backend/tests/test_conversations.py::test_malicious_title_round_trips_verbatim | ORM/parameterised queries throughout; malicious input round-trips verbatim instead of executing. |
+| OWASP-A05 | Injection | mitigated | low | high | 1 | backend/tests/test_chat_stream.py::test_a_hostile_title_round_trips_through_postgres_unexecuted | ORM/parameterised queries throughout; a `DROP TABLE`-shaped title is written via the real rename endpoint into the real Postgres database and read back unchanged, with the table and row still present. |
 | OWASP-A06 | Insecure Design | planned | high | low | 12a | T12.0.5 | This document and its gate step are the control: every design decision (P12-D1…D4) is written down and checked against a catalogue entry before being considered done. |
 | OWASP-A07 | Authentication Failures | planned | medium | medium | 12a | T12.1.2 | F1 (JWT in `localStorage`, no server-side logout), F3 (user enumeration via 409 + timing), F10 (weak password policy) close across 12a (sessions) and 12b (12.4). |
 | OWASP-A08 | Software or Data Integrity Failures | planned | high | low | 15.5 | T15.5.5 | Keyless signing + digest verification; corpus integrity hash manifest (15.4.5). |

@@ -14,7 +14,10 @@ The catalogue lives as ordinary Markdown tables between two HTML comment markers
 in **Test ID** — there is nothing to run yet. A ``mitigated`` row's **Test ID** must be a
 ``path::test_function`` that resolves to a tracked file containing ``def test_function(``;
 this is the regression test for a catalogue that drifts from the code it claims mitigates a
-risk (an entry marked done when the test backing it was renamed or deleted).
+risk (an entry marked done when the test backing it was renamed or deleted). A data row whose
+cell count doesn't match its table's header (too few cells, or extra ones from an unescaped
+``|`` inside a cell) is a failure too, never a silent skip (DA-12aA-1) — a catalogue that quietly
+shrinks must fail the gate, not just report fewer entries than it should.
 
     python -m rag_app.devtools.threat_catalogue [--root REPO] [FILE]
 
@@ -32,6 +35,7 @@ from pathlib import Path
 _BEGIN = "<!-- threat-catalogue:begin -->"
 _END = "<!-- threat-catalogue:end -->"
 _STATUSES = {"mitigated", "planned", "accepted"}
+_MALFORMED = "malformed"  # sentinel status: never a real entry, always a CatalogueProblem
 _DEFAULT_FILE = Path("docs/security/THREAT_MODEL.md")
 _TEST_ID = re.compile(r"^(?P<path>[\w./-]+\.py)::(?P<func>[A-Za-z_][\w]*)$")
 
@@ -71,6 +75,16 @@ def _table_cells(line: str) -> list[str] | None:
 _OUTSIDE, _HEADER_SEEN, _IN_DATA = range(3)
 
 
+def _malformed(source: Path, number: int, cells: list[str]) -> CatalogueRow:
+    """A data row whose cell count doesn't match its table's header (too few cells, or
+    extra ones from an unescaped ``|`` inside a cell) — flagged, never silently dropped
+    (DA-12aA-1): a shrinking catalogue must fail the gate, not just print fewer entries."""
+    label = cells[0] if cells and cells[0] else f"<malformed row, {len(cells)} cell(s)>"
+    return CatalogueRow(
+        source=source, line=number, entry_id=label, status=_MALFORMED, phase="", test_id=""
+    )
+
+
 def extract_rows(text: str, source: Path) -> list[CatalogueRow]:
     """Every data row of every table between the begin/end markers."""
     lines = text.splitlines()
@@ -82,22 +96,23 @@ def extract_rows(text: str, source: Path) -> list[CatalogueRow]:
 
     rows: list[CatalogueRow] = []
     state = _OUTSIDE
+    expected_cols = 0
     for number, line in enumerate(lines[start + 1 : stop], start=start + 2):
         cells = _table_cells(line)
         if cells is None:
             state = _OUTSIDE
             continue
         if state == _OUTSIDE:
+            expected_cols = len(cells)  # this line is the table's header row
             state = _HEADER_SEEN
             continue
         if state == _HEADER_SEEN:
             state = _IN_DATA  # this line is the "|---|---|" separator rule
             continue
-        if len(cells) < 7:
+        if len(cells) != expected_cols or len(cells) < 7 or not cells[0]:
+            rows.append(_malformed(source, number, cells))
             continue
         entry_id, _entry, status, _difficulty, _attack, phase, test_id = cells[:7]
-        if not entry_id:
-            continue
         rows.append(
             CatalogueRow(
                 source=source,
@@ -125,6 +140,15 @@ def _test_exists(root: Path, test_id: str) -> bool:
 def check(root: Path, rows: list[CatalogueRow]) -> list[CatalogueProblem]:
     problems: list[CatalogueProblem] = []
     for row in rows:
+        if row.status == _MALFORMED:
+            problems.append(
+                CatalogueProblem(
+                    row,
+                    "malformed row — wrong column count (check for an unescaped '|' or a "
+                    "missing cell)",
+                )
+            )
+            continue
         if not row.phase:
             problems.append(CatalogueProblem(row, "missing phase"))
         if not row.test_id:
