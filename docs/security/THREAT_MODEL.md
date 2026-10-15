@@ -272,12 +272,31 @@ named for this catalogue (Phase 12 re-check, W3).
 - `planned` and `accepted` rows may use a future task ID (e.g. `T15.1.1`) or a plain tracking
   ID (e.g. `DEBT-020`) instead, since there is no test to point at yet.
 
-## 7. Azure read-only checks (T12.0.6 — orchestrator, not this block)
+## 7. Azure read-only checks (T12.0.6)
 
-> **Left for the orchestrator**, per the block prompt: `curl -I` against the live Azure URLs,
-> F9 behaviour on the deployed backend, and the ACS managed-domain send quota. No LLM calls.
-> This section is a placeholder until those checks are run and their results recorded below.
+Read-only `curl` against the live Azure URLs, no auth, no writes, no LLM calls. Results
+recorded 2026-10-16.
 
-- [ ] `curl -I https://<frontend fqdn>/` and `https://<backend fqdn>/health` — headers observed:
-- [ ] F9 (`resend-verification`) behaviour on the deployed backend — link present / absent in the response:
-- [ ] ACS managed-domain send quota — daily limit observed:
+- [x] `curl -I` on the frontend's `/` and `/login`: both `200`; **no security headers** (no
+  HSTS, CSP, nosniff, `Referrer-Policy`, `Permissions-Policy`, `frame-ancestors`); `X-Powered-By:
+  Next.js` present. Confirms F2 (OWASP-A02, API-8), closes in 12.2.
+- [x] `curl -I` on the backend's `/health`: `200`. `/docs`, `/redoc`, `/openapi.json`: all `200`
+  **publicly reachable**. Confirms F7 (OWASP-A02, API-8), closes in 12.2. `Server: uvicorn`
+  header present (informational). `/metrics` on the API port: `404` — metrics are only served on
+  the internal port (REC-01), as expected.
+- [x] CORS preflight (`Origin: https://evil.example` → `/auth/login`): `400` — the foreign
+  origin itself is rejected, but the response still advertises
+  `Access-Control-Allow-Methods: DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, QUERY` and echoes
+  the requested headers. Confirms F8 (methods/headers still wide open even though the origin is
+  narrowed): 12a narrows further, 12b removes CORS entirely (T12.5.3).
+- [x] F9 behaviour on the deployed backend: by code review (the resend-verification endpoint
+  only returns the verification link when `ENV=dev`) and the production replica's `ENV=prod`
+  (already verified in 11a), the deployed backend does **not** return the link in its response.
+  The dev-only code path itself is removed once Mailpit lands locally (12a, T12.1.11).
+- [ ] ACS managed-domain send quota: **not checked** — no ACS resource exists yet (it is created
+  in 12b). To verify during the 12.6b pre-merge; Azure-managed domains have low default daily
+  send limits, and the 12b Azure smoke already budgets for ≤ 3 emails.
+
+No catalogue entry's status changes as a result of these checks — OWASP-A02/API-8 (F2/F7/F8)
+and OWASP-A09 (F9) were already `planned` for the phase/task shown above, and these checks
+confirm exactly the gap each is meant to close, nothing new or already-closed.
