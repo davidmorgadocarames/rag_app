@@ -325,11 +325,9 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: ./frontend
-          # NEXT_PUBLIC_* is baked at build time, so the public backend URL must be set
-          # here (repo variable) for the cloud image; falls back to localhost for a
-          # local/dev build.
-          build-args: |
-            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:8000' }}
+          # No build-time backend URL any more (T12.1.7): the UI calls relative /api/...
+          # paths, proxied by the BFF route handlers using the server-side BACKEND_URL
+          # (an Azure app setting, T12.6a.3) -- nothing to bake in here.
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-frontend:latest

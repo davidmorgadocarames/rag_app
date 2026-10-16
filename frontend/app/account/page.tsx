@@ -3,8 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
-import { deleteAccount, me, resendVerification, type UserInfo } from "@/lib/api";
-import { clearToken, getToken } from "@/lib/session";
+import { ApiError, deleteAccount, logout, me, resendVerification, type UserInfo } from "@/lib/api";
 
 export default function AccountPage() {
   const router = useRouter();
@@ -12,51 +11,49 @@ export default function AccountPage() {
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
-  const [verifyLink, setVerifyLink] = useState<string | null>(null);
   // The server's 202 message after an erasure (it states the purge and backup deadlines).
   const [deleted, setDeleted] = useState<string | null>(null);
 
   async function onResend() {
-    const token = getToken();
-    if (!token) return;
     setVerifyMsg(null);
-    setVerifyLink(null);
     try {
-      const res = await resendVerification(token);
+      const res = await resendVerification();
       setVerifyMsg(res.detail);
-      setVerifyLink(res.verification_link);
     } catch (err) {
       setVerifyMsg(err instanceof Error ? err.message : "Something went wrong");
     }
   }
 
   useEffect(() => {
-    const token = getToken();
-    if (!token) {
-      router.replace("/login");
-      return;
-    }
-    me(token)
+    // T12.1.8/T12.1.9: the middleware already redirects a visitor with no session cookie at
+    // all; this call is what catches a present-but-invalid/forged/expired cookie (it still
+    // passes the middleware's UX-only guard) -- the backend's own 401 is the real check.
+    me()
       .then(setUser)
       .catch(() => {
-        clearToken();
         router.replace("/login");
       });
   }, [router]);
 
-  function signOut() {
-    clearToken();
+  async function signOut() {
+    try {
+      await logout();
+    } catch {
+      // the cookie is cleared server-side either way when the call succeeds; on failure the
+      // user still leaves this page -- there is nothing client-side left to clear.
+    }
     router.push("/login");
   }
 
   async function onDelete() {
-    const token = getToken();
-    if (!token) return;
     try {
-      const res = await deleteAccount(token);
-      clearToken();
+      const res = await deleteAccount();
       setDeleted(res.detail);
     } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        router.replace("/login");
+        return;
+      }
       setError(err instanceof Error ? err.message : "Something went wrong");
     }
   }
@@ -106,16 +103,6 @@ export default function AccountPage() {
             RESEND VERIFICATION
           </button>
           {verifyMsg && <p className="mt-3 text-sm text-vault-steel">{verifyMsg}</p>}
-          {verifyLink && (
-            <a
-              href={verifyLink}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-1 block break-all text-sm text-vault-amber underline hover:text-vault-amber-bright"
-            >
-              Verify now (dev link)
-            </a>
-          )}
         </div>
       )}
 

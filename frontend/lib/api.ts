@@ -1,8 +1,31 @@
-// Typed client for the SecRAG backend API.
+// Typed client for the SecRAG backend API, called ONLY through the BFF (T12.1.7, P12-D1):
+// relative /api/... paths (no build-time backend URL, no NEXT_PUBLIC_API_URL), same-origin
+// cookies for auth (no token argument anywhere -- the browser attaches the HttpOnly session
+// cookie automatically) and a CSRF header read from the readable, non-HttpOnly
+// `__Host-secrag_csrf` cookie on every state-changing request.
 
-import { consumeChatStream, refusedStream } from "./chatStream";
+import { consumeChatStream, refusedStream } from "./chatStream.ts";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// --- CSRF (P12-D2): pure, DOM-light helpers so they stay directly testable -----------------
+
+export const CSRF_COOKIE_NAME = "__Host-secrag_csrf";
+
+/** The raw value of cookie `name` out of a `document.cookie`-shaped header string. */
+export function readCookie(cookieHeader: string, name: string): string | null {
+  for (const part of cookieHeader.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim() || null;
+  }
+  return null;
+}
+
+const CSRF_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
+
+function currentCsrfToken(): string | null {
+  if (typeof document === "undefined") return null; // SSR / no browser context
+  return readCookie(document.cookie, CSRF_COOKIE_NAME);
+}
 
 export interface Citation {
   marker: number;
@@ -70,18 +93,30 @@ export interface ConversationDetail {
 }
 
 export class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status?: number,
-  ) {
+  readonly status?: number;
+  // A plain assignment, not a TS "parameter property" (`readonly status?: number` straight
+  // in the constructor signature): Node's --test type-stripping (no full tsc) rejects that
+  // syntax outright (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX) the moment anything imports this
+  // module directly, which api.test.ts now does.
+  constructor(message: string, status?: number) {
     super(message);
+    this.status = status;
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const method = (options.method ?? "GET").toUpperCase();
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const response = await fetch(`${API_URL}${path}`, { ...options, headers });
+  if (CSRF_METHODS.has(method)) {
+    const csrf = currentCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
+  const response = await fetch(`/api${path}`, {
+    ...options,
+    method,
+    headers,
+    credentials: "same-origin", // the BFF is always same-origin: send the session cookie
+  });
   if (!response.ok) {
     let detail = `request failed (${response.status})`;
     try {
@@ -95,51 +130,49 @@ async function request<T>(path: string, options: RequestInit = {}, token?: strin
   return (await response.json()) as T;
 }
 
-export function register(email: string, password: string): Promise<{ access_token: string }> {
+export function register(email: string, password: string): Promise<void> {
   return request("/auth/register", { method: "POST", body: JSON.stringify({ email, password }) });
 }
 
-export function login(email: string, password: string): Promise<{ access_token: string }> {
+export function login(email: string, password: string): Promise<void> {
   return request("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
 }
 
-export function me(token: string): Promise<UserInfo> {
-  return request("/auth/me", {}, token);
+export function logout(): Promise<{ detail: string }> {
+  return request("/auth/logout", { method: "POST" });
 }
 
-export function resendVerification(
-  token: string,
-): Promise<{ detail: string; verification_link: string | null }> {
-  return request("/auth/resend-verification", { method: "POST" }, token);
+export function me(): Promise<UserInfo> {
+  return request("/auth/me");
 }
 
-export function deleteAccount(token: string): Promise<{ detail: string }> {
-  return request("/account", { method: "DELETE" }, token);
+export function resendVerification(): Promise<{ detail: string }> {
+  return request("/auth/resend-verification", { method: "POST" });
+}
+
+export function deleteAccount(): Promise<{ detail: string }> {
+  return request("/account", { method: "DELETE" });
 }
 
 // --- conversations -------------------------------------------------------
 
-export function listConversations(token: string): Promise<ConversationSummary[]> {
-  return request("/conversations", {}, token);
+export function listConversations(): Promise<ConversationSummary[]> {
+  return request("/conversations");
 }
 
-export function getConversation(id: string, token: string): Promise<ConversationDetail> {
-  return request(`/conversations/${id}`, {}, token);
+export function getConversation(id: string): Promise<ConversationDetail> {
+  return request(`/conversations/${id}`);
 }
 
-export function renameConversation(
-  id: string,
-  title: string,
-  token: string,
-): Promise<{ detail: string }> {
-  return request(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }, token);
+export function renameConversation(id: string, title: string): Promise<{ detail: string }> {
+  return request(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify({ title }) });
 }
 
-export function deleteConversation(id: string, token: string): Promise<{ detail: string }> {
-  return request(`/conversations/${id}`, { method: "DELETE" }, token);
+export function deleteConversation(id: string): Promise<{ detail: string }> {
+  return request(`/conversations/${id}`, { method: "DELETE" });
 }
 
-// --- streaming chat (Server-Sent Events over fetch) ----------------------
+// --- streaming chat (Server-Sent Events over fetch, through the BFF) ----------------------
 
 export interface StreamCallbacks {
   // First event of every stream: the conversation the message belongs to (null only when
@@ -155,14 +188,18 @@ export interface StreamCallbacks {
 
 export async function streamChat(
   body: { question: string; conversation_id?: string; version?: string },
-  token: string,
   cb: StreamCallbacks,
 ): Promise<void> {
+  const csrf = currentCsrfToken();
   let response: Response;
   try {
-    response = await fetch(`${API_URL}/chat/stream`, {
+    response = await fetch("/api/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        ...(csrf ? { "X-CSRF-Token": csrf } : {}),
+      },
       body: JSON.stringify(body),
     });
   } catch {

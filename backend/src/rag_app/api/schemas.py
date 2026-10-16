@@ -57,10 +57,9 @@ class MessageResponse(BaseModel):
 
 
 class ResendVerificationResponse(BaseModel):
+    # T12.1.11: the verification link never travels in an API response (dev or prod) — only
+    # by email, now via Mailpit locally (DA-G2-5 taken further: not even ENV=dev is special).
     detail: str
-    # Only populated with ENV=dev and no SMTP configured, so the UI can offer the link;
-    # never in prod (DA-G2-5).
-    verification_link: str | None = None
 
 
 class ChatStreamRequest(BaseModel):

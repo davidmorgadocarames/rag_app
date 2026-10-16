@@ -110,7 +110,7 @@ adds them. `DEC-005/006/007` are the three Phase-12 decisions the user ratified 
 | Tampering | CSRF on state-changing routes | — | Signed double-submit token, `Origin` check (T12.1.4) |
 | Repudiation | No record of who acted when sessions aren't server-tracked | — | Server-side `sessions` table (migration 0006, T12.1.1); `audit_events` (15.3) |
 | Information disclosure | `/docs`, `/redoc`, `/openapi.json` public (F7); CORS `*` methods/headers (F8) | — | Docs gated to `ENV=dev` (T12.2.4), CORS narrowed (T12.2.4) then removed (12b T12.5.3) |
-| Denial of service | Anonymous chat cost (daily cap already mitigates, §5.5); on Azure every request arrives from the same internal address today, so per-IP limiting is defeated (F4) | Daily answer cap (`test_the_default_cap_is_on_and_valid_in_prod`) | Per-IP/account rate limits keyed by the signed client IP (F4, T12.1.6) |
+| Denial of service | Anonymous chat cost (daily cap already mitigates, §5.5); on Azure every request arrives from the same internal address today, so per-IP limiting is defeated (F4). **Caveat (DA-12aC-2, DEBT-034):** `login:<email>:<ip>` keying only closes to a per-account bucket once a caller actually goes through the BFF and signs its IP; a request reaching the public backend directly (still possible until 12b's internal ingress) falls back to the shared Azure connection address, collapsing the key to `login:<email>` only — targeted per-account login throttling, not worse than the old pure-IP keying, accepted until 12b | Daily answer cap (`test_the_default_cap_is_on_and_valid_in_prod`) | Per-IP/account rate limits keyed by the signed client IP (F4, T12.1.6); fully closes once the backend is unreachable except via the BFF (12b) |
 | Elevation of privilege | No roles today (F6) | — | `users.role`, `require_role` (12a/12b, T12.3.2) |
 
 **Planned, decision-driven (DEC-005/DEC-006):** `/api/health` added to the BFF allow-list
@@ -123,7 +123,7 @@ under Azure's ingress limit) is not silently shortened by the new frontend hop.
 
 | STRIDE | Threat | Existing control | Planned control |
 |---|---|---|---|
-| Spoofing | Backend trusting a forged client-IP header, or every request on Azure sharing the same internal address (F4) | — | HMAC-signed `X-SecRAG-Client-IP`, 30 s window, fallback + security event on failure (T12.1.6) |
+| Spoofing | Backend trusting a forged client-IP header, or every request on Azure sharing the same internal address (F4). **Caveat:** closes fully only once the backend is unreachable except via the BFF (12b, DEBT-034) — until then a request straight to the backend's public URL still gets the shared address | — | HMAC-signed `X-SecRAG-Client-IP`, 30 s window, fallback + security event on failure (T12.1.6) |
 | Tampering | BFF silently mutating or dropping the SSE stream | — | Explicit allow-list route handlers, unbuffered SSE (T12.1.5); `e2e` Playwright proof |
 | Information disclosure | BFF exposing `/metrics` or `/docs` by accident | — | Allow-list never includes them (T12.1.5 Done-when) |
 | Denial of service | Slow/blocked upstream cut early by a short BFF timeout, defeating the 11b cold-start fix | — | BFF timeouts ≥ 240 s, keep-alive pings pass through (T12.1.5, DEC-006); 1 fully-cold chat question smoke (T12.6a.5) |
@@ -156,7 +156,7 @@ under Azure's ingress limit) is not silently shortened by the new frontend hop.
 
 | STRIDE | Threat | Existing control | Planned control |
 |---|---|---|---|
-| Information disclosure | Verification link returned in the API response or logged (F9) | Log line already removed (11a, T11.2.15) | Link removed from the response entirely once Mailpit lands (12a, T12.1.11); real SMTP send in 12b |
+| Information disclosure | Verification link returned in the API response or logged (F9) | Log line removed (11a, T11.2.15); link removed from the response entirely, Mailpit locally (12a, T12.1.11, `test_resend_never_returns_a_verification_link`) | Real SMTP send (ACS) in 12b |
 | Denial of service | Email bombing via register/resend/forgot | — | Per-IP/recipient/global abuse limits (T12.4.8) |
 
 ### TB7 — CI/CD ↔ Azure

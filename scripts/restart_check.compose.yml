@@ -10,6 +10,13 @@
 services:
   db:
     ports: !reset []
+  # T12.1.11: backend now depends on mailpit (SMTP for the register/resend-verification
+  # emails this check sends); its published ports must be reset too, or a concurrently
+  # running development stack's own mailpit (same host ports) collides with this project's.
+  # No port is needed here: the backend reaches it by service name on the project's own
+  # compose network.
+  mailpit:
+    ports: !reset []
   backend:
     ports: !override
       - "127.0.0.1:${RESTART_CHECK_API_PORT:?restart_check.sh sets RESTART_CHECK_API_PORT}:8000"

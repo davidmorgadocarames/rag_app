@@ -16,7 +16,6 @@ import {
   streamChat,
 } from "@/lib/api";
 import { conversationLoadError } from "@/lib/chatStream";
-import { getToken } from "@/lib/session";
 
 interface UiMessage {
   role: "user" | "assistant";
@@ -70,33 +69,32 @@ export default function ChatPage() {
   const threadRef = useRef<HTMLDivElement>(null);
 
   const refreshConversations = useCallback(async () => {
-    const token = getToken();
-    if (!token) return;
     try {
-      setConversations(await listConversations(token));
-    } catch {
-      // ignore list errors; the thread still works
+      setConversations(await listConversations());
+    } catch (err) {
+      // T12.1.8/T12.1.9: the middleware already redirects a visitor with no session cookie
+      // at all; this is what catches a present-but-invalid/forged/expired one (it still
+      // passes the middleware's UX-only guard) -- the backend's own 401 is the real check.
+      if (err instanceof ApiError && err.status === 401) {
+        router.replace("/login");
+        return;
+      }
+      // other list errors are ignored; the thread still works
     }
-  }, []);
+  }, [router]);
 
   useEffect(() => {
-    if (!getToken()) {
-      router.replace("/login");
-      return;
-    }
     void refreshConversations();
-  }, [router, refreshConversations]);
+  }, [refreshConversations]);
 
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight });
   }, [messages, stage]);
 
   async function selectConversation(id: string) {
-    const token = getToken();
-    if (!token) return;
     setSidebarOpen(false);
     try {
-      const detail = await getConversation(id, token);
+      const detail = await getConversation(id);
       setActiveId(id);
       setMessages(
         detail.messages.map((m) => ({
@@ -116,9 +114,13 @@ export default function ChatPage() {
         ),
       );
     } catch (err) {
+      const status = err instanceof ApiError ? err.status : undefined;
+      if (status === 401) {
+        router.replace("/login");
+        return;
+      }
       // DA-G2-7: an unreadable (409) or vanished (404) conversation gets a clear message and
       // an empty thread, so nothing is sent into it.
-      const status = err instanceof ApiError ? err.status : undefined;
       const detail = err instanceof Error ? err.message : "Could not load conversation";
       const outcome = conversationLoadError(status, detail);
       if (outcome.clear) {
@@ -140,17 +142,13 @@ export default function ChatPage() {
   }
 
   async function onDelete(id: string) {
-    const token = getToken();
-    if (!token) return;
-    await apiDeleteConversation(id, token);
+    await apiDeleteConversation(id);
     if (id === activeId) newChat();
     void refreshConversations();
   }
 
   async function onRename(id: string, title: string) {
-    const token = getToken();
-    if (!token) return;
-    await apiRenameConversation(id, title, token);
+    await apiRenameConversation(id, title);
     void refreshConversations();
   }
 
@@ -169,9 +167,8 @@ export default function ChatPage() {
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const token = getToken();
     const question = input.trim();
-    if (!question || busy || !token) return;
+    if (!question || busy) return;
 
     setInput("");
     setError(null);
@@ -185,7 +182,6 @@ export default function ChatPage() {
 
     await streamChat(
       { question, conversation_id: activeId ?? undefined },
-      token,
       {
         // The id arrives first (T11.2.16): keep it even if the turn then fails, so the next
         // message continues this conversation instead of starting a new one.

@@ -81,6 +81,10 @@ export JWT_SECRET="${JWT_SECRET:-$(python3 -c 'import secrets; print(secrets.tok
 # CSRF_SECRET (T12.1.4): required by docker-compose.yml like JWT_SECRET/DATA_MASTER_KEY --
 # a fresh random one per run unless set, so `docker compose config` never refuses here.
 export CSRF_SECRET="${CSRF_SECRET:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')}"
+# CLIENT_IP_HMAC_KEYS (T12.1.6, DEBT-033/DA-12aC-1): required with ENV=prod (this script's
+# default below) since 12a-C's validate_api_settings change -- same throwaway-value pattern
+# as CSRF_SECRET/JWT_SECRET, else the backend refuses to start and every `up` step here fails.
+export CLIENT_IP_HMAC_KEYS="${CLIENT_IP_HMAC_KEYS:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}"
 export DATA_MASTER_KEY="${DATA_MASTER_KEY:-$(new_master_key)}"
 export ENV="${ENV:-prod}"
 original_key="$DATA_MASTER_KEY"

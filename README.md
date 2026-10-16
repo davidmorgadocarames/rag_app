@@ -237,9 +237,11 @@ a root `.env` — use the same key in both. The API checks this at start-up: it 
 refuses to start when the key is not the one the database was initialised with (a stored
 key fingerprint) — see [Recovering from a changed master key](#recovering-from-a-changed-master-key).
 
-SMTP is optional. Without it no email is sent and nothing personal is logged; only with `ENV=dev`
-does the account page get the verification link from `POST /auth/resend-verification` — in prod
-the link is never returned. Logs never contain an email address, a password or a token: query
+SMTP is optional. Without it no email is sent and nothing personal is logged; the verification
+link is never returned by `POST /auth/resend-verification` either, in any environment (T12.1.11)
+— `docker compose up` points the backend's SMTP at the bundled Mailpit (http://127.0.0.1:8025),
+so locally the link only ever shows up there. Logs never contain an email address, a password or
+a token: query
 strings are redacted from the uvicorn access log (the verification link is
 `GET /auth/verify?token=…`), database errors never print bound parameters, a concurrent sign-up
 of the same address is a plain 409 (never a traceback with the driver's `DETAIL` line), and the
@@ -284,8 +286,9 @@ npm install
 npm run dev                                    # http://localhost:3000
 ```
 
-The frontend calls `http://localhost:8000` by default. To use a different backend, set
-`NEXT_PUBLIC_API_URL` (it is read at build time).
+The frontend calls the backend only through its own BFF route handlers (`/api/...`), using
+the server-side `BACKEND_URL` (default `http://localhost:8000`, never built into the
+browser bundle).
 
 ### 7. Tests, quality checks and the eval gate
 

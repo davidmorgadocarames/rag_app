@@ -92,6 +92,7 @@ erasure-scale    db 600
 restart-check    docker 900
 eval             seed 1200
 latency          seed 900
+e2e              seed 600
 "
 STACK_BUDGET=300   # up + migrate + seed restore
 
@@ -445,7 +446,7 @@ step_erasure-scale() {
 step_restart-check() {
   docker info >/dev/null 2>&1 \
     || { echo "  FAIL: docker is not reachable from WSL — start Docker Desktop"; return 1; }
-  env -u JWT_SECRET -u CSRF_SECRET -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
+  env -u JWT_SECRET -u CSRF_SECRET -u CLIENT_IP_HMAC_KEYS -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
     --project secrag-gate-rc --restart-project secrag-gate-rc2 --restart-master-key 2>&1 \
     | sed 's/^/  /'
   return "${PIPESTATUS[0]}"
@@ -484,6 +485,83 @@ step_latency() {
   [ -n "${LATENCY_EXTRA_ARGS:-}" ] && extra=($LATENCY_EXTRA_ARGS)
   (cd backend && HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
     "$PY" -m rag_app.eval.latency --require-stack "${extra[@]}")
+}
+
+# T12.1.10: Playwright end-to-end proof (seed stack, --full only -- never in CI, DEBT-029
+# keeps the 5 required job names pinned). Starts a NATIVE backend (uvicorn, against the gate
+# DB/Ollama main() already exported) and the built frontend (`next start`, not the Docker
+# `standalone` output -- this step runs the app directly, never the image) as plain
+# background processes on throwaway loopback ports, runs frontend/e2e/*.spec.ts headless
+# against them, and always stops both, even on failure (global pids + a top-level trap, like
+# restart_check.sh's own teardown -- a function nested inside step_e2e is never callable from
+# a trap the same way). ENV=dev (no SMTP, no cap on verification) so register → login needs
+# no email step.
+E2E_BACKEND_PORT="${E2E_BACKEND_PORT:-18100}"
+E2E_FRONTEND_PORT="${E2E_FRONTEND_PORT:-18101}"
+E2E_BACKEND_PID=""
+E2E_FRONTEND_PID=""
+e2e_cleanup() {
+  [ -n "$E2E_FRONTEND_PID" ] && kill "$E2E_FRONTEND_PID" 2>/dev/null
+  [ -n "$E2E_BACKEND_PID" ] && kill "$E2E_BACKEND_PID" 2>/dev/null
+  [ -n "$E2E_FRONTEND_PID" ] && wait "$E2E_FRONTEND_PID" 2>/dev/null
+  [ -n "$E2E_BACKEND_PID" ] && wait "$E2E_BACKEND_PID" 2>/dev/null
+}
+# e2e_wait_healthy <url> <pid> <seconds> <log file>: polls <url>; fails fast if <pid> exited.
+e2e_wait_healthy() {
+  local url="$1" pid="$2" tries="$3" log="$4" _
+  for _ in $(seq 1 "$tries"); do
+    curl -fsS -m 2 "$url" >/dev/null 2>&1 && return 0
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  echo "  FAIL: not healthy after ${tries}s ($url); last log lines:"
+  tail -n 20 "$log" | sed 's/^/  /'
+  return 1
+}
+step_e2e() {
+  need_venv || return 1
+  [ -d "$REPO_ROOT/frontend/node_modules/@playwright" ] \
+    || { missing_tool "@playwright/test (npm ci, in frontend/)"; return; }
+  command -v npx >/dev/null || { missing_tool "npx (node toolchain)"; return; }
+  if ! "$VENV/bin/python" -c 'import uvicorn' 2>/dev/null; then
+    missing_tool "uvicorn (pip install -r backend/requirements.txt)"
+    return
+  fi
+
+  local e2e_log="$GATE_STATE/e2e"
+  mkdir -p "$e2e_log"
+  local e2e_jwt e2e_csrf e2e_master_key e2e_client_ip_key rc
+  e2e_jwt="$(openssl rand -hex 24)"
+  e2e_csrf="$(openssl rand -hex 24)"
+  e2e_client_ip_key="$(openssl rand -hex 16)"
+  e2e_master_key="$("$PY" -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+  trap e2e_cleanup EXIT
+
+  echo "  native backend on 127.0.0.1:$E2E_BACKEND_PORT (log: $e2e_log/backend.log)"
+  (cd "$REPO_ROOT/backend" && exec env \
+      DATABASE_URL="$DATABASE_URL" ENV=dev JWT_SECRET="$e2e_jwt" CSRF_SECRET="$e2e_csrf" \
+      DATA_MASTER_KEY="$e2e_master_key" CLIENT_IP_HMAC_KEYS="$e2e_client_ip_key" \
+      FRONTEND_ORIGIN="http://127.0.0.1:$E2E_FRONTEND_PORT" OLLAMA_HOST="$OLLAMA_HOST" \
+      DAILY_ANSWER_CAP=1000 SMTP_HOST="" \
+      "$VENV/bin/uvicorn" rag_app.api.app:create_app --factory \
+        --host 127.0.0.1 --port "$E2E_BACKEND_PORT" \
+  ) >"$e2e_log/backend.log" 2>&1 &
+  E2E_BACKEND_PID=$!
+  e2e_wait_healthy "http://127.0.0.1:$E2E_BACKEND_PORT/health" "$E2E_BACKEND_PID" 60 "$e2e_log/backend.log" || return 1
+
+  echo "  frontend build + next start on 127.0.0.1:$E2E_FRONTEND_PORT (log: $e2e_log/frontend.log)"
+  (cd "$REPO_ROOT/frontend" \
+     && BACKEND_URL="http://127.0.0.1:$E2E_BACKEND_PORT" CLIENT_IP_HMAC_KEYS="$e2e_client_ip_key" \
+        CLIENT_IP_TRUSTED_HOPS=0 npx next build \
+     && exec env BACKEND_URL="http://127.0.0.1:$E2E_BACKEND_PORT" CLIENT_IP_HMAC_KEYS="$e2e_client_ip_key" \
+        CLIENT_IP_TRUSTED_HOPS=0 npx next start -p "$E2E_FRONTEND_PORT" -H 127.0.0.1 \
+  ) >"$e2e_log/frontend.log" 2>&1 &
+  E2E_FRONTEND_PID=$!
+  e2e_wait_healthy "http://127.0.0.1:$E2E_FRONTEND_PORT/api/health" "$E2E_FRONTEND_PID" 90 "$e2e_log/frontend.log" || return 1
+
+  (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://127.0.0.1:$E2E_FRONTEND_PORT" npx playwright test)
+  rc=$?
+  return "$rc"
 }
 
 # --- backend venv matching the pins (DA-B-4) --------------------------------------------

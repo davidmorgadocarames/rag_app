@@ -25,7 +25,7 @@ from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.csrf import CSRF_COOKIE_NAME, csrf_token, require_csrf, require_origin
 from rag_app.db.models import EmailVerificationToken, User, UserKey
-from rag_app.emailer import send_verification_email, verification_link
+from rag_app.emailer import send_verification_email
 from rag_app.erasure import (
     ERASURE_ACCEPTED_MESSAGE,
     ERASURE_RETRY_AFTER_SECONDS,
@@ -219,9 +219,9 @@ def verify_email(token: str, session: SessionDep) -> MessageResponse:
     dependencies=[Depends(require_csrf)],
 )
 def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVerificationResponse:
-    """Issue a fresh verification token. Only with ENV=dev and no SMTP is the link returned
-    to the UI; in prod it never is — without SMTP anyone could otherwise verify an address
-    they do not own (DA-G2-5)."""
+    """Issue a fresh verification token. The link never travels in this response, in any
+    environment (T12.1.11) — only by email (Mailpit locally, DA-G2-5): without SMTP anyone
+    could otherwise verify an address they do not own."""
     if user.email_verified:
         return ResendVerificationResponse(detail="Email already verified.")
     if user.email is None:  # scrubbed by erasure (0005); nothing to send to
@@ -239,10 +239,6 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
     settings = get_settings()
     if settings.smtp_host:
         return ResendVerificationResponse(detail="Verification email sent.")
-    if settings.env == "dev":
-        return ResendVerificationResponse(
-            detail="Verification email sent.", verification_link=verification_link(raw_token)
-        )
     return ResendVerificationResponse(detail="Verification email requested.")
 
 

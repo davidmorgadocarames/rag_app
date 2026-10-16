@@ -146,6 +146,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `security-suite` | gate DB | 180 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
+| | | | `e2e` | gate DB + seed + Ollama | 600 s |
 
 `latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
 questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +
@@ -183,6 +184,17 @@ instance, never the production singleton) is the "before, warm" reference; `--wa
 and `--concurrency N` are two further one-off modes (`LATENCY_EXTRA_ARGS` passes flags to this
 step for ad-hoc runs against the isolated gate project) — see ADR 11 decision 8 for the full
 measurement table and the rerank floor result.
+
+`e2e` (T12.1.10, Playwright, `--full` only, not in CI — the 5 required job names stay pinned,
+DEBT-029): the real BFF + backend wired end to end, in a browser. The step itself starts a
+native backend (`uvicorn`, gate DB + seed + Ollama, same "seed" stack as `eval`/`latency`)
+and the built, standalone frontend (`npm run build` then `node server.js`, pointed at that
+backend via `BACKEND_URL`), then runs `frontend/e2e/*.spec.ts` headless against it: register
+→ one streamed chat turn → logout → login again. Chromium is a one-time local install
+(`npx playwright install chromium`, cached under `~/.cache/ms-playwright`; if the WSL system
+libraries are missing, that install needs `sudo` once, run by the user in their own
+terminal — never by an agent). Playwright (`@playwright/test`) is a frontend `devDependency`
+only — never baked into the runner image (`output: standalone` never copies `node_modules`).
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →

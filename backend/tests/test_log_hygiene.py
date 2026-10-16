@@ -98,6 +98,31 @@ def test_emailer_without_smtp_logs_neither_address_nor_link(
     assert token not in text and "/auth/verify" not in text
 
 
+def test_emailer_with_an_unreachable_smtp_host_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T12.1.11: Mailpit's `depends_on` only waits for "started", not healthy (it has no
+    healthcheck) -- a transient connection failure right after `docker compose up` must
+    never turn register/resend-verification into a 500. Old code (no try/except around
+    smtplib) propagated this exception straight out of send_verification_email."""
+    import socket
+
+    from rag_app.emailer import send_verification_email
+
+    with socket.socket() as probe:  # a guaranteed-unused loopback port, nothing listens there
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("SMTP_HOST", "127.0.0.1")
+    monkeypatch.setenv("SMTP_PORT", str(port))
+    token = "raw-verification-token-" + uuid.uuid4().hex
+    with caplog.at_level(logging.DEBUG):
+        send_verification_email("carol.leak@example.test", token)  # must not raise
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SMTP error" in text
+    assert "carol.leak" not in text and "example.test" not in text
+    assert token not in text and "/auth/verify" not in text
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
@@ -285,7 +310,7 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         assert server.call("POST", "/auth/login", {"email": email, "password": "wrong"})[0] == 401
         assert server.call("POST", "/auth/login", credentials)[0] == 403
         status, body = server.call("POST", "/auth/resend-verification", token=jwt)
-        assert status == 200 and body["verification_link"]  # returned to the UI, not logged
+        assert status == 200 and "verification_link" not in body  # T12.1.11: never in the response
         assert server.call("GET", "/auth/verify?token=not-a-real-token")[0] == 400
         assert server.call("GET", f"/auth/verify?token={issued[-1]}")[0] == 200
         status, body = server.call("POST", "/auth/login", {"email": email, "password": password})
@@ -396,14 +421,18 @@ def test_postgres_logs_no_detail_lines_locally() -> None:
         assert "log_error_verbosity=terse" in (root / compose).read_text(), compose
 
 
-# --- DA-G2-5: the verification link only ever goes to the UI in dev -------------------------
+# --- T12.1.11: the verification link never travels in any API response, dev or prod --------
 
 
 @pytest.mark.db
 @pytest.mark.parametrize("env", ["dev", "prod"])
-def test_resend_returns_the_link_only_in_dev(
+def test_resend_never_returns_a_verification_link(
     db_engine: Engine, monkeypatch: pytest.MonkeyPatch, env: str
 ) -> None:
+    """Old behaviour (pre-T12.1.11): ENV=dev with no SMTP returned ``verification_link`` in
+    the body, so the UI could offer a clickable link with no email sent at all. That branch
+    is gone -- the link only ever reaches the user by email (Mailpit locally); this response
+    never carries it, in dev or prod, with or without SMTP configured."""
     from fastapi.testclient import TestClient
 
     from rag_app.api.app import create_app
@@ -415,8 +444,9 @@ def test_resend_returns_the_link_only_in_dev(
     monkeypatch.setenv("JWT_SECRET", "t" * 48)
     monkeypatch.setenv("ENV", env)
     monkeypatch.setenv("SMTP_HOST", "")
+    raw_email = f"erin.{uuid.uuid4().hex[:8]}@example.test"
     with Session(db_engine) as session:
-        user = User(email=f"erin.{uuid.uuid4().hex[:8]}@example.test", password_hash="x")
+        user = User(email=raw_email, password_hash="x")
         session.add(user)
         session.flush()
         session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
@@ -429,8 +459,5 @@ def test_resend_returns_the_link_only_in_dev(
     )
     assert res.status_code == 200
     body = res.json()
-    if env == "dev":
-        assert body["verification_link"] and "token=" in body["verification_link"]
-    else:
-        assert body["verification_link"] is None
-        assert "token" not in json.dumps(body) and body["detail"]
+    assert "verification_link" not in body
+    assert "token" not in json.dumps(body) and body["detail"]
