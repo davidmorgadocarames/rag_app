@@ -500,11 +500,22 @@ E2E_BACKEND_PORT="${E2E_BACKEND_PORT:-18100}"
 E2E_FRONTEND_PORT="${E2E_FRONTEND_PORT:-18101}"
 E2E_BACKEND_PID=""
 E2E_FRONTEND_PID=""
+# e2e_kill_port <port>: belt-and-suspenders (found the hard way: `npx next start` does not
+# reliably exec-replace itself, so killing only $E2E_FRONTEND_PID once left an orphaned
+# `next-server` still listening) -- whatever actually ended up bound to the port dies too,
+# not just the PID this step itself backgrounded.
+e2e_kill_port() {
+  local pid
+  pid="$(ss -ltnp 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {print $NF}' | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+  [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+}
 e2e_cleanup() {
   [ -n "$E2E_FRONTEND_PID" ] && kill "$E2E_FRONTEND_PID" 2>/dev/null
   [ -n "$E2E_BACKEND_PID" ] && kill "$E2E_BACKEND_PID" 2>/dev/null
   [ -n "$E2E_FRONTEND_PID" ] && wait "$E2E_FRONTEND_PID" 2>/dev/null
   [ -n "$E2E_BACKEND_PID" ] && wait "$E2E_BACKEND_PID" 2>/dev/null
+  e2e_kill_port "$E2E_BACKEND_PORT"
+  e2e_kill_port "$E2E_FRONTEND_PORT"
 }
 # e2e_wait_healthy <url> <pid> <seconds> <log file>: polls <url>; fails fast if <pid> exited.
 e2e_wait_healthy() {
@@ -541,7 +552,7 @@ step_e2e() {
   (cd "$REPO_ROOT/backend" && exec env \
       DATABASE_URL="$DATABASE_URL" ENV=dev JWT_SECRET="$e2e_jwt" CSRF_SECRET="$e2e_csrf" \
       DATA_MASTER_KEY="$e2e_master_key" CLIENT_IP_HMAC_KEYS="$e2e_client_ip_key" \
-      FRONTEND_ORIGIN="http://127.0.0.1:$E2E_FRONTEND_PORT" OLLAMA_HOST="$OLLAMA_HOST" \
+      FRONTEND_ORIGIN="http://localhost:$E2E_FRONTEND_PORT" OLLAMA_HOST="$OLLAMA_HOST" \
       DAILY_ANSWER_CAP=1000 SMTP_HOST="" \
       "$VENV/bin/uvicorn" rag_app.api.app:create_app --factory \
         --host 127.0.0.1 --port "$E2E_BACKEND_PORT" \
@@ -550,16 +561,27 @@ step_e2e() {
   e2e_wait_healthy "http://127.0.0.1:$E2E_BACKEND_PORT/health" "$E2E_BACKEND_PID" 60 "$e2e_log/backend.log" || return 1
 
   echo "  frontend build + next start on 127.0.0.1:$E2E_FRONTEND_PORT (log: $e2e_log/frontend.log)"
+  # The direct binary, not `npx next ...`: npx does not reliably exec-replace itself with
+  # the resolved binary, which left an orphaned `next-server` running after $E2E_FRONTEND_PID
+  # (npx's own PID) was killed -- found running this step for real (e2e_kill_port above is
+  # the belt; this is the suspenders).
   (cd "$REPO_ROOT/frontend" \
      && BACKEND_URL="http://127.0.0.1:$E2E_BACKEND_PORT" CLIENT_IP_HMAC_KEYS="$e2e_client_ip_key" \
-        CLIENT_IP_TRUSTED_HOPS=0 npx next build \
+        CLIENT_IP_TRUSTED_HOPS=0 ./node_modules/.bin/next build \
      && exec env BACKEND_URL="http://127.0.0.1:$E2E_BACKEND_PORT" CLIENT_IP_HMAC_KEYS="$e2e_client_ip_key" \
-        CLIENT_IP_TRUSTED_HOPS=0 npx next start -p "$E2E_FRONTEND_PORT" -H 127.0.0.1 \
+        CLIENT_IP_TRUSTED_HOPS=0 ./node_modules/.bin/next start -p "$E2E_FRONTEND_PORT" -H 127.0.0.1 \
   ) >"$e2e_log/frontend.log" 2>&1 &
   E2E_FRONTEND_PID=$!
   e2e_wait_healthy "http://127.0.0.1:$E2E_FRONTEND_PORT/api/health" "$E2E_FRONTEND_PID" 90 "$e2e_log/frontend.log" || return 1
 
-  (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://127.0.0.1:$E2E_FRONTEND_PORT" npx playwright test)
+  # "localhost", not "127.0.0.1": Next.js's own middleware (next start, self-hosted)
+  # constructs its redirect Location from `new URL(path, request.url)` using "localhost" as
+  # the canonical host regardless of the Host header the browser actually sent (reproduced:
+  # a 127.0.0.1-based run got redirected mid-test to a DIFFERENT origin, http://localhost:…,
+  # and the next request's Origin header then failed FRONTEND_ORIGIN's exact-match check).
+  # Visiting "localhost" from the start keeps the browser's origin consistent with every
+  # middleware redirect; FRONTEND_ORIGIN above is set to match.
+  (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" npx playwright test)
   rc=$?
   return "$rc"
 }

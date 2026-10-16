@@ -11,7 +11,18 @@ export default defineConfig({
   retries: 0,
   reporter: "list",
   use: {
-    baseURL: process.env.E2E_BASE_URL ?? "http://127.0.0.1:18101",
+    // "localhost", not "127.0.0.1": Next.js's own middleware redirects canonicalise to
+    // "localhost" regardless of the actual Host header (see scripts/gate.sh's step_e2e) --
+    // visiting "localhost" from the start keeps the browser's origin consistent throughout.
+    baseURL: process.env.E2E_BASE_URL ?? "http://localhost:18101",
     headless: true,
+    // VaultDoor's open-sequence is driven by requestAnimationFrame, which never progressed
+    // in a real headless run here (reproduced: the component stayed stuck at "unlocking…"
+    // until the test's own 60s timeout, confirmed by the page snapshot) -- rather than
+    // masking that with a longer timeout, use the component's OWN existing accessibility
+    // affordance (components/VaultDoor.tsx checks prefers-reduced-motion and skips straight
+    // to the open state, synchronously, when it matches): deterministic and fast, not a
+    // blanket timeout raise.
+    reducedMotion: "reduce",
   },
 });

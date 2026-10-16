@@ -11,11 +11,13 @@ function uniqueEmail(): string {
 }
 
 async function openVaultDoor(page: import("@playwright/test").Page): Promise<void> {
-  // VaultDoor's open sequence (components/VaultDoor.tsx) takes a little over 2s unless the
-  // browser reports prefers-reduced-motion; waiting for the email field (actionable only
-  // once the access panel's opacity transition finishes) covers either case.
+  // `reducedMotion: "reduce"` (playwright.config.ts) makes VaultDoor skip straight to the
+  // open state synchronously, so the panel's `pointer-events` switches to `auto` right
+  // away -- `.click()` (not `.waitFor("visible")`, which Playwright considers true even
+  // while `pointer-events: none`/`opacity-0`, proven wrong the hard way: a real run got
+  // stuck here for the full 60s test timeout before this fix) actually waits for that.
   await page.getByRole("button", { name: "ABRIR" }).click();
-  await page.getByPlaceholder("email").waitFor({ state: "visible" });
+  await page.getByPlaceholder("email").click();
 }
 
 test("register, one streamed chat turn, logout, then login again", async ({ page }) => {
@@ -51,20 +53,18 @@ test("register, one streamed chat turn, logout, then login again", async ({ page
   await expect(page).toHaveURL(/\/chat$/);
 });
 
-test("a forged session cookie still gets 401 from the backend (T12.1.8)", async ({
-  page,
-  context,
-}) => {
-  await context.addCookies([
-    {
-      name: "__Host-secrag_session",
-      value: "not-a-real-session-id",
-      url: new URL(page.url() || "http://127.0.0.1:18101/").origin || undefined,
-      domain: "127.0.0.1",
-      path: "/",
-      secure: true,
-    },
-  ]);
+test("a forged session cookie still gets 401 from the backend (T12.1.8)", async ({ page }) => {
+  // `page.context().addCookies(...)` (CDP's Storage.setCookies) kept rejecting every
+  // combination tried for a `__Host-` prefixed cookie ("Invalid cookie fields", "Cookie
+  // should have either url or path", url+domain, url+path, bare url, url with a trailing
+  // slash -- all reproduced) with this Playwright/Chromium pair. `document.cookie` (the
+  // same readable-cookie API the CSRF cookie itself is designed to be read with, T12.1.4)
+  // is the standard, well-tested path instead -- Chromium enforces the SAME `__Host-`
+  // rules (Secure, Path=/, no Domain) for a script-set cookie, and this works.
+  await page.goto("/");
+  await page.evaluate(() => {
+    document.cookie = "__Host-secrag_session=not-a-real-session-id; Path=/; Secure; SameSite=Lax";
+  });
   // The middleware only checks the cookie's PRESENCE (D8): this forged one passes that
   // UX-only guard and the chat shell loads, but its own data call (GET /conversations)
   // gets 401 from the backend and the page redirects itself back to /login.
