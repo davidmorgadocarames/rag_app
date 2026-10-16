@@ -1,5 +1,5 @@
-"""Migration 0005 (T11.2.3) and the master-key fingerprint at start-up (T11.2.4), on
-harness databases (marker ``db``: gate --full / CI)."""
+"""Migrations 0005 (T11.2.3) and 0006 (T12.1.1), and the master-key fingerprint at start-up
+(T11.2.4), on harness databases (marker ``db``: gate --full / CI)."""
 
 from __future__ import annotations
 
@@ -104,14 +104,16 @@ def _seed_user(engine: Engine, *, erased: bool = False, master: str | None = Non
 
 
 def test_0005_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    """0005's OWN round trip, in isolation from 0006 (head since 12a): targets the revision
+    by name rather than "head" on purpose."""
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0005_persistence_erasure")
     engine = _engine(fresh_db)
     try:
         assert _version(engine) == "0005_persistence_erasure"
         command.downgrade(cfg, "-1")
         assert _version(engine) == "0004_conv_titles_tokens"
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0005_persistence_erasure")
         assert _version(engine) == "0005_persistence_erasure"
     finally:
         engine.dispose()
@@ -123,14 +125,14 @@ def test_0005_round_trip_on_a_seeded_database_without_erased_users(fresh_db: URL
     engine = _engine(fresh_db)
     try:
         user_id = _seed_user(engine)
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0005_persistence_erasure")
         with engine.connect() as conn:
             status, completed = conn.execute(
                 text("SELECT status, completed_at IS NOT NULL FROM deletion_requests")
             ).one()
             assert (status, completed) == ("done", True)  # old tombstones are complete
         command.downgrade(cfg, "-1")
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0005_persistence_erasure")
         with engine.connect() as conn:
             assert (
                 conn.execute(
@@ -158,8 +160,10 @@ def test_0005_round_trip_on_a_seeded_database_without_erased_users(fresh_db: URL
 
 
 def test_0005_downgrade_refuses_while_erased_users_exist(fresh_db: URL) -> None:
+    """Targets 0005 directly (not "head", now 0006, T12.1.1): isolates 0005's own refusal
+    from 0006's (``test_0006_downgrade_refuses_while_a_non_default_role_exists`` below)."""
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0005_persistence_erasure")
     engine = _engine(fresh_db)
     try:
         _seed_user(engine, erased=True)
@@ -170,6 +174,54 @@ def test_0005_downgrade_refuses_while_erased_users_exist(fresh_db: URL) -> None:
             assert conn.execute(text("SELECT count(*) FROM users")).scalar_one() == 1
     finally:
         engine.dispose()
+
+
+# --- 0006 (T12.1.1) ----------------------------------------------------------------------
+
+
+def test_0006_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        assert _version(engine) == "0006_sessions_role"
+        command.downgrade(cfg, "-1")
+        assert _version(engine) == "0005_persistence_erasure"
+        command.upgrade(cfg, "head")
+        assert _version(engine) == "0006_sessions_role"
+    finally:
+        engine.dispose()
+
+
+def test_0006_downgrade_refuses_while_a_non_default_role_exists(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        user_id = _seed_user(engine)
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE users SET role = 'admin' WHERE id = :id"), {"id": user_id})
+        with pytest.raises(RuntimeError, match="refusing to downgrade 0006"):
+            command.downgrade(cfg, "-1")
+        assert _version(engine) == "0006_sessions_role"  # nothing was changed
+    finally:
+        engine.dispose()
+
+
+def test_0006_grants_follow_the_migration_map(db_engine: Engine) -> None:
+    def can(role: str, privilege: str) -> bool:
+        with db_engine.connect() as conn:
+            return bool(
+                conn.execute(
+                    text("SELECT has_table_privilege(:r, 'public.sessions', :p)"),
+                    {"r": role, "p": privilege},
+                ).scalar_one()
+            )
+
+    p = "secrag_purger"
+    assert can(p, "SELECT") and can(p, "DELETE")
+    assert not can(p, "INSERT")
+    assert can("secrag_backup", "SELECT") and not can("secrag_backup", "UPDATE")
 
 
 def test_0005_grants_follow_the_migration_map(db_engine: Engine) -> None:
@@ -236,7 +288,7 @@ def test_a_broken_downgrade_fails_the_round_trip(fresh_db: URL, tmp_path: Path) 
         '"""broken downgrade (test only)"""\n'
         "from alembic import op\n"
         'revision = "0099_broken_downgrade"\n'
-        'down_revision = "0005_persistence_erasure"\n'
+        'down_revision = "0006_sessions_role"\n'
         "branch_labels = None\n"
         "depends_on = None\n\n\n"
         "def upgrade():\n"

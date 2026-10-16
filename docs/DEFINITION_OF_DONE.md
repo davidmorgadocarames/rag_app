@@ -57,6 +57,13 @@ are a human/agent checklist.
   (`rag_app.devtools.threat_catalogue`). A new route, store or trust boundary added by a later
   phase either closes an existing catalogue entry (test ID filled in, status flipped to
   `mitigated`) or adds a new one.
+- **Phase 12a+ (security suite, T12.1.0)** — `backend/tests/security/` (sessions, cookie
+  auth, and from 12a-C/12.2 CSRF, the route walker, security headers) is marked `db` **and**
+  `security`; the second marker runs it as its own gate step/CI step, **never** inside
+  `db-tests`/the "Pytest (DB tests …)" CI step too (a marker/path split keeps each test
+  collected exactly once across `pytest`/`db-tests`/`security-suite` locally and across the
+  matching CI steps). Enforced by the gate step `security-suite` (needs the gate DB, in
+  `--full`, not `--fast`).
 - **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
   it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
   image that is still running (and the previous image in a rollback) keeps working on the
@@ -136,6 +143,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
 | `private-names` | - | 30 s | `backup-drill` | gate DB | 300 s |
 | `threat-catalogue` | - | 30 s | `erasure-scale` | gate DB | 600 s |
+| | | | `security-suite` | gate DB | 180 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 
@@ -185,6 +193,13 @@ passwords → `downgrade -1` → `upgrade head`. The local role passwords live i
 git-ignored `.gate/roles.env` (0600, generated once). CI runs the same round trip on its
 Postgres service (after `roles.sql`), and a DB test proves that a broken downgrade makes
 `alembic downgrade -1` fail (`test_startup_db.py`).
+
+`security-suite` (T12.1.0, `backend/tests/security/`): every test under this directory
+(marked `db` and `security`); excluded from `db-tests` (and CI's "Pytest (DB tests …)" step)
+by the second marker, so it is collected exactly once across the whole gate/CI run. 12a:
+session creation/rejection (unknown, idle-expired, absolute-expired, revoked) and rotation
+(T12.1.2); cookie + legacy Bearer auth, logout, erasure revoking every session (T12.1.3).
+Grows in 12a-C/12.2 (CSRF, the route walker) and 12b (roles, MFA).
 
 `backup-drill` (T11.2.10, `scripts/db/backup_drill.sh`): throwaway `secrag_drill_*`
 databases on the gate server and throwaway `age` keys (never the real backup key) —

@@ -6,11 +6,12 @@ import datetime as dt
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from rag_app import sessions as session_service
 from rag_app.api.deps import SessionDep, SignupTrackerDep, rate_limit_login
 from rag_app.api.schemas import (
     LoginRequest,
@@ -44,13 +45,32 @@ router = APIRouter()
 _bearer = HTTPBearer(auto_error=False)
 
 
-def get_current_user(
-    session: SessionDep,
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
-) -> User:
-    if credentials is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
-    subject = decode_token(credentials.credentials)
+# __Host- cookie attributes (T12.1.3): Secure + Path=/ + no Domain (required by the prefix),
+# HttpOnly (never readable by page script) and SameSite=Lax (P12-D2's CSRF layer, 12a-C,
+# covers the state-changing routes it still allows cross-site).
+def _set_session_cookie(response: Response, raw_session: str) -> None:
+    response.set_cookie(
+        session_service.SESSION_COOKIE_NAME,
+        raw_session,
+        path=session_service.COOKIE_PATH,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        session_service.SESSION_COOKIE_NAME,
+        path=session_service.COOKIE_PATH,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+
+
+def _bearer_user(session: SessionDep, token: str) -> User:
+    subject = decode_token(token)
     if subject is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
     try:
@@ -65,6 +85,29 @@ def get_current_user(
     return user
 
 
+def get_current_user(
+    session: SessionDep,
+    http: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> User:
+    """T12.1.3: the cookie (``__Host-secrag_session``) and the legacy Bearer JWT both
+    authenticate — during 12a only, for the pre-BFF frontend's rollback path (TF10). The
+    cookie is tried first; when it is present but does not resolve (unknown, idle-expired,
+    absolute-expired or revoked — ``rag_app.sessions.authenticate`` does not distinguish
+    which, by design), the request is rejected outright rather than silently falling back to
+    a Bearer header that might also be present."""
+    cookie_raw = http.cookies.get(session_service.SESSION_COOKIE_NAME)
+    if cookie_raw:
+        user = session_service.authenticate(session, cookie_raw)
+        session.commit()
+        if user is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired session")
+        return user
+    if credentials is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+    return _bearer_user(session, credentials.credentials)
+
+
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
 
 
@@ -72,6 +115,7 @@ CurrentUserDep = Annotated[User, Depends(get_current_user)]
 def register(
     request: RegisterRequest,
     http: Request,
+    response: Response,
     session: SessionDep,
     tracker: SignupTrackerDep,
 ) -> TokenResponse:
@@ -96,6 +140,9 @@ def register(
                 expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=24),
             )
         )
+        # T12.1.3: register opens a session in 12a, same UX as today (the response still
+        # carries the JWT too — the rollback path, TF10).
+        raw_session = session_service.create_session(session, user)
         session.commit()
     except IntegrityError:
         # A concurrent registration of the same address won the race (double click): the
@@ -106,6 +153,7 @@ def register(
 
     send_verification_email(request.email, raw_token)
     tracker.record(ip)
+    _set_session_cookie(response, raw_session)
     return TokenResponse(access_token=create_token(str(user.id)))
 
 
@@ -159,7 +207,7 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
 
 
 @router.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_login)])
-def login(request: LoginRequest, session: SessionDep) -> TokenResponse:
+def login(request: LoginRequest, session: SessionDep, response: Response) -> TokenResponse:
     user = session.scalar(
         select(User).where(User.email == request.email, User.deleted_at.is_(None))
     )
@@ -171,7 +219,25 @@ def login(request: LoginRequest, session: SessionDep) -> TokenResponse:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
     if get_settings().require_email_verification and not user.email_verified:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "email not verified")
+    # T12.1.3: login still returns the JWT (rollback path, TF10) and also opens a session.
+    raw_session = session_service.create_session(session, user)
+    session.commit()
+    _set_session_cookie(response, raw_session)
     return TokenResponse(access_token=create_token(str(user.id)))
+
+
+@router.post("/auth/logout", response_model=MessageResponse)
+def logout(http: Request, session: SessionDep, response: Response) -> MessageResponse:
+    """T12.1.3: deletes the session row named by the cookie (a no-op if there is none, or if
+    it does not name a live session — logout is idempotent) and always clears the cookie.
+    No CSRF protection yet (that is T12.1.4, 12a-C): acceptable for this block (B8), since the
+    worst a cross-site request can do here is log the victim's own browser out."""
+    cookie_raw = http.cookies.get(session_service.SESSION_COOKIE_NAME)
+    if cookie_raw:
+        session_service.revoke(session, cookie_raw)
+        session.commit()
+    _clear_session_cookie(response)
+    return MessageResponse(detail="Logged out.")
 
 
 @router.get("/auth/me", response_model=UserOut)

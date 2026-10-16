@@ -42,6 +42,12 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "db: needs the test DB harness (TEST_DATABASE_URL); skipped in --fast"
     )
+    # T12.1.0: backend/tests/security/ is also marked `db` (every test there needs the
+    # harness) -- `security` is the extra marker gate.sh/CI use to run it as its OWN step
+    # (`security-suite`), excluded from the plain `db-tests` step/job so nothing runs twice.
+    config.addinivalue_line(
+        "markers", "security: backend/tests/security/ — the security-suite gate step"
+    )
     raw = os.environ.get("TEST_DATABASE_URL", "")
     if raw:
         try:

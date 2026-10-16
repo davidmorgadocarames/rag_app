@@ -85,6 +85,7 @@ threat-catalogue - 30
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
+security-suite   db 180
 migrations-roundtrip db 180
 backup-drill     db 300
 erasure-scale    db 600
@@ -271,7 +272,17 @@ step_dependency-audit() {
 
 step_db-tests() {
   need_venv || return 1
-  (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m db -p no:cacheprovider -rs)
+  # "and not security": backend/tests/security/ is also marked `db` but runs as its OWN
+  # step below (T12.1.0) -- never both, so nothing runs twice.
+  (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m "db and not security" -p no:cacheprovider -rs)
+}
+
+# T12.1.0: backend/tests/security/ — sessions, cookie auth (12a), later CSRF/route-walker
+# (12.1/12.2), roles/MFA (12b). Needs the gate DB like db-tests; kept as its own step so a red
+# security test is never buried among the much larger db-tests run.
+step_security-suite() {
+  need_venv || return 1
+  (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m security -p no:cacheprovider -rs)
 }
 
 # Fresh database → roles.sql twice (catalog identical) → the roles log in with the gate

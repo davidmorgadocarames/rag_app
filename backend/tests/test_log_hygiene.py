@@ -29,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from rag_app.logsafe import REDACTED, AccessLogRedactor, install_log_redaction, redact_query
+from rag_app.sessions import SESSION_COOKIE_NAME
 
 # --- helpers ------------------------------------------------------------------------------
 
@@ -68,6 +69,15 @@ def _remove_redactors() -> None:
 
 def _leaks(rendered: list[str], secrets: list[str]) -> list[str]:
     return [line for line in rendered for secret in secrets if secret and secret in line]
+
+
+def _cookie_value(set_cookie: str, name: str) -> str:
+    """The raw value of cookie ``name`` out of a ``Set-Cookie`` response header, or ``""``."""
+    for part in set_cookie.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return ""
 
 
 # --- unit: emailer, redactor, engine ------------------------------------------------------
@@ -167,6 +177,7 @@ class _Server:
             time.sleep(0.05)
         port = self.server.servers[0].sockets[0].getsockname()[1]
         self.base = f"http://127.0.0.1:{port}"
+        self.last_set_cookie = ""
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -184,8 +195,10 @@ class _Server:
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as res:  # noqa: S310 - local test server
+                self.last_set_cookie = res.headers.get("set-cookie", "")
                 return res.status, json.loads(res.read() or b"{}")
         except urllib.error.HTTPError as err:
+            self.last_set_cookie = err.headers.get("set-cookie", "")
             return err.code, json.loads(err.read() or b"{}")
 
 
@@ -259,11 +272,13 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
     email = f"carol.{uuid.uuid4().hex[:8]}@example.test"
     password = "correct horse battery staple " + uuid.uuid4().hex[:6]
     access_tokens: list[str] = []
+    session_cookies: list[str] = []
     with _Server(create_app) as server:
         _attach(captured_logs)
         status, body = server.call("POST", "/auth/register", {"email": email, "password": password})
         assert status == 201
         access_tokens.append(body["access_token"])
+        session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
         jwt = body["access_token"]
         credentials = {"email": email, "password": password}
         assert server.call("POST", "/auth/register", credentials)[0] == 409
@@ -276,6 +291,7 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         status, body = server.call("POST", "/auth/login", {"email": email, "password": password})
         assert status == 200
         access_tokens.append(body["access_token"])
+        session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
         assert server.call("GET", "/auth/me", token=body["access_token"])[0] == 200
         assert server.call("GET", "/conversations", token=body["access_token"])[0] == 200
         assert server.call("DELETE", "/account", token=body["access_token"])[0] == 202
@@ -284,11 +300,12 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         time.sleep(0.2)
 
     assert len(issued) == 2
+    assert len(session_cookies) == 2 and all(session_cookies)  # register + login both set one
     names = {r.name for r in captured_logs.records}
     assert "uvicorn.access" in names and "sqlalchemy.engine.Engine" in names  # really captured
     assert f"/auth/verify?token={REDACTED}" in "\n".join(captured_logs.rendered)
     local_part = email.split("@", 1)[0]
-    secrets = [email, local_part, password, *issued, *access_tokens]
+    secrets = [email, local_part, password, *issued, *access_tokens, *session_cookies]
     assert not _leaks(captured_logs.rendered, secrets)
 
     # the erasure scrubbed the address, so nothing is left to leak later either

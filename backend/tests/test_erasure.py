@@ -37,7 +37,13 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 
 def test_the_registry_is_leaf_first_with_users_last() -> None:
     names = [step.name for step in erasure.PURGE_STEPS]
-    assert names == ["messages", "conversations", "email_verification_tokens", "users"]
+    assert names == [
+        "messages",
+        "conversations",
+        "email_verification_tokens",
+        "sessions",
+        "users",
+    ]
     for step in erasure.PURGE_STEPS:
         assert "SKIP LOCKED" in step.delete_batch and ":uid" in step.delete_batch
     exempt = {("deletion_requests", "user_id"), ("user_keys", "user_id")}
@@ -343,11 +349,18 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "messages": 75,
         "conversations": 3,
         "email_verification_tokens": 1,
+        "sessions": 0,
         "users": 1,
     }
     assert result.batches >= 8 + 1 + 1 + 1 and result.max_transaction_seconds < 2
     order = [s for i, s in enumerate(seen) if i == 0 or seen[i - 1] != s]
-    assert order == ["messages", "conversations", "email_verification_tokens", "users"]
+    assert order == [
+        "messages",
+        "conversations",
+        "email_verification_tokens",
+        "sessions",
+        "users",
+    ]
     gone = _counts(db_engine, user_id)
     assert gone["users"] == gone["conversations"] == gone["messages"] == gone["tokens"] == 0
     assert gone["tombstone"] == "done"
