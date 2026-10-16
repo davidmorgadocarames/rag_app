@@ -51,7 +51,7 @@ from starlette.concurrency import iterate_in_threadpool
 from starlette.types import Receive, Scope, Send
 
 from rag_app import metrics
-from rag_app.api.auth import CurrentUserDep
+from rag_app.api.auth import CurrentUserDep, get_current_user
 from rag_app.api.deps import SessionDep, rate_limit_chat
 from rag_app.api.schemas import (
     ChatStreamRequest,
@@ -63,6 +63,7 @@ from rag_app.api.schemas import (
 )
 from rag_app.config import get_settings
 from rag_app.crypto import decrypt, encrypt, unwrap_key
+from rag_app.csrf import require_csrf
 from rag_app.db.models import Conversation, Message, User
 from rag_app.db.session import make_session_factory
 from rag_app.generation import (
@@ -537,7 +538,14 @@ def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None,
     return None, cap > 0
 
 
-@router.post("/chat/stream", dependencies=[Depends(rate_limit_chat)])
+@router.post(
+    "/chat/stream",
+    dependencies=[
+        Depends(get_current_user),
+        Depends(rate_limit_chat),
+        Depends(require_csrf),
+    ],
+)
 def chat_stream(
     request: ChatStreamRequest, session: SessionDep, user: CurrentUserDep
 ) -> StreamingResponse:
@@ -650,7 +658,11 @@ def get_conversation(
     return ConversationDetailOut(id=str(conv.id), title=title, messages=out_messages)
 
 
-@router.patch("/conversations/{conversation_id}", response_model=MessageResponse)
+@router.patch(
+    "/conversations/{conversation_id}",
+    response_model=MessageResponse,
+    dependencies=[Depends(require_csrf)],
+)
 def rename_conversation(
     conversation_id: str, request: RenameRequest, session: SessionDep, user: CurrentUserDep
 ) -> MessageResponse:
@@ -665,7 +677,11 @@ def rename_conversation(
     return MessageResponse(detail="renamed")
 
 
-@router.delete("/conversations/{conversation_id}", response_model=MessageResponse)
+@router.delete(
+    "/conversations/{conversation_id}",
+    response_model=MessageResponse,
+    dependencies=[Depends(require_csrf)],
+)
 def delete_conversation(
     conversation_id: str, session: SessionDep, user: CurrentUserDep
 ) -> MessageResponse:

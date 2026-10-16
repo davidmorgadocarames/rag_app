@@ -382,6 +382,48 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
     assert other["users"] == 1 and other["messages"] == 3 and other["keys"] == 1
 
 
+@pytest.mark.db
+def test_the_purger_deletes_a_live_session_row(
+    db_engine: Engine, purger_engine: Engine, master_key: str
+) -> None:
+    """DEBT-031 / DA-12aB-1: the ``sessions`` purge step is a backstop registered by analogy
+    with ``messages``/``conversations`` (T12.1.1) but never exercised against a real row --
+    every existing purger test's tombstone already has 0 live sessions, because the
+    request-path's own revoke-all (``erasure._short_step``) always runs first. Here a session
+    is inserted directly AFTER the erasure request, bypassing that revoke-all (simulating one
+    created on another "device" in the gap before the purger gets to it), so this is the
+    first test where ``secrag_purger``'s own ``DELETE`` grant on ``sessions`` is what has to
+    do the work."""
+    from rag_app import sessions as session_service
+    from rag_app.db.models import User
+    from rag_app.purger import Purger
+
+    user_id, _ = _make_user(db_engine, conversations=0, messages=0, token=False)
+    request_id = _request(db_engine, user_id)  # revoke-all runs here; no session exists yet
+
+    with Session(db_engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None
+        session_service.create_session(session, user)
+        session.commit()
+
+    with db_engine.connect() as conn:
+        before = conn.execute(
+            text("SELECT count(*) FROM sessions WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+    assert before == 1
+
+    result = Purger(purger_engine, batch_size=10, sleep=_no_sleep).run(only=request_id)
+    assert result.ok and result.done == 1
+    assert result.rows.get("sessions") == 1
+
+    with db_engine.connect() as conn:
+        after = conn.execute(
+            text("SELECT count(*) FROM sessions WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+    assert after == 0
+
+
 class _Killed(Exception):
     pass
 

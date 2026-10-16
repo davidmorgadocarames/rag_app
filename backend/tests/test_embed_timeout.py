@@ -28,6 +28,8 @@ def _settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = {
         "database_url": "postgresql+psycopg://u:p@127.0.0.1:15432/embed_timeout_unit",
         "jwt_secret": "j" * 32,
+        "csrf_secret": "c" * 32,
+        "client_ip_hmac_keys": "k" * 32,
         "data_master_key": Fernet.generate_key().decode(),
     }
     values.update(overrides)

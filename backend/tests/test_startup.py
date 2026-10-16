@@ -38,6 +38,8 @@ def _settings(**overrides: str) -> Settings:
     values = {
         "database_url": GOOD_URL,
         "jwt_secret": "j" * 32,
+        "csrf_secret": "c" * 32,
+        "client_ip_hmac_keys": "k" * 32,
         "data_master_key": Fernet.generate_key().decode(),
     }
     values.update(overrides)
@@ -53,6 +55,8 @@ def test_valid_settings_pass() -> None:
     [
         ({"jwt_secret": "short-secret-value"}, "JWT_SECRET must be at least 32 characters"),
         ({"jwt_secret": ""}, "JWT_SECRET must be at least 32 characters"),
+        ({"csrf_secret": "short-secret-value"}, "CSRF_SECRET must be at least 32 characters"),
+        ({"csrf_secret": ""}, "CSRF_SECRET must be at least 32 characters"),
         ({"data_master_key": "not-a-fernet-key-SECRETVALUE"}, "DATA_MASTER_KEY is not a valid"),
         ({"data_master_key": ""}, "DATA_MASTER_KEY is not a valid"),
         ({"database_url": "mysql://u:pw-not-echoed@h/db"}, "must be a PostgreSQL URL"),
@@ -80,6 +84,14 @@ def test_every_problem_is_reported_at_once() -> None:
     assert "JWT_SECRET" in str(info.value) and "DATA_MASTER_KEY" in str(info.value)
 
 
+def test_client_ip_hmac_keys_required_only_with_env_prod() -> None:
+    with pytest.raises(SettingsValidationError, match="CLIENT_IP_HMAC_KEYS"):
+        validate_api_settings(_settings(client_ip_hmac_keys=""))
+    # dev is unaffected: the feature simply stays off (connection-address fallback, no
+    # security event) until it is adopted end to end (12a-C/D, T12.1.7).
+    validate_api_settings(_settings(client_ip_hmac_keys="", env="dev"))
+
+
 def test_prod_refuses_the_development_database_default() -> None:
     settings = Settings(
         _env_file=None, jwt_secret="j" * 32, data_master_key=Fernet.generate_key().decode()
@@ -92,7 +104,10 @@ def test_prod_refuses_the_development_database_default() -> None:
 def test_dev_accepts_the_development_database_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENV", "dev")
     settings = Settings(
-        _env_file=None, jwt_secret="j" * 32, data_master_key=Fernet.generate_key().decode()
+        _env_file=None,
+        jwt_secret="j" * 32,
+        csrf_secret="c" * 32,
+        data_master_key=Fernet.generate_key().decode(),
     )
     validate_api_settings(settings)
 
@@ -100,6 +115,8 @@ def test_dev_accepts_the_development_database_default(monkeypatch: pytest.Monkey
 def test_database_url_from_the_environment_counts_as_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", GOOD_URL)
     monkeypatch.setenv("JWT_SECRET", "j" * 32)
+    monkeypatch.setenv("CSRF_SECRET", "c" * 32)
+    monkeypatch.setenv("CLIENT_IP_HMAC_KEYS", "k" * 32)
     monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
     validate_api_settings(Settings(_env_file=None))
 

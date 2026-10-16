@@ -445,7 +445,7 @@ step_erasure-scale() {
 step_restart-check() {
   docker info >/dev/null 2>&1 \
     || { echo "  FAIL: docker is not reachable from WSL — start Docker Desktop"; return 1; }
-  env -u JWT_SECRET -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
+  env -u JWT_SECRET -u CSRF_SECRET -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
     --project secrag-gate-rc --restart-project secrag-gate-rc2 --restart-master-key 2>&1 \
     | sed 's/^/  /'
   return "${PIPESTATUS[0]}"

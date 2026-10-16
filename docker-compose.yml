@@ -143,6 +143,11 @@ services:
       # Native Ollama through host.docker.internal (see the header); override with CONTAINER_OLLAMA_HOST.
       OLLAMA_HOST: ${CONTAINER_OLLAMA_HOST:-http://host.docker.internal:11434}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      CSRF_SECRET: ${CSRF_SECRET:?set CSRF_SECRET}
+      # Signed client IP (T12.1.6): empty is fine locally (the feature degrades to the
+      # connection address, no event) -- set the SAME value as the frontend's below to adopt
+      # it end to end.
+      CLIENT_IP_HMAC_KEYS: ${CLIENT_IP_HMAC_KEYS:-}
       DATA_MASTER_KEY: ${DATA_MASTER_KEY:?set DATA_MASTER_KEY}
       ENV: ${ENV:-prod}
       # Global daily answer cap (R6-1): high locally; must stay positive with ENV=prod.
@@ -175,6 +180,15 @@ services:
         NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
       - "127.0.0.1:3000:3000"
+    environment:
+      # The BFF's new route handlers (T12.1.5, P12-D1): server-side only, never built into
+      # the client bundle (no NEXT_PUBLIC_ prefix). The UI itself still calls the backend
+      # directly with Bearer until T12.1.7 -- unused by it today.
+      BACKEND_URL: http://backend:8000
+      # Signed client IP (T12.1.6): same value as the backend's above to adopt it end to
+      # end; empty disables signing (the backend then just uses the connection address).
+      CLIENT_IP_HMAC_KEYS: ${CLIENT_IP_HMAC_KEYS:-}
+      CLIENT_IP_TRUSTED_HOPS: ${CLIENT_IP_TRUSTED_HOPS:-0}
     depends_on:
       - backend
 

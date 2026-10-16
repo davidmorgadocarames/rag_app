@@ -17,6 +17,7 @@ from sqlalchemy import Engine, text
 
 from rag_app.api.app import create_app
 from rag_app.api.deps import get_signup_tracker
+from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
 from rag_app.risk import SignupTracker
 from rag_app.security import decode_token
 from rag_app.sessions import SESSION_COOKIE_NAME
@@ -26,10 +27,20 @@ pytestmark = [pytest.mark.db, pytest.mark.security]
 BASE_URL = "https://testserver"
 
 
+def _csrf_header(response) -> dict[str, str]:  # noqa: ANN001 - httpx.Response, kept untyped to dodge the import
+    """T12.1.4 (12a-C): every cookie-authenticated mutating request in this file now also
+    needs a matching X-CSRF-Token -- CSRF itself is tested in test_csrf.py; here it is just
+    plumbing so the T12.1.3 cookie-auth behaviour this file actually tests keeps working."""
+    token = response.cookies.get(CSRF_COOKIE_NAME)
+    assert token
+    return {CSRF_HEADER_NAME: token}
+
+
 @pytest.fixture()
 def api_env(db_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Engine:
     monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("JWT_SECRET", "t" * 48)
+    monkeypatch.setenv("CSRF_SECRET", "c" * 48)
     monkeypatch.setenv("ENV", "dev")
     monkeypatch.setenv("SMTP_HOST", "")
     return db_engine
@@ -119,7 +130,7 @@ def test_logout_makes_the_cookie_fail_server_side(api_env: Engine) -> None:
 
     assert client.get("/auth/me").status_code == 200
 
-    logout = client.post("/auth/logout")
+    logout = client.post("/auth/logout", headers=_csrf_header(register))
     assert logout.status_code == 200
 
     # Re-present the EXACT old cookie value directly (bypassing whatever the client's own
@@ -150,7 +161,12 @@ def test_erasure_revokes_every_session(api_env: Engine) -> None:
     second_cookie = second_login.cookies.get(SESSION_COOKIE_NAME)
     assert second_login.status_code == 200 and second_cookie and second_cookie != first_cookie
 
-    erase = client.delete("/account", headers={"Authorization": f"Bearer {access_token}"})
+    # The client's cookie jar now carries the SECOND session's cookie (login overwrote the
+    # first one), so this cookie-authenticated DELETE needs ITS CSRF token, not the first's.
+    erase = client.delete(
+        "/account",
+        headers={"Authorization": f"Bearer {access_token}", **_csrf_header(second_login)},
+    )
     assert erase.status_code == 202
 
     for stale_cookie in (first_cookie, second_cookie):

@@ -22,6 +22,7 @@ from rag_app.api.deps import (
 )
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
 from rag_app.config import Settings, check_dev_only_flags, get_settings, validate_api_settings
+from rag_app.csrf import require_csrf
 from rag_app.db.session import make_engine
 from rag_app.keycheck import check_master_key_fingerprint
 from rag_app.logsafe import install_log_redaction
@@ -88,7 +89,11 @@ def create_app() -> FastAPI:
     @app.post(
         "/chat",
         response_model=ChatResponse,
-        dependencies=[Depends(get_current_user), Depends(rate_limit_chat)],
+        dependencies=[
+            Depends(get_current_user),
+            Depends(rate_limit_chat),
+            Depends(require_csrf),
+        ],
     )
     def chat(
         request: ChatRequest,

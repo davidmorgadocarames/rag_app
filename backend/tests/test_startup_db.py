@@ -380,7 +380,12 @@ def test_api_lifespan_end_to_end(migrated: Engine, monkeypatch: pytest.MonkeyPat
 
     def settings(master: str) -> Settings:
         return Settings(
-            _env_file=None, database_url=url, jwt_secret="j" * 40, data_master_key=master
+            _env_file=None,
+            database_url=url,
+            jwt_secret="j" * 40,
+            csrf_secret="c" * 40,
+            client_ip_hmac_keys="k" * 32,
+            data_master_key=master,
         )
 
     # T11.4.1: the lifespan now also warms up the real (heavy, downloaded) cross-encoder —

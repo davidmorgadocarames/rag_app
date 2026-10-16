@@ -23,6 +23,7 @@ from rag_app.api.schemas import (
 )
 from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
+from rag_app.csrf import CSRF_COOKIE_NAME, csrf_token, require_csrf, require_origin
 from rag_app.db.models import EmailVerificationToken, User, UserKey
 from rag_app.emailer import send_verification_email, verification_link
 from rag_app.erasure import (
@@ -69,6 +70,32 @@ def _clear_session_cookie(response: Response) -> None:
     )
 
 
+# CSRF double-submit cookie (T12.1.4, P12-D2): readable (NOT HttpOnly) so client-side
+# JavaScript can echo its value in the X-CSRF-Token header; still __Host- (Secure + Path=/ +
+# no Domain). Issued/rotated together with the session cookie — register and login only in
+# 12a (no rotate() call site yet; 12b's step-up wires this in too, T12.3.5).
+def _set_csrf_cookie(response: Response, raw_session: str) -> None:
+    settings = get_settings()
+    response.set_cookie(
+        CSRF_COOKIE_NAME,
+        csrf_token(settings.csrf_secret, raw_session),
+        path=session_service.COOKIE_PATH,
+        httponly=False,
+        secure=True,
+        samesite="lax",
+    )
+
+
+def _clear_csrf_cookie(response: Response) -> None:
+    response.delete_cookie(
+        CSRF_COOKIE_NAME,
+        path=session_service.COOKIE_PATH,
+        httponly=False,
+        secure=True,
+        samesite="lax",
+    )
+
+
 def _bearer_user(session: SessionDep, token: str) -> User:
     subject = decode_token(token)
     if subject is None:
@@ -102,16 +129,24 @@ def get_current_user(
         session.commit()
         if user is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired session")
+        http.state.user_id = user.id  # T12.1.6: rate_limit_chat keys on this, not just the IP
         return user
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
-    return _bearer_user(session, credentials.credentials)
+    user = _bearer_user(session, credentials.credentials)
+    http.state.user_id = user.id
+    return user
 
 
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
 
 
-@router.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/auth/register",
+    response_model=TokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_origin)],
+)
 def register(
     request: RegisterRequest,
     http: Request,
@@ -154,6 +189,7 @@ def register(
     send_verification_email(request.email, raw_token)
     tracker.record(ip)
     _set_session_cookie(response, raw_session)
+    _set_csrf_cookie(response, raw_session)
     return TokenResponse(access_token=create_token(str(user.id)))
 
 
@@ -177,7 +213,11 @@ def verify_email(token: str, session: SessionDep) -> MessageResponse:
     return MessageResponse(detail="Email verified. You can now log in.")
 
 
-@router.post("/auth/resend-verification", response_model=ResendVerificationResponse)
+@router.post(
+    "/auth/resend-verification",
+    response_model=ResendVerificationResponse,
+    dependencies=[Depends(require_csrf)],
+)
 def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVerificationResponse:
     """Issue a fresh verification token. Only with ENV=dev and no SMTP is the link returned
     to the UI; in prod it never is — without SMTP anyone could otherwise verify an address
@@ -206,7 +246,11 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
     return ResendVerificationResponse(detail="Verification email requested.")
 
 
-@router.post("/auth/login", response_model=TokenResponse, dependencies=[Depends(rate_limit_login)])
+@router.post(
+    "/auth/login",
+    response_model=TokenResponse,
+    dependencies=[Depends(require_origin), Depends(rate_limit_login)],
+)
 def login(request: LoginRequest, session: SessionDep, response: Response) -> TokenResponse:
     user = session.scalar(
         select(User).where(User.email == request.email, User.deleted_at.is_(None))
@@ -223,20 +267,22 @@ def login(request: LoginRequest, session: SessionDep, response: Response) -> Tok
     raw_session = session_service.create_session(session, user)
     session.commit()
     _set_session_cookie(response, raw_session)
+    _set_csrf_cookie(response, raw_session)
     return TokenResponse(access_token=create_token(str(user.id)))
 
 
-@router.post("/auth/logout", response_model=MessageResponse)
+@router.post("/auth/logout", response_model=MessageResponse, dependencies=[Depends(require_csrf)])
 def logout(http: Request, session: SessionDep, response: Response) -> MessageResponse:
-    """T12.1.3: deletes the session row named by the cookie (a no-op if there is none, or if
-    it does not name a live session — logout is idempotent) and always clears the cookie.
-    No CSRF protection yet (that is T12.1.4, 12a-C): acceptable for this block (B8), since the
-    worst a cross-site request can do here is log the victim's own browser out."""
+    """T12.1.3/T12.1.4: deletes the session row named by the cookie (a no-op if there is none,
+    or if it does not name a live session — logout is idempotent) and always clears both
+    cookies. CSRF-protected since 12a-C (``require_csrf``) — a Bearer-only request (no
+    session cookie) is exempt, the cookie path needs a matching ``X-CSRF-Token``."""
     cookie_raw = http.cookies.get(session_service.SESSION_COOKIE_NAME)
     if cookie_raw:
         session_service.revoke(session, cookie_raw)
         session.commit()
     _clear_session_cookie(response)
+    _clear_csrf_cookie(response)
     return MessageResponse(detail="Logged out.")
 
 
@@ -245,7 +291,12 @@ def me(user: CurrentUserDep) -> UserOut:
     return UserOut(id=str(user.id), email=user.email, email_verified=user.email_verified)
 
 
-@router.delete("/account", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.delete(
+    "/account",
+    response_model=MessageResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_csrf)],
+)
 def delete_account(user: CurrentUserDep, session: SessionDep) -> MessageResponse:
     """GDPR erasure, asynchronous (D-ER, T11.2b.2): one short transaction deletes the data key
     (crypto-shred), scrubs the email and password hash, marks the account deleted and queues
