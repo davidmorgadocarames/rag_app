@@ -1,6 +1,14 @@
 import type { Metadata } from "next";
 import "./globals.css";
 
+// D12.2 (T12.2.2/T12.2.3): every page under this layout renders dynamically (SSR), never
+// statically pre-rendered -- middleware.ts generates a FRESH nonce per request and the CSP
+// header carries it; a statically-generated page would bake in one build-time nonce and
+// serve it to every visitor forever, which is not a nonce at all. Segment config is
+// inherited from the root layout unless a page overrides it, so this one line covers the
+// whole app.
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   title: "SecRAG — OWASP security assistant",
   description:

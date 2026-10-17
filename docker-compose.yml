@@ -134,6 +134,16 @@ services:
               count: all
               capabilities: [gpu]
 
+  # Mailpit (T12.1.11): a local SMTP sink + web UI so the verification link is visible
+  # somewhere locally without ever appearing in an API response or a log line. UI/SMTP on
+  # 127.0.0.1 only -- never on the LAN or the internet. Image pinned by digest (X1), like
+  # Prometheus below, so a re-tagged upstream image can never silently change what runs.
+  mailpit:
+    image: axllent/mailpit@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
+    ports:
+      - "127.0.0.1:8025:8025"  # web UI
+      - "127.0.0.1:1025:1025"  # SMTP
+
   backend:
     build: ./backend
     ports:
@@ -143,6 +153,11 @@ services:
       # Native Ollama through host.docker.internal (see the header); override with CONTAINER_OLLAMA_HOST.
       OLLAMA_HOST: ${CONTAINER_OLLAMA_HOST:-http://host.docker.internal:11434}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      CSRF_SECRET: ${CSRF_SECRET:?set CSRF_SECRET}
+      # Signed client IP (T12.1.6): empty is fine locally (the feature degrades to the
+      # connection address, no event) -- set the SAME value as the frontend's below to adopt
+      # it end to end.
+      CLIENT_IP_HMAC_KEYS: ${CLIENT_IP_HMAC_KEYS:-}
       DATA_MASTER_KEY: ${DATA_MASTER_KEY:?set DATA_MASTER_KEY}
       ENV: ${ENV:-prod}
       # Global daily answer cap (R6-1): high locally; must stay positive with ENV=prod.
@@ -152,6 +167,10 @@ services:
       # internal port, never published to the host and never the API port. Only the
       # `prometheus` service (same compose network) reads it.
       METRICS_PORT: ${METRICS_PORT:-9100}
+      # T12.1.11: local SMTP sink (Mailpit, no auth/TLS -- a throwaway local inbox, never
+      # Azure, which has no SMTP in 12a). Unset (empty host) keeps the old dev no-op path.
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
     # Built in on Docker Desktop; needed on a plain Linux engine.
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -167,14 +186,23 @@ services:
       ollama:
         condition: service_started
         required: false
+      mailpit:
+        condition: service_started
 
   frontend:
     build:
       context: ./frontend
-      args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
       - "127.0.0.1:3000:3000"
+    environment:
+      # The BFF's route handlers (T12.1.5, P12-D1): server-side only, never built into the
+      # client bundle. Since T12.1.7 the UI calls only relative /api/... paths (no build-time
+      # backend URL at all -- NEXT_PUBLIC_API_URL is gone).
+      BACKEND_URL: http://backend:8000
+      # Signed client IP (T12.1.6): same value as the backend's above to adopt it end to
+      # end; empty disables signing (the backend then just uses the connection address).
+      CLIENT_IP_HMAC_KEYS: ${CLIENT_IP_HMAC_KEYS:-}
+      CLIENT_IP_TRUSTED_HOPS: ${CLIENT_IP_TRUSTED_HOPS:-0}
     depends_on:
       - backend
 

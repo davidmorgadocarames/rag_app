@@ -222,10 +222,11 @@ $env:PYTHONPATH = "src"
 Copy-Item ..\.env.example .env
 ```
 
-Fill in two required secrets in `backend/.env` (it is git-ignored and must never be committed):
+Fill in three required secrets in `backend/.env` (it is git-ignored and must never be committed):
 
 ```bash
 python -c "import secrets; print('JWT_SECRET=' + secrets.token_urlsafe(64))"
+python -c "import secrets; print('CSRF_SECRET=' + secrets.token_urlsafe(64))"   # T12.1.4
 python -c "from cryptography.fernet import Fernet; print('DATA_MASTER_KEY=' + Fernet.generate_key().decode())"
 chmod 600 .env                                 # secrets: owner-only (scripts/prereqs/check.sh checks it)
 ```
@@ -233,13 +234,18 @@ chmod 600 .env                                 # secrets: owner-only (scripts/pr
 Keep **one** `DATA_MASTER_KEY` per database, and keep a copy in your password manager: every
 user's data key is wrapped with it. Native runs read `backend/.env`; compose reads the shell or
 a root `.env` — use the same key in both. The API checks this at start-up: it validates
-`DATABASE_URL`, `JWT_SECRET` (≥ 32 characters) and `DATA_MASTER_KEY` (a Fernet key), and it
-refuses to start when the key is not the one the database was initialised with (a stored
-key fingerprint) — see [Recovering from a changed master key](#recovering-from-a-changed-master-key).
+`DATABASE_URL`, `JWT_SECRET` (≥ 32 characters), `CSRF_SECRET` (same length rule) and
+`DATA_MASTER_KEY` (a Fernet key), and it refuses to start when the key is not the one the
+database was initialised with (a stored key fingerprint) — see
+[Recovering from a changed master key](#recovering-from-a-changed-master-key).
+`CLIENT_IP_HMAC_KEYS` (T12.1.6, signed client IP) is required only with `ENV=prod` — leave it
+unset locally.
 
-SMTP is optional. Without it no email is sent and nothing personal is logged; only with `ENV=dev`
-does the account page get the verification link from `POST /auth/resend-verification` — in prod
-the link is never returned. Logs never contain an email address, a password or a token: query
+SMTP is optional. Without it no email is sent and nothing personal is logged; the verification
+link is never returned by `POST /auth/resend-verification` either, in any environment (T12.1.11)
+— `docker compose up` points the backend's SMTP at the bundled Mailpit (http://127.0.0.1:8025),
+so locally the link only ever shows up there. Logs never contain an email address, a password or
+a token: query
 strings are redacted from the uvicorn access log (the verification link is
 `GET /auth/verify?token=…`), database errors never print bound parameters, a concurrent sign-up
 of the same address is a plain 409 (never a traceback with the driver's `DETAIL` line), and the
@@ -271,7 +277,7 @@ python -m rag_app.generation "How do I configure a Cisco ASA firewall?"   # abst
 ### 5. Run the API
 
 ```bash
-uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000   # Swagger UI at http://localhost:8000/docs
+uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000   # Swagger UI at http://localhost:8000/docs (ENV=dev only, T12.2.4)
 ```
 
 ### 6. Run the frontend
@@ -284,8 +290,9 @@ npm install
 npm run dev                                    # http://localhost:3000
 ```
 
-The frontend calls `http://localhost:8000` by default. To use a different backend, set
-`NEXT_PUBLIC_API_URL` (it is read at build time).
+The frontend calls the backend only through its own BFF route handlers (`/api/...`), using
+the server-side `BACKEND_URL` (default `http://localhost:8000`, never built into the
+browser bundle).
 
 ### 7. Tests, quality checks and the eval gate
 

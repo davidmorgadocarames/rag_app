@@ -236,6 +236,19 @@ class Settings(JobSettings):
     # Master key (urlsafe base64, 32 bytes) that wraps per-user data keys. Set in .env.
     data_master_key: str = ""
     require_email_verification: bool = False  # gate login on a verified email when true
+    # CSRF (T12.1.4, P12-D2, DEC-010 = A): HMAC key for the double-submit token bound to the
+    # session id. Same fail-fast treatment as JWT_SECRET (validate_api_settings) -- always
+    # required, at least JWT_SECRET_MIN_LENGTH characters, never a real secret in .env.example.
+    csrf_secret: str = ""
+    # Signed client IP (T12.1.6, T5/V7): HMAC key(s) the BFF signs `X-SecRAG-Client-IP` with,
+    # comma-separated, CURRENT key first (rotation keeps the previous one verifiable for a
+    # while). Empty = the feature is not adopted yet (12a-C/D): the backend silently falls
+    # back to the connection address with no security event (nothing to be suspicious about
+    # when nothing has ever been configured to sign). Once set, a missing/forged/stale
+    # signature DOES fall back + emit a security event (rag_app.client_ip). Required with
+    # ENV=prod once the BFF is the only path (T12.1.7+) -- checked here regardless, so a typo
+    # cannot silently disable the check in production.
+    client_ip_hmac_keys: str = ""
 
     # --- Email verification (SMTP) ---
     smtp_host: str = ""
@@ -245,8 +258,18 @@ class Settings(JobSettings):
     smtp_from: str = "no-reply@example.com"
 
     # --- Frontend ---
-    next_public_api_url: str = Field(default="http://localhost:8000")
     frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
+
+    # --- Email verification link (DEBT-035 / DA-12aD-2) ---
+    # Base URL used ONLY to build the link emailer.py puts in the verification e-mail
+    # (`{base}/auth/verify?token=...`). Historically named `NEXT_PUBLIC_API_URL`, which
+    # collided with the (unrelated, frontend build-time) env var of the same name that
+    # T12.1.7 already removed from the frontend/CD -- this field was never actually read
+    # from that GitHub Actions variable (it reads the *process* env of the backend
+    # container only), but the shared name could confuse whoever removes that GitHub
+    # variable at 12a-P. Renamed here; no compatibility break (grepped: no `.env`, compose
+    # service or CD workflow ever set `NEXT_PUBLIC_API_URL` for the *backend*).
+    email_link_base_url: str = Field(default="http://localhost:8000")
 
     # --- Metrics (T11.3.2, TF4) ---
     # Prometheus histograms + the in-flight gauge are served on this SEPARATE internal
@@ -300,11 +323,12 @@ def validate_api_settings(settings: Settings) -> None:
     only — never at import time and never by a Job.
 
     Checks ``DATABASE_URL`` (a PostgreSQL URL; explicitly set when ``ENV=prod``),
-    ``JWT_SECRET`` (at least 32 characters), ``DATA_MASTER_KEY`` (a valid Fernet key) and
-    ``ENV`` (``dev``/``prod``), ``DAILY_ANSWER_CAP`` (never negative; positive with
-    ``ENV=prod``) and ``EMBED_TIMEOUT_SECONDS`` (always positive, and at most
-    ``EMBED_TIMEOUT_MAX_SECONDS`` -- DA-11bH-4). Every problem is reported at once, by
-    setting name only.
+    ``JWT_SECRET`` (at least 32 characters), ``CSRF_SECRET`` (same length rule, T12.1.4),
+    ``DATA_MASTER_KEY`` (a valid Fernet key) and ``ENV`` (``dev``/``prod``),
+    ``DAILY_ANSWER_CAP`` (never negative; positive with ``ENV=prod``),
+    ``EMBED_TIMEOUT_SECONDS`` (always positive, and at most ``EMBED_TIMEOUT_MAX_SECONDS`` --
+    DA-11bH-4) and ``CLIENT_IP_HMAC_KEYS`` (at least one key set with ``ENV=prod`` --
+    T12.1.6). Every problem is reported at once, by setting name only.
     """
     from cryptography.fernet import Fernet
 
@@ -316,6 +340,12 @@ def validate_api_settings(settings: Settings) -> None:
         problems.append(db_problem)
     if len(settings.jwt_secret) < JWT_SECRET_MIN_LENGTH:
         problems.append(f"JWT_SECRET must be at least {JWT_SECRET_MIN_LENGTH} characters")
+    if len(settings.csrf_secret) < JWT_SECRET_MIN_LENGTH:
+        problems.append(f"CSRF_SECRET must be at least {JWT_SECRET_MIN_LENGTH} characters")
+    if settings.env == "prod" and not any(
+        k.strip() for k in settings.client_ip_hmac_keys.split(",")
+    ):
+        problems.append("CLIENT_IP_HMAC_KEYS must be set with ENV=prod (signed client IP, T12.1.6)")
     try:
         Fernet(settings.data_master_key.encode())
     except Exception:  # noqa: BLE001 - never echo the key

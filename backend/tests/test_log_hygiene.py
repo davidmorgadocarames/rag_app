@@ -29,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from rag_app.logsafe import REDACTED, AccessLogRedactor, install_log_redaction, redact_query
+from rag_app.sessions import SESSION_COOKIE_NAME
 
 # --- helpers ------------------------------------------------------------------------------
 
@@ -70,6 +71,15 @@ def _leaks(rendered: list[str], secrets: list[str]) -> list[str]:
     return [line for line in rendered for secret in secrets if secret and secret in line]
 
 
+def _cookie_value(set_cookie: str, name: str) -> str:
+    """The raw value of cookie ``name`` out of a ``Set-Cookie`` response header, or ``""``."""
+    for part in set_cookie.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return ""
+
+
 # --- unit: emailer, redactor, engine ------------------------------------------------------
 
 
@@ -85,6 +95,31 @@ def test_emailer_without_smtp_logs_neither_address_nor_link(
     assert caplog.records, "the missing SMTP configuration is still reported"
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "alice.leak" not in text and "example.test" not in text
+    assert token not in text and "/auth/verify" not in text
+
+
+def test_emailer_with_an_unreachable_smtp_host_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T12.1.11: Mailpit's `depends_on` only waits for "started", not healthy (it has no
+    healthcheck) -- a transient connection failure right after `docker compose up` must
+    never turn register/resend-verification into a 500. Old code (no try/except around
+    smtplib) propagated this exception straight out of send_verification_email."""
+    import socket
+
+    from rag_app.emailer import send_verification_email
+
+    with socket.socket() as probe:  # a guaranteed-unused loopback port, nothing listens there
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("SMTP_HOST", "127.0.0.1")
+    monkeypatch.setenv("SMTP_PORT", str(port))
+    token = "raw-verification-token-" + uuid.uuid4().hex
+    with caplog.at_level(logging.DEBUG):
+        send_verification_email("carol.leak@example.test", token)  # must not raise
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SMTP error" in text
+    assert "carol.leak" not in text and "example.test" not in text
     assert token not in text and "/auth/verify" not in text
 
 
@@ -167,6 +202,7 @@ class _Server:
             time.sleep(0.05)
         port = self.server.servers[0].sockets[0].getsockname()[1]
         self.base = f"http://127.0.0.1:{port}"
+        self.last_set_cookie = ""
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -184,8 +220,10 @@ class _Server:
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as res:  # noqa: S310 - local test server
+                self.last_set_cookie = res.headers.get("set-cookie", "")
                 return res.status, json.loads(res.read() or b"{}")
         except urllib.error.HTTPError as err:
+            self.last_set_cookie = err.headers.get("set-cookie", "")
             return err.code, json.loads(err.read() or b"{}")
 
 
@@ -259,23 +297,26 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
     email = f"carol.{uuid.uuid4().hex[:8]}@example.test"
     password = "correct horse battery staple " + uuid.uuid4().hex[:6]
     access_tokens: list[str] = []
+    session_cookies: list[str] = []
     with _Server(create_app) as server:
         _attach(captured_logs)
         status, body = server.call("POST", "/auth/register", {"email": email, "password": password})
         assert status == 201
         access_tokens.append(body["access_token"])
+        session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
         jwt = body["access_token"]
         credentials = {"email": email, "password": password}
         assert server.call("POST", "/auth/register", credentials)[0] == 409
         assert server.call("POST", "/auth/login", {"email": email, "password": "wrong"})[0] == 401
         assert server.call("POST", "/auth/login", credentials)[0] == 403
         status, body = server.call("POST", "/auth/resend-verification", token=jwt)
-        assert status == 200 and body["verification_link"]  # returned to the UI, not logged
+        assert status == 200 and "verification_link" not in body  # T12.1.11: never in the response
         assert server.call("GET", "/auth/verify?token=not-a-real-token")[0] == 400
         assert server.call("GET", f"/auth/verify?token={issued[-1]}")[0] == 200
         status, body = server.call("POST", "/auth/login", {"email": email, "password": password})
         assert status == 200
         access_tokens.append(body["access_token"])
+        session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
         assert server.call("GET", "/auth/me", token=body["access_token"])[0] == 200
         assert server.call("GET", "/conversations", token=body["access_token"])[0] == 200
         assert server.call("DELETE", "/account", token=body["access_token"])[0] == 202
@@ -284,11 +325,12 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         time.sleep(0.2)
 
     assert len(issued) == 2
+    assert len(session_cookies) == 2 and all(session_cookies)  # register + login both set one
     names = {r.name for r in captured_logs.records}
     assert "uvicorn.access" in names and "sqlalchemy.engine.Engine" in names  # really captured
     assert f"/auth/verify?token={REDACTED}" in "\n".join(captured_logs.rendered)
     local_part = email.split("@", 1)[0]
-    secrets = [email, local_part, password, *issued, *access_tokens]
+    secrets = [email, local_part, password, *issued, *access_tokens, *session_cookies]
     assert not _leaks(captured_logs.rendered, secrets)
 
     # the erasure scrubbed the address, so nothing is left to leak later either
@@ -379,14 +421,18 @@ def test_postgres_logs_no_detail_lines_locally() -> None:
         assert "log_error_verbosity=terse" in (root / compose).read_text(), compose
 
 
-# --- DA-G2-5: the verification link only ever goes to the UI in dev -------------------------
+# --- T12.1.11: the verification link never travels in any API response, dev or prod --------
 
 
 @pytest.mark.db
 @pytest.mark.parametrize("env", ["dev", "prod"])
-def test_resend_returns_the_link_only_in_dev(
+def test_resend_never_returns_a_verification_link(
     db_engine: Engine, monkeypatch: pytest.MonkeyPatch, env: str
 ) -> None:
+    """Old behaviour (pre-T12.1.11): ENV=dev with no SMTP returned ``verification_link`` in
+    the body, so the UI could offer a clickable link with no email sent at all. That branch
+    is gone -- the link only ever reaches the user by email (Mailpit locally); this response
+    never carries it, in dev or prod, with or without SMTP configured."""
     from fastapi.testclient import TestClient
 
     from rag_app.api.app import create_app
@@ -398,8 +444,9 @@ def test_resend_returns_the_link_only_in_dev(
     monkeypatch.setenv("JWT_SECRET", "t" * 48)
     monkeypatch.setenv("ENV", env)
     monkeypatch.setenv("SMTP_HOST", "")
+    raw_email = f"erin.{uuid.uuid4().hex[:8]}@example.test"
     with Session(db_engine) as session:
-        user = User(email=f"erin.{uuid.uuid4().hex[:8]}@example.test", password_hash="x")
+        user = User(email=raw_email, password_hash="x")
         session.add(user)
         session.flush()
         session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
@@ -412,8 +459,5 @@ def test_resend_returns_the_link_only_in_dev(
     )
     assert res.status_code == 200
     body = res.json()
-    if env == "dev":
-        assert body["verification_link"] and "token=" in body["verification_link"]
-    else:
-        assert body["verification_link"] is None
-        assert "token" not in json.dumps(body) and body["detail"]
+    assert "verification_link" not in body
+    assert "token" not in json.dumps(body) and body["detail"]

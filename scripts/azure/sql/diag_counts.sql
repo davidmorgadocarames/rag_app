@@ -18,3 +18,15 @@ SELECT 'deletion_requests', count(*) FROM deletion_requests;
 SELECT 'email_verification_tokens', count(*) FROM email_verification_tokens;
 SELECT 'documents', count(*) FROM documents;
 SELECT 'chunks', count(*) FROM chunks;
+-- sessions (0006, DEBT-031 / DEC-009 = B): guarded with \if/\gset (not a plain SELECT ...
+-- FROM sessions, which Postgres would refuse to even PARSE on a database still on 0005 --
+-- a CASE/to_regclass guard inside one statement does not help, since the planner resolves
+-- the table reference before any condition is evaluated). Works unmodified on both the
+-- live, not-yet-promoted Azure database (0005, no `sessions` table yet) and 0006+.
+SELECT (to_regclass('sessions') IS NOT NULL) AS has_sessions
+\gset
+\if :has_sessions
+SELECT 'sessions', count(*) FROM sessions;
+\else
+SELECT 'sessions', '(table not present yet - pre-0006)';
+\endif

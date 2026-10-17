@@ -80,6 +80,10 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 0006 (T12.1.1): CHECK (role IN ('user', 'admin')) in the migration; no API path sets it
+    # (the admin bootstrap CLI, T12.3.3, is the only writer). P12-D3 reads it to pick the
+    # shorter admin session timeouts.
+    role: Mapped[str] = mapped_column(String, server_default="user", default="user")
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -212,6 +216,28 @@ class MasterKeyFingerprint(Base):
     algorithm: Mapped[str] = mapped_column(String)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class UserSession(Base):
+    """Server-side session (0006, T12.1.1/T12.1.2): the cookie carries the raw, random ID —
+    only its SHA-256 hash is the primary key here (``rag_app.security.hash_token``), so a
+    stolen row of this table never yields a working session. ``idle_expires_at`` is pushed
+    forward on every throttled touch; ``absolute_expires_at`` is fixed at creation (P12-D3).
+    ``mfa_verified_at`` arrives empty in 12a, set by the 12b step-up flow."""
+
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    idle_expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    absolute_expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    mfa_verified_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 

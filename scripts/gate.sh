@@ -81,15 +81,20 @@ shellcheck       - 60
 schema-check     - 30
 adr-links        - 30
 private-names    - 30
+threat-catalogue - 30
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
+security-suite   db 180
 migrations-roundtrip db 180
 backup-drill     db 300
 erasure-scale    db 600
 restart-check    docker 900
 eval             seed 1200
 latency          seed 900
+e2e              seed 600
+security-headers db 300
+zap-baseline     db 600
 "
 STACK_BUDGET=300   # up + migrate + seed restore
 
@@ -240,6 +245,10 @@ step_adr-links() { need_venv && "$PY" -m rag_app.devtools.adr_links --root "$REP
 # DEBT-026: no public, tracked Markdown file names a private planning file.
 step_private-names() { need_venv && "$PY" -m rag_app.devtools.private_names --root "$REPO_ROOT"; }
 
+# T12.0.5: every THREAT_MODEL.md catalogue entry has a phase + test ID; mitigated entries
+# point at a test that exists.
+step_threat-catalogue() { need_venv && "$PY" -m rag_app.devtools.threat_catalogue --root "$REPO_ROOT"; }
+
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
 # Toolchain floor: Node >= 22.13 (22.x) and npm >= 11 (scripts/prereqs/install.sh node).
@@ -266,7 +275,17 @@ step_dependency-audit() {
 
 step_db-tests() {
   need_venv || return 1
-  (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m db -p no:cacheprovider -rs)
+  # "and not security": backend/tests/security/ is also marked `db` but runs as its OWN
+  # step below (T12.1.0) -- never both, so nothing runs twice.
+  (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m "db and not security" -p no:cacheprovider -rs)
+}
+
+# T12.1.0: backend/tests/security/ — sessions, cookie auth (12a), later CSRF/route-walker
+# (12.1/12.2), roles/MFA (12b). Needs the gate DB like db-tests; kept as its own step so a red
+# security test is never buried among the much larger db-tests run.
+step_security-suite() {
+  need_venv || return 1
+  (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m security -p no:cacheprovider -rs)
 }
 
 # Fresh database → roles.sql twice (catalog identical) → the roles log in with the gate
@@ -429,7 +448,7 @@ step_erasure-scale() {
 step_restart-check() {
   docker info >/dev/null 2>&1 \
     || { echo "  FAIL: docker is not reachable from WSL — start Docker Desktop"; return 1; }
-  env -u JWT_SECRET -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
+  env -u JWT_SECRET -u CSRF_SECRET -u CLIENT_IP_HMAC_KEYS -u DATA_MASTER_KEY -u ENV bash "$REPO_ROOT/scripts/restart_check.sh" \
     --project secrag-gate-rc --restart-project secrag-gate-rc2 --restart-master-key 2>&1 \
     | sed 's/^/  /'
   return "${PIPESTATUS[0]}"
@@ -468,6 +487,199 @@ step_latency() {
   [ -n "${LATENCY_EXTRA_ARGS:-}" ] && extra=($LATENCY_EXTRA_ARGS)
   (cd backend && HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
     "$PY" -m rag_app.eval.latency --require-stack "${extra[@]}")
+}
+
+# T12.1.10/T12.2.5/T12.2.6: a NATIVE backend (uvicorn, against the gate DB/Ollama main()
+# already exported) and the built frontend (`next start`, not the Docker `standalone` output
+# -- these steps run the app directly, never the image) as plain background processes on
+# throwaway loopback ports. Three gate steps share this ONE pair of helpers --
+# `step_e2e`/`step_security-headers`/`step_zap-baseline` -- never running concurrently (each
+# step is its own `bash "$SELF" --run-step <name>` subprocess, run_step/main's `for name in
+# steps` loop is sequential), so the shared globals below never collide across them. ENV=dev
+# (no SMTP, no cap on verification) so register → login needs no email step.
+E2E_BACKEND_PORT="${E2E_BACKEND_PORT:-18100}"
+E2E_FRONTEND_PORT="${E2E_FRONTEND_PORT:-18101}"
+E2E_BACKEND_PID=""
+E2E_FRONTEND_PID=""
+E2E_CLIENT_IP_KEY=""   # set by e2e_start_backend; e2e_start_frontend must reuse the SAME value
+# Local secrets shared by every native backend these three steps start (git-ignored, 0600;
+# same pattern as ROLES_ENV). MUST be identical across e2e/security-headers/zap-baseline
+# within one gate DB lifetime: the master-key fingerprint (T11.2.4) is stored on the gate
+# DB's FIRST ever backend start, and every later start against that SAME database refuses if
+# its own DATA_MASTER_KEY does not match -- found running `--only
+# e2e,security-headers,zap-baseline` for real (2026-10-17): three independently-random keys,
+# one shared DB, two steps refused to start. Regenerated only when missing -- reused freely
+# across separate gate.sh runs too (the gate DB itself is always recreated fresh, so an old
+# key here is never a stale-data risk, only ever a throwaway local secret).
+E2E_ENV="$GATE_STATE/e2e.env"
+ensure_e2e_env() {
+  [ -f "$E2E_ENV" ] && return 0
+  mkdir -p "$GATE_STATE" || return 1
+  chmod 700 "$GATE_STATE" || return 1
+  (
+    umask 077
+    {
+      echo "# Local secrets shared by the e2e/security-headers/zap-baseline native backends."
+      echo "# Git-ignored; regenerated only when missing (see the comment above in gate.sh)."
+      echo "E2E_JWT_SECRET=$(openssl rand -hex 24)"
+      echo "E2E_CSRF_SECRET=$(openssl rand -hex 24)"
+      echo "E2E_CLIENT_IP_KEY=$(openssl rand -hex 16)"
+      echo "E2E_MASTER_KEY=$("$PY" -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+    } >"$E2E_ENV.tmp" && mv -f "$E2E_ENV.tmp" "$E2E_ENV"
+  )
+}
+# e2e_kill_port <port>: belt-and-suspenders (found the hard way: `npx next start` does not
+# reliably exec-replace itself, so killing only $E2E_FRONTEND_PID once left an orphaned
+# `next-server` still listening) -- whatever actually ended up bound to the port dies too,
+# not just the PID this step itself backgrounded.
+e2e_kill_port() {
+  local pid
+  pid="$(ss -ltnp 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {print $NF}' | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+  [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+}
+e2e_cleanup() {
+  [ -n "$E2E_FRONTEND_PID" ] && kill "$E2E_FRONTEND_PID" 2>/dev/null
+  [ -n "$E2E_BACKEND_PID" ] && kill "$E2E_BACKEND_PID" 2>/dev/null
+  [ -n "$E2E_FRONTEND_PID" ] && wait "$E2E_FRONTEND_PID" 2>/dev/null
+  [ -n "$E2E_BACKEND_PID" ] && wait "$E2E_BACKEND_PID" 2>/dev/null
+  e2e_kill_port "$E2E_BACKEND_PORT"
+  e2e_kill_port "$E2E_FRONTEND_PORT"
+}
+# e2e_wait_healthy <url> <pid> <seconds> <log file>: polls <url>; fails fast if <pid> exited.
+e2e_wait_healthy() {
+  local url="$1" pid="$2" tries="$3" log="$4" _
+  for _ in $(seq 1 "$tries"); do
+    curl -fsS -m 2 "$url" >/dev/null 2>&1 && return 0
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  echo "  FAIL: not healthy after ${tries}s ($url); last log lines:"
+  tail -n 20 "$log" | sed 's/^/  /'
+  return 1
+}
+# e2e_start_backend <log dir>: sets E2E_BACKEND_PID + E2E_CLIENT_IP_KEY.
+e2e_start_backend() {
+  local log_dir="$1"
+  ensure_e2e_env || return 1
+  set -a
+  # shellcheck source=/dev/null
+  . "$E2E_ENV"
+  set +a
+  echo "  native backend on 127.0.0.1:$E2E_BACKEND_PORT (log: $log_dir/backend.log)"
+  (cd "$REPO_ROOT/backend" && exec env \
+      DATABASE_URL="$DATABASE_URL" ENV=dev JWT_SECRET="$E2E_JWT_SECRET" CSRF_SECRET="$E2E_CSRF_SECRET" \
+      DATA_MASTER_KEY="$E2E_MASTER_KEY" CLIENT_IP_HMAC_KEYS="$E2E_CLIENT_IP_KEY" \
+      FRONTEND_ORIGIN="http://localhost:$E2E_FRONTEND_PORT" OLLAMA_HOST="$OLLAMA_HOST" \
+      DAILY_ANSWER_CAP=1000 SMTP_HOST="" \
+      "$VENV/bin/uvicorn" rag_app.api.app:create_app --factory \
+        --host 127.0.0.1 --port "$E2E_BACKEND_PORT" \
+  ) >"$log_dir/backend.log" 2>&1 &
+  E2E_BACKEND_PID=$!
+  e2e_wait_healthy "http://127.0.0.1:$E2E_BACKEND_PORT/health" "$E2E_BACKEND_PID" 60 "$log_dir/backend.log"
+}
+# e2e_start_frontend <log dir>: needs E2E_CLIENT_IP_KEY already set by e2e_start_backend.
+e2e_start_frontend() {
+  local log_dir="$1"
+  echo "  frontend build + next start on 127.0.0.1:$E2E_FRONTEND_PORT (log: $log_dir/frontend.log)"
+  # The direct binary, not `npx next ...`: npx does not reliably exec-replace itself with
+  # the resolved binary, which left an orphaned `next-server` running after $E2E_FRONTEND_PID
+  # (npx's own PID) was killed -- found running this step for real (e2e_kill_port above is
+  # the belt; this is the suspenders).
+  (cd "$REPO_ROOT/frontend" \
+     && BACKEND_URL="http://127.0.0.1:$E2E_BACKEND_PORT" CLIENT_IP_HMAC_KEYS="$E2E_CLIENT_IP_KEY" \
+        CLIENT_IP_TRUSTED_HOPS=0 ./node_modules/.bin/next build \
+     && exec env BACKEND_URL="http://127.0.0.1:$E2E_BACKEND_PORT" CLIENT_IP_HMAC_KEYS="$E2E_CLIENT_IP_KEY" \
+        CLIENT_IP_TRUSTED_HOPS=0 ./node_modules/.bin/next start -p "$E2E_FRONTEND_PORT" -H 127.0.0.1 \
+  ) >"$log_dir/frontend.log" 2>&1 &
+  E2E_FRONTEND_PID=$!
+  e2e_wait_healthy "http://127.0.0.1:$E2E_FRONTEND_PORT/api/health" "$E2E_FRONTEND_PID" 90 "$log_dir/frontend.log"
+}
+# e2e_start_stack <log dir>: both of the above, with the shared cleanup trap armed first.
+e2e_start_stack() {
+  mkdir -p "$1"
+  trap e2e_cleanup EXIT
+  e2e_start_backend "$1" || return 1
+  e2e_start_frontend "$1" || return 1
+}
+
+step_e2e() {
+  need_venv || return 1
+  [ -d "$REPO_ROOT/frontend/node_modules/@playwright" ] \
+    || { missing_tool "@playwright/test (npm ci, in frontend/)"; return; }
+  command -v npx >/dev/null || { missing_tool "npx (node toolchain)"; return; }
+  if ! "$VENV/bin/python" -c 'import uvicorn' 2>/dev/null; then
+    missing_tool "uvicorn (pip install -r backend/requirements.txt)"
+    return
+  fi
+
+  e2e_start_stack "$GATE_STATE/e2e" || return 1
+
+  # "localhost", not "127.0.0.1": Next.js's own middleware (next start, self-hosted)
+  # constructs its redirect Location from `new URL(path, request.url)` using "localhost" as
+  # the canonical host regardless of the Host header the browser actually sent (reproduced:
+  # a 127.0.0.1-based run got redirected mid-test to a DIFFERENT origin, http://localhost:…,
+  # and the next request's Origin header then failed FRONTEND_ORIGIN's exact-match check).
+  # Visiting "localhost" from the start keeps the browser's origin consistent with every
+  # middleware redirect; FRONTEND_ORIGIN above is set to match.
+  (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
+    npx playwright test e2e/auth.spec.ts)
+}
+
+# T12.2.3/T12.2.5 (E3/E9): the Playwright page walk (frontend/e2e/security-headers.spec.ts)
+# against the SAME native backend+frontend pair as `e2e`. --full only, never CI.
+step_security-headers() {
+  need_venv || return 1
+  [ -d "$REPO_ROOT/frontend/node_modules/@playwright" ] \
+    || { missing_tool "@playwright/test (npm ci, in frontend/)"; return; }
+  command -v npx >/dev/null || { missing_tool "npx (node toolchain)"; return; }
+  if ! "$VENV/bin/python" -c 'import uvicorn' 2>/dev/null; then
+    missing_tool "uvicorn (pip install -r backend/requirements.txt)"
+    return
+  fi
+
+  e2e_start_stack "$GATE_STATE/security-headers" || return 1
+  (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
+    npx playwright test e2e/security-headers.spec.ts)
+}
+
+# T12.2.6 (E8): OWASP ZAP passive baseline scan against the SAME native backend+frontend pair
+# as `e2e`/`security-headers`. The official image, pinned by digest (resolved read-only via
+# `docker buildx imagetools inspect`, never a mutable tag). The ZAP container reaches the
+# host's own loopback port via `host.docker.internal` -- Docker Desktop's WSL2 backend
+# resolves this automatically to the host (confirmed with a throwaway `curlimages/curl`
+# container, 2026-10-17); `--network host` does NOT work the same way there (also confirmed:
+# a container on `--network host` could not reach a host loopback port at all). Both the
+# target host and any extra `docker run` flags a different environment might need (e.g. a
+# native Linux Docker install's `--add-host=host.docker.internal:host-gateway`) are
+# configurable, never hard-coded to this one machine's setup.
+ZAP_IMAGE="ghcr.io/zaproxy/zaproxy@sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6"
+ZAP_TARGET_HOST="${ZAP_TARGET_HOST:-host.docker.internal}"
+ZAP_RULES_FILE="$REPO_ROOT/scripts/zap/zap-rules.tsv"
+step_zap-baseline() {
+  need_venv || return 1
+  command -v docker >/dev/null || { missing_tool "docker"; return; }
+  [ -f "$ZAP_RULES_FILE" ] || { echo "  FAIL: $ZAP_RULES_FILE missing"; return 1; }
+  if ! "$VENV/bin/python" -c 'import uvicorn' 2>/dev/null; then
+    missing_tool "uvicorn (pip install -r backend/requirements.txt)"
+    return
+  fi
+
+  local zap_log="$GATE_STATE/zap-baseline"
+  e2e_start_stack "$zap_log" || return 1
+
+  local report="$zap_log/report.json" docker_extra=()
+  rm -f "$report"
+  # shellcheck disable=SC2206 # our own space-separated flag list (one-off host setups only)
+  [ -n "${ZAP_DOCKER_EXTRA_ARGS:-}" ] && docker_extra=($ZAP_DOCKER_EXTRA_ARGS)
+  echo "  ZAP baseline against http://$ZAP_TARGET_HOST:$E2E_FRONTEND_PORT/ (image $ZAP_IMAGE)"
+  docker run --rm "${docker_extra[@]}" -v "$zap_log:/zap/wrk/:rw" "$ZAP_IMAGE" \
+    zap-baseline.py -t "http://$ZAP_TARGET_HOST:$E2E_FRONTEND_PORT/" -J report.json -I \
+    2>&1 | sed 's/^/  /'
+  # zap-baseline.py's OWN exit code is informational only here (its `-c`/threshold mechanism
+  # is not used): the real pass/fail judgment is this project's, against the real `risk`
+  # field of every alert in the JSON report (rag_app.devtools.zap_report) -- any High-risk
+  # alert fails unless its plugin id is listed, with a reason, in $ZAP_RULES_FILE.
+  "$PY" -m rag_app.devtools.zap_report --report "$report" --rules "$ZAP_RULES_FILE"
 }
 
 # --- backend venv matching the pins (DA-B-4) --------------------------------------------

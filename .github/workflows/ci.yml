@@ -73,15 +73,20 @@ jobs:
           alembic upgrade head && alembic current
       - name: Pytest (unit)
         run: pytest -rs -m "not db"
+      # "and not security": backend/tests/security/ is also marked `db` but runs as its own
+      # step below (T12.1.0) -- never both, so nothing runs twice.
       - name: Pytest (DB tests through the harness — must run, never skip)
-        run: pytest -rs -m db
-      - name: Links (adr-links), eval data (schema-check), private names (DEBT-026)
+        run: pytest -rs -m "db and not security"
+      - name: Security suite (backend/tests/security/ — T12.1.0)
+        run: pytest -rs -m security
+      - name: Links (adr-links), eval data (schema-check), private names (DEBT-026), threat catalogue (T12.0.5)
         env:
           PYTHONPATH: src
         run: |
           python -m rag_app.devtools.adr_links --root ..
           python -m rag_app.devtools.schema_check --root ..
           python -m rag_app.devtools.private_names --root ..
+          python -m rag_app.devtools.threat_catalogue --root ..
 
   frontend:
     name: Frontend (lint, types, build)
@@ -338,7 +343,7 @@ jobs:
         run: |
           shellcheck --version | grep -x "version: 0.11.0"
           node --version && npm --version
-      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names
+      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue
         env:
           GATE_VENV: ${{ github.workspace }}/backend/.venv
-        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names
+        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue

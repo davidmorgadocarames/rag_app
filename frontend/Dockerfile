@@ -10,9 +10,8 @@ RUN npm install -g --no-fund --no-audit npm@11.20.0
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-# NEXT_PUBLIC_* is baked at build time; override for a real deploy.
-ARG NEXT_PUBLIC_API_URL=http://localhost:8000
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+# No build-time backend URL any more (T12.1.7): the UI calls relative /api/... paths only,
+# proxied by the BFF route handlers using the server-side BACKEND_URL (set at run time).
 RUN npm run build
 
 FROM ${NODE_IMAGE} AS runner

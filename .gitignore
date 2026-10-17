@@ -39,6 +39,11 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# --- Playwright (T12.1.10): traces/screenshots/HTML report from a local or gate `e2e` run ---
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+
 # --- Data / corpus (kept out of git; only .gitkeep tracked) ---
 data/raw_pdfs/*
 !data/raw_pdfs/.gitkeep

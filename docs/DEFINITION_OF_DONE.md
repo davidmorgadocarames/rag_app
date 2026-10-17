@@ -49,6 +49,33 @@ are a human/agent checklist.
   does **not** conflict with a container that *runs in production* on Azure.
 - **Phase 11+ (gate hygiene, X5)** — `--full` runs only in the isolated gate project; every
   sub-phase closes with `--full` or `--only <the steps it adds>`; target `--full` ≤ 30 min.
+- **Phase 12+ (threat catalogue, T12.0.4/T12.0.5)** — every vulnerability-catalogue entry in
+  [`docs/security/THREAT_MODEL.md`](security/THREAT_MODEL.md) carries a status (`mitigated` /
+  `planned` / `accepted`), a defence difficulty, an attack level, an assigned phase and a test
+  ID; a row missing a phase or test ID fails; a `mitigated` row's test ID must resolve to a
+  real, tracked test. Enforced by the gate step `threat-catalogue`
+  (`rag_app.devtools.threat_catalogue`). A new route, store or trust boundary added by a later
+  phase either closes an existing catalogue entry (test ID filled in, status flipped to
+  `mitigated`) or adds a new one.
+- **Phase 12a+ (security suite, T12.1.0)** — `backend/tests/security/` (sessions, cookie
+  auth, and from 12a-C/12.2 CSRF, the route walker, security headers) is marked `db` **and**
+  `security`; the second marker runs it as its own gate step/CI step, **never** inside
+  `db-tests`/the "Pytest (DB tests …)" CI step too (a marker/path split keeps each test
+  collected exactly once across `pytest`/`db-tests`/`security-suite` locally and across the
+  matching CI steps). Enforced by the gate step `security-suite` (needs the gate DB, in
+  `--full`, not `--fast`).
+- **Phase 12a+ (security headers + CSP, T12.2.1/T12.2.2/T12.2.3)** — every frontend response
+  carries HSTS (no `preload`), `X-Content-Type-Options`, `Referrer-Policy`,
+  `Permissions-Policy` and a per-request nonce CSP; every API response carries
+  `X-Content-Type-Options`, `Referrer-Policy`, `Content-Security-Policy: frame-ancestors
+  'none'`, `Cache-Control: no-store`; `/docs`/`/redoc`/`/openapi.json` only with `ENV=dev`;
+  CORS narrowed to exactly what a caller needs. `CSP_MODE` (`frontend/lib/csp.ts`) is a
+  single switch: `"report-only"` until the `security-headers` gate step (Playwright walk)
+  proves zero violations, then `"enforce"` — only the latter satisfies T12.2.3's own
+  Done-when. Enforced by the gate steps `security-headers` and `zap-baseline` (both need the
+  gate DB + a running native frontend/backend, `--full` only, never CI — DEBT-029 keeps the 5
+  required job names pinned) and the backend's own `pytest` step (`/docs` gating, CORS,
+  headers — no browser needed for that half).
 - **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
   it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
   image that is still running (and the previous image in a rollback) keeps working on the
@@ -127,9 +154,13 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `mypy` | - | 240 s | `eval` | gate DB + seed + Ollama | 1200 s |
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
 | `private-names` | - | 30 s | `backup-drill` | gate DB | 300 s |
-| | | | `erasure-scale` | gate DB | 600 s |
+| `threat-catalogue` | - | 30 s | `erasure-scale` | gate DB | 600 s |
+| | | | `security-suite` | gate DB | 180 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
+| | | | `e2e` | gate DB + seed + Ollama | 600 s |
+| | | | `security-headers` | gate DB | 300 s |
+| | | | `zap-baseline` | gate DB | 600 s |
 
 `latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
 questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +
@@ -168,6 +199,52 @@ and `--concurrency N` are two further one-off modes (`LATENCY_EXTRA_ARGS` passes
 step for ad-hoc runs against the isolated gate project) — see ADR 11 decision 8 for the full
 measurement table and the rerank floor result.
 
+`e2e` (T12.1.10, Playwright, `--full` only, not in CI — the 5 required job names stay pinned,
+DEBT-029): the real BFF + backend wired end to end, in a browser. The step itself starts a
+native backend (`uvicorn`, gate DB + Ollama once `security-headers`/`zap-baseline` are also
+requested — see below) and the built frontend (`next build` then `next start` directly, not
+the Docker `standalone` output — this step runs the app itself, never the image), pointed at
+that backend via `BACKEND_URL`, then runs `frontend/e2e/auth.spec.ts` headless against it:
+register → one streamed chat turn (a REAL security question through classify → retrieve →
+rerank → generate → groundedness, DEBT-035 — not the chitchat fast path) → logout → login
+again. Chromium is a one-time local install (`npx playwright install chromium`, cached under
+`~/.cache/ms-playwright`; if the WSL system libraries are missing, that install needs `sudo`
+once, run by the user in their own terminal — never by an agent). Playwright
+(`@playwright/test`) is a frontend `devDependency` only — never baked into the runner image
+(`output: standalone` never copies `node_modules`).
+
+`security-headers` (T12.2.1/T12.2.2/T12.2.3/T12.2.5, Playwright, `--full` only): the SAME
+native backend+frontend pair `e2e` starts (`scripts/gate.sh`'s `e2e_start_backend`/
+`e2e_start_frontend`, shared by all three Playwright/ZAP steps — they never run
+concurrently), walked by `frontend/e2e/security-headers.spec.ts`: every page, logged out and
+in, must serve HSTS (no `preload`, E7), `X-Content-Type-Options: nosniff`,
+`Referrer-Policy`, `Permissions-Policy` and a nonce CSP (`script-src 'self' 'nonce-…'
+'strict-dynamic'`, `style-src 'self' 'unsafe-inline'`, `frame-ancestors 'none'`); the spec
+also listens for the browser's own `securitypolicyviolation`-triggered console message
+across the whole walk and fails on any. This step needs only the gate DB (register/login),
+not Ollama/the seed — no chat message is ever sent. `CSP_MODE` (`frontend/lib/csp.ts`) must
+be `"enforce"` for this step's green run to actually prove T12.2.3's Done-when ("zero
+violations WITH CSP enforcing") — the same spec also passes against `"report-only"` (useful
+while fixing violations one by one), so a green run alone does not by itself prove which mode
+was active; check `CSP_MODE`'s own value when citing this step as that proof.
+
+`zap-baseline` (T12.2.6, E8, `--full` only): OWASP ZAP's official image, pinned by digest
+(`scripts/gate.sh`'s `ZAP_IMAGE`, resolved read-only via `docker buildx imagetools inspect`,
+never a mutable tag), runs a passive baseline scan (`zap-baseline.py`) against the same
+native frontend `e2e`/`security-headers` start. The container reaches the host's own
+loopback port via `host.docker.internal` (`ZAP_TARGET_HOST`, confirmed working on this
+Docker Desktop/WSL2 setup; `--network host` is NOT a drop-in substitute there — confirmed it
+cannot reach a host loopback port at all) — both the target host and any extra `docker run`
+flags a different Docker setup might need (`ZAP_DOCKER_EXTRA_ARGS`) are env-var
+configurable, never hard-coded to one machine. `zap-baseline.py`'s own exit code (its
+`-c`/per-rule-threshold mechanism) is not used for pass/fail: `rag_app.devtools.zap_report`
+instead judges the scan's own `-J report.json` directly against the real `risk` field of
+every alert — **any High-risk alert fails** the step unless its ZAP plugin id is listed, with
+a reason, in the committed `scripts/zap/zap-rules.tsv` (Medium/Low/Informational alerts are
+always printed but never fail it). `rag_app.devtools.zap_report`'s own pure JSON/TSV logic is
+unit-tested by the ordinary `pytest` step (`backend/tests/test_zap_report.py`) — no docker/
+ZAP needed for that part.
+
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →
 `pg_dump` as `secrag_backup` (only the default privileges can make the new tables readable)
@@ -177,6 +254,13 @@ passwords → `downgrade -1` → `upgrade head`. The local role passwords live i
 git-ignored `.gate/roles.env` (0600, generated once). CI runs the same round trip on its
 Postgres service (after `roles.sql`), and a DB test proves that a broken downgrade makes
 `alembic downgrade -1` fail (`test_startup_db.py`).
+
+`security-suite` (T12.1.0, `backend/tests/security/`): every test under this directory
+(marked `db` and `security`); excluded from `db-tests` (and CI's "Pytest (DB tests …)" step)
+by the second marker, so it is collected exactly once across the whole gate/CI run. 12a:
+session creation/rejection (unknown, idle-expired, absolute-expired, revoked) and rotation
+(T12.1.2); cookie + legacy Bearer auth, logout, erasure revoking every session (T12.1.3).
+Grows in 12a-C/12.2 (CSRF, the route walker) and 12b (roles, MFA).
 
 `backup-drill` (T11.2.10, `scripts/db/backup_drill.sh`): throwaway `secrag_drill_*`
 databases on the gate server and throwaway `age` keys (never the real backup key) —

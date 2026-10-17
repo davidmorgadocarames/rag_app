@@ -18,7 +18,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from wsgiref.simple_server import WSGIServer
 
-from prometheus_client import CollectorRegistry, Gauge, Histogram, start_http_server
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, start_http_server
 
 REGISTRY = CollectorRegistry()
 
@@ -33,6 +33,15 @@ STAGE_SECONDS = Histogram(
 CHAT_IN_FLIGHT = Gauge(
     "secrag_chat_requests_in_flight",
     "Chat requests (streaming or not) currently being answered.",
+    registry=REGISTRY,
+)
+
+# T12.1.6: a request whose X-SecRAG-Client-IP signature was missing, stale or matched no
+# configured key once CLIENT_IP_HMAC_KEYS is set -- the connection address was used instead.
+# No labels (no IP, no path): log hygiene, counted only when the feature is actually adopted.
+CLIENT_IP_SIGNATURE_EVENTS = Counter(
+    "secrag_client_ip_signature_invalid_total",
+    "Requests with a missing/forged/stale signed client IP (CLIENT_IP_HMAC_KEYS set).",
     registry=REGISTRY,
 )
 

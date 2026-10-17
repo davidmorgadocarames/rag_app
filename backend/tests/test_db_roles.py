@@ -149,3 +149,14 @@ def test_roles_are_not_superusers_and_have_only_their_mapped_rights(db_engine: E
         assert not conn.execute(
             text("SELECT has_table_privilege('secrag_purger', 'public.chunks', 'SELECT')")
         ).scalar_one()
+        # 0006 (T12.1.1): sessions follows the same leaf-table map as messages/conversations/
+        # email_verification_tokens — never a role that can create or insert sessions.
+        assert conn.execute(
+            text("SELECT has_table_privilege('secrag_purger', 'public.sessions', 'DELETE')")
+        ).scalar_one()
+        assert not conn.execute(
+            text("SELECT has_table_privilege('secrag_purger', 'public.sessions', 'INSERT')")
+        ).scalar_one()
+        assert conn.execute(
+            text("SELECT has_table_privilege('secrag_backup', 'public.sessions', 'SELECT')")
+        ).scalar_one()

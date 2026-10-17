@@ -39,7 +39,7 @@ from sqlalchemy import CursorResult, Result, delete, exists, func, literal, sele
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from rag_app.db.models import DeletionRequest, User, UserKey
+from rag_app.db.models import DeletionRequest, User, UserKey, UserSession
 from rag_app.retention import BACKUP_RETENTION_DAYS, TOMBSTONE_EXPORT_RETENTION_DAYS
 
 # The promise of the 202 message (PHASE_PLANNING 11.2b): the purger removes the remaining
@@ -123,7 +123,20 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
             DELETE FROM email_verification_tokens WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM email_verification_tokens WHERE user_id = :uid)",
     ),
-    # Sessions / lockout rows join here (and the request path) when 12a/12b add their tables.
+    # Sessions (0006, T12.1.1): the request path already deletes every row of the user
+    # immediately (revoke-all, below) — this step is the X3 purge-step registration/
+    # defense-in-depth backstop for anything that outlives the short transaction.
+    PurgeStep(
+        name="sessions",
+        table="sessions",
+        delete_batch="""
+            WITH victim AS (
+                SELECT id FROM sessions WHERE user_id = :uid
+                 LIMIT :n FOR UPDATE SKIP LOCKED)
+            DELETE FROM sessions WHERE id IN (SELECT id FROM victim)""",
+        remaining="SELECT EXISTS (SELECT 1 FROM sessions WHERE user_id = :uid)",
+    ),
+    # Lockout rows join here when 12b adds its table.
     PurgeStep(
         name="users",
         table="users",
@@ -203,6 +216,9 @@ def _short_step(session: Session, user_id: uuid.UUID, now: dt.datetime) -> bool:
     if _rowcount(marked) == 0:
         return False
     session.execute(delete(UserKey).where(UserKey.user_id == user_id))
+    # T12.1.3: every session of this user stops authenticating at once (revoke-all), not
+    # only once the purger's "sessions" step above gets to it.
+    session.execute(delete(UserSession).where(UserSession.user_id == user_id))
     _enqueue(session, user_id, now)
     return True
 

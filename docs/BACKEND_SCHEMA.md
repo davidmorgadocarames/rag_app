@@ -3,10 +3,11 @@
 How user and corpus data is stored and organised, including the authentication flow and every table
 with its columns and relationships. Target store: **PostgreSQL 16 + pgvector**.
 
-Sections 1–3 are the **target design** from the planning phase (some tables — sessions,
-password resets, login attempts, query logs — arrive in later phases). What the migrations
-create **today** (head `0005_persistence_erasure`), including the database roles and their
-grants, is in [section 5](#5-as-implemented-migrations-0001-0005).
+Sections 1–3 are the **target design** from the planning phase (some tables — password
+resets, login attempts, query logs — arrive in later phases; `sessions` arrived in 0006, with
+a narrower column set than the target design below — see section 5). What the migrations
+create **today** (head `0006_sessions_role`), including the database roles and their grants,
+is in [section 5](#5-as-implemented-migrations-0001-0006).
 
 ## 1. Authentication flow
 
@@ -159,18 +160,22 @@ users 1───∞ query_logs
 
 ## 4. Erasure coverage (GDPR)
 
-**As implemented (11a, asynchronous erasure — ADR phase 11 decision 6).** `DELETE /account`
-runs one short transaction: delete `user_keys` (crypto-shred), set `users.email` and
-`users.password_hash` to NULL, set `users.deleted_at`, and upsert `deletion_requests`
-(`status = pending`). The purger (`rag_app.purger`, role `secrag_purger`) follows the
-purge-step registry `rag_app.erasure.PURGE_STEPS`, leaf-first — `messages` → `conversations`
-→ `email_verification_tokens` → `users` — in batches with `FOR UPDATE SKIP LOCKED`, recording
-`progress`/`attempts`/`last_error` on the tombstone and one row per run in `purger_runs`.
-**Schema-scan rule (X3):** every column named `user_id`, `*_user_id`, `admin_id` or `*_hmac`
-needs a purge step or a documented exemption (today: `deletion_requests.user_id` — the opaque
-tombstone kept for replay; `user_keys.user_id` — deleted in the request transaction); a test
-fails otherwise. Tables added later (sessions, lockout, audit, …) add their step with their
-migration.
+**As implemented (11a, asynchronous erasure — ADR phase 11 decision 6; 12a/T12.1.3 adds
+sessions).** `DELETE /account` runs one short transaction: delete `user_keys` (crypto-shred),
+delete every row of the user's `sessions` (revoke-all — a live cookie/Bearer stops
+authenticating at once), set `users.email` and `users.password_hash` to NULL, set
+`users.deleted_at`, and upsert `deletion_requests` (`status = pending`). The purger
+(`rag_app.purger`, role `secrag_purger`) follows the purge-step registry
+`rag_app.erasure.PURGE_STEPS`, leaf-first — `messages` → `conversations` →
+`email_verification_tokens` → `sessions` → `users` — in batches with `FOR UPDATE SKIP LOCKED`,
+recording `progress`/`attempts`/`last_error` on the tombstone and one row per run in
+`purger_runs`. The `sessions` step is a backstop (the request path already deletes them all
+immediately): it still needs its own step for the X3 scan and for any session that could
+somehow be created after the short transaction. **Schema-scan rule (X3):** every column named
+`user_id`, `*_user_id`, `admin_id` or `*_hmac` needs a purge step or a documented exemption
+(today: `deletion_requests.user_id` — the opaque tombstone kept for replay; `user_keys.user_id`
+— deleted in the request transaction); a test fails otherwise. Tables added later (lockout,
+audit, …) add their step with their migration.
 
 Migration 0005 columns used here: `users.deleted_at`, nullable `users.email`/`password_hash`,
 `deletion_requests.status` (`pending`/`running`/`done`/`failed`), `progress` (jsonb, rows
@@ -188,15 +193,16 @@ Deleting a user removes/renders-unrecoverable, at minimum:
 `messages`, `citations`, `query_logs` — **plus** any per-user cache entries and external trace records.
 Corpus tables (`documents`, `chunks`) are shared and not user-owned.
 
-## 5. As implemented (migrations 0001-0005)
+## 5. As implemented (migrations 0001-0006)
 
 Source of truth: `backend/src/rag_app/db/models.py` and `backend/migrations/versions/`. Head:
-**`0005_persistence_erasure`** (Phase 11a, expand-only — see the
+**`0006_sessions_role`** (Phase 12a, T12.1.1, expand-only — see the
 [Definition of Done](DEFINITION_OF_DONE.md#phase-specific-norms), expand/contract).
 
 | Table | Columns (type; nullable = null) | Notes |
 |---|---|---|
-| `users` | `id` uuid PK · `email` varchar unique, **null since 0005** · `password_hash` varchar, **null since 0005** · `email_verified` bool · `created_at` · **`deleted_at`** timestamptz null (0005) | an erased account has `email`/`password_hash` NULL and `deleted_at` set until the purger removes the row; login and token checks ignore it |
+| `users` | `id` uuid PK · `email` varchar unique, **null since 0005** · `password_hash` varchar, **null since 0005** · `email_verified` bool · `created_at` · **`deleted_at`** timestamptz null (0005) · **`role`** varchar, `CHECK (role IN ('user','admin'))`, default `'user'` (0006) | an erased account has `email`/`password_hash` NULL and `deleted_at` set until the purger removes the row; login and token checks ignore it. No API path sets `role` in 12a — the admin bootstrap CLI (T12.3.3, 12b) is the only writer |
+| `sessions` (0006) | `id` varchar PK (SHA-256 hex of the random cookie value — only the hash is stored) · `user_id` uuid → `users` (cascade) · `created_at` · `last_seen_at` (throttled, ≥ 60 s between writes) · `idle_expires_at` · `absolute_expires_at` (P12-D3: 30 min / 12 h, admin 15 min / 8 h) · `mfa_verified_at` timestamptz null (empty in 12a; set by the 12b step-up flow) | server-side sessions (`rag_app.sessions`); the erasure request path deletes every row of the user at once (revoke-all), and the purger has its own leaf-first step as a backstop (X3) |
 | `user_keys` | `user_id` uuid PK → `users` (cascade) · `wrapped_key` bytea · `created_at` | the per-user Fernet key wrapped by `DATA_MASTER_KEY`; deleted in the erasure request (crypto-shred) |
 | `conversations` | `id` · `user_id` → `users` (cascade) · `title_encrypted` bytea null · `created_at` | |
 | `messages` | `id` · `conversation_id` → `conversations` (cascade) · `role` · `content_encrypted` bytea · `prompt_tokens`, `completion_tokens` int null · `created_at` | citations inside the encrypted JSON; failed/interrupted turns are stored as assistant error markers |
@@ -215,10 +221,12 @@ outside Alembic by `scripts/db/apply_roles.sh` (it sends only a client-side SCRA
 
 | Role | Grants | Used by |
 |---|---|---|
-| `secrag_backup` | `CONNECT`, `USAGE` on `public`; `SELECT` on every table and sequence, and **default privileges** so every future table is readable too (0005 also grants its new tables explicitly) | `scripts/db/backup.sh` (`pg_dump` → `age`), the backup Job |
-| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`: `SELECT, DELETE, UPDATE (id)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` | `rag_app.purger` (purge Job, compose `purger`) |
+| `secrag_backup` | `CONNECT`, `USAGE` on `public`; `SELECT` on every table and sequence, and **default privileges** so every future table is readable too (0005/0006 also grant their new tables explicitly) | `scripts/db/backup.sh` (`pg_dump` → `age`), the backup Job |
+| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`, **`sessions`** (0006): `SELECT, DELETE, UPDATE (id)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` | `rag_app.purger` (purge Job, compose `purger`) |
 
-0005 checks that both roles exist (a missing role fails the upgrade with a clear message)
-and its downgrade revokes the purger's grants. The **downgrade refuses** while any user has
-`email`/`password_hash` NULL or `deleted_at` set: it is never a rollback path (roll images
-back instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback)).
+0005/0006 check that both roles exist (a missing role fails the upgrade with a clear
+message). 0005's downgrade revokes the purger's grants and **refuses** while any user has
+`email`/`password_hash` NULL or `deleted_at` set; 0006's downgrade revokes its grants too and
+**refuses** while any user has a non-default `role`. Neither is a rollback path once that
+data exists (roll images back instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback);
+0006 stays in place after the 12a rollback).

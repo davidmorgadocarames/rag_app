@@ -1,0 +1,9 @@
+# OWASP ZAP baseline — committed exceptions (T12.2.6, E8).
+# Format: <ZAP plugin id><TAB><reason>. One exception per line; blank lines and lines
+# starting with "#" are ignored. Read by backend/src/rag_app/devtools/zap_report.py
+# (scripts/gate.sh's `zap-baseline` step): any High-risk alert whose plugin id is NOT in
+# this file fails the step. Medium/Low/Informational alerts are always reported but never
+# fail the step on their own.
+#
+# Every row below MUST carry a real reason — "noisy" is not a reason, "the demo frontend has
+# no cookie consent UI and is not public-facing session storage, accepted until Phase X" is.
