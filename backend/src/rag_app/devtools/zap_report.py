@@ -14,7 +14,10 @@ fails") is about.
     python -m rag_app.devtools.zap_report --report <report.json> --rules <rules.tsv>
 
 Exit code: 0 no unexempted High-risk alert; 1 otherwise, or the report/rules file is
-missing/unreadable/malformed.
+missing/unreadable/malformed/empty/partial (DA-12aE-2: a syntactically-valid-but-empty
+report, e.g. ``{}`` or ``{"site": []}``, must FAIL rather than silently read as "0 alerts,
+PASS" -- ``validate_report_has_scanned_a_site()`` requires at least one named ``site``
+entry before any alert is judged).
 """
 
 from __future__ import annotations
@@ -72,6 +75,24 @@ def parse_alerts(report: dict[str, object]) -> list[Alert]:
     return alerts
 
 
+def validate_report_has_scanned_a_site(report: dict[str, object]) -> str | None:
+    """``None`` if ``report`` looks like ``zap-baseline.py`` actually scanned at least one
+    site (even if it found zero alerts there -- a real, legitimate "0 alerts" pass always has
+    a named ``site`` entry); an error string otherwise.
+
+    Catches a syntactically-valid-but-empty-or-partial report -- ``{}``, ``{"site": []}``, or
+    a ``site`` entry with no ``@name`` -- that ``parse_alerts()`` would otherwise read as "0
+    alerts" and let through as a clean pass, even though the scan never actually ran against
+    a target (DA-12aE-2)."""
+    sites = report.get("site", [])
+    if not isinstance(sites, list) or not sites:
+        return "report has no 'site' entries — the scan likely never ran against a target"
+    for site in sites:
+        if not isinstance(site, dict) or not str(site.get("@name", "")).strip():
+            return "a 'site' entry is missing its own '@name' — the report looks partial"
+    return None
+
+
 def parse_rules(text: str) -> dict[str, str]:
     """``plugin id -> reason`` from the committed exceptions file. Blank lines and ``#``
     comments are skipped; every data row MUST be exactly ``<plugin id>\\t<reason>`` (E8: "a
@@ -124,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         exceptions = parse_rules(args.rules.read_text(encoding="utf-8"))
     except ValueError as exc:
         print(f"zap-baseline: FAIL — {exc}", file=sys.stderr)
+        return 1
+
+    structure_error = validate_report_has_scanned_a_site(report)
+    if structure_error is not None:
+        print(f"zap-baseline: FAIL — {structure_error}", file=sys.stderr)
         return 1
 
     alerts = parse_alerts(report)

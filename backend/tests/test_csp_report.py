@@ -7,6 +7,7 @@ like ``test_security_headers.py`` (T12.2.4's own gate)."""
 
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from rag_app.api.app import create_app
 from rag_app.api.deps import get_rate_limiter
-from rag_app.csp_report import blocked_origin, parse_report_entries
+from rag_app.csp_report import _sanitize_directive, blocked_origin, parse_report_entries
 from rag_app.ratelimit import RateLimiter
 
 
@@ -63,6 +64,46 @@ def test_parse_report_entries_reporting_api_shape() -> None:
 def test_parse_report_entries_ignores_unrelated_reporting_api_entries() -> None:
     payload = [{"type": "deprecation", "body": {}}]
     assert parse_report_entries(payload) == []
+
+
+# --- _sanitize_directive (DA-12aE-1: cap + strip, mirroring blocked_origin()) ------------
+
+
+def test_sanitize_directive_strips_newlines_and_crlf() -> None:
+    result = _sanitize_directive("script-src\r\ninjected: fake log line\nFAIL=1")
+    assert "\n" not in result
+    assert "\r" not in result
+
+
+def test_sanitize_directive_strips_ansi_escapes() -> None:
+    result = _sanitize_directive("script-src\x1b[31mRED\x1b[0m")
+    assert "\x1b" not in result
+
+
+def test_sanitize_directive_caps_length() -> None:
+    result = _sanitize_directive("a" * 500)
+    assert len(result) == 64
+
+
+def test_sanitize_directive_strips_unicode() -> None:
+    result = _sanitize_directive("scrîpt-src\U0001f600")
+    assert result == "scrpt-src"
+
+
+def test_sanitize_directive_falls_back_to_unknown_when_nothing_survives() -> None:
+    assert _sanitize_directive("\U0001f600\U0001f600") == "unknown"
+
+
+def test_parse_report_entries_sanitizes_a_hostile_directive() -> None:
+    payload = {
+        "csp-report": {
+            "violated-directive": "script-src\r\ninjected: fake log line",
+            "blocked-uri": "",
+        }
+    }
+    (directive, _origin) = parse_report_entries(payload)[0]
+    assert "\n" not in directive
+    assert "\r" not in directive
 
 
 # --- the route --------------------------------------------------------------------------
@@ -133,6 +174,77 @@ def test_a_request_with_no_csrf_token_is_still_accepted() -> None:
         headers={"Content-Type": "application/csp-report"},
     )
     assert response.status_code == 204
+
+
+def test_a_crlf_injection_in_the_directive_stays_a_single_log_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _client()
+    body = json.dumps(
+        {
+            "csp-report": {
+                "violated-directive": "script-src\r\nFAKE LOG LINE level=CRITICAL",
+                "blocked-uri": "",
+            }
+        }
+    ).encode()
+    with caplog.at_level(logging.WARNING, logger="rag_app.csp_report"):
+        response = client.post(
+            "/csp-report", content=body, headers={"Content-Type": "application/csp-report"}
+        )
+    assert response.status_code == 204
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "\n" not in message
+    assert "\r" not in message
+
+
+def test_an_ansi_escape_in_the_directive_is_stripped_before_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _client()
+    body = json.dumps(
+        {"csp-report": {"violated-directive": "script-src\x1b[31mRED\x1b[0m", "blocked-uri": ""}}
+    ).encode()
+    with caplog.at_level(logging.WARNING, logger="rag_app.csp_report"):
+        response = client.post(
+            "/csp-report", content=body, headers={"Content-Type": "application/csp-report"}
+        )
+    assert response.status_code == 204
+    assert "\x1b" not in caplog.records[0].getMessage()
+
+
+def test_an_oversized_directive_is_capped_before_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _client()
+    body = json.dumps({"csp-report": {"violated-directive": "x" * 500, "blocked-uri": ""}}).encode()
+    with caplog.at_level(logging.WARNING, logger="rag_app.csp_report"):
+        response = client.post(
+            "/csp-report", content=body, headers={"Content-Type": "application/csp-report"}
+        )
+    assert response.status_code == 204
+    message = caplog.records[0].getMessage()
+    assert "x" * 65 not in message
+    assert "x" * 64 in message
+
+
+def test_a_unicode_directive_is_stripped_before_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _client()
+    body = json.dumps(
+        {"csp-report": {"violated-directive": "scrîpt-src\U0001f600", "blocked-uri": ""}}
+    ).encode()
+    with caplog.at_level(logging.WARNING, logger="rag_app.csp_report"):
+        response = client.post(
+            "/csp-report", content=body, headers={"Content-Type": "application/csp-report"}
+        )
+    assert response.status_code == 204
+    message = caplog.records[0].getMessage()
+    assert "î" not in message
+    assert "\U0001f600" not in message
+    assert "scrpt-src" in message
 
 
 def test_rate_limited_per_ip() -> None:

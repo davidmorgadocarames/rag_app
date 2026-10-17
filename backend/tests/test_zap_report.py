@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from rag_app.devtools.zap_report import Alert, check, main, parse_alerts, parse_rules
+from rag_app.devtools.zap_report import (
+    Alert,
+    check,
+    main,
+    parse_alerts,
+    parse_rules,
+    validate_report_has_scanned_a_site,
+)
 
 
 def _report(*alerts: dict[str, object]) -> dict[str, object]:
@@ -43,6 +50,29 @@ def test_parse_alerts_tolerates_a_malformed_report() -> None:
     assert parse_alerts({"site": "not a list"}) == []
     assert parse_alerts({"site": [{"alerts": "not a list"}]}) == []
     assert parse_alerts({"site": [{"alerts": ["not a dict"]}]}) == []
+
+
+# --- validate_report_has_scanned_a_site (DA-12aE-2) ---------------------------------------
+
+
+def test_validate_passes_on_a_real_report_with_zero_alerts() -> None:
+    assert validate_report_has_scanned_a_site(_report()) is None
+
+
+def test_validate_fails_on_an_empty_report() -> None:
+    assert validate_report_has_scanned_a_site({}) is not None
+
+
+def test_validate_fails_on_a_report_with_no_sites() -> None:
+    assert validate_report_has_scanned_a_site({"site": []}) is not None
+
+
+def test_validate_fails_on_a_site_missing_its_own_name() -> None:
+    assert validate_report_has_scanned_a_site({"site": [{"alerts": []}]}) is not None
+
+
+def test_validate_fails_when_site_is_not_a_list() -> None:
+    assert validate_report_has_scanned_a_site({"site": "not a list"}) is not None
 
 
 def test_parse_rules_skips_blank_lines_and_comments() -> None:
@@ -111,6 +141,30 @@ def test_main_passes_when_the_high_risk_alert_is_exempted_with_a_reason(tmp_path
     )
     rules.write_text("10038\taccepted, see ADR phase 12\n", encoding="utf-8")
     assert main(["--report", str(report), "--rules", str(rules)]) == 0
+
+
+def test_main_fails_on_an_empty_but_syntactically_valid_report(tmp_path: Path) -> None:
+    report = tmp_path / "report.json"
+    rules = tmp_path / "zap-rules.tsv"
+    report.write_text(json.dumps({}), encoding="utf-8")
+    rules.write_text("# no exceptions\n", encoding="utf-8")
+    assert main(["--report", str(report), "--rules", str(rules)]) == 1
+
+
+def test_main_fails_on_a_report_with_an_empty_site_list(tmp_path: Path) -> None:
+    report = tmp_path / "report.json"
+    rules = tmp_path / "zap-rules.tsv"
+    report.write_text(json.dumps({"site": []}), encoding="utf-8")
+    rules.write_text("# no exceptions\n", encoding="utf-8")
+    assert main(["--report", str(report), "--rules", str(rules)]) == 1
+
+
+def test_main_fails_on_a_partial_report_whose_site_has_no_name(tmp_path: Path) -> None:
+    report = tmp_path / "report.json"
+    rules = tmp_path / "zap-rules.tsv"
+    report.write_text(json.dumps({"site": [{"alerts": []}]}), encoding="utf-8")
+    rules.write_text("# no exceptions\n", encoding="utf-8")
+    assert main(["--report", str(report), "--rules", str(rules)]) == 1
 
 
 def test_main_fails_when_the_report_file_is_missing(tmp_path: Path) -> None:

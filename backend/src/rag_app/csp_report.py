@@ -21,12 +21,19 @@ the path or query string -- a ``blocked-uri`` can legitimately carry a query str
 nothing here is allowed to echo one into a log line, T11.2.15/R6-5 pattern). Never raises on
 a malformed, oversized or wrongly-typed body: a hostile or buggy report is dropped silently,
 not a 500 or a 400 that could itself become a probe surface.
+
+Both the directive and the origin are sanitised before logging (``_sanitize_directive()``/
+``blocked_origin()``): this route is unauthenticated by design, so a hostile POST fully
+controls both fields, and a naive ``logger.warning("...%s...", directive, ...)`` would let it
+inject newlines/CRLF (forged multi-line log entries), ANSI escapes (log-viewer/terminal
+abuse) or an oversized value into the log stream (DA-12aE-1).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -41,6 +48,23 @@ router = APIRouter()
 # over any real one while still bounding the memory/log-line cost of a hostile body.
 MAX_BODY_BYTES = 8 * 1024
 _NO_CONTENT = Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# Real CSP directive names (``script-src-elem``, ``style-src``, ``report-to``, ...) are all
+# short tokens of ASCII letters, digits and hyphens. The directive field is attacker-
+# controlled (this route is unauthenticated by design), so anything outside that charset --
+# newlines/CRLF, ANSI escapes, other control characters, unicode -- is stripped before the
+# value ever reaches ``logger.warning``, the same log-injection concern (forged multi-line
+# log entries, terminal/log-viewer escape-sequence abuse) that ``blocked_origin()`` already
+# guards against for the URL field (T11.2.15/R6-5 pattern, DA-12aE-1).
+_DIRECTIVE_MAX_LEN = 64
+_DIRECTIVE_DISALLOWED = re.compile(r"[^A-Za-z0-9-]")
+
+
+def _sanitize_directive(directive: str) -> str:
+    """Cap to ``_DIRECTIVE_MAX_LEN`` chars and strip anything outside the CSP directive-name
+    charset (ASCII letters/digits/hyphen). Never returns an empty string."""
+    cleaned = _DIRECTIVE_DISALLOWED.sub("", directive)[:_DIRECTIVE_MAX_LEN]
+    return cleaned or "unknown"
 
 
 def blocked_origin(uri: str) -> str:
@@ -66,7 +90,7 @@ def _legacy_entries(payload: object) -> list[tuple[str, str]]:
     directive = str(
         report.get("violated-directive") or report.get("effective-directive") or "unknown"
     )
-    return [(directive, blocked_origin(str(report.get("blocked-uri") or "")))]
+    return [(_sanitize_directive(directive), blocked_origin(str(report.get("blocked-uri") or "")))]
 
 
 def _reporting_api_entries(payload: object) -> list[tuple[str, str]]:
@@ -80,7 +104,9 @@ def _reporting_api_entries(payload: object) -> list[tuple[str, str]]:
         if not isinstance(body, dict):
             continue
         directive = str(body.get("effectiveDirective") or "unknown")
-        entries.append((directive, blocked_origin(str(body.get("blockedURL") or ""))))
+        entries.append(
+            (_sanitize_directive(directive), blocked_origin(str(body.get("blockedURL") or "")))
+        )
     return entries
 
 
