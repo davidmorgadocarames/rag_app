@@ -170,6 +170,68 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
   instructions**.
 - **Agent limits**: bounded steps, retries, and tokens to prevent runaway loops.
 
+### 8.1 Session, BFF and CSRF (Phase 12a)
+
+See [`docs/security/THREAT_MODEL.md`](security/THREAT_MODEL.md) for the full STRIDE/
+catalogue analysis; this is the implementation summary.
+
+- **Server-side sessions** (migration 0006, `rag_app.sessions`): a 256-bit random session
+  ID, only its SHA-256 hash stored. Idle (30 min) and absolute (12 h; admin 15 min / 8 h,
+  P12-D3) expiry; `last_seen_at` is throttled (≥ 60 s between writes). The cookie
+  (`__Host-secrag_session`; `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`) carries **no
+  `Max-Age`/`Expires`** — it is a browser-session cookie by design (DEBT-032): the server's
+  own absolute/idle expiry is the real limit either way, and this avoids a client-controlled
+  lifetime claim that could outlive it. Logout deletes the row; account erasure revokes every
+  session for the user (crypto-shred's short transaction).
+- **BFF** (`frontend/app/api/[...path]/route.ts` + `lib/bffProxy.ts`/`bffRoutes.ts`/
+  `bffConfig.ts`, P12-D1): an explicit allow-list of `(method, pattern)` pairs — anything not
+  listed is a 404 by construction, never `/metrics`/`/docs`/`/redoc`/`/openapi.json`. Cookies
+  forwarded both directions; the upstream fetch's own timeout is ≥ 240 s (`MIN_TIMEOUT_MS`,
+  DEC-006) so the Azure ingress's ~240 s cutoff stays the only real limit on a slow/cold
+  answer; once headers arrive the response body streams through unbuffered (SSE survives the
+  hop token-by-token). `access_token` is stripped from `/auth/login` and `/auth/register`
+  responses before they reach the browser, so the BFF-fronted UI never sees a bearer token at
+  all (F1 closes on this path; the legacy Bearer rollback, TF10, is unaffected).
+- **CSRF** (`rag_app.csrf`, P12-D2): double-submit, `csrf_token = HMAC-SHA256(CSRF_SECRET,
+  raw_session_id)`, issued in a **readable** (non-`HttpOnly`) `__Host-secrag_csrf` cookie so
+  page script can echo it back as `X-CSRF-Token`. `require_csrf` is attached to every
+  cookie-authenticated state-changing route; a request with **no session cookie at all**
+  (the legacy Bearer-only path) is exempt — a bearer token is never sent automatically by the
+  browser, so it cannot be forged cross-site. `require_origin` (lighter: a present-but-wrong
+  `Origin` is rejected, a missing one allowed) covers register/login, where no session exists
+  yet to bind a token to — DA-12aC's accepted trade-off (a curl/legacy client, or a browser
+  that omits `Origin` on some same-origin requests, still gets through; a cross-site forger
+  still cannot set a matching `Origin`).
+- **Signed client IP** (`rag_app.client_ip` / `frontend/lib/clientIp.ts`, T5/V7): once
+  `CLIENT_IP_HMAC_KEYS` is configured, the BFF derives the real client address from
+  `X-Forwarded-For` (after `CLIENT_IP_TRUSTED_HOPS`), signs
+  `client_ip|method|path|timestamp` (HMAC-SHA256, 30 s window) and sends it as
+  `X-SecRAG-Client-IP`; the backend verifies the signature and keys rate limits by
+  account/user **plus** this real IP instead of the shared Azure connection address. A
+  missing/forged/stale signature falls back to the connection address and emits a security
+  event. **Caveat (DA-12aC-2, DEBT-034, accepted until 12b):** this only protects callers that
+  actually go through the BFF — a request reaching the still-public backend directly in 12a
+  falls back to the shared address, so `login:<email>:<ip>` collapses to `login:<email>`
+  for that path; not worse than the old pure-IP keying, closes fully once the backend's
+  ingress goes internal (12b).
+- **Security headers + CSP** (T12.2.1/T12.2.2/T12.2.3, `frontend/middleware.ts` +
+  `lib/csp.ts`/`lib/securityHeaders.mjs`; backend `rag_app.api.app._add_security_headers`):
+  HSTS (no `preload` — shared `*.azurecontainerapps.io` domain, E7), `X-Content-Type-Options:
+  nosniff`, `Referrer-Policy`, `Permissions-Policy`, `poweredByHeader: false` on every
+  frontend response; a per-request nonce CSP (`script-src 'self' 'nonce-…'
+  'strict-dynamic'`, `style-src 'self' 'unsafe-inline'`, `frame-ancestors 'none'`) on every
+  HTML route, reported to `/api/csp-report` (`rag_app.csp_report`, E5: unauthenticated,
+  rate-limited by real IP, body-size capped, logs only the violated directive and the
+  blocked origin — never a path or query string, CSRF-exempt by design) via both
+  `report-uri` (Firefox/Safari) and the Reporting API (`Reporting-Endpoints` header,
+  Chromium). `CSP_MODE` (`lib/csp.ts`) is a single switch: `"report-only"` until the
+  Playwright page walk proves zero `script-src` violations against the real built app in a
+  real browser, then `"enforce"` (T12.2.3's literal Done-when) — **still `"report-only"` as
+  of this document** (12a-E Phase 1; the walk is Phase 2 work). The backend narrows CORS to
+  the old (pre-BFF) frontend's exact needs (single origin, `GET`/`POST`/`PATCH`/`DELETE`,
+  `Authorization`/`Content-Type`, no credentials) and gates `/docs`/`/redoc`/`/openapi.json`
+  behind `ENV=dev` — both removed entirely once the backend goes internal-only in 12b.
+
 ## 9. Compliance (data erasure)
 
 - **Crypto-shredding**: user data is encrypted with a per-user key; deleting the key renders the data

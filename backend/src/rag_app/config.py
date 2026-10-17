@@ -258,8 +258,18 @@ class Settings(JobSettings):
     smtp_from: str = "no-reply@example.com"
 
     # --- Frontend ---
-    next_public_api_url: str = Field(default="http://localhost:8000")
     frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
+
+    # --- Email verification link (DEBT-035 / DA-12aD-2) ---
+    # Base URL used ONLY to build the link emailer.py puts in the verification e-mail
+    # (`{base}/auth/verify?token=...`). Historically named `NEXT_PUBLIC_API_URL`, which
+    # collided with the (unrelated, frontend build-time) env var of the same name that
+    # T12.1.7 already removed from the frontend/CD -- this field was never actually read
+    # from that GitHub Actions variable (it reads the *process* env of the backend
+    # container only), but the shared name could confuse whoever removes that GitHub
+    # variable at 12a-P. Renamed here; no compatibility break (grepped: no `.env`, compose
+    # service or CD workflow ever set `NEXT_PUBLIC_API_URL` for the *backend*).
+    email_link_base_url: str = Field(default="http://localhost:8000")
 
     # --- Metrics (T11.3.2, TF4) ---
     # Prometheus histograms + the in-flight gauge are served on this SEPARATE internal

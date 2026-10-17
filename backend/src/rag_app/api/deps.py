@@ -125,6 +125,16 @@ def get_answer_reserver() -> ReserveFn:
     return reserve_daily_answer
 
 
+def rate_limit_csp_report(
+    request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
+) -> None:
+    """``/csp-report`` (T12.2.2, E5): no account to key by (unauthenticated, no session) --
+    the real client IP (T12.1.6) alone, so one noisy/hostile reporter cannot drown out
+    everyone else's genuine reports either."""
+    if not limiter.allow(f"csp-report:{_client_ip(request)}", cost=1.0):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
 async def rate_limit_login(
     request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
 ) -> None:

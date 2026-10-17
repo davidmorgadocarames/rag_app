@@ -22,6 +22,9 @@ export const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   { method: "GET", pattern: /^\/conversations\/[^/]+$/ },
   { method: "PATCH", pattern: /^\/conversations\/[^/]+$/ },
   { method: "DELETE", pattern: /^\/conversations\/[^/]+$/ },
+  // T12.2.2/E5: the CSP violation reporter -- unauthenticated, no session, explicitly
+  // CSRF-exempt on the backend (rag_app.csp_report); still only ever POST.
+  { method: "POST", pattern: /^\/csp-report$/ },
 ];
 
 /** Whether ``method path`` (upstream path, no "/api" prefix) is on the allow-list. */

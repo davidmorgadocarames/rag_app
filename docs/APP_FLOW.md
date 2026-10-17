@@ -48,14 +48,25 @@ Chat (/chat)              [authenticated]
 3. User enters credentials. On **ENTER**:
    - Server checks **login rate limit** (token bucket) for the IP/account.
    - Verifies argon2 hash; requires `email_verified = true`.
-   - Success → issues session/JWT → redirect to **`/chat`**.
+   - Success → creates a server-side **session** and sets the `__Host-secrag_session`
+     cookie (`HttpOnly`, `Secure`, `SameSite=Lax`) plus the readable
+     `__Host-secrag_csrf` cookie the browser echoes back as `X-CSRF-Token` on every later
+     state-changing request (Phase 12a, TRD §8.1) → redirect to **`/chat`**. The response
+     body still carries a JWT for the **pre-BFF rollback frontend** (the current,
+     BFF-fronted frontend strips it before the browser ever sees it).
    - Failure → generic error (no user enumeration); increment `login_attempts`.
 
 ### 2.4 Ask a question (core loop)
 
 1. On **`/chat`** (a message thread with the input pinned at the bottom), the user types a question and
    presses **Send** (Enter; Shift+Enter for a newline). Requires auth → redirects to `/login` otherwise.
-2. Client → `POST /chat/stream` (Bearer token). Server:
+2. Client → `POST /api/chat/stream` (relative; the request never leaves the frontend's own
+   origin). The Next.js **BFF** route handler forwards it to the backend, carrying the
+   session cookie and a `X-CSRF-Token` header it read back from the readable CSRF cookie, and
+   adds a **signed client-IP header** derived from `X-Forwarded-For` so backend rate limits
+   key on the real caller, not the shared Azure address (TRD §8.1). The BFF streams the
+   response body through unbuffered, so the SSE events below still arrive progressively. The
+   pre-BFF rollback frontend instead calls the backend directly with a Bearer token. Server:
    - Applies the **per-user rate limit / quota** (cost-aware). Over limit → 429.
    - Checks the **global daily answer cap** (`DAILY_ANSWER_CAP` answers per UTC day for all
      users together — a cost guard for the public demo; 150 by default). The answer is
@@ -143,6 +154,11 @@ Chat (/chat)              [authenticated]
 | `/chat`, `/account` | yes | Redirect to `/login` if not authenticated |
 | `POST /chat/stream`, `POST /chat`, `GET/PATCH/DELETE /conversations…` | yes | Chat is rate-limited (cost-aware) and counted against the global daily answer cap |
 | `POST /auth/resend-verification`, `DELETE /account` | yes | |
+| `POST /api/csp-report` | no | Unauthenticated, rate-limited by real IP, CSRF-exempt (no session to protect) — the browser's CSP violation reports (Phase 12a, TRD §8.1) |
+
+Every path above the backend actually serves is also on the BFF's explicit allow-list
+(`frontend/lib/bffRoutes.ts`) under `/api/...` — a path not listed there is a 404 from the
+frontend itself, before it would ever reach the backend.
 
 ## 4. Key states to design for
 

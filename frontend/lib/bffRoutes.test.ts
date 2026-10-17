@@ -14,6 +14,7 @@ test("the allow-listed backend routes pass", () => {
   assert.equal(isAllowedUpstreamPath("GET", "/conversations/abc-123"), true);
   assert.equal(isAllowedUpstreamPath("PATCH", "/conversations/abc-123"), true);
   assert.equal(isAllowedUpstreamPath("DELETE", "/conversations/abc-123"), true);
+  assert.equal(isAllowedUpstreamPath("POST", "/csp-report"), true);
 });
 
 test("never /metrics, /docs, /redoc or /openapi.json, whatever the method", () => {

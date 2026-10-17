@@ -2,9 +2,27 @@
 // backend (scripts/gate.sh's `e2e` step starts both; --full only). Proves, in a real
 // browser, what the lib-level `node --test` suites can only prove in parts: the cookie
 // actually gets set by the browser, the CSRF cookie is actually readable and sent back,
-// the SSE stream actually renders token by token, and a session-less visit to /chat is
-// actually redirected (T12.1.8) by the real middleware.
+// a genuinely slow, multi-chunk, Ollama-backed SSE stream (not the instant, hardcoded
+// chitchat reply) actually renders token by token through the whole cookie + CSRF + BFF +
+// Next.js path, and a session-less visit to /chat is actually redirected (T12.1.8) by the
+// real middleware.
+//
+// DEC-014/DEBT-035 (DA-12aD-1, high): the question used to be "hello", which
+// `classify_intent` (backend/src/rag_app/generation.py) resolves to "chitchat" --
+// `backend/tests/test_generation.py::test_classify_intent_chitchat` pins exactly that. The
+// hardcoded chitchat reply is streamed word-by-word with NO retrieval/rerank/LLM call at
+// all, so the whole test completed in under a second and never actually exercised the
+// slow, real pipeline this harness exists to prove through a real browser. The question
+// below is the one unit-level-verified to resolve to "security" instead
+// (`backend/tests/test_generation.py::test_classify_intent_security`, same exact string,
+// first parametrize case) -- it is also the backend's own first golden-set item
+// (`eval/golden_set.jsonl`, id "sqli-prevent"), so the answer is expected to be grounded.
 import { expect, test } from "@playwright/test";
+
+const SECURITY_QUESTION = "How do I prevent SQL injection?";
+// Real pipeline stage labels only (ChatPage's STAGE_LABELS), never chitchat's "Responding…".
+const REAL_PIPELINE_STAGE =
+  /Classifying…|Retrieving sources…|Reranking…|Generating…|Checking grounding…/;
 
 function uniqueEmail(): string {
   return `e2e-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
@@ -32,10 +50,21 @@ test("register, one streamed chat turn, logout, then login again", async ({ page
   await page.getByRole("button", { name: "REGISTER" }).click();
   await expect(page).toHaveURL(/\/chat$/);
 
-  await page.getByPlaceholder("Ask a security question…").fill("hello");
+  await page.getByPlaceholder("Ask a security question…").fill(SECURITY_QUESTION);
   await page.getByRole("button", { name: "SEND" }).click();
+  // Proves the stream actually went through classify -> retrieve -> rerank -> generate ->
+  // check (ChatPage's `stage` state, STAGE_LABELS) rather than finishing instantly: at least
+  // one real-pipeline label must become visible before the terminal event. A bounded
+  // timeout, not the default: retrieval/rerank/generation legitimately take a few seconds
+  // once Ollama is cold (latency gate step's own p95 numbers), well inside this spec's
+  // overall 45s budget below.
+  await expect(page.getByText(REAL_PIPELINE_STAGE)).toBeVisible({ timeout: 20_000 });
   // The SEND button re-enables once the stream's terminal "done"/"error" event lands.
   await expect(page.getByRole("button", { name: "SEND" })).toBeEnabled({ timeout: 45_000 });
+  // A real, chunk-grounded answer carries at least one citation (Citations component,
+  // ChatPage) -- the hardcoded chitchat reply never has any. This is the actual proof that
+  // a multi-chunk, retrieval-backed answer arrived, not just that SOME text did.
+  await expect(page.getByText("Sources")).toBeVisible();
 
   await page.goto("/account");
   await page.getByRole("button", { name: "Sign out" }).click();

@@ -19,7 +19,7 @@ logger = logging.getLogger("rag_app.emailer")
 
 
 def verification_link(token: str) -> str:
-    base = get_settings().next_public_api_url.rstrip("/")
+    base = get_settings().email_link_base_url.rstrip("/")
     return f"{base}/auth/verify?token={token}"
 
 

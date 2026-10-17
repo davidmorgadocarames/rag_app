@@ -222,10 +222,11 @@ $env:PYTHONPATH = "src"
 Copy-Item ..\.env.example .env
 ```
 
-Fill in two required secrets in `backend/.env` (it is git-ignored and must never be committed):
+Fill in three required secrets in `backend/.env` (it is git-ignored and must never be committed):
 
 ```bash
 python -c "import secrets; print('JWT_SECRET=' + secrets.token_urlsafe(64))"
+python -c "import secrets; print('CSRF_SECRET=' + secrets.token_urlsafe(64))"   # T12.1.4
 python -c "from cryptography.fernet import Fernet; print('DATA_MASTER_KEY=' + Fernet.generate_key().decode())"
 chmod 600 .env                                 # secrets: owner-only (scripts/prereqs/check.sh checks it)
 ```
@@ -233,9 +234,12 @@ chmod 600 .env                                 # secrets: owner-only (scripts/pr
 Keep **one** `DATA_MASTER_KEY` per database, and keep a copy in your password manager: every
 user's data key is wrapped with it. Native runs read `backend/.env`; compose reads the shell or
 a root `.env` — use the same key in both. The API checks this at start-up: it validates
-`DATABASE_URL`, `JWT_SECRET` (≥ 32 characters) and `DATA_MASTER_KEY` (a Fernet key), and it
-refuses to start when the key is not the one the database was initialised with (a stored
-key fingerprint) — see [Recovering from a changed master key](#recovering-from-a-changed-master-key).
+`DATABASE_URL`, `JWT_SECRET` (≥ 32 characters), `CSRF_SECRET` (same length rule) and
+`DATA_MASTER_KEY` (a Fernet key), and it refuses to start when the key is not the one the
+database was initialised with (a stored key fingerprint) — see
+[Recovering from a changed master key](#recovering-from-a-changed-master-key).
+`CLIENT_IP_HMAC_KEYS` (T12.1.6, signed client IP) is required only with `ENV=prod` — leave it
+unset locally.
 
 SMTP is optional. Without it no email is sent and nothing personal is logged; the verification
 link is never returned by `POST /auth/resend-verification` either, in any environment (T12.1.11)
@@ -273,7 +277,7 @@ python -m rag_app.generation "How do I configure a Cisco ASA firewall?"   # abst
 ### 5. Run the API
 
 ```bash
-uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000   # Swagger UI at http://localhost:8000/docs
+uvicorn rag_app.api.app:app --host 0.0.0.0 --port 8000   # Swagger UI at http://localhost:8000/docs (ENV=dev only, T12.2.4)
 ```
 
 ### 6. Run the frontend

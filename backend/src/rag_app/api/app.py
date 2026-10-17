@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from rag_app import __version__, metrics, reranking, timing
+from rag_app import __version__, csp_report, metrics, reranking, timing
 from rag_app.api import auth, conversations
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import (
@@ -26,6 +26,14 @@ from rag_app.csrf import require_csrf
 from rag_app.db.session import make_engine
 from rag_app.keycheck import check_master_key_fingerprint
 from rag_app.logsafe import install_log_redaction
+
+# T12.2.4 (E6): the old frontend (12a rollback, TF10) is the only remaining *browser* CORS
+# caller -- it sends a Bearer token (never cookies), so `allow_credentials` stays False and
+# the method/header lists only need to cover what it actually uses. The BFF-based new
+# frontend never triggers a browser CORS preflight at all (same-origin, server-to-server
+# fetch) -- `test_cors_narrowed_to_the_old_frontends_needs` pins both halves of this.
+CORS_ALLOWED_METHODS = ["GET", "POST", "PATCH", "DELETE"]
+CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type"]
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 ReserverDep = Annotated[ReserveFn, Depends(get_answer_reserver)]
@@ -65,20 +73,58 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+def _add_security_headers(app: FastAPI) -> None:
+    """T12.2.4 (E6): the same handful of headers on every API response, never only on the
+    "interesting" routes -- a response that never reaches this middleware does not exist
+    (FastAPI/Starlette run ``http`` middleware around every route, including 404s).
+
+    ``frame-ancestors 'none'`` is carried in a ``Content-Security-Policy`` header rather
+    than the legacy ``X-Frame-Options`` (same effect, the modern directive): this API is
+    never meant to render inside a frame, on any origin including its own. ``Cache-Control:
+    no-store`` on every response is deliberately broad ("where sensible" = everywhere on an
+    authenticated JSON API that only ever returns session-specific or already up-to-date
+    data -- nothing here benefits from a shared/browser cache)."""
+
+    @app.middleware("http")
+    async def security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 def create_app() -> FastAPI:
     # Query strings (the e-mail verification token) never reach the access log (T11.2.15).
     install_log_redaction()
     # Per-answer timing JSON lines actually reach stdout (T11.3.1; see install_timing_log).
     timing.install_timing_log()
-    app = FastAPI(title="SecRAG API", version=__version__, lifespan=lifespan)
+    settings = get_settings()
+    # T12.2.4 (E6, F7): interactive API docs only with ENV=dev -- `None` makes FastAPI skip
+    # registering the route entirely (a 404, not an auth-gated one) with ENV=prod.
+    docs_enabled = settings.env == "dev"
+    app = FastAPI(
+        title="SecRAG API",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
+    _add_security_headers(app)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[get_settings().frontend_origin],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=[settings.frontend_origin],
+        allow_methods=CORS_ALLOWED_METHODS,
+        allow_headers=CORS_ALLOWED_HEADERS,
+        allow_credentials=False,
     )
     app.include_router(auth.router)
     app.include_router(conversations.router)
+    app.include_router(csp_report.router)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
