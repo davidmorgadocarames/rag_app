@@ -19,24 +19,12 @@
 // (`eval/golden_set.jsonl`, id "sqli-prevent"), so the answer is expected to be grounded.
 import { expect, test } from "@playwright/test";
 
+import { openVaultDoor, uniqueEmail } from "./helpers.ts";
+
 const SECURITY_QUESTION = "How do I prevent SQL injection?";
 // Real pipeline stage labels only (ChatPage's STAGE_LABELS), never chitchat's "Responding…".
 const REAL_PIPELINE_STAGE =
   /Classifying…|Retrieving sources…|Reranking…|Generating…|Checking grounding…/;
-
-function uniqueEmail(): string {
-  return `e2e-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
-}
-
-async function openVaultDoor(page: import("@playwright/test").Page): Promise<void> {
-  // `reducedMotion: "reduce"` (playwright.config.ts) makes VaultDoor skip straight to the
-  // open state synchronously, so the panel's `pointer-events` switches to `auto` right
-  // away -- `.click()` (not `.waitFor("visible")`, which Playwright considers true even
-  // while `pointer-events: none`/`opacity-0`, proven wrong the hard way: a real run got
-  // stuck here for the full 60s test timeout before this fix) actually waits for that.
-  await page.getByRole("button", { name: "ABRIR" }).click();
-  await page.getByPlaceholder("email").click();
-}
 
 test("register, one streamed chat turn, logout, then login again", async ({ page }) => {
   const email = uniqueEmail();
@@ -51,6 +39,7 @@ test("register, one streamed chat turn, logout, then login again", async ({ page
   await expect(page).toHaveURL(/\/chat$/);
 
   await page.getByPlaceholder("Ask a security question…").fill(SECURITY_QUESTION);
+  const turnStarted = Date.now();
   await page.getByRole("button", { name: "SEND" }).click();
   // Proves the stream actually went through classify -> retrieve -> rerank -> generate ->
   // check (ChatPage's `stage` state, STAGE_LABELS) rather than finishing instantly: at least
@@ -61,6 +50,10 @@ test("register, one streamed chat turn, logout, then login again", async ({ page
   await expect(page.getByText(REAL_PIPELINE_STAGE)).toBeVisible({ timeout: 20_000 });
   // The SEND button re-enables once the stream's terminal "done"/"error" event lands.
   await expect(page.getByRole("button", { name: "SEND" })).toBeEnabled({ timeout: 45_000 });
+  // DEBT-035 proof: a real, multi-second, Ollama-backed chat turn (not the sub-second
+  // chitchat reply) actually survived the whole cookie + CSRF + BFF + Next.js path.
+  // eslint-disable-next-line no-console -- deliberately visible in the gate step's own log.
+  console.log(`[e2e] real security-question chat turn took ${Date.now() - turnStarted}ms`);
   // A real, chunk-grounded answer carries at least one citation (Citations component,
   // ChatPage) -- the hardcoded chitchat reply never has any. This is the actual proof that
   // a multi-chunk, retrieval-backed answer arrived, not just that SOME text did.

@@ -40,12 +40,12 @@ test("buildCsp sets frame-ancestors 'none' and both reporting directives", () =>
   assert.match(csp, /report-to csp-endpoint/);
 });
 
-test("CSP_MODE is report-only until Phase 2 proves zero violations (T12.2.3)", () => {
-  // This is a DELIBERATE guard-rail, not an accident: flipping it to "enforce" without first
-  // re-running the Playwright walk against the real built app would violate T12.2.3's own
-  // Done-when. See csp.ts's module comment for the exact Phase-2 steps.
-  assert.equal(CSP_MODE, "report-only");
-  assert.equal(CSP_HEADER_NAME, "Content-Security-Policy-Report-Only");
+test("CSP_MODE is enforce, proven by the Playwright walk (T12.2.3)", () => {
+  // Flipping this back to "report-only" without a reason (a real regression found by the
+  // `security-headers` gate step) would silently weaken the deployed policy -- see csp.ts's
+  // module comment for when and why this changed.
+  assert.equal(CSP_MODE, "enforce");
+  assert.equal(CSP_HEADER_NAME, "Content-Security-Policy");
 });
 
 test("REPORTING_ENDPOINTS_HEADER names the same path the policy's report-uri/report-to use", () => {

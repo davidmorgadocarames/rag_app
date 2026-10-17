@@ -3,24 +3,21 @@
 // real randomness (the Edge runtime's Web Crypto API) and attaches the result to the
 // response.
 //
-// CSP_MODE is the single switch E3 asks for: "report-only" until the Playwright page walk
-// (T12.2.3) has actually proven zero `script-src` violations against the REAL built app in
-// a real browser -- not provable in this throttled, no-browser Phase 1 session (DEC-014's PC
-// constraint: ZAP/Playwright/builds wait for "PC libre"). Flip to "enforce" as the FIRST step
-// of Phase 2, re-run the walk, and only commit "enforce" once it is clean -- that is T12.2.3's
-// literal Done-when ("zero violations WITH CSP enforcing"), not "zero violations in
-// report-only mode".
+// CSP_MODE is the single switch E3 asks for. **Enforcing since 2026-10-17 (12a-E phase 2):**
+// the Playwright page walk (`frontend/e2e/security-headers.spec.ts`, `scripts/gate.sh`'s
+// `security-headers` step) ran clean in `"report-only"` first (zero violations) and then
+// again after flipping this to `"enforce"` (still zero) -- T12.2.3's literal Done-when
+// ("zero violations WITH CSP enforcing") is satisfied, not just the weaker report-only case.
 export type CspMode = "report-only" | "enforce";
 
 // A function, not a bare literal `const`: TypeScript narrows an unreassigned `const`
 // initialised with a string literal down to that one literal type for every comparison in
 // the program, even across an explicit wider annotation -- which would make the
-// `CSP_HEADER_NAME` ternary below a compile error ("comparison has no overlap") the moment
-// Phase 2 flips this single line to `"enforce"`. Wrapping it in a function whose declared
-// return type is the union sidesteps that narrowing while still being exactly one line to
-// change.
+// `CSP_HEADER_NAME` ternary below a compile error ("comparison has no overlap") if this ever
+// moved back to a single fixed value. Wrapping it in a function whose declared return type
+// is the union sidesteps that narrowing while still being exactly one line to change.
 function cspMode(): CspMode {
-  return "report-only";
+  return "enforce";
 }
 
 export const CSP_MODE: CspMode = cspMode();

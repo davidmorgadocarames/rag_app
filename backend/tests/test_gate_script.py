@@ -235,6 +235,35 @@ def test_informational_flags_never_open_a_log_file(tmp_path: Path) -> None:
     assert not (home / "secrag-gate-logs").exists()
 
 
+@needs_tools
+def test_list_includes_the_12a_e_steps_as_stack_only_not_fast(tmp_path: Path) -> None:
+    """T12.2.5/T12.2.6 (E9): `security-headers`/`zap-baseline` need the running
+    frontend+backend (the gate stack), so they must never show up in `--fast`'s step set --
+    only `--only`/`--full`. `--list`'s own output is the single source of truth for "which
+    steps exist and what they need" (no separate step-name list to drift)."""
+    proc = _gate(_make_repo(tmp_path), "--list")
+    assert proc.returncode == 0, proc.stdout
+    lines = {
+        line.split()[0]: line.split()[1] for line in proc.stdout.splitlines() if line.split()[:1]
+    }
+    for name in ("security-headers", "zap-baseline"):
+        assert name in lines, f"{name} missing from --list"
+        assert (
+            lines[name] != "-"
+        ), f"{name} must need the gate stack (not '-', or it would run in --fast)"
+
+
+@needs_tools
+def test_only_security_headers_and_zap_baseline_are_unknown_in_a_repo_without_the_app(
+    tmp_path: Path,
+) -> None:
+    """A cheap, no-stack-needed sanity check that both new steps are real, dispatchable step
+    names (is_step), the same way every other step name is validated by --only."""
+    proc = _gate(_make_repo(tmp_path), "--only", "security-headers,zap-baseline,not-a-real-step")
+    assert proc.returncode == 2, proc.stdout
+    assert "unknown step: not-a-real-step" in proc.stdout + proc.stderr
+
+
 def test_the_real_hook_and_gate_are_executable_in_git() -> None:
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("needs a git checkout")

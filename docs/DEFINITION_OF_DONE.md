@@ -64,6 +64,18 @@ are a human/agent checklist.
   collected exactly once across `pytest`/`db-tests`/`security-suite` locally and across the
   matching CI steps). Enforced by the gate step `security-suite` (needs the gate DB, in
   `--full`, not `--fast`).
+- **Phase 12a+ (security headers + CSP, T12.2.1/T12.2.2/T12.2.3)** — every frontend response
+  carries HSTS (no `preload`), `X-Content-Type-Options`, `Referrer-Policy`,
+  `Permissions-Policy` and a per-request nonce CSP; every API response carries
+  `X-Content-Type-Options`, `Referrer-Policy`, `Content-Security-Policy: frame-ancestors
+  'none'`, `Cache-Control: no-store`; `/docs`/`/redoc`/`/openapi.json` only with `ENV=dev`;
+  CORS narrowed to exactly what a caller needs. `CSP_MODE` (`frontend/lib/csp.ts`) is a
+  single switch: `"report-only"` until the `security-headers` gate step (Playwright walk)
+  proves zero violations, then `"enforce"` — only the latter satisfies T12.2.3's own
+  Done-when. Enforced by the gate steps `security-headers` and `zap-baseline` (both need the
+  gate DB + a running native frontend/backend, `--full` only, never CI — DEBT-029 keeps the 5
+  required job names pinned) and the backend's own `pytest` step (`/docs` gating, CORS,
+  headers — no browser needed for that half).
 - **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
   it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
   image that is still running (and the previous image in a rollback) keeps working on the
@@ -147,6 +159,8 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 | | | | `e2e` | gate DB + seed + Ollama | 600 s |
+| | | | `security-headers` | gate DB | 300 s |
+| | | | `zap-baseline` | gate DB | 600 s |
 
 `latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
 questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +
@@ -187,14 +201,49 @@ measurement table and the rerank floor result.
 
 `e2e` (T12.1.10, Playwright, `--full` only, not in CI — the 5 required job names stay pinned,
 DEBT-029): the real BFF + backend wired end to end, in a browser. The step itself starts a
-native backend (`uvicorn`, gate DB + seed + Ollama, same "seed" stack as `eval`/`latency`)
-and the built, standalone frontend (`npm run build` then `node server.js`, pointed at that
-backend via `BACKEND_URL`), then runs `frontend/e2e/*.spec.ts` headless against it: register
-→ one streamed chat turn → logout → login again. Chromium is a one-time local install
-(`npx playwright install chromium`, cached under `~/.cache/ms-playwright`; if the WSL system
-libraries are missing, that install needs `sudo` once, run by the user in their own
-terminal — never by an agent). Playwright (`@playwright/test`) is a frontend `devDependency`
-only — never baked into the runner image (`output: standalone` never copies `node_modules`).
+native backend (`uvicorn`, gate DB + Ollama once `security-headers`/`zap-baseline` are also
+requested — see below) and the built frontend (`next build` then `next start` directly, not
+the Docker `standalone` output — this step runs the app itself, never the image), pointed at
+that backend via `BACKEND_URL`, then runs `frontend/e2e/auth.spec.ts` headless against it:
+register → one streamed chat turn (a REAL security question through classify → retrieve →
+rerank → generate → groundedness, DEBT-035 — not the chitchat fast path) → logout → login
+again. Chromium is a one-time local install (`npx playwright install chromium`, cached under
+`~/.cache/ms-playwright`; if the WSL system libraries are missing, that install needs `sudo`
+once, run by the user in their own terminal — never by an agent). Playwright
+(`@playwright/test`) is a frontend `devDependency` only — never baked into the runner image
+(`output: standalone` never copies `node_modules`).
+
+`security-headers` (T12.2.1/T12.2.2/T12.2.3/T12.2.5, Playwright, `--full` only): the SAME
+native backend+frontend pair `e2e` starts (`scripts/gate.sh`'s `e2e_start_backend`/
+`e2e_start_frontend`, shared by all three Playwright/ZAP steps — they never run
+concurrently), walked by `frontend/e2e/security-headers.spec.ts`: every page, logged out and
+in, must serve HSTS (no `preload`, E7), `X-Content-Type-Options: nosniff`,
+`Referrer-Policy`, `Permissions-Policy` and a nonce CSP (`script-src 'self' 'nonce-…'
+'strict-dynamic'`, `style-src 'self' 'unsafe-inline'`, `frame-ancestors 'none'`); the spec
+also listens for the browser's own `securitypolicyviolation`-triggered console message
+across the whole walk and fails on any. This step needs only the gate DB (register/login),
+not Ollama/the seed — no chat message is ever sent. `CSP_MODE` (`frontend/lib/csp.ts`) must
+be `"enforce"` for this step's green run to actually prove T12.2.3's Done-when ("zero
+violations WITH CSP enforcing") — the same spec also passes against `"report-only"` (useful
+while fixing violations one by one), so a green run alone does not by itself prove which mode
+was active; check `CSP_MODE`'s own value when citing this step as that proof.
+
+`zap-baseline` (T12.2.6, E8, `--full` only): OWASP ZAP's official image, pinned by digest
+(`scripts/gate.sh`'s `ZAP_IMAGE`, resolved read-only via `docker buildx imagetools inspect`,
+never a mutable tag), runs a passive baseline scan (`zap-baseline.py`) against the same
+native frontend `e2e`/`security-headers` start. The container reaches the host's own
+loopback port via `host.docker.internal` (`ZAP_TARGET_HOST`, confirmed working on this
+Docker Desktop/WSL2 setup; `--network host` is NOT a drop-in substitute there — confirmed it
+cannot reach a host loopback port at all) — both the target host and any extra `docker run`
+flags a different Docker setup might need (`ZAP_DOCKER_EXTRA_ARGS`) are env-var
+configurable, never hard-coded to one machine. `zap-baseline.py`'s own exit code (its
+`-c`/per-rule-threshold mechanism) is not used for pass/fail: `rag_app.devtools.zap_report`
+instead judges the scan's own `-J report.json` directly against the real `risk` field of
+every alert — **any High-risk alert fails** the step unless its ZAP plugin id is listed, with
+a reason, in the committed `scripts/zap/zap-rules.tsv` (Medium/Low/Informational alerts are
+always printed but never fail it). `rag_app.devtools.zap_report`'s own pure JSON/TSV logic is
+unit-tested by the ordinary `pytest` step (`backend/tests/test_zap_report.py`) — no docker/
+ZAP needed for that part.
 
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →

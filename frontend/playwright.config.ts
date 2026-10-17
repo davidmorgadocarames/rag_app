@@ -7,7 +7,11 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
-  timeout: 60_000,
+  // 90s (was 60s, T12.1.10): `auth.spec.ts`'s real-security-question test (12a-E, DEBT-035)
+  // now waits out a genuinely cold Ollama generate call on top of register/login/navigation
+  // -- 60s left too little margin once the chat turn alone can legitimately take several
+  // seconds (see the `latency` gate step's own p95 numbers).
+  timeout: 90_000,
   retries: 0,
   reporter: "list",
   use: {
