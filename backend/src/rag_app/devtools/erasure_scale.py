@@ -440,6 +440,11 @@ def run(args: argparse.Namespace) -> int:
             "DATABASE_URL": owner_url,
             "DATA_MASTER_KEY": master,
             "JWT_SECRET": secrets.token_urlsafe(48),
+            # CSRF_SECRET (T12.1.4): unconditionally required since 12a-C, same as
+            # JWT_SECRET -- missed here and in restart_check.sh originally (DEBT-033 fixed
+            # the latter); without it this child API process refuses to start
+            # ("CSRF_SECRET must be at least 32 characters"), found running --full for real.
+            "CSRF_SECRET": secrets.token_urlsafe(48),
             "ENV": "dev",
             "PYTHONPATH": str(BACKEND / "src"),
         }
