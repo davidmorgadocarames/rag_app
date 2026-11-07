@@ -11,3 +11,9 @@ PyYAML==6.0.3
 # The installer itself is in the audited venv: a fresh `python -m venv` seeds an old,
 # vulnerable pip (CI found pip 25.0.1), so it is pinned like everything else.
 pip==26.2.1
+
+# Transitive dev-only dependencies with no requirement line of their own, pinned explicitly
+# so their own advisory fixes are not left to whatever version pip's resolver picks (DEC-018,
+# 2026-11-07 dependency-advisory fix block):
+virtualenv==21.15.6  # via pre-commit
+msgpack==1.2.3       # via pip-audit's CacheControl

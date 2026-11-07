@@ -3,7 +3,7 @@ annotated-types==0.8.0    # via pydantic
 azure-core==1.41.0        # via azure-identity, azure-storage-blob
 azure-identity==1.25.3    # via -r requirements-jobs.in
 azure-storage-blob==12.30.3  # via -r requirements-jobs.in
-certifi==2026.7.22        # via requests
+certifi==2026.10.23       # via requests, -c requirements.txt
 cffi==2.1.1               # via cryptography
 charset-normalizer==3.5.1  # via requests
 cryptography==50.0.1      # via azure-identity, azure-storage-blob, msal, pyjwt, -c requirements.txt, -r requirements-jobs.in

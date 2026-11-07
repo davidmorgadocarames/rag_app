@@ -25,7 +25,7 @@ tokenizers==0.23.2
 safetensors==0.8.0
 # torch requires setuptools on Python >= 3.12; pinned so its advisory fix is not left to
 # whatever version the installer brings (D-2026-09-27-6 a1).
-setuptools==84.0.0
+setuptools==84.1.0
 
 # Web API
 fastapi==0.142.2
@@ -40,3 +40,11 @@ prometheus-client==0.26.0
 argon2-cffi==23.1.0
 PyJWT==2.15.0
 cryptography==50.0.1
+
+# Transitive dependencies with no requirement line of their own, pinned explicitly so their
+# own advisory fixes are not left to whatever version pip's resolver picks (same convention as
+# setuptools above; DEC-018, 2026-11-07 dependency-advisory fix block):
+certifi==2026.10.23        # via httpx (and requests, in the jobs image)
+filelock==4.2.1            # via huggingface-hub, torch
+opentelemetry-api==1.45.1  # via fastapi (hard dependency since fastapi==0.142.2)
+pillow==13.0.0             # via huggingface-hub/transformers optional extras
