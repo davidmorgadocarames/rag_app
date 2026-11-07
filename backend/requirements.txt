@@ -47,4 +47,3 @@ cryptography==50.0.1
 certifi==2026.10.23        # via httpx (and requests, in the jobs image)
 filelock==4.2.1            # via huggingface-hub, torch
 opentelemetry-api==1.45.1  # via fastapi (hard dependency since fastapi==0.142.2)
-pillow==13.0.0             # via huggingface-hub/transformers optional extras

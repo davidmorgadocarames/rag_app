@@ -147,6 +147,23 @@ def test_the_backend_image_never_migrates() -> None:
     assert "alembic" not in cmd and "uvicorn" in cmd
 
 
+def test_the_backend_and_jobs_images_pin_the_same_base_by_digest() -> None:
+    """DEC-020: `backend/Dockerfile`'s base, like the jobs/frontend images, is pinned by
+    digest (X1) rather than the mutable `python:3.12-slim` tag — and, since both images build
+    from the same `python:3.12-slim`, the same digest (bumped in both files together)."""
+    backend = COMPOSE.parent / "backend"
+    bases = {}
+    for name in ("Dockerfile", "Dockerfile.jobs"):
+        lines = [
+            line
+            for line in (backend / name).read_text(encoding="utf-8").splitlines()
+            if line.startswith("FROM ")
+        ]
+        assert len(lines) == 1 and "@sha256:" in lines[0]  # base pinned by digest
+        bases[name] = lines[0]
+    assert bases["Dockerfile"] == bases["Dockerfile.jobs"]
+
+
 def test_the_jobs_image_is_slim_pinned_and_migrates() -> None:
     backend = COMPOSE.parent / "backend"
     dockerfile = (backend / "Dockerfile.jobs").read_text(encoding="utf-8")
