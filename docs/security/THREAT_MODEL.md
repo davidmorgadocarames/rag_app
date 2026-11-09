@@ -249,11 +249,30 @@ file name.
 Not deferred risks — controls already in place, recorded here because they were explicitly
 named for this catalogue (Phase 12 re-check, W3).
 
+**X10 — No TOCTOU (cross-cutting project rule X10, 2026-11-09).** A
+state-dependent decision backed by the database is never a SELECT to check the state
+followed by a separate UPDATE (a classic check-then-use race: two concurrent callers can
+both read the "not yet used/not yet locked out/still valid" state before either writes,
+and both then act on it). Instead it is ONE atomic statement whose `WHERE` clause encodes
+the check — `UPDATE … WHERE <condition> RETURNING`, or an equivalent single-statement
+claim — so that under Postgres' normal (READ COMMITTED) concurrency, a second caller's
+statement either finds nothing left to match (the first already committed the state
+change) or blocks briefly on the row lock and then finds nothing to match once it runs.
+**Template, written first here (T12.3.5):** `rag_app.api.admin.claim_recovery_code` —
+`UPDATE mfa_recovery_codes SET used_at = now() WHERE user_id = :uid AND code_hash = :hash
+AND used_at IS NULL`, proved single-use under genuine thread concurrency (not just two
+sequential HTTP calls) by
+`backend/tests/security/test_mfa.py::test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through`.
+12b-B's lockout counters (T12.4.2) and 12b-C's reset/verify token consume (T12.4.6) follow
+the exact same shape: the counter/consume update's `WHERE` clause IS the check, never a
+prior SELECT.
+
 | ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |
 |---|---|---|---|---|---|---|---|
 | REC-01 | Internal metrics port (9100) never served on the API port or exposed by any Container Apps ingress | mitigated | low | low | 11a | backend/tests/test_metrics.py::test_api_port_never_serves_metrics | Separate port, scraped only by the local Prometheus; no Azure ingress rule maps to it. |
 | REC-02 | Daily answer cap / per-request rate limits (R6-1) | mitigated | low | medium | 11a | backend/tests/test_daily_cap.py::test_the_default_cap_is_on_and_valid_in_prod | On by default and required positive in `ENV=prod`. |
 | REC-03 | Crypto-shred erasure (per-user data key destroyed on account deletion) | mitigated | high | low | 6/11a | backend/tests/test_key_recovery.py::test_erase_end_to_end_through_the_app_erasure_path | Makes the user's encrypted rows permanently unreadable even where a backup copy still exists; restores replay tombstones (`replay_deletions`). |
+| REC-04 | X10 no-TOCTOU: recovery-code single-use is one atomic `UPDATE … WHERE used_at IS NULL`, never SELECT-then-UPDATE | planned | medium | low | 12b | T12.3.5 | Implementation (`rag_app.api.admin.claim_recovery_code`) lands in the 12b-A fix block; flips to `mitigated` with the real thread-concurrency test id once that test is written (`backend/tests/security/test_mfa.py::test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through` is the intended name) — not yet present, left `planned` on purpose so `threat-catalogue` stays green. Template for 12b-B's lockout counters (T12.4.2) and 12b-C's reset/verify token consume (T12.4.6). |
 
 <!-- threat-catalogue:end -->
 

@@ -10,10 +10,12 @@ API -- the admin bootstrap CLI (``rag_app.admin``) is the only writer (T12.3.3).
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import delete, update
+from sqlalchemy.orm import Session
 
 from rag_app import mfa as mfa_service
 from rag_app import sessions as session_service
@@ -44,6 +46,34 @@ def _rate_limit_mfa(
     once 12b-B's lockout work (T12.4.2) lands alongside this."""
     if not limiter.allow(f"mfa:{user.id}", cost=1.0):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
+def claim_recovery_code(session: Session, user_id: uuid.UUID, code: str) -> bool:
+    """X10 (no TOCTOU, DA-12bA-2/DEBT: see ``docs/security/THREAT_MODEL.md`` X10): claims
+    ONE unused recovery code in a SINGLE ``UPDATE ... WHERE used_at IS NULL`` statement --
+    never a SELECT to check ``used_at`` followed by a separate UPDATE. Under READ COMMITTED
+    (Postgres' default), a second concurrent UPDATE targeting the same row blocks on the
+    first's row lock, then re-evaluates its own ``WHERE`` against the row the first call
+    already committed -- so at most one caller's ``UPDATE`` ever matches a row, whatever the
+    scheduling. A SELECT-then-UPDATE shape would instead let two transactions both read
+    ``used_at IS NULL`` before either writes, and both then "claim" the same code.
+
+    Returns whether THIS call is the one that claimed it (``rowcount > 0``). Caller commits
+    -- extracted out of the route handler so a concurrency test
+    (``test_mfa.py::test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through``)
+    exercises the EXACT statement production uses, not a re-typed copy of it. This is the
+    template 12b-B's lockout counters and 12b-C's reset/verify token consume should follow.
+    """
+    claimed = session.execute(
+        update(MfaRecoveryCode)
+        .where(
+            MfaRecoveryCode.user_id == user_id,
+            MfaRecoveryCode.code_hash == hash_recovery_code(code),
+            MfaRecoveryCode.used_at.is_(None),
+        )
+        .values(used_at=dt.datetime.now(dt.UTC))
+    )
+    return claimed.rowcount > 0
 
 
 @router.get(
@@ -134,19 +164,9 @@ def mfa_step_up(
     secret = unwrap_key(record.secret_encrypted).decode()
     verified = mfa_service.verify_totp_code(secret, request.code)
     if not verified:
-        # X10 (no TOCTOU): claim-and-mark a recovery code in ONE statement -- two concurrent
-        # attempts with the same code can never both succeed (the second UPDATE's WHERE
-        # re-evaluates against the first's committed row and matches nothing).
-        claimed = session.execute(
-            update(MfaRecoveryCode)
-            .where(
-                MfaRecoveryCode.user_id == user.id,
-                MfaRecoveryCode.code_hash == hash_recovery_code(request.code),
-                MfaRecoveryCode.used_at.is_(None),
-            )
-            .values(used_at=dt.datetime.now(dt.UTC))
-        )
-        verified = claimed.rowcount > 0
+        # X10 (no TOCTOU, docs/security/THREAT_MODEL.md "X10"): claim_recovery_code is ONE
+        # atomic UPDATE -- two concurrent attempts with the same code can never both succeed.
+        verified = claim_recovery_code(session, user.id, request.code)
 
     if not verified:
         session.commit()  # persist the (non-)claim attempt either way
