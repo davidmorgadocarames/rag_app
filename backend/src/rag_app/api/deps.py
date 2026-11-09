@@ -10,7 +10,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from rag_app import metrics
-from rag_app.client_ip import CLIENT_IP_HEADER, verify_client_ip_header
+from rag_app.client_ip import CLIENT_IP_HEADER, classify_client_ip_header
 from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
 from rag_app.generation import Answer, answer_question
@@ -70,22 +70,26 @@ def _connection_ip(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """T12.1.6: once ``CLIENT_IP_HMAC_KEYS`` is set, trust only a fresh, correctly-signed
-    ``X-SecRAG-Client-IP`` (the BFF derives it from ``X-Forwarded-For``); a missing, forged
-    or stale signature falls back to the raw connection address and records a security event
-    (a log line + a metrics counter, never the IP itself -- log hygiene). An unconfigured key
-    (the feature not adopted yet, 12a-C/D) is the normal path today and emits nothing."""
+    """T12.1.6 / T12.3.0a: once ``CLIENT_IP_HMAC_KEYS`` is set, trust only a fresh,
+    correctly-signed ``X-SecRAG-Client-IP`` (the BFF derives it from ``X-Forwarded-For``); a
+    missing, forged or stale (outside ``SIGNATURE_WINDOW_SECONDS``) signature falls back to
+    the raw connection address and records which of the three happened -- a log line (the
+    result label only, never the IP) plus the ``client_ip_signature_total{result=...}``
+    counter. An unconfigured key (the feature not adopted yet, 12a-C/D) is the normal path
+    today and emits nothing."""
     keys = [k for k in get_settings().client_ip_hmac_keys.split(",") if k.strip()]
     if not keys:
         return _connection_ip(request)
     header = request.headers.get(CLIENT_IP_HEADER)
-    verified = (
-        verify_client_ip_header(header, keys, request.method, request.url.path) if header else None
-    )
-    if verified is not None:
-        return verified
-    logger.warning("client IP signature missing or invalid; using the connection address")
-    metrics.CLIENT_IP_SIGNATURE_EVENTS.inc()
+    if not header:
+        metrics.CLIENT_IP_SIGNATURE_TOTAL.labels(result="fallback").inc()
+        logger.warning("client IP signature fallback; using the connection address")
+        return _connection_ip(request)
+    client_ip, result = classify_client_ip_header(header, keys, request.method, request.url.path)
+    metrics.CLIENT_IP_SIGNATURE_TOTAL.labels(result=result).inc()
+    if result == "verified" and client_ip is not None:
+        return client_ip
+    logger.warning("client IP signature %s; using the connection address", result)
     return _connection_ip(request)
 
 

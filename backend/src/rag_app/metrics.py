@@ -36,12 +36,16 @@ CHAT_IN_FLIGHT = Gauge(
     registry=REGISTRY,
 )
 
-# T12.1.6: a request whose X-SecRAG-Client-IP signature was missing, stale or matched no
-# configured key once CLIENT_IP_HMAC_KEYS is set -- the connection address was used instead.
-# No labels (no IP, no path): log hygiene, counted only when the feature is actually adopted.
-CLIENT_IP_SIGNATURE_EVENTS = Counter(
-    "secrag_client_ip_signature_invalid_total",
-    "Requests with a missing/forged/stale signed client IP (CLIENT_IP_HMAC_KEYS set).",
+# T12.1.6 / T12.3.0a (DEBT-038): one ``result`` label, a small fixed vocabulary -- never an
+# IP or a path (log hygiene) -- counted only once CLIENT_IP_HMAC_KEYS is actually set:
+#   verified  a fresh, correctly-signed header was trusted
+#   fallback  no X-SecRAG-Client-IP header was present at all
+#   stale     a correctly-signed header outside SIGNATURE_WINDOW_SECONDS (e.g. a cold start)
+#   forged    a header present but its signature matches no configured key
+CLIENT_IP_SIGNATURE_TOTAL = Counter(
+    "secrag_client_ip_signature_total",
+    "Requests by signed-client-IP outcome (CLIENT_IP_HMAC_KEYS set).",
+    ["result"],
     registry=REGISTRY,
 )
 

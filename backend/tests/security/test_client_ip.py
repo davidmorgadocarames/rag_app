@@ -23,7 +23,12 @@ from starlette.requests import Request
 
 from rag_app import metrics
 from rag_app.api.deps import _client_ip, rate_limit_chat, rate_limit_login
-from rag_app.client_ip import CLIENT_IP_HEADER, sign_client_ip, verify_client_ip_header
+from rag_app.client_ip import (
+    CLIENT_IP_HEADER,
+    classify_client_ip_header,
+    sign_client_ip,
+    verify_client_ip_header,
+)
 from rag_app.config import get_settings
 from rag_app.ratelimit import RateLimiter
 
@@ -69,9 +74,22 @@ def test_a_freshly_signed_header_verifies() -> None:
     assert resolved == "203.0.113.7"
 
 
-def test_a_stale_signature_outside_the_30s_window_is_rejected() -> None:
+def test_a_120s_old_signature_is_accepted() -> None:
+    """T12.3.0a (DEBT-038): a cold start can take longer than the old 30 s window; 120 s
+    must still verify."""
     header = sign_client_ip(KEY, "203.0.113.7", "POST", "/chat/stream", now=1_000)
-    assert verify_client_ip_header(header, [KEY], "POST", "/chat/stream", now=1_031) is None
+    resolved = verify_client_ip_header(header, [KEY], "POST", "/chat/stream", now=1_120)
+    assert resolved == "203.0.113.7"
+
+
+def test_a_301s_old_signature_is_rejected_as_stale() -> None:
+    """T12.3.0a (DEBT-038) Done-when: 301 s rejected, and classified as "stale" (a key DOES
+    match -- it is genuinely too old), not "forged"."""
+    header = sign_client_ip(KEY, "203.0.113.7", "POST", "/chat/stream", now=1_000)
+    assert verify_client_ip_header(header, [KEY], "POST", "/chat/stream", now=1_301) is None
+    client_ip, result = classify_client_ip_header(header, [KEY], "POST", "/chat/stream", now=1_301)
+    assert client_ip is None
+    assert result == "stale"
 
 
 def test_signed_for_a_different_method_or_path_does_not_verify() -> None:
@@ -115,26 +133,49 @@ _STALE_HEADER = sign_client_ip(KEY, "198.51.100.9", "POST", "/chat/stream", now=
 
 
 @pytest.mark.parametrize(
-    "headers",
+    ("headers", "expected_result"),
     [
-        {},  # missing
-        {CLIENT_IP_HEADER: "198.51.100.9|9999999999|deadbeef"},  # forged (wrong signature)
-        {CLIENT_IP_HEADER: _STALE_HEADER},  # stale: signed, but far outside the 30s window
+        ({}, "fallback"),  # no header at all
+        ({CLIENT_IP_HEADER: "198.51.100.9|9999999999|deadbeef"}, "forged"),  # wrong signature
+        ({CLIENT_IP_HEADER: _STALE_HEADER}, "stale"),  # signed, but far outside the window
     ],
     ids=["missing", "forged", "stale"],
 )
-def test_missing_forged_or_stale_signature_falls_back_and_records_an_event(
-    client_ip_env: None, headers: dict[str, str], caplog: pytest.LogCaptureFixture
+def test_missing_forged_or_stale_signature_falls_back_and_records_the_right_result(
+    client_ip_env: None,
+    headers: dict[str, str],
+    expected_result: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    before = metrics.CLIENT_IP_SIGNATURE_EVENTS._value.get()
+    """T12.3.0a (DEBT-038): the three non-``verified`` outcomes are told apart in the metric
+    (``client_ip_signature_total{result=...}``), never just one generic "invalid" bucket."""
+    before = metrics.CLIENT_IP_SIGNATURE_TOTAL.labels(result=expected_result)._value.get()
     with caplog.at_level(logging.WARNING, logger="rag_app.api.deps"):
         resolved = _client_ip(_request(headers))
     assert resolved == "10.0.0.5"  # the connection address, never the (possibly forged) header
-    after = metrics.CLIENT_IP_SIGNATURE_EVENTS._value.get()
+    after = metrics.CLIENT_IP_SIGNATURE_TOTAL.labels(result=expected_result)._value.get()
     assert after == before + 1
     assert any("client IP" in r.message for r in caplog.records)
     # Log hygiene: the event line never carries the candidate/forged IP value itself.
     assert not any("198.51.100.9" in r.message for r in caplog.records)
+
+
+def test_a_valid_signature_records_the_verified_result(client_ip_env: None) -> None:
+    before = metrics.CLIENT_IP_SIGNATURE_TOTAL.labels(result="verified")._value.get()
+    header = sign_client_ip(KEY, "198.51.100.9", "POST", "/chat/stream")
+    _client_ip(_request({CLIENT_IP_HEADER: header}))
+    after = metrics.CLIENT_IP_SIGNATURE_TOTAL.labels(result="verified")._value.get()
+    assert after == before + 1
+
+
+def test_a_signature_replayed_onto_a_different_path_does_not_verify_at_the_deps_level(
+    client_ip_env: None,
+) -> None:
+    """Done-when: "a signature for another path rejected" -- checked at the level the
+    backend actually uses it (``_client_ip``), not only the pure ``client_ip`` module."""
+    header = sign_client_ip(KEY, "198.51.100.9", "POST", "/chat/stream")
+    request = _request({CLIENT_IP_HEADER: header}, path="/account")
+    assert _client_ip(request) == "10.0.0.5"
 
 
 def test_an_incoming_header_is_simply_ignored_when_the_feature_is_not_configured(
