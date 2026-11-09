@@ -154,6 +154,33 @@ export function deleteAccount(): Promise<{ detail: string }> {
   return request("/account", { method: "DELETE" });
 }
 
+// --- admin MFA (T12.3.4/T12.3.5; written in 12b-A, frontend verification is Phase 2) ------
+
+export interface MfaEnrollResponse {
+  secret: string;
+  provisioning_uri: string;
+}
+
+export interface MfaConfirmResponse {
+  recovery_codes: string[];
+}
+
+export function mfaEnroll(): Promise<MfaEnrollResponse> {
+  return request("/account/mfa/enroll", { method: "POST" });
+}
+
+export function mfaConfirm(code: string): Promise<MfaConfirmResponse> {
+  return request("/account/mfa/confirm", { method: "POST", body: JSON.stringify({ code }) });
+}
+
+export function mfaStepUp(code: string): Promise<{ detail: string }> {
+  return request("/account/mfa/step-up", { method: "POST", body: JSON.stringify({ code }) });
+}
+
+export function adminPing(): Promise<{ detail: string }> {
+  return request("/admin/ping");
+}
+
 // --- conversations -------------------------------------------------------
 
 export function listConversations(): Promise<ConversationSummary[]> {

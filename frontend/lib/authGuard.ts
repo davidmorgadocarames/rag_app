@@ -9,7 +9,11 @@
 export const SESSION_COOKIE_NAME = "__Host-secrag_session";
 
 // Routes a visitor should never see the shell of without (at least) a session cookie.
-export const PROTECTED_PATHS = ["/chat", "/account"] as const;
+// "/admin" (T12.3.5): the UX-only guard here is the same "has a cookie at all" check as
+// every other protected path -- the actual role + MFA step-up check is the backend's
+// (rag_app.authz), re-proven server-side by the page itself (SSR role check, see
+// app/admin/page.tsx).
+export const PROTECTED_PATHS = ["/chat", "/account", "/admin"] as const;
 
 export function isProtectedPath(pathname: string): boolean {
   return PROTECTED_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));

@@ -3,16 +3,18 @@ import { test } from "node:test";
 
 import { hasSessionCookie, isProtectedPath, shouldRedirectToLogin } from "./authGuard.ts";
 
-test("chat and account (and their sub-paths) are protected; everything else is not", () => {
+test("chat, account and admin (and their sub-paths) are protected; everything else is not", () => {
   assert.equal(isProtectedPath("/chat"), true);
   assert.equal(isProtectedPath("/chat/anything"), true);
   assert.equal(isProtectedPath("/account"), true);
   assert.equal(isProtectedPath("/account/security"), true);
+  assert.equal(isProtectedPath("/admin"), true);
   assert.equal(isProtectedPath("/"), false);
   assert.equal(isProtectedPath("/login"), false);
   // a path that merely starts with the same letters is NOT protected (no false positive)
   assert.equal(isProtectedPath("/chatbot"), false);
   assert.equal(isProtectedPath("/accounting"), false);
+  assert.equal(isProtectedPath("/administrator"), false);
 });
 
 test("the session cookie's mere presence is detected, whatever its value", () => {

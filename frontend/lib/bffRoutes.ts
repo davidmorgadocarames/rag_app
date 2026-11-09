@@ -25,6 +25,13 @@ export const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   // T12.2.2/E5: the CSP violation reporter -- unauthenticated, no session, explicitly
   // CSRF-exempt on the backend (rag_app.csp_report); still only ever POST.
   { method: "POST", pattern: /^\/csp-report$/ },
+  // Admin MFA (T12.3.4/T12.3.5, code written in 12b-A -- frontend verification is Phase 2):
+  // the backend itself still gates every one of these with rag_app.authz (permission map +
+  // MFA step-up) -- the allow-list only decides what reaches the backend at all.
+  { method: "POST", pattern: /^\/account\/mfa\/enroll$/ },
+  { method: "POST", pattern: /^\/account\/mfa\/confirm$/ },
+  { method: "POST", pattern: /^\/account\/mfa\/step-up$/ },
+  { method: "GET", pattern: /^\/admin\/ping$/ },
 ];
 
 /** Whether ``method path`` (upstream path, no "/api" prefix) is on the allow-list. */
