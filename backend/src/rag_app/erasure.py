@@ -136,7 +136,28 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
             DELETE FROM sessions WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM sessions WHERE user_id = :uid)",
     ),
-    # Lockout rows join here when 12b adds its table.
+    # MFA (0007 "part 1", T12.3.4): recovery codes before the one-row-per-user secret.
+    PurgeStep(
+        name="mfa_recovery_codes",
+        table="mfa_recovery_codes",
+        delete_batch="""
+            WITH victim AS (
+                SELECT id FROM mfa_recovery_codes WHERE user_id = :uid
+                 LIMIT :n FOR UPDATE SKIP LOCKED)
+            DELETE FROM mfa_recovery_codes WHERE id IN (SELECT id FROM victim)""",
+        remaining="SELECT EXISTS (SELECT 1 FROM mfa_recovery_codes WHERE user_id = :uid)",
+    ),
+    PurgeStep(
+        name="user_mfa",
+        table="user_mfa",
+        delete_batch="""
+            WITH victim AS (
+                SELECT user_id FROM user_mfa WHERE user_id = :uid
+                 LIMIT :n FOR UPDATE SKIP LOCKED)
+            DELETE FROM user_mfa WHERE user_id IN (SELECT user_id FROM victim)""",
+        remaining="SELECT EXISTS (SELECT 1 FROM user_mfa WHERE user_id = :uid)",
+    ),
+    # Lockout rows join here when 12b-B adds its table.
     PurgeStep(
         name="users",
         table="users",

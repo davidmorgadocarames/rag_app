@@ -49,7 +49,7 @@ _bearer = HTTPBearer(auto_error=False)
 # __Host- cookie attributes (T12.1.3): Secure + Path=/ + no Domain (required by the prefix),
 # HttpOnly (never readable by page script) and SameSite=Lax (P12-D2's CSRF layer, 12a-C,
 # covers the state-changing routes it still allows cross-site).
-def _set_session_cookie(response: Response, raw_session: str) -> None:
+def set_session_cookie(response: Response, raw_session: str) -> None:
     response.set_cookie(
         session_service.SESSION_COOKIE_NAME,
         raw_session,
@@ -72,9 +72,9 @@ def _clear_session_cookie(response: Response) -> None:
 
 # CSRF double-submit cookie (T12.1.4, P12-D2): readable (NOT HttpOnly) so client-side
 # JavaScript can echo its value in the X-CSRF-Token header; still __Host- (Secure + Path=/ +
-# no Domain). Issued/rotated together with the session cookie — register and login only in
-# 12a (no rotate() call site yet; 12b's step-up wires this in too, T12.3.5).
-def _set_csrf_cookie(response: Response, raw_session: str) -> None:
+# no Domain). Issued/rotated together with the session cookie — register and login in 12a;
+# the MFA step-up's session rotation (``rag_app.api.admin``, T12.3.5) also reissues both.
+def set_csrf_cookie(response: Response, raw_session: str) -> None:
     settings = get_settings()
     response.set_cookie(
         CSRF_COOKIE_NAME,
@@ -130,6 +130,9 @@ def get_current_user(
         if user is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired session")
         http.state.user_id = user.id  # T12.1.6: rate_limit_chat keys on this, not just the IP
+        # T12.3.5: admin-grade routes (rag_app.authz.require_permission_and_mfa) read this --
+        # None on the Bearer path below (no server-side session to have stepped up).
+        http.state.mfa_verified_at = session_service.mfa_verified_at(session, cookie_raw)
         return user
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
@@ -188,8 +191,8 @@ def register(
 
     send_verification_email(request.email, raw_token)
     tracker.record(ip)
-    _set_session_cookie(response, raw_session)
-    _set_csrf_cookie(response, raw_session)
+    set_session_cookie(response, raw_session)
+    set_csrf_cookie(response, raw_session)
     return TokenResponse(access_token=create_token(str(user.id)))
 
 
@@ -262,8 +265,8 @@ def login(request: LoginRequest, session: SessionDep, response: Response) -> Tok
     # T12.1.3: login still returns the JWT (rollback path, TF10) and also opens a session.
     raw_session = session_service.create_session(session, user)
     session.commit()
-    _set_session_cookie(response, raw_session)
-    _set_csrf_cookie(response, raw_session)
+    set_session_cookie(response, raw_session)
+    set_csrf_cookie(response, raw_session)
     return TokenResponse(access_token=create_token(str(user.id)))
 
 

@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import datetime as dt
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class StrictModel(BaseModel):
+    """Base for every request BODY (T12.3.6, mass-assignment defence): an unexpected field
+    (``role``, ``is_admin``, ``mfa_verified_at``, ``user_id``, ...) is REJECTED with 422
+    rather than silently dropped -- explicit, tested proof over pydantic's default
+    "ignore extra fields" behaviour. Response models stay plain ``BaseModel`` (never built
+    from untrusted client input)."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class HealthResponse(BaseModel):
     status: str
 
 
-class ChatRequest(BaseModel):
+class ChatRequest(StrictModel):
     question: str = Field(min_length=1, max_length=2000)
     version: str | None = None
 
@@ -31,12 +41,12 @@ class ChatResponse(BaseModel):
     citations: list[CitationOut]
 
 
-class RegisterRequest(BaseModel):
+class RegisterRequest(StrictModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=8, max_length=256)
 
 
-class LoginRequest(BaseModel):
+class LoginRequest(StrictModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=1, max_length=256)
 
@@ -62,7 +72,7 @@ class ResendVerificationResponse(BaseModel):
     detail: str
 
 
-class ChatStreamRequest(BaseModel):
+class ChatStreamRequest(StrictModel):
     question: str = Field(min_length=1, max_length=2000)
     conversation_id: str | None = None
     version: str | None = None
@@ -97,5 +107,29 @@ class ConversationDetailOut(BaseModel):
     messages: list[MessageOut]
 
 
-class RenameRequest(BaseModel):
+class RenameRequest(StrictModel):
     title: str = Field(min_length=1, max_length=200)
+
+
+# --- Admin MFA (T12.3.4/T12.3.5) ----------------------------------------------------------
+
+
+class MfaEnrollResponse(BaseModel):
+    # The PLAINTEXT base32 secret, shown once so the account page can render a manual-entry
+    # fallback next to the QR -- never stored in the clear (user_mfa.secret_encrypted is).
+    secret: str
+    provisioning_uri: str
+
+
+class MfaConfirmRequest(StrictModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+class MfaConfirmResponse(BaseModel):
+    # Shown to the user exactly once; never stored in the clear and never logged.
+    recovery_codes: list[str]
+
+
+class MfaStepUpRequest(StrictModel):
+    # A 6-digit TOTP code OR a recovery code ("XXXX-XXXX-XXXX", generous upper bound).
+    code: str = Field(min_length=6, max_length=64)

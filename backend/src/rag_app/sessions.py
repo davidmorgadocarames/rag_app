@@ -22,7 +22,7 @@ import datetime as dt
 import secrets
 import uuid
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from rag_app.db.models import User, UserSession
@@ -112,6 +112,29 @@ def authenticate(session: Session, raw: str, *, now: dt.datetime | None = None) 
         row.last_seen_at = moment
         row.idle_expires_at = moment + _idle_timeout(user.role or "user")
     return user
+
+
+def mfa_verified_at(session: Session, raw: str) -> dt.datetime | None:
+    """The live session's ``mfa_verified_at`` (T12.3.5): ``None`` when the session never
+    stepped up, or does not name a live row. A read-only lookup -- ``get_current_user``
+    exposes the result on ``request.state`` for ``rag_app.authz.require_permission_and_mfa``;
+    it does not throttle/touch ``last_seen_at`` (``authenticate`` already does that for the
+    same request)."""
+    row = _row(session, raw)
+    return row.mfa_verified_at if row is not None else None
+
+
+def set_mfa_verified(session: Session, raw: str, *, now: dt.datetime | None = None) -> None:
+    """Mark the live session named by ``raw`` as having completed MFA step-up (T12.3.5) at
+    ``now``. A no-op if ``raw`` does not name a live session. Caller commits.
+
+    Called right after ``rotate`` on the NEW raw id -- ``create_session``/``rotate`` never
+    set ``mfa_verified_at`` themselves (it stays NULL until a real step-up), so this is the
+    only writer."""
+    moment = now if now is not None else _now()
+    session.execute(
+        update(UserSession).where(UserSession.id == hash_token(raw)).values(mfa_verified_at=moment)
+    )
 
 
 def revoke(session: Session, raw: str) -> None:

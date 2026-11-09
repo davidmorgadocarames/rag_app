@@ -25,6 +25,9 @@ EXPECTED_TABLES = {
     "messages",
     "deletion_requests",
     "email_verification_tokens",
+    "sessions",
+    "user_mfa",
+    "mfa_recovery_codes",
 }
 
 

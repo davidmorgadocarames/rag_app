@@ -205,15 +205,41 @@ catalogue analysis; this is the implementation summary.
 - **Signed client IP** (`rag_app.client_ip` / `frontend/lib/clientIp.ts`, T5/V7): once
   `CLIENT_IP_HMAC_KEYS` is configured, the BFF derives the real client address from
   `X-Forwarded-For` (after `CLIENT_IP_TRUSTED_HOPS`), signs
-  `client_ip|method|path|timestamp` (HMAC-SHA256, 30 s window) and sends it as
+  `client_ip|method|path|timestamp` (HMAC-SHA256, 300 s window — widened from 30 s in
+  T12.3.0a/DEBT-038, a cold start could otherwise outlast the window) and sends it as
   `X-SecRAG-Client-IP`; the backend verifies the signature and keys rate limits by
   account/user **plus** this real IP instead of the shared Azure connection address. A
-  missing/forged/stale signature falls back to the connection address and emits a security
-  event. **Caveat (DA-12aC-2, DEBT-034, accepted until 12b):** this only protects callers that
+  missing/forged/stale signature falls back to the connection address and emits a
+  `result`-labelled security event (`client_ip_signature_total{result="verified|fallback|
+  stale|forged"}`, no IP label — `rag_app.metrics.CLIENT_IP_SIGNATURE_TOTAL`).
+  **Caveat (DA-12aC-2, DEBT-034, accepted until 12b):** this only protects callers that
   actually go through the BFF — a request reaching the still-public backend directly in 12a
   falls back to the shared address, so `login:<email>:<ip>` collapses to `login:<email>`
   for that path; not worse than the old pure-IP keying, closes fully once the backend's
   ingress goes internal (12b).
+- **Roles + permission map + admin MFA** (`rag_app.authz`, T12.3.2/T12.3.2b/T12.3.3/T12.3.4/
+  T12.3.5): `users.role` stays `user`/`admin` (CHECK constraint, migration 0006); every
+  protected route declares a **permission** (`require_permission("admin:read")`), never a
+  role string — `ROLE_PERMISSIONS` maps role -> the permissions it holds, and
+  `require_permission` fails closed (403, every role including admin) when a route names a
+  permission not yet in that map, so a future department role (Phase 21) is one map entry,
+  never a route-level code change. `require_role(role)` is a thin alias
+  (`require_permission(f"{role}'s base permission")`). `role` is never accepted from a
+  client request (every request body is a `StrictModel`, `extra="forbid"` — an unexpected
+  `role`/`is_admin`/`user_id` field is rejected, not silently dropped) and the only writer
+  of `role = 'admin'` anywhere in the codebase is the interactive bootstrap CLI
+  (`python -m rag_app.admin create`, password via `getpass`, never an argument or logged).
+  Admin-grade routes additionally require `require_permission_and_mfa`: a fresh TOTP
+  step-up (`pyotp`, migration 0007 `user_mfa`/`mfa_recovery_codes`, single-use recovery
+  codes hashed like every other token) that **rotates the session id** and sets
+  `sessions.mfa_verified_at` — the legacy Bearer path can never satisfy this (no session row
+  to step up). `PROTECTED_ROUTES` (populated at route-definition time, never guessed
+  afterwards) drives a role x route client-tampering matrix (T12.3.6, OWASP A01/API5):
+  mass assignment, query/header tricks (`X-Role`, `X-Admin`, forged `X-SecRAG-Client-IP`),
+  cookie tampering (the cookie is always opaque — the role is re-read from the database on
+  every request, never decoded from the cookie), direct backend calls bypassing the
+  frontend, and a missing MFA step-up all deny — proven in
+  `backend/tests/security/test_client_tampering.py`.
 - **Security headers + CSP** (T12.2.1/T12.2.2/T12.2.3, `frontend/middleware.ts` +
   `lib/csp.ts`/`lib/securityHeaders.mjs`; backend `rag_app.api.app._add_security_headers`):
   HSTS (no `preload` — shared `*.azurecontainerapps.io` domain, E7), `X-Content-Type-Options:

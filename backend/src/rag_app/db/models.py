@@ -241,6 +241,43 @@ class UserSession(Base):
     )
 
 
+class UserMfa(Base):
+    """TOTP enrolment (0007 "part 1", T12.3.4): one row per user, like ``UserKey``.
+    ``secret_encrypted`` is the TOTP secret wrapped with ``DATA_MASTER_KEY`` (defence in
+    depth; crypto-shredding ``user_keys`` already makes the account's data unreadable).
+    ``enabled`` only flips true once ``POST /account/mfa/confirm`` verifies a real code."""
+
+    __tablename__ = "user_mfa"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    secret_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    confirmed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MfaRecoveryCode(Base):
+    """Single-use TOTP recovery codes (0007 "part 1", T12.3.4): only ``code_hash``
+    (SHA-256, ``rag_app.security.hash_token``) is ever stored -- the plaintext codes are
+    shown once at confirm time and never logged."""
+
+    __tablename__ = "mfa_recovery_codes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    code_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    used_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class EmailVerificationToken(Base):
     __tablename__ = "email_verification_tokens"
 

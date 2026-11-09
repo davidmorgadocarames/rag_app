@@ -1,5 +1,5 @@
-"""Migrations 0005 (T11.2.3) and 0006 (T12.1.1), and the master-key fingerprint at start-up
-(T11.2.4), on harness databases (marker ``db``: gate --full / CI)."""
+"""Migrations 0005 (T11.2.3), 0006 (T12.1.1) and 0007 "part 1" (T12.3.4), and the master-key
+fingerprint at start-up (T11.2.4), on harness databases (marker ``db``: gate --full / CI)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
@@ -46,6 +47,17 @@ def _alembic(url: URL, script_location: Path | None = None) -> Config:
     )
     cfg.attributes["configure_logger"] = False
     return cfg
+
+
+def _head_revision() -> str:
+    """The real migrations' current head -- read dynamically so a fake test-only revision
+    (``test_a_broken_downgrade_fails_the_round_trip``) always stacks on top of it instead of
+    silently branching the moment a new migration becomes head."""
+    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    assert head is not None
+    return head
 
 
 @pytest.fixture()
@@ -180,14 +192,16 @@ def test_0005_downgrade_refuses_while_erased_users_exist(fresh_db: URL) -> None:
 
 
 def test_0006_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    """Targets 0006 directly (not "head", now 0007, T12.3.4): isolates 0006's own round
+    trip from 0007's (see the 0007 tests below)."""
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0006_sessions_role")
     engine = _engine(fresh_db)
     try:
         assert _version(engine) == "0006_sessions_role"
         command.downgrade(cfg, "-1")
         assert _version(engine) == "0005_persistence_erasure"
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0006_sessions_role")
         assert _version(engine) == "0006_sessions_role"
     finally:
         engine.dispose()
@@ -195,7 +209,7 @@ def test_0006_round_trip_on_an_empty_database(fresh_db: URL) -> None:
 
 def test_0006_downgrade_refuses_while_a_non_default_role_exists(fresh_db: URL) -> None:
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0006_sessions_role")
     engine = _engine(fresh_db)
     try:
         user_id = _seed_user(engine)
@@ -206,6 +220,59 @@ def test_0006_downgrade_refuses_while_a_non_default_role_exists(fresh_db: URL) -
         assert _version(engine) == "0006_sessions_role"  # nothing was changed
     finally:
         engine.dispose()
+
+
+# --- 0007 (T12.3.4, "part 1": TOTP + recovery codes) --------------------------------------
+
+
+def test_0007_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        assert _version(engine) == "0007_mfa"
+        command.downgrade(cfg, "-1")
+        assert _version(engine) == "0006_sessions_role"
+        command.upgrade(cfg, "head")
+        assert _version(engine) == "0007_mfa"
+    finally:
+        engine.dispose()
+
+
+def test_0007_downgrade_refuses_while_mfa_data_exists(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        user_id = _seed_user(engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO user_mfa (user_id, secret_encrypted) VALUES (:id, :s)"),
+                {"id": user_id, "s": b"not-really-encrypted-in-this-test"},
+            )
+        with pytest.raises(RuntimeError, match="refusing to downgrade 0007"):
+            command.downgrade(cfg, "-1")
+        assert _version(engine) == "0007_mfa"  # nothing was changed
+    finally:
+        engine.dispose()
+
+
+def test_0007_grants_follow_the_migration_map(db_engine: Engine) -> None:
+    def can(role: str, table: str, privilege: str) -> bool:
+        with db_engine.connect() as conn:
+            return bool(
+                conn.execute(
+                    text("SELECT has_table_privilege(:r, :t, :p)"),
+                    {"r": role, "t": f"public.{table}", "p": privilege},
+                ).scalar_one()
+            )
+
+    p = "secrag_purger"
+    for table in ("user_mfa", "mfa_recovery_codes"):
+        assert can(p, table, "SELECT") and can(p, table, "DELETE"), table
+        assert not can(p, table, "INSERT"), table
+        assert can("secrag_backup", table, "SELECT"), table
+        assert not can("secrag_backup", table, "UPDATE"), table
 
 
 def test_0006_grants_follow_the_migration_map(db_engine: Engine) -> None:
@@ -288,7 +355,7 @@ def test_a_broken_downgrade_fails_the_round_trip(fresh_db: URL, tmp_path: Path) 
         '"""broken downgrade (test only)"""\n'
         "from alembic import op\n"
         'revision = "0099_broken_downgrade"\n'
-        'down_revision = "0006_sessions_role"\n'
+        f'down_revision = "{_head_revision()}"\n'
         "branch_labels = None\n"
         "depends_on = None\n\n\n"
         "def upgrade():\n"

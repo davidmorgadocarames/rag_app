@@ -42,6 +42,8 @@ def test_the_registry_is_leaf_first_with_users_last() -> None:
         "conversations",
         "email_verification_tokens",
         "sessions",
+        "mfa_recovery_codes",
+        "user_mfa",
         "users",
     ]
     for step in erasure.PURGE_STEPS:
@@ -350,6 +352,8 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "conversations": 3,
         "email_verification_tokens": 1,
         "sessions": 0,
+        "mfa_recovery_codes": 0,
+        "user_mfa": 0,
         "users": 1,
     }
     assert result.batches >= 8 + 1 + 1 + 1 and result.max_transaction_seconds < 2
@@ -359,6 +363,8 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "conversations",
         "email_verification_tokens",
         "sessions",
+        "mfa_recovery_codes",
+        "user_mfa",
         "users",
     ]
     gone = _counts(db_engine, user_id)

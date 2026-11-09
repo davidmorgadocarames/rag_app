@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from rag_app import __version__, csp_report, metrics, reranking, timing
-from rag_app.api import auth, conversations
+from rag_app.api import admin, auth, conversations
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import (
     AnswerFn,
@@ -125,6 +125,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(conversations.router)
     app.include_router(csp_report.router)
+    app.include_router(admin.router)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
