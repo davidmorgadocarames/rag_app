@@ -1134,8 +1134,9 @@ Decisions 1–7, 9 and 10 landed in 11a (the italic notes say where); decisions 
     is no restart. `off` returns every app to min 0 and removes the tag. `status` reports
     each app's state and an approximate running cost from the tag's start time
     (`DEMO_MODE_HOURLY_COST_EUR`, default 0.17 EUR/h for the 3 apps together — the internal
-    cost-planning notes' §2.2 estimate: ≈0.15–0.17 EUR/h; actual Container Apps billing is
-    under review, see [Costs](#costs)). A demo switched `off` on time (the fixed 3 h window)
+    cost-planning notes' §2.2 estimate: ≈0.15–0.17 EUR/h, kept as the upper bound — October
+    2026 billing measured ≥ 0.12 EUR/h once the monthly free grant is used up, see
+    [Costs](#costs)). A demo switched `off` on time (the fixed 3 h window)
     costs ≈0.50 EUR; a forgotten demo left running until the guard (see below) catches it can
     cost up to ≈1.30 EUR before it is scaled back down.
     `.github/workflows/demo-guard.yml` runs `scripts/azure/demo-guard.sh` on an **hourly
@@ -1615,6 +1616,14 @@ standard `secrag-cae` environment, most likely the monthly free grant now coveri
 subscription's usage; left as an open question, not assumed permanent. **11b total ≈ €0.025**
 against the ≈€0.15 estimate and the €1 cap. Subscription total since 2026-09-01: **€6.17 of
 the €40** budget.
+
+**Container Apps billing, settled (October 2026, measured 2026-11-09).** The open question
+above is answered: the standard environment's **monthly free grant** covers the first part of
+each month's usage, then Container Apps is billed normally. October: €0 until 2026-10-18, then
+**€0.81** on 2026-10-19 (a demo left on ~6 h 50 min → ≥ €0.12/h for the three apps) and
+~€0.01/day afterwards for the scheduled purge and backup Jobs (in line with the ≈€0.16/month
+estimate above); Container Apps €1.05 of the month's €1.08. November restarted at €0. The
+demo-mode default of 0.17 EUR/h stays as a conservative upper bound.
 
 
 

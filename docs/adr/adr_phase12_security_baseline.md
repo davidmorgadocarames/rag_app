@@ -1,6 +1,7 @@
 # ADR phase 12 — Security baseline: sessions, BFF, CSRF, headers/CSP
 
-- **Status:** **12a** in progress (branch `phase-12a-sessions-bff`); this ADR records the
+- **Status:** **12a accepted and promoted** 2026-11-08/09 (`main` `791b250`, tag `phase-12a`,
+  report [`docs/phases/phase-12a.md`](../phases/phase-12a.md)); this ADR records the
   **12a part** only (12.0 threat model, 12.1 sessions/BFF/CSRF, 12.2 security headers +
   surface reduction). **12b** (RBAC, MFA, email verification, lockout, backend ingress →
   internal) is a separate promotion and gets its own decisions appended here when it lands.
@@ -111,11 +112,10 @@ connection address and emits a security event.
   - **`CSP_MODE` single switch (`lib/csp.ts`):** `"report-only"` until a Playwright page walk
     proves **zero** `script-src` violations against the real built app in a real browser,
     then flipped to `"enforce"` — T12.2.3's literal Done-when is "zero violations **with CSP
-    enforcing**", not "zero violations in report-only mode". **As of this ADR's 12a-E
-    Phase 1 (code + unit tests, no browser/build available), `CSP_MODE` is still
-    `"report-only"`** — the walk and the flip are 12a-E Phase 2 work, done once a browser and
-    a build are available; this paragraph is updated (or the ADR's successor note is) once
-    that lands.
+    enforcing**", not "zero violations in report-only mode". **`CSP_MODE` is `"enforce"`
+    since 2026-10-17:** the walk showed zero violations both before and after the flip, and
+    the Azure smoke confirmed the enforcing header (nonce + `strict-dynamic` +
+    `frame-ancestors 'none'`) on `/` and `/login`.
 - **Backend** (`rag_app.api.app`): the same handful of headers
   (`X-Content-Type-Options`, `Referrer-Policy`, `Content-Security-Policy: frame-ancestors
   'none'`, `Cache-Control: no-store`) on every API response via one ASGI middleware;
@@ -148,8 +148,36 @@ the whole repo), but the shared name risked confusing whoever removes that GitHu
 12a-P. Renamed to `EMAIL_LINK_BASE_URL` / `Settings.email_link_base_url`; no compatibility
 break (nothing in `.env`, compose or CD ever set the old name for the backend).
 
+## Promotion (12a) — decisions taken at deploy time
+
+- **DEC-016 = A — new secrets in place.** `CSRF_SECRET` and `CLIENT_IP_HMAC_KEYS` were added
+  with `az containerapp secret set` (values typed by the operator, never in argv or history)
+  plus `update --set-env-vars …=secretref:…`, which created a new revision; verified in the
+  running replicas by **length only**. The recreate-the-app fallback (needed once on an older
+  environment) was not required.
+- **DEC-017 = A — deviation from P12-D1.** The frontend's `BACKEND_URL` is the backend's
+  **public `https://` address** in 12a, not the in-environment app name: the backend still has
+  external ingress with plain HTTP disallowed, and nothing in the environment proved the bare
+  app-name form works on it. No exposure added (the backend is public in 12a anyway, DEBT-034);
+  12b switches to the internal address together with the internal ingress.
+- **DEC-015 = A.** The backend's stale `NEXT_PUBLIC_API_URL` variable (read only by the old
+  e-mail-link setting, renamed above) was removed in the same update; the GitHub repository
+  variable of the same name was deleted after the smoke.
+- **DEC-021 = A — known gap found by the smoke.** A fully cold request through the BFF arrives
+  at the backend ~69 s after the BFF signed the client address, past the 30 s window, so that
+  one request falls back to the connection address (and logs a security event). Accepted for
+  12a; 12b widens the window (bound to method + path) and adds a privacy-safe verified/fallback
+  counter (DEBT-038).
+
 ## Rollback
 
+- **Rollback digests (pre-12a):** backend
+  `rag_app-backend@sha256:83027a258ea5355591925212981b029cce7d79927b0656580d6f5f0cc4aa5231`,
+  frontend `rag_app-frontend@sha256:dc0b60a77c6160d3ddd66a86942d5e9e7d0427ee722ff5656996bae78b6efef4`,
+  Ollama `rag_app-ollama@sha256:00333ab77cc1f1a7ddec2a540a037127302344de7ef17894e16b737fe5a5f3fd`,
+  jobs `rag_app-jobs@sha256:abd004382467d1b262ec30504d735b73e161f4775c646f006901095f8fa0c9f5`.
+  Deployed 12a digests: backend `…0a92f59d40cdf165d419bdf11f1bf4227e5df6e6192653f886b6f6d3542c3c14`,
+  frontend `…452747f7d69344ba63f2e57577d6c0d0f4d20245d13f983bc3ce5b12129915f8`.
 - **Images roll back; the schema does not** (same principle as ADR phase 11). Migration
   `0006` (`sessions` + `users.role`) is expand-only; the pre-12a backend image never reads
   either new table/column, so a rollback to the previous backend digest still works against
@@ -164,6 +192,13 @@ break (nothing in `.env`, compose or CD ever set the old name for the backend).
   narrowing/docs-gating) is also safe in the other direction: none of 12a-E's changes are
   stored state — headers, CSP mode and the docs-gating condition are all read fresh from
   config/code on every request, nothing persists them.
+
+## Costs (12a)
+
+Estimate ≈ €0.15, cap €1. Measured (Azure Cost Management, read-only): **≈ €0.06** — €0.057
+on 2026-10-21 (pre-merge configuration revisions) and ≈ €0.001 on 2026-11-08/09 (merge, CD,
+smoke; Container Apps inside November's free grant). Detail in the
+[phase report](../phases/phase-12a.md#cost).
 
 ## Successor note (for 12b)
 
