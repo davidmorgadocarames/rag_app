@@ -57,6 +57,35 @@ def test_classify_intent_security(query: str) -> None:
     assert classify_intent(query) == "security"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "hol",  # missing one letter from "hola"
+        "holaa",  # one repeated letter
+        "helo",  # missing one letter from "hello"
+        "graicas",  # transposition of "gracias"
+        "heeey",  # repeated letters collapse to "hey"
+        "thnks",  # missing one letter from "thanks"
+    ],
+)
+def test_classify_intent_typo_tolerant_chitchat(query: str) -> None:
+    """T12.3.0c (DEBT-040): a typo'd short greeting/farewell/thanks is still chitchat."""
+    assert classify_intent(query) == "chitchat"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "how",  # too far from any lexicon word to be a believable typo
+        "sql",  # security term, forces "security" before the typo check ever runs
+        "hold on",  # not a greeting typo, even though it starts like one
+        "xss",  # security term
+    ],
+)
+def test_classify_intent_typo_tolerant_chitchat_does_not_misfire(query: str) -> None:
+    assert classify_intent(query) == "security"
+
+
 def test_usage_accumulates() -> None:
     total = Usage()
     total.add(Usage(prompt_tokens=10, completion_tokens=5))

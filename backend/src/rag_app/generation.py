@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -256,6 +257,81 @@ _SECURITY_TERM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# T12.3.0c (DEBT-040): a short, typo'd greeting/farewell/thanks ("hol", "holaa", "helo",
+# "graicas") should not fall through to the full RAG pipeline (and abstain) just because it
+# missed the exact regexes above. Deliberately only the greeting/farewell/thanks words --
+# never the (open-ended, security-sensitive) meta questions -- and only for VERY short
+# messages, so a real mistyped security question is never swallowed as small talk.
+_SMALL_TALK_LEXICON: tuple[str, ...] = (
+    "hi", "hello", "hey", "hiya", "yo", "sup", "hola", "greetings",
+    "good morning", "good afternoon", "good evening",
+    "bye", "goodbye", "see you", "cya", "adios",
+    "thanks", "thank you", "thx", "cheers", "gracias",
+)  # fmt: skip
+
+_NON_LETTER_RE = re.compile(r"[^a-z\s]")
+
+
+def _collapse_repeats(word: str) -> str:
+    """ "holaaaa" -> "hola", "heeey" -> "hey": a repeated-key typo almost always repeats one
+    character run, never changes which distinct letters are present."""
+    out: list[str] = []
+    for ch in word:
+        if out and out[-1] == ch:
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _normalize_for_typos(text: str) -> str:
+    """Lowercase, strip accents (``graicas`` has none, but a future ``grácias`` would),
+    drop punctuation and collapse repeated letters word by word (never across a space)."""
+    lowered = unicodedata.normalize("NFKD", text.lower())
+    stripped = "".join(c for c in lowered if not unicodedata.combining(c))
+    letters_only = _NON_LETTER_RE.sub("", stripped)
+    words = [_collapse_repeats(w) for w in letters_only.split()]
+    return " ".join(words)
+
+
+def _edit_distance_at_most_one(a: str, b: str) -> bool:
+    """Restricted Damerau-Levenshtein <= 1: an exact match, one substitution, one adjacent
+    transposition (``graicas`` / ``gracias``), or one insertion/deletion (``hol`` / ``hola``,
+    ``helo`` / ``hello``)."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        diffs = [i for i in range(len(a)) if a[i] != b[i]]
+        if len(diffs) == 1:
+            return True
+        if len(diffs) == 2:
+            i, j = diffs
+            return j == i + 1 and a[i] == b[j] and a[j] == b[i]
+        return False
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    i = j = 0
+    skipped = False
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+            continue
+        if skipped:
+            return False
+        skipped = True
+        j += 1
+    return True
+
+
+def _is_typo_tolerant_small_talk(q: str) -> bool:
+    if not (1 <= len(q.split()) <= 3):
+        return False
+    normalized = _normalize_for_typos(q)
+    if not normalized:
+        return False
+    return any(_edit_distance_at_most_one(normalized, word) for word in _SMALL_TALK_LEXICON)
+
 
 def classify_intent(query: str) -> str:
     """Return "chitchat" for small talk / meta questions, else "security".
@@ -269,6 +345,8 @@ def classify_intent(query: str) -> str:
     if _GREETING_RE.match(q) or _FAREWELL_RE.match(q) or _META_RE.search(q):
         return "chitchat"
     if _THANKS_RE.search(q) and len(q.split()) <= 4:
+        return "chitchat"
+    if _is_typo_tolerant_small_talk(q):
         return "chitchat"
     return "security"
 
