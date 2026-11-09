@@ -22,26 +22,26 @@
 advisory = "GHSA-6g55-p6wh-862q"
 package = "postcss"
 ecosystem = "npm"
-reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
+reason = "postcss bundled inside next@15.5.28 (the nested 8.4.31 next ships internally -- not our direct devDependency, which T12.3.0b/DEBT-039 bumped to 8.5.23 and is not affected by this advisory). Fixing next's own nested copy needs a major Next upgrade. Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
 expires = 2027-06-30
 
 [[exception]]
 advisory = "GHSA-fxqj-rqcc-2cmp"
 package = "postcss"
 ecosystem = "npm"
-reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
+reason = "postcss bundled inside next@15.5.28 (the nested 8.4.31 next ships internally -- not our direct devDependency, which T12.3.0b/DEBT-039 bumped to 8.5.23 and is not affected by this advisory). Fixing next's own nested copy needs a major Next upgrade. Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
 expires = 2027-06-30
 
 [[exception]]
 advisory = "GHSA-qx2v-qp2m-jg93"
 package = "postcss"
 ecosystem = "npm"
-reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
+reason = "postcss bundled inside next@15.5.28 (the nested 8.4.31 next ships internally -- not our direct devDependency, which T12.3.0b/DEBT-039 bumped to 8.5.23 and is not affected by this advisory). Fixing next's own nested copy needs a major Next upgrade. Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
 expires = 2027-06-30
 
 [[exception]]
 advisory = "GHSA-r28c-9q8g-f849"
 package = "postcss"
 ecosystem = "npm"
-reason = "postcss bundled inside next (not a direct dependency; the fix needs a major Next upgrade). Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
+reason = "postcss bundled inside next@15.5.28 (the nested 8.4.31 next ships internally -- not our direct devDependency, which T12.3.0b/DEBT-039 bumped to 8.5.23 and is not affected by this advisory). Fixing next's own nested copy needs a major Next upgrade. Not reachable at runtime: build-time CSS processing of our own styles only, no user-supplied CSS. Accepted until Phase 15 (supply chain); the date is a backstop."
 expires = 2027-06-30
