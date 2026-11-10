@@ -1,19 +1,19 @@
 "use client";
 
-// Admin MFA enrolment + step-up (T12.3.5). Written in 12b-A; NOT run through
-// `npm run build`/`node --test`/Playwright this session (PC constraint) -- verification is
-// phase 2 work. CSR only (T12.1.9 "SSR shell + CSR form" convention, like /login): the real
-// guard is `middleware.ts` (has-a-cookie, UX only) + this page's own 401 handling below, and
-// ultimately the backend (`rag_app.authz`) on every call.
+// Admin MFA enrolment + step-up (T12.3.5). CSR only (T12.1.9 "SSR shell + CSR form"
+// convention, like /login): the real guard is `middleware.ts` (has-a-cookie, UX only) +
+// this page's own 401 handling below, and ultimately the backend (`rag_app.authz`) on
+// every call.
 //
-// QR rendering: deferred to phase 2 (no client-side QR library can be added without
-// `npm install`, which this session cannot run). Meanwhile the page shows the
-// `otpauth://` URI and the raw secret for manual entry into any TOTP app -- both work with
-// every authenticator, a QR code is only a convenience on top.
+// QR rendering (DEC-024 = B, phase 2): `components/QrCode.tsx` renders the `otpauth://`
+// provisioning URI as an inline SVG, client-side only, no network call -- the secret never
+// leaves the browser (not logged, not placed in any URL/query). The raw secret and URI are
+// kept visible underneath as a manual-entry fallback for any TOTP app that cannot scan.
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
+import QrCode from "@/components/QrCode";
 import { ApiError, mfaConfirm, mfaEnroll, mfaStepUp } from "@/lib/api";
 
 type Stage = "idle" | "enrolled" | "confirmed";
@@ -96,10 +96,12 @@ export default function AccountSecurityPage() {
       {stage === "enrolled" && secret && provisioningUri && (
         <div className="flex flex-col gap-3 border border-vault-steel-dark p-4">
           <p className="text-sm text-vault-steel-light">
-            Add this account to your authenticator app. QR rendering is not available yet
-            (manual entry only) -- enter the secret below, or paste the full URI if your app
-            accepts it.
+            Scan this QR code with your authenticator app, or enter the secret manually below
+            if your app cannot scan.
           </p>
+          <div className="flex justify-center bg-white p-2" data-testid="mfa-qr-code">
+            <QrCode data={provisioningUri} />
+          </div>
           <p className="break-all text-xs text-vault-steel">Secret: {secret}</p>
           <p className="break-all text-xs text-vault-steel">URI: {provisioningUri}</p>
           <label className="text-sm text-vault-steel-light">
