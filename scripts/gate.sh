@@ -621,8 +621,11 @@ step_e2e() {
   # and the next request's Origin header then failed FRONTEND_ORIGIN's exact-match check).
   # Visiting "localhost" from the start keeps the browser's origin consistent with every
   # middleware redirect; FRONTEND_ORIGIN above is set to match.
+  # auth.spec.ts: the chat-flow walk (T12.1.10/DEBT-035). admin.spec.ts: T12.3.6 case (5)/(6)
+  # (client-state tampering buys an ordinary user nothing on /admin). mfa.spec.ts: T12.3.5/
+  # DEC-024 (the QR code actually renders from the real backend-issued provisioning URI).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
-    npx playwright test e2e/auth.spec.ts)
+    npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/mfa.spec.ts)
 }
 
 # T12.2.3/T12.2.5 (E3/E9): the Playwright page walk (frontend/e2e/security-headers.spec.ts)
