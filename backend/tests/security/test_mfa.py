@@ -6,6 +6,7 @@ Same cookie/CSRF harness as ``test_auth_cookies.py``/``test_csrf.py``.
 
 from __future__ import annotations
 
+import inspect
 import threading
 import uuid
 
@@ -235,6 +236,29 @@ def test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through(
     with Session(db_engine) as session:
         row = session.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == user_id).one()
         assert row.used_at is not None
+
+
+def test_claim_recovery_code_is_a_single_atomic_statement() -> None:
+    """Cheap, deterministic companion to the threaded race test above (12b-A phase 2 note,
+    PHASE_STATUS.md): the DA-12bA-3 race only reproduces in ~1/30 runs of the threaded test
+    (confirmed by temporarily reverting to a naive SELECT-then-UPDATE and looping the gate),
+    so a future regression could easily slip through on a lucky run. This structural check
+    is deterministic every single run: ``claim_recovery_code`` must issue exactly ONE
+    ``session.execute`` call, and that statement must be the atomic conditional
+    ``UPDATE ... WHERE used_at IS NULL`` -- never a separate SELECT (TOCTOU) feeding a later
+    UPDATE."""
+    source = inspect.getsource(claim_recovery_code)
+    assert source.count("session.execute(") == 1, (
+        "claim_recovery_code must issue exactly one DB statement (a single atomic UPDATE), "
+        "not a SELECT followed by a separate UPDATE"
+    )
+    assert "update(MfaRecoveryCode)" in source
+    assert (
+        "MfaRecoveryCode.used_at.is_(None)" in source
+    ), "the UPDATE must be conditional on used_at IS NULL"
+    assert (
+        "select(" not in source and "session.query(" not in source and "session.get(" not in source
+    )
 
 
 # --- /admin/ping: permission map + MFA step-up, end to end ----------------------------------
