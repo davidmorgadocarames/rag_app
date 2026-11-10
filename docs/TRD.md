@@ -233,7 +233,13 @@ catalogue analysis; this is the implementation summary.
   step-up (`pyotp`, migration 0007 `user_mfa`/`mfa_recovery_codes`, single-use recovery
   codes hashed like every other token) that **rotates the session id** and sets
   `sessions.mfa_verified_at` — the legacy Bearer path can never satisfy this (no session row
-  to step up). `PROTECTED_ROUTES` (populated at route-definition time, never guessed
+  to step up). The recovery-code claim itself follows the X10 no-TOCTOU rule
+  (`docs/security/THREAT_MODEL.md` X10/REC-04): a single atomic `UPDATE … WHERE used_at IS
+  NULL` (`rag_app.api.admin.claim_recovery_code`), proved single-use under genuine 8-thread
+  concurrency by `backend/tests/security/test_mfa.py::
+  test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through` — the template
+  12b-B's lockout counters and 12b-C's reset/verify token consume follow. `PROTECTED_ROUTES`
+  (populated at route-definition time, never guessed
   afterwards) drives a role x route client-tampering matrix (T12.3.6, OWASP A01/API5):
   mass assignment, query/header tricks (`X-Role`, `X-Admin`, forged `X-SecRAG-Client-IP`),
   cookie tampering (the cookie is always opaque — the role is re-read from the database on

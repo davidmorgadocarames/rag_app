@@ -6,6 +6,7 @@ Same cookie/CSRF harness as ``test_auth_cookies.py``/``test_csrf.py``.
 
 from __future__ import annotations
 
+import threading
 import uuid
 
 import pyotp
@@ -16,10 +17,14 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from rag_app.admin import create_admin
+from rag_app.api.admin import claim_recovery_code
 from rag_app.api.app import create_app
 from rag_app.api.deps import get_signup_tracker
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from rag_app.db.models import MfaRecoveryCode, User
+from rag_app.mfa import hash_recovery_code
 from rag_app.risk import SignupTracker
+from rag_app.security import hash_password
 from rag_app.sessions import SESSION_COOKIE_NAME
 
 pytestmark = [pytest.mark.db, pytest.mark.security]
@@ -179,6 +184,57 @@ def test_a_recovery_code_steps_up_and_is_then_single_use(api_env: Engine) -> Non
         "/account/mfa/step-up", json={"code": recovery_code}, headers=_csrf_header(first)
     )
     assert second.status_code == 403
+
+
+def test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through(
+    db_engine: Engine,
+) -> None:
+    """DA-12bA-3 / X10 (docs/security/THREAT_MODEL.md "X10", REC-04): ``claim_recovery_code``
+    is a SINGLE ``UPDATE ... WHERE used_at IS NULL`` statement, so N threads racing to claim
+    the SAME recovery code get exactly one success, whatever the DB's scheduling -- never
+    two. Calls the exact production function at the DB level (own ``Session`` per thread,
+    each committing), deliberately bypassing ``/account/mfa/step-up``: going through the
+    HTTP endpoint entangles the result with session-rotation side effects (the winning call
+    deletes/replaces the session row, which can turn a losing thread's own
+    ``get_current_user`` into a 401 instead of a clean "claim failed")."""
+    code = "concurrent-recovery-code"
+    with Session(db_engine) as session:
+        user = User(
+            email=f"mfa-race-{uuid.uuid4().hex[:10]}@example.test",
+            password_hash=hash_password("correct horse battery"),
+        )
+        session.add(user)
+        session.flush()
+        session.add(MfaRecoveryCode(user_id=user.id, code_hash=hash_recovery_code(code)))
+        session.commit()
+        user_id = user.id
+
+    thread_count = 8
+    barrier = threading.Barrier(thread_count)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def claim() -> None:
+        barrier.wait()
+        with Session(db_engine) as session:
+            claimed = claim_recovery_code(session, user_id, code)
+            session.commit()
+        with lock:
+            results.append(claimed)
+
+    threads = [threading.Thread(target=claim) for _ in range(thread_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert len(results) == thread_count
+    assert results.count(True) == 1, "more than one thread claimed the same recovery code"
+    assert results.count(False) == thread_count - 1
+
+    with Session(db_engine) as session:
+        row = session.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == user_id).one()
+        assert row.used_at is not None
 
 
 # --- /admin/ping: permission map + MFA step-up, end to end ----------------------------------
