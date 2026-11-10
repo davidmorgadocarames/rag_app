@@ -204,10 +204,15 @@ DEBT-029): the real BFF + backend wired end to end, in a browser. The step itsel
 native backend (`uvicorn`, gate DB + Ollama once `security-headers`/`zap-baseline` are also
 requested — see below) and the built frontend (`next build` then `next start` directly, not
 the Docker `standalone` output — this step runs the app itself, never the image), pointed at
-that backend via `BACKEND_URL`, then runs `frontend/e2e/auth.spec.ts` headless against it:
+that backend via `BACKEND_URL`, then runs `frontend/e2e/auth.spec.ts`,
+`frontend/e2e/admin.spec.ts` and `frontend/e2e/mfa.spec.ts` headless against it:
 register → one streamed chat turn (a REAL security question through classify → retrieve →
 rerank → generate → groundedness, DEBT-035 — not the chitchat fast path) → logout → login
-again. Chromium is a one-time local install (`npx playwright install chromium`, cached under
+again (`auth.spec.ts`); an ordinary user, even after tampering with `localStorage`/the DOM,
+still gets the denied placeholder on `/admin` (T12.3.6 case 5/6, `admin.spec.ts`); starting
+MFA enrolment on `/account/security` renders a real QR code built from the backend's own
+`otpauth://` provisioning URI (T12.3.5, DEC-024, `mfa.spec.ts`). Chromium is a one-time local
+install (`npx playwright install chromium`, cached under
 `~/.cache/ms-playwright`; if the WSL system libraries are missing, that install needs `sudo`
 once, run by the user in their own terminal — never by an agent). Playwright
 (`@playwright/test`) is a frontend `devDependency` only — never baked into the runner image
