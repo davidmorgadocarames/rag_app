@@ -107,6 +107,28 @@ def test_prod_refuses_the_development_database_default() -> None:
         validate_api_settings(settings)
 
 
+# --- T12.4.4: require_email_verification's ENV=prod default (DA-12bB-3) --------------------
+
+
+def test_require_email_verification_defaults_true_in_prod(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_default_require_email_verification_with_prod`` claims ``ENV=prod`` with the field
+    left unset turns it on -- a direct unit test, not inference by reading the validator."""
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFICATION", raising=False)
+    settings = Settings(_env_file=None, env="prod")
+    assert settings.require_email_verification is True
+
+
+def test_require_email_verification_explicit_false_survives_prod_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validator only FILLS IN the default: an explicit ``REQUIRE_EMAIL_VERIFICATION=false``
+    (e.g. a demo account runbook step) stays honoured even with ``ENV=prod`` -- same
+    "explicitly set" pattern as ``test_database_url_from_the_environment_counts_as_set``."""
+    monkeypatch.delenv("REQUIRE_EMAIL_VERIFICATION", raising=False)
+    settings = Settings(_env_file=None, env="prod", require_email_verification=False)
+    assert settings.require_email_verification is False
+
+
 def test_dev_accepts_the_development_database_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENV", "dev")
     settings = Settings(
