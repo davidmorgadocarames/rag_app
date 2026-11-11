@@ -22,21 +22,35 @@ Chat (/chat)              [authenticated]
 ### 2.1 Sign up
 
 1. User opens **`/signup`**, enters email + password.
-2. On **Create account**:
-   - Client validates format; server enforces password policy.
-   - Server runs **risk scoring** (IP velocity, disposable-email check, account-age heuristics). High
-     risk → challenge (CAPTCHA) or block.
-   - On success: user row created (`email_verified = false`), a verification token is emailed
-     (the address and the link are never written to a log; the cloud deployment has no SMTP
-     yet, so it does not require verification).
-   - Redirect to **`/verify`** ("Check your email").
-3. If email already exists → inline error (409, also when two sign-ups race), stay on page.
+2. On **Create account** (T12.4.3/T12.4.4):
+   - Client validates format; server enforces the password policy (>= 12 chars, NCSC/
+     SecLists breach-list check, must not contain the email's local part).
+   - Server runs **risk scoring** (IP velocity, disposable-email check). High risk → 403,
+     no account created.
+   - **Generic 202** either way — a brand-new account, an address that already has one, or
+     a race between two sign-ups of the same address — never a 409 (F3/F11, user
+     enumeration): "If that address can be used to register, you'll receive an email."
+     A new account's row is created (`email_verified = false`) and a verification email is
+     sent to it; an already-registered address instead gets a "you already have an account"
+     notice — the caller cannot tell which happened. **No session is opened** (not even for
+     a brand-new account): the UI shows the generic message and stays on the sign-in form.
+3. The scrubbed email of an ERASED account is free again at once: re-registering it right
+   after an erasure creates a genuinely new account (D-ER).
 
 ### 2.2 Verify email
 
-1. User clicks the link → **`/verify?token=…`**.
-2. Server validates the token (unexpired, unused) → sets `email_verified = true`, consumes token.
-3. Redirect to **`/login`** with a success banner. Invalid/expired token → offer to resend.
+1. User clicks the emailed link → **`/verify?token=…`** (a GET: it only renders the page,
+   never consumes the token — a mail scanner pre-fetching it can do no harm).
+2. The page's own **Verify email** button issues `POST /auth/verify` with the token in the
+   body. The server validates it (unexpired, unused) → sets `email_verified = true`,
+   consumes the token.
+3. A link to **`/login`** appears on success. Invalid/expired token → an error message.
+   **Resend verification** is reachable two ways, both posting the email (never an
+   authenticated session, T12.4.4) and showing the same generic response either way:
+   `/account`, once signed in (`ENV=dev` only — `ENV=prod` blocks login before verification,
+   so there is no session to reach it with); or directly on `/login`, which offers it the
+   moment a sign-in attempt fails with "email not verified" — the only UI path left once
+   nothing has a session yet.
 
 ### 2.3 Login
 
@@ -121,10 +135,13 @@ Chat (/chat)              [authenticated]
 ### 2.6 Account & data deletion
 
 1. **`/account`** shows email and account controls. If the email isn't verified, a **Resend
-   verification** button issues a fresh token (`POST /auth/resend-verification`); only with `ENV=dev`
-   and no SMTP does the API return the verification link, so the user can complete
-   `GET /auth/verify` directly. In prod it never returns the link (without SMTP anyone could
-   otherwise verify an address they do not own).
+   verification** button posts the account's own email (`POST /auth/resend-verification`,
+   T12.4.4: reached by email now, not an authenticated session — a freshly registered
+   account has none) and shows the same generic response whatever the outcome. The link
+   only ever arrives by email (Mailpit locally), never in any API response, in any
+   environment (T12.1.11) — the `/verify` page it points at (`PUBLIC_APP_URL`, T12.4.5) only
+   renders on a GET; its own button issues the `POST /auth/verify` that actually consumes
+   the token, so a mail scanner pre-fetching the link can never do so.
 2. **Delete my data** → confirmation modal ("This is irreversible").
 3. On confirm → `DELETE /api/account` → **202 Accepted** (asynchronous erasure, ADR phase 11
    decision 6). One short transaction:
@@ -150,10 +167,11 @@ Chat (/chat)              [authenticated]
 | Route | Auth required | Notes |
 |-------|---------------|-------|
 | `/` | no | Landing |
-| `/signup`, `/login`, `/verify` | no | Redirect to `/chat` if already authenticated |
+| `/signup`, `/login`, `/verify`, `/reset` | no | `/verify`/`/reset` (T12.4.5): a GET only renders the page; its own button POSTs the token |
 | `/chat`, `/account` | yes | Redirect to `/login` if not authenticated |
 | `POST /chat/stream`, `POST /chat`, `GET/PATCH/DELETE /conversations…` | yes | Chat is rate-limited (cost-aware) and counted against the global daily answer cap |
-| `POST /auth/resend-verification`, `DELETE /account` | yes | |
+| `POST /auth/register`, `POST /auth/resend-verification`, `POST /auth/verify` | no | T12.4.4: register/resend-verification never confirm whether an address already has an account (generic response either way); resend is reached by email, not a session |
+| `DELETE /account` | yes | |
 | `POST /api/csp-report` | no | Unauthenticated, rate-limited by real IP, CSRF-exempt (no session to protect) — the browser's CSP violation reports (Phase 12a, TRD §8.1) |
 
 Every path above the backend actually serves is also on the BFF's explicit allow-list

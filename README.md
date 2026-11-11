@@ -678,6 +678,23 @@ bound, so the worst-case cost of a day at the cap is known in advance
 - [ADR phase 10 — Cloud deployment on Azure](docs/adr/adr_phase10_azure.md)
 - [ADR phase 11 — Stability: data persistence and rerank latency](docs/adr/adr_phase11_stability.md) (11a Azure-promoted: persistence, migrations Job, asynchronous erasure, backups, daily cap; 11b landed locally: adopted reranker, concurrency cap, baked images, real `latency` gate check — Azure promotion pending)
 
+## Licences and attribution
+
+- **Password denylist (T12.4.3)** — the backend's password policy
+  (`backend/src/rag_app/password_policy.py`) checks new/changed passwords against the
+  NCSC's published list of the 100,000 most commonly used/breached passwords. This project
+  bundles it from **[SecLists](https://github.com/danielmiessler/SecLists)** (MIT License,
+  © Daniel Miessler and contributors), file
+  `Passwords/Common-Credentials/100k-most-used-passwords-NCSC.txt` — itself sourced from the
+  NCSC's own analysis. A citable, crawlable redistribution licence could not be confirmed
+  directly from `ncsc.gov.uk` at the time this was added (its copyright/licence footer is
+  client-rendered), so the SecLists mirror is used instead, gzip-compressed (~420 KB) and
+  sha256-pinned so a later drift in the upstream file is a detectable test failure
+  (`backend/tests/test_password_policy.py`).
+- **Reranker model** — `BAAI/bge-reranker-base` (MIT License), pinned to a specific Hugging
+  Face Hub commit (`RERANKER_REVISION`, `backend/src/rag_app/config.py`) and baked into the
+  backend image offline.
+
 ## License
 
 [MIT](LICENSE) © 2026 David Morgado Carames

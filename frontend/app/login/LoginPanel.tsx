@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import VaultDoor from "@/components/VaultDoor";
-import { login, register } from "@/lib/api";
+import { login, register, resendVerification } from "@/lib/api";
 
 export default function LoginPanel() {
   const router = useRouter();
@@ -17,12 +17,18 @@ export default function LoginPanel() {
   // instead, and the panel switches back to the login form.
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // T12.4.4: with ENV=prod (REQUIRE_EMAIL_VERIFICATION defaults on), an unverified account
+  // cannot log in at all -- and has no session, so /account's own "Resend verification"
+  // button is unreachable too. Offering it right here, on the exact failed-login error, is
+  // the only UI path left to request a fresh email without one.
+  const [showResend, setShowResend] = useState(false);
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setError(null);
     setMessage(null);
+    setShowResend(false);
     try {
       if (mode === "login") {
         await login(email, password);
@@ -37,9 +43,22 @@ export default function LoginPanel() {
       setMode("login");
       setPassword("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
+      const detail = err instanceof Error ? err.message : "Something went wrong";
+      setError(detail);
+      if (mode === "login" && detail === "email not verified") setShowResend(true);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function onResend() {
+    setMessage(null);
+    try {
+      const res = await resendVerification(email);
+      setMessage(res.detail);
+      setShowResend(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong");
     }
   }
 
@@ -80,6 +99,15 @@ export default function LoginPanel() {
           />
           {message && <p className="text-xs text-vault-steel">{message}</p>}
           {error && <p className="text-xs text-vault-danger">{error}</p>}
+          {showResend && (
+            <button
+              type="button"
+              onClick={onResend}
+              className="w-fit cursor-pointer text-xs tracking-[0.1em] text-vault-steel-dark transition-colors hover:text-vault-steel"
+            >
+              Resend verification email
+            </button>
+          )}
           <button
             type="submit"
             disabled={busy}

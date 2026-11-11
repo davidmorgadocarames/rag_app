@@ -148,6 +148,11 @@ the whole repo), but the shared name risked confusing whoever removes that GitHu
 12a-P. Renamed to `EMAIL_LINK_BASE_URL` / `Settings.email_link_base_url`; no compatibility
 break (nothing in `.env`, compose or CD ever set the old name for the backend).
 
+**12b-B follow-up:** renamed again, to `PUBLIC_APP_URL` / `Settings.public_app_url`, once
+T12.4.5 built the frontend's own `/verify`/`/reset` pages and the link had to point there
+instead of at the backend directly (the field's whole reason to exist). Same
+"no compatibility break" note applies.
+
 ## Promotion (12a) — decisions taken at deploy time
 
 - **DEC-016 = A — new secrets in place.** `CSRF_SECRET` and `CLIENT_IP_HMAC_KEYS` were added

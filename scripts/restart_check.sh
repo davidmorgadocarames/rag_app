@@ -85,8 +85,16 @@ export CSRF_SECRET="${CSRF_SECRET:-$(python3 -c 'import secrets; print(secrets.t
 # default below) since 12a-C's validate_api_settings change -- same throwaway-value pattern
 # as CSRF_SECRET/JWT_SECRET, else the backend refuses to start and every `up` step here fails.
 export CLIENT_IP_HMAC_KEYS="${CLIENT_IP_HMAC_KEYS:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}"
+# LOCKOUT_HMAC_SECRET (T12.4.2): required like CSRF_SECRET/JWT_SECRET, else the backend
+# refuses to start and every `up` step here fails.
+export LOCKOUT_HMAC_SECRET="${LOCKOUT_HMAC_SECRET:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')}"
 export DATA_MASTER_KEY="${DATA_MASTER_KEY:-$(new_master_key)}"
 export ENV="${ENV:-prod}"
+# REQUIRE_EMAIL_VERIFICATION (T12.4.4): defaults to true with ENV=prod unless set
+# explicitly -- this script tests data persistence across a restart, not the email flow
+# (no Mailpit here), so its dedicated throwaway account must be able to log in right after
+# registering without ever verifying.
+export REQUIRE_EMAIL_VERIFICATION="${REQUIRE_EMAIL_VERIFICATION:-false}"
 original_key="$DATA_MASTER_KEY"
 
 # resolved_volumes <project> [key]: the volume names compose resolves for that project (all,
@@ -234,9 +242,13 @@ say "migrate one-shot: exited 0, alembic $head"
 
 # --- 3. account + one encrypted message -----------------------------------------------------
 res="$(http POST /auth/register - "$creds")"
-[ "$(status_of "$res")" = 201 ] || fail "register" "HTTP $(status_of "$res") on /auth/register"
-token="$(body_of "$res" | json_get access_token)"
+[ "$(status_of "$res")" = 202 ] || fail "register" "HTTP $(status_of "$res") on /auth/register"
 say "registered a dedicated throwaway account"
+# T12.4.4: register no longer opens a session -- log in explicitly for the token
+# (REQUIRE_EMAIL_VERIFICATION=false above: this script never verifies the address).
+res="$(http POST /auth/login - "$creds")"
+[ "$(status_of "$res")" = 200 ] || fail "register" "HTTP $(status_of "$res") on /auth/login right after register"
+token="$(body_of "$res" | json_get access_token)"
 
 stream="$(curl -sS -N -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
             --data '{"question": "hello"}' "$API/chat/stream")"

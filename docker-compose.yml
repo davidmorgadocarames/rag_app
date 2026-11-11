@@ -154,6 +154,9 @@ services:
       OLLAMA_HOST: ${CONTAINER_OLLAMA_HOST:-http://host.docker.internal:11434}
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
       CSRF_SECRET: ${CSRF_SECRET:?set CSRF_SECRET}
+      # Login lockout (T12.4.2): required like JWT_SECRET/CSRF_SECRET (always, not only with
+      # ENV=prod) -- a throwaway dev value is fine, never a real secret.
+      LOCKOUT_HMAC_SECRET: ${LOCKOUT_HMAC_SECRET:?set LOCKOUT_HMAC_SECRET}
       # Signed client IP (T12.1.6): empty is fine locally (the feature degrades to the
       # connection address, no event) -- set the SAME value as the frontend's below to adopt
       # it end to end.
@@ -171,6 +174,9 @@ services:
       # Azure, which has no SMTP in 12a). Unset (empty host) keeps the old dev no-op path.
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
+      # T12.4.5: verification/reset links point at the FRONTEND's own pages (never the
+      # backend directly) -- see rag_app.emailer / app/verify, app/reset.
+      PUBLIC_APP_URL: http://localhost:3000
     # Built in on Docker Desktop; needed on a plain Linux engine.
     extra_hosts:
       - "host.docker.internal:host-gateway"

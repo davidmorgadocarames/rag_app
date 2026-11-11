@@ -217,6 +217,28 @@ catalogue analysis; this is the implementation summary.
   falls back to the shared address, so `login:<email>:<ip>` collapses to `login:<email>`
   for that path; not worse than the old pure-IP keying, closes fully once the backend's
   ingress goes internal (12b).
+- **Constant-time login, lockout, password policy, register/verify contract** (12b-B,
+  T12.4.1-T12.4.5, F3/F5/F10/F11, OWASP-A07/API-2/API-6): `login` runs `verify_password`
+  against a REAL argon2 hash whether the account exists or not (`rag_app.security.
+  dummy_password_hash`), so argon2's own cost dominates either path (timing-proven,
+  `backend/tests/test_security.py::test_login_timing_does_not_distinguish_a_real_account_
+  from_a_missing_one`). `rag_app.lockout` keys a per-account exponential-back-off counter by
+  `HMAC(LOCKOUT_HMAC_SECRET, email)` (never `user_id` — an attempt against an unregistered
+  address is throttled the same as a real one), checked-and-incremented in one atomic
+  `INSERT … ON CONFLICT DO UPDATE` (X10, REC-05); deleted in the erasure request path while
+  the email is still known, plus a 30-day age-based retention sweep in the purger.
+  `rag_app.password_policy` enforces >= 12 chars, the NCSC/SecLists breach list and "not the
+  email's own local part" (licence note in the module). `register` returns a generic 202
+  whatever happened server-side (new account, already-registered, or a race between two
+  registrations of the same address) — never a 409 — and opens **no session** any more
+  (an unverified account has nothing useful to do yet); `resend-verification` moved from an
+  authenticated call to an email-addressed one for the same reason. `REQUIRE_EMAIL_
+  VERIFICATION` now defaults to `true` with `ENV=prod` unless set explicitly. `/auth/verify`
+  moved from a mutating GET (query-string token) to a POST (body token, T12.4.5) — the
+  frontend's `/verify`/`/reset` pages (`PUBLIC_APP_URL`) are what a GET actually renders; a
+  mail scanner pre-fetching the emailed link can no longer consume anything. DEBT-034's
+  design note (does not close it — closes at T12.6b.5) and REC-05 are in
+  `docs/security/THREAT_MODEL.md`.
 - **Roles + permission map + admin MFA** (`rag_app.authz`, T12.3.2/T12.3.2b/T12.3.3/T12.3.4/
   T12.3.5): `users.role` stays `user`/`admin` (CHECK constraint, migration 0006); every
   protected route declares a **permission** (`require_permission("admin:read")`), never a
