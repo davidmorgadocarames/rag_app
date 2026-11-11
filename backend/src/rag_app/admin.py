@@ -22,11 +22,10 @@ from sqlalchemy.orm import Session
 
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.db.models import User, UserKey
+from rag_app.password_policy import validate_password
 from rag_app.security import hash_password
 
 ADMIN_ROLE = "admin"
-MIN_PASSWORD_LENGTH = 12  # T12.4.3 brings the full NCSC-list policy; this is a sane floor
-# for a bootstrap tool used before that lands.
 
 
 class AdminCreateError(RuntimeError):
@@ -54,11 +53,15 @@ def create_admin(session: Session, email: str, password: str) -> User:
     return user
 
 
-def _prompt_password() -> str:
+def _prompt_password(email: str) -> str:
+    """T12.4.3: the SAME password policy as a normal registration (``rag_app.password_policy``,
+    checked against the email already entered) -- an admin account is never exempt."""
     while True:
         password = getpass.getpass("Password: ")
-        if len(password) < MIN_PASSWORD_LENGTH:
-            print(f"password must be at least {MIN_PASSWORD_LENGTH} characters", file=sys.stderr)
+        problems = validate_password(password, email)
+        if problems:
+            for problem in problems:
+                print(problem, file=sys.stderr)
             continue
         confirm = getpass.getpass("Confirm password: ")
         if password != confirm:
@@ -78,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     email = args.email or input("Email: ").strip()
-    password = _prompt_password()
+    password = _prompt_password(email)
 
     from rag_app.db.session import make_engine
 

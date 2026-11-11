@@ -11,21 +11,24 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from rag_app import lockout
 from rag_app import sessions as session_service
 from rag_app.api.deps import SessionDep, SignupTrackerDep, rate_limit_login
 from rag_app.api.schemas import (
     LoginRequest,
     MessageResponse,
     RegisterRequest,
+    ResendVerificationRequest,
     ResendVerificationResponse,
     TokenResponse,
     UserOut,
+    VerifyEmailRequest,
 )
 from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.csrf import CSRF_COOKIE_NAME, csrf_token, require_csrf, require_origin
 from rag_app.db.models import EmailVerificationToken, User, UserKey
-from rag_app.emailer import send_verification_email
+from rag_app.emailer import send_already_registered_email, send_verification_email
 from rag_app.erasure import (
     ERASURE_ACCEPTED_MESSAGE,
     ERASURE_RETRY_AFTER_SECONDS,
@@ -36,11 +39,20 @@ from rag_app.risk import is_high_risk, signup_risk_score
 from rag_app.security import (
     create_token,
     decode_token,
+    dummy_password_hash,
     generate_verification_token,
     hash_password,
     hash_token,
     verify_password,
 )
+
+# T12.4.4: the SAME response, worded the same way, whatever happened server-side (a brand
+# new account, an address that already has one, or a race between two registrations of the
+# same address) -- the only way the caller ever learns an address already has an account is
+# by actually owning its inbox (send_already_registered_email), never from this response.
+GENERIC_REGISTER_MESSAGE = "If that address can be used to register, you'll receive an email."
+GENERIC_RESEND_MESSAGE = "If that address needs verifying, you'll receive an email."
+EMAIL_VERIFICATION_TOKEN_TTL = dt.timedelta(hours=24)
 
 router = APIRouter()
 _bearer = HTTPBearer(auto_error=False)
@@ -146,24 +158,30 @@ CurrentUserDep = Annotated[User, Depends(get_current_user)]
 
 @router.post(
     "/auth/register",
-    response_model=TokenResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=MessageResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_origin)],
 )
 def register(
     request: RegisterRequest,
     http: Request,
-    response: Response,
     session: SessionDep,
     tracker: SignupTrackerDep,
-) -> TokenResponse:
+) -> MessageResponse:
+    """T12.4.4: a generic 202 whatever the outcome (new account, an address that already
+    has one, or a race between two registrations of the same address) -- never a 409, and
+    NO session/token on success any more (F3/F11, user enumeration): the account must be
+    verified by email before it can do anything, so there is nothing useful to log in as
+    yet. See GENERIC_REGISTER_MESSAGE."""
     ip = http.client.host if http.client else "unknown"
     if is_high_risk(signup_risk_score(request.email, tracker.count(ip))):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "signup blocked by risk check")
 
     existing = session.scalar(select(User).where(User.email == request.email))
     if existing is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
+        tracker.record(ip)
+        send_already_registered_email(request.email)
+        return MessageResponse(detail=GENERIC_REGISTER_MESSAGE)
 
     raw_token = generate_verification_token()
     try:
@@ -175,32 +193,35 @@ def register(
             EmailVerificationToken(
                 user_id=user.id,
                 token_hash=hash_token(raw_token),
-                expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=24),
+                expires_at=dt.datetime.now(dt.UTC) + EMAIL_VERIFICATION_TOKEN_TTL,
             )
         )
-        # T12.1.3: register opens a session in 12a, same UX as today (the response still
-        # carries the JWT too — the rollback path, TF10).
-        raw_session = session_service.create_session(session, user)
         session.commit()
     except IntegrityError:
         # A concurrent registration of the same address won the race (double click): the
-        # unique index said no. Same answer as the check above, and nothing is logged — the
-        # driver's message carries the address in Postgres' DETAIL line (DA-G2-1).
+        # unique index said no. Same generic answer as the "already exists" branch above --
+        # never a different one for the racing case, and nothing is logged (the driver's
+        # message carries the address in Postgres' DETAIL line, DA-G2-1).
         session.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered") from None
+        tracker.record(ip)
+        send_already_registered_email(request.email)
+        return MessageResponse(detail=GENERIC_REGISTER_MESSAGE)
 
     send_verification_email(request.email, raw_token)
     tracker.record(ip)
-    set_session_cookie(response, raw_session)
-    set_csrf_cookie(response, raw_session)
-    return TokenResponse(access_token=create_token(str(user.id)))
+    return MessageResponse(detail=GENERIC_REGISTER_MESSAGE)
 
 
-@router.get("/auth/verify", response_model=MessageResponse)
-def verify_email(token: str, session: SessionDep) -> MessageResponse:
+@router.post("/auth/verify", response_model=MessageResponse, dependencies=[Depends(require_origin)])
+def verify_email(request: VerifyEmailRequest, session: SessionDep) -> MessageResponse:
+    """T12.4.5: POST, not a GET query param -- the frontend's `/verify?token=...` page (a
+    plain GET, safe to pre-fetch) only renders; this is the request its own button click
+    issues. A mail scanner that pre-fetches the GET link can never consume the token."""
     now = dt.datetime.now(dt.UTC)
     record = session.scalar(
-        select(EmailVerificationToken).where(EmailVerificationToken.token_hash == hash_token(token))
+        select(EmailVerificationToken).where(
+            EmailVerificationToken.token_hash == hash_token(request.token)
+        )
     )
     if record is None or record.used_at is not None or record.expires_at < now:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired token")
@@ -219,30 +240,33 @@ def verify_email(token: str, session: SessionDep) -> MessageResponse:
 @router.post(
     "/auth/resend-verification",
     response_model=ResendVerificationResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[Depends(require_origin)],
 )
-def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVerificationResponse:
-    """Issue a fresh verification token. The link never travels in this response, in any
-    environment (T12.1.11) — only by email (Mailpit locally, DA-G2-5): without SMTP anyone
-    could otherwise verify an address they do not own."""
-    if user.email_verified:
-        return ResendVerificationResponse(detail="Email already verified.")
-    if user.email is None:  # scrubbed by erasure (0005); nothing to send to
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "account has no email address")
-    raw_token = generate_verification_token()
-    session.add(
-        EmailVerificationToken(
-            user_id=user.id,
-            token_hash=hash_token(raw_token),
-            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(hours=24),
-        )
+def resend_verification(
+    request: ResendVerificationRequest, session: SessionDep
+) -> ResendVerificationResponse:
+    """T12.4.4: reached by email, not by an authenticated session -- a freshly registered
+    (unverified) account has no session any more (no session on register), so it could
+    never call an authenticated resend. Same generic response whatever the outcome (no
+    account, already verified, or a fresh token actually issued): see GENERIC_RESEND_MESSAGE.
+    The link never travels in this response, in any environment (T12.1.11) -- only by email
+    (Mailpit locally, DA-G2-5): without SMTP anyone could otherwise verify an address they do
+    not own."""
+    user = session.scalar(
+        select(User).where(User.email == request.email, User.deleted_at.is_(None))
     )
-    session.commit()
-    send_verification_email(user.email, raw_token)
-    settings = get_settings()
-    if settings.smtp_host:
-        return ResendVerificationResponse(detail="Verification email sent.")
-    return ResendVerificationResponse(detail="Verification email requested.")
+    if user is not None and not user.email_verified and user.email is not None:
+        raw_token = generate_verification_token()
+        session.add(
+            EmailVerificationToken(
+                user_id=user.id,
+                token_hash=hash_token(raw_token),
+                expires_at=dt.datetime.now(dt.UTC) + EMAIL_VERIFICATION_TOKEN_TTL,
+            )
+        )
+        session.commit()
+        send_verification_email(user.email, raw_token)
+    return ResendVerificationResponse(detail=GENERIC_RESEND_MESSAGE)
 
 
 @router.post(
@@ -251,17 +275,41 @@ def resend_verification(user: CurrentUserDep, session: SessionDep) -> ResendVeri
     dependencies=[Depends(require_origin), Depends(rate_limit_login)],
 )
 def login(request: LoginRequest, session: SessionDep, response: Response) -> TokenResponse:
+    """T12.4.1 (constant-time, F3 user enumeration via timing) + T12.4.2 (lockout, F5/API-6).
+
+    A dummy argon2 verify runs on EVERY failing path (no such email, no password hash, or a
+    real but wrong one) so the argon2 cost is paid identically whether the email exists or
+    not (``rag_app.security.dummy_password_hash``). The lockout counter (X10, one atomic
+    statement, ``rag_app.lockout``) is kept BEFORE the email-verification gate so a correct
+    password always clears it, but only incremented on an actually wrong credential --
+    never on a correct-password-but-unverified attempt, which proves nothing malicious."""
+    settings = get_settings()
+    lock = lockout.locked_until(session, settings.lockout_hmac_secret, request.email)
+    if lock is not None and lock > dt.datetime.now(dt.UTC):
+        retry_after = max(1, int((lock - dt.datetime.now(dt.UTC)).total_seconds()))
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "too many failed attempts; account temporarily locked",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     user = session.scalar(
         select(User).where(User.email == request.email, User.deleted_at.is_(None))
     )
-    if (
-        user is None
-        or user.password_hash is None  # scrubbed by erasure (0005)
-        or not verify_password(request.password, user.password_hash)
-    ):
+    password_hash = (
+        user.password_hash
+        if user is not None and user.password_hash is not None
+        else dummy_password_hash()
+    )
+    valid = verify_password(request.password, password_hash)
+    if user is None or user.password_hash is None or not valid:
+        lockout.record_failed_login(session, settings.lockout_hmac_secret, request.email)
+        session.commit()
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
-    if get_settings().require_email_verification and not user.email_verified:
+    if settings.require_email_verification and not user.email_verified:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "email not verified")
+
+    lockout.clear_lockout(session, settings.lockout_hmac_secret, request.email)
     # T12.1.3: login still returns the JWT (rollback path, TF10) and also opens a session.
     raw_session = session_service.create_session(session, user)
     session.commit()

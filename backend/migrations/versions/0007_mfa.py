@@ -1,4 +1,5 @@
-"""admin MFA (expand): TOTP secret + single-use recovery codes (T12.3.4, "part 1").
+"""admin MFA + login lockout (expand): TOTP secret + recovery codes (T12.3.4, "part 1") and
+the login lockout counter (T12.4.2, "part 2").
 
 Revision ID: 0007_mfa
 Revises: 0006_sessions_role
@@ -7,14 +8,14 @@ Create Date: 2026-11-10
 Expand-only (docs/DEFINITION_OF_DONE.md, "Expand/contract"): every change is additive or
 relaxes a constraint, so the previous image keeps working on the migrated schema.
 
-Authored for 12b-A (T12.3.4, "part 1": TOTP secret + recovery codes). ``0006 is NOT edited``
-(it is 12a's file, already shipped). Later 12b blocks on the SAME branch EXTEND THIS FILE
-with their own part before it is ever merged to ``main``:
-  - 12b-B (T12.4.2, "part 2"): lockout table, keyed by ``HMAC(secret, email)``.
-  - 12b-C (T12.4.6, "part 3"): password reset tokens.
-Each part adds its own ``CREATE TABLE``/grants in ``upgrade()``, its own teardown in
-``downgrade()`` (leaf-first, mirroring ``upgrade``), and its own purge-step registration in
-``rag_app.erasure.PURGE_STEPS`` -- never touching the other parts' statements.
+Authored for 12b-A (T12.3.4, "part 1": TOTP secret + recovery codes); 12b-B (T12.4.2, "part
+2": login lockout) EXTENDS THIS SAME FILE -- 0007 is not promoted to `main` yet, so there is
+no new revision number for part 2 (0008 is reserved for Phase 13). ``0006 is NOT edited``
+(it is 12a's file, already shipped). 12b-C (T12.4.6, "part 3": password reset tokens) will
+extend this same file again before the branch is ever merged to ``main``. Each part adds its
+own ``CREATE TABLE``/grants in ``upgrade()``, its own teardown in ``downgrade()`` (leaf-first,
+mirroring ``upgrade``), and its own purge-step registration (or X3 exemption) -- never
+touching the other parts' statements.
 
 ``user_mfa`` is a one-row-per-user table (like ``user_keys``): ``secret_encrypted`` is the
 TOTP secret wrapped with ``DATA_MASTER_KEY`` (``rag_app.crypto``, same crypto-shred guarantee
@@ -82,6 +83,29 @@ PART1_REFUSE_DOWNGRADE_SQL = (
     "SELECT EXISTS (SELECT 1 FROM user_mfa) OR EXISTS (SELECT 1 FROM mfa_recovery_codes)"
 )
 
+# --- part 2 (T12.4.2, 12b-B): login lockout --------------------------------------------
+
+# Keyed by HMAC(LOCKOUT_HMAC_SECRET, email) -- rag_app.lockout.lockout_key -- never a
+# user_id FK: a lockout row can legitimately exist for an email that is not (or is no
+# longer) a registered account (enumeration-safe throttling, F5/API-6). See
+# rag_app.erasure.X3_EXEMPTIONS for why this has no PURGE_STEPS entry.
+LOGIN_LOCKOUTS_TABLE = """
+    CREATE TABLE login_lockouts (
+        email_hmac varchar PRIMARY KEY,
+        failed_count integer NOT NULL DEFAULT 0,
+        locked_until timestamptz,
+        updated_at timestamptz NOT NULL DEFAULT now()
+    )"""
+
+# No secrag_backup UPDATE needed: the retention purge below fully DELETEs stale rows, it
+# never partially updates one. secrag_purger needs only SELECT (to find candidates) + DELETE.
+PART2_GRANTS = (
+    "GRANT SELECT, DELETE ON login_lockouts TO secrag_purger",
+    "GRANT SELECT ON login_lockouts TO secrag_backup",
+)
+
+PART2_REFUSE_DOWNGRADE_SQL = "SELECT EXISTS (SELECT 1 FROM login_lockouts)"
+
 
 def _require_roles() -> None:
     bind = op.get_bind()
@@ -111,11 +135,22 @@ def upgrade() -> None:
     for grant in PART1_GRANTS:
         op.execute(grant)
 
-    # 12b-B (part 2, lockout) and 12b-C (part 3, reset tokens) add their CREATE TABLE/grants
-    # here, below this line -- never above (leaf-first ordering of downgrade mirrors it).
+    # --- part 2 (T12.4.2): login lockout ---
+    op.execute(LOGIN_LOCKOUTS_TABLE)
+    for grant in PART2_GRANTS:
+        op.execute(grant)
+
+    # 12b-C (part 3, reset tokens) adds its CREATE TABLE/grants here, below this line --
+    # never above (leaf-first ordering of downgrade mirrors it).
 
 
 def downgrade() -> None:
+    if op.get_bind().execute(text(PART2_REFUSE_DOWNGRADE_SQL)).scalar_one():
+        raise RuntimeError(
+            "refusing to downgrade 0007: a login lockout row exists. The downgrade is not a"
+            " rollback path once that data exists — roll back images instead (ADR phase 11,"
+            " Rollback)."
+        )
     if op.get_bind().execute(text(PART1_REFUSE_DOWNGRADE_SQL)).scalar_one():
         raise RuntimeError(
             "refusing to downgrade 0007: an MFA enrolment or recovery code exists. The"
@@ -123,6 +158,9 @@ def downgrade() -> None:
             " instead (ADR phase 11, Rollback)."
         )
 
+    # Leaf-first, mirroring upgrade() in reverse: part 2 before part 1.
+    op.execute("REVOKE ALL ON login_lockouts FROM secrag_purger, secrag_backup")
+    op.execute("DROP TABLE IF EXISTS login_lockouts")
     op.execute("REVOKE ALL ON mfa_recovery_codes FROM secrag_purger, secrag_backup")
     op.execute("DROP TABLE IF EXISTS mfa_recovery_codes")
     op.execute("REVOKE ALL ON user_mfa FROM secrag_purger, secrag_backup")

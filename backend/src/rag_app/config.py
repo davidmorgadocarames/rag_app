@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from types import UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Development-only features (PHASE_PLANNING §1 rule 2, "fail-closed flags"): fake LLM
@@ -235,7 +235,19 @@ class Settings(JobSettings):
     jwt_expires_minutes: int = 30
     # Master key (urlsafe base64, 32 bytes) that wraps per-user data keys. Set in .env.
     data_master_key: str = ""
+    # T12.4.4: the DEFAULT depends on ENV (see `_default_require_email_verification_with_prod`
+    # below) -- off in dev, on in prod, unless explicitly set either way (model_fields_set,
+    # same pattern as `_database_url_problem`'s "explicitly set" check). An explicit
+    # REQUIRE_EMAIL_VERIFICATION=false in ENV=prod is still honoured (e.g. a demo account
+    # runbook step) -- this only fills in a sane default, never overrides one.
     require_email_verification: bool = False  # gate login on a verified email when true
+    # Lockout (0007 "part 2", T12.4.2): HMAC key for `rag_app.lockout`'s per-account key —
+    # never the email itself, and never shared with JWT_SECRET/CSRF_SECRET (domain
+    # separation between unrelated secrets, same reasoning as those two staying separate).
+    # Always required (like JWT_SECRET/CSRF_SECRET, not only with ENV=prod): the lockout
+    # counter must work the same way in dev and prod, so a developer who forgets to set it
+    # finds out immediately (validate_api_settings), not only once ENV=prod.
+    lockout_hmac_secret: str = ""
     # CSRF (T12.1.4, P12-D2, DEC-010 = A): HMAC key for the double-submit token bound to the
     # session id. Same fail-fast treatment as JWT_SECRET (validate_api_settings) -- always
     # required, at least JWT_SECRET_MIN_LENGTH characters, never a real secret in .env.example.
@@ -260,16 +272,16 @@ class Settings(JobSettings):
     # --- Frontend ---
     frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
 
-    # --- Email verification link (DEBT-035 / DA-12aD-2) ---
-    # Base URL used ONLY to build the link emailer.py puts in the verification e-mail
-    # (`{base}/auth/verify?token=...`). Historically named `NEXT_PUBLIC_API_URL`, which
-    # collided with the (unrelated, frontend build-time) env var of the same name that
-    # T12.1.7 already removed from the frontend/CD -- this field was never actually read
-    # from that GitHub Actions variable (it reads the *process* env of the backend
-    # container only), but the shared name could confuse whoever removes that GitHub
-    # variable at 12a-P. Renamed here; no compatibility break (grepped: no `.env`, compose
-    # service or CD workflow ever set `NEXT_PUBLIC_API_URL` for the *backend*).
-    email_link_base_url: str = Field(default="http://localhost:8000")
+    # --- Email verification/reset links (DEBT-035 / DA-12aD-2; renamed T12.4.5) ---
+    # Base URL used ONLY to build the links emailer.py puts in verification/reset e-mails —
+    # `{base}/verify?token=...`, `{base}/reset?token=...`. T12.4.5 points these at the
+    # FRONTEND's own `/verify`/`/reset` pages (a GET renders the page; a button there POSTs
+    # the token, so a mail scanner pre-fetching the GET link can never consume it) instead of
+    # the backend directly -- the previous field (`email_link_base_url`, default
+    # "http://localhost:8000", the backend's own port) predates those pages. Renamed to
+    # `public_app_url`/`PUBLIC_APP_URL` to say so plainly; no other code read the old name
+    # (grepped). Default now the frontend's dev port.
+    public_app_url: str = Field(default="http://localhost:3000")
 
     # --- Metrics (T11.3.2, TF4) ---
     # Prometheus histograms + the in-flight gauge are served on this SEPARATE internal
@@ -287,6 +299,17 @@ class Settings(JobSettings):
     # ever targets port 8000, so this setting cannot make the metrics port internet-reachable
     # either way — see the runbook / ADR phase 11 decision 8).
     metrics_bind_addr: str = "0.0.0.0"  # noqa: S104 - see the comment above
+
+    @model_validator(mode="after")
+    def _default_require_email_verification_with_prod(self) -> Settings:
+        """T12.4.4: ``require_email_verification`` defaults to ``True`` with ``ENV=prod`` and
+        stays ``False`` with ``ENV=dev`` -- but only fills in the default; an explicit value
+        (env var, ``.env``, constructor kwarg -- anything ``model_fields_set`` records) is
+        always honoured, in either direction. Same "explicitly set" pattern as
+        ``_database_url_problem``'s check on ``database_url``."""
+        if self.env == "prod" and "require_email_verification" not in self.model_fields_set:
+            self.require_email_verification = True
+        return self
 
 
 def get_settings() -> Settings:
@@ -324,6 +347,7 @@ def validate_api_settings(settings: Settings) -> None:
 
     Checks ``DATABASE_URL`` (a PostgreSQL URL; explicitly set when ``ENV=prod``),
     ``JWT_SECRET`` (at least 32 characters), ``CSRF_SECRET`` (same length rule, T12.1.4),
+    ``LOCKOUT_HMAC_SECRET`` (same length rule, T12.4.2),
     ``DATA_MASTER_KEY`` (a valid Fernet key) and ``ENV`` (``dev``/``prod``),
     ``DAILY_ANSWER_CAP`` (never negative; positive with ``ENV=prod``),
     ``EMBED_TIMEOUT_SECONDS`` (always positive, and at most ``EMBED_TIMEOUT_MAX_SECONDS`` --
@@ -342,6 +366,8 @@ def validate_api_settings(settings: Settings) -> None:
         problems.append(f"JWT_SECRET must be at least {JWT_SECRET_MIN_LENGTH} characters")
     if len(settings.csrf_secret) < JWT_SECRET_MIN_LENGTH:
         problems.append(f"CSRF_SECRET must be at least {JWT_SECRET_MIN_LENGTH} characters")
+    if len(settings.lockout_hmac_secret) < JWT_SECRET_MIN_LENGTH:
+        problems.append(f"LOCKOUT_HMAC_SECRET must be at least {JWT_SECRET_MIN_LENGTH} characters")
     if settings.env == "prod" and not any(
         k.strip() for k in settings.client_ip_hmac_keys.split(",")
     ):

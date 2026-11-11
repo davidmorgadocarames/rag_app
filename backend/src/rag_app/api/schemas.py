@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from rag_app.password_policy import validate_password
 
 
 class StrictModel(BaseModel):
@@ -43,12 +45,36 @@ class ChatResponse(BaseModel):
 
 class RegisterRequest(StrictModel):
     email: str = Field(min_length=3, max_length=255)
-    password: str = Field(min_length=8, max_length=256)
+    # The real floor/ceiling (T12.4.3: >= 12, <= 256, NCSC-list check, must not contain the
+    # email local part) is `rag_app.password_policy.validate_password`, below -- this Field's
+    # own bound is only a cheap backstop against an absurdly long body.
+    password: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _check_password_policy(self) -> RegisterRequest:
+        problems = validate_password(self.password, self.email)
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
 
 
 class LoginRequest(StrictModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=1, max_length=256)
+
+
+class ResendVerificationRequest(StrictModel):
+    # T12.4.4: resend is now reached by email, not by an authenticated session -- a freshly
+    # registered (unverified) account has no session to authenticate with any more (no
+    # session on register). Same shape/length bound as RegisterRequest.email.
+    email: str = Field(min_length=3, max_length=255)
+
+
+class VerifyEmailRequest(StrictModel):
+    # T12.4.5: POST, not a GET query param -- a mail scanner pre-fetching the frontend's
+    # /verify?token=... link (a plain GET) can never consume the token; only the page's own
+    # button click issues this POST.
+    token: str = Field(min_length=1, max_length=512)
 
 
 class TokenResponse(BaseModel):

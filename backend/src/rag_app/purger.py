@@ -90,6 +90,9 @@ class RunResult:
     problems: list[str] = field(default_factory=list)
     errors: int = 0
     last_error: str | None = None
+    # T12.4.2: login_lockouts rows older than the retention window and not currently locked
+    # -- an age-based sweep, not a per-tombstone PURGE_STEPS entry (no user_id to batch by).
+    lockouts_purged: int = 0
     # After the run (DA-G1-1, DA-G1-8): tombstones still open, and those open for more than
     # PURGE_DEADLINE_HOURS; None when they could not be counted (that is an error).
     open_left: int | None = None
@@ -129,6 +132,7 @@ class RunResult:
             f"rows deleted: {rows}",
             f"{self.batches} batch transaction(s), longest {self.max_transaction_seconds:.3f} s,"
             f" {self.backoffs} back-off(s)",
+            f"login lockouts purged (retention): {self.lockouts_purged}",
             f"export: {self.export or 'none'}; pruned {len(self.pruned)} old export(s)",
             still_open,
         ]
@@ -394,6 +398,13 @@ class Purger:
                 elif outcome == "stopped":
                     result.stopped += 1
                     break
+            try:
+                from rag_app.lockout import purge_expired_lockouts
+
+                result.lockouts_purged = purge_expired_lockouts(self.engine)
+            except SQLAlchemyError as exc:
+                result.errors += 1
+                result.last_error = f"lockout retention purge: {_error_class(exc)}"
             if self.export is not None:
                 try:
                     result.export, result.pruned, result.problems = self.export.publish(self.engine)

@@ -15,6 +15,22 @@ from rag_app.config import get_settings
 _hasher = PasswordHasher()
 _ALGORITHM = "HS256"
 
+_dummy_password_hash: str | None = None
+
+
+def dummy_password_hash() -> str:
+    """T12.4.1: a REAL argon2 hash of a fixed, never-issued password -- computed once per
+    process (lazily, not at import time) and cached. ``login`` verifies against this hash
+    when no account matches the submitted email, so the argon2 cost is paid on exactly the
+    same code path whether the email exists or not: an attacker cannot time-distinguish
+    "no such account" from "wrong password" (F3, user enumeration via timing, OWASP-A07).
+    The random suffix only has to be stable within one process; it is never a real secret
+    and never compared against a real password."""
+    global _dummy_password_hash
+    if _dummy_password_hash is None:
+        _dummy_password_hash = _hasher.hash("not-a-real-account-" + secrets.token_hex(16))
+    return _dummy_password_hash
+
 
 def generate_verification_token() -> str:
     return secrets.token_urlsafe(32)

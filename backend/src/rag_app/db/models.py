@@ -278,6 +278,24 @@ class MfaRecoveryCode(Base):
     )
 
 
+class LoginLockout(Base):
+    """Login lockout counter (0007 "part 2", T12.4.2): keyed by
+    ``HMAC(LOCKOUT_HMAC_SECRET, email)`` (``rag_app.lockout.lockout_key``) -- NOT a
+    ``user_id`` FK, so a login attempt against an email that is not even a registered
+    account is throttled exactly like a real one (enumeration-safe). See
+    ``rag_app.lockout`` for the atomic counter/back-off and ``rag_app.erasure.
+    X3_EXEMPTIONS`` for why this table has no ``PURGE_STEPS`` entry."""
+
+    __tablename__ = "login_lockouts"
+
+    email_hmac: Mapped[str] = mapped_column(String, primary_key=True)
+    failed_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    locked_until: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class EmailVerificationToken(Base):
     __tablename__ = "email_verification_tokens"
 

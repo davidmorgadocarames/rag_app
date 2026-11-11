@@ -39,7 +39,9 @@ from sqlalchemy import CursorResult, Result, delete, exists, func, literal, sele
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from rag_app.config import get_settings
 from rag_app.db.models import DeletionRequest, User, UserKey, UserSession
+from rag_app.lockout import delete_lockout_for_email
 from rag_app.retention import BACKUP_RETENTION_DAYS, TOMBSTONE_EXPORT_RETENTION_DAYS
 
 # The promise of the 202 message (PHASE_PLANNING 11.2b): the purger removes the remaining
@@ -176,6 +178,11 @@ X3_EXEMPTIONS: dict[tuple[str, str], str] = {
     ("deletion_requests", "user_id"): "the opaque tombstone kept for replay after a restore",
     ("user_keys", "user_id"): "deleted in the request path's short transaction"
     " (crypto-shred); replay_deletions deletes it as the owner",
+    ("login_lockouts", "email_hmac"): "keyed by HMAC(secret, email), no user_id FK to batch a"
+    " per-account purge by (T12.4.2) -- deleted in the erasure request path's short"
+    " transaction while the email is still known (before it is scrubbed, see _short_step)"
+    " and by rag_app.lockout.purge_expired_lockouts' age-based retention sweep for rows"
+    " whose email was never registered or was already erased",
 }
 
 X3_SCAN_SQL = r"""
@@ -225,6 +232,14 @@ def _enqueue(session: Session, user_id: uuid.UUID, now: dt.datetime) -> None:
 def _short_step(session: Session, user_id: uuid.UUID, now: dt.datetime) -> bool:
     """Crypto-shred + PII scrub + ``deleted_at`` + tombstone ``pending`` (no commit).
     False when the user row does not exist."""
+    # T12.4.2: the lockout row is keyed by HMAC(secret, email) -- it must be deleted WHILE
+    # the email is still known, before the UPDATE below scrubs it (afterwards there is
+    # nothing left to recompute the key from). A plain read of the still-live email, not a
+    # TOCTOU-sensitive decision (nothing is mutated based on it) -- the scrub below is what
+    # actually commits the erasure.
+    live_email = session.scalar(select(User.email).where(User.id == user_id))
+    if live_email is not None:
+        delete_lockout_for_email(session, get_settings().lockout_hmac_secret, live_email)
     marked = session.execute(
         update(User)
         .where(User.id == user_id)
