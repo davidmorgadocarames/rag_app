@@ -172,20 +172,29 @@ def register(
     has one, or a race between two registrations of the same address) -- never a 409, and
     NO session/token on success any more (F3/F11, user enumeration): the account must be
     verified by email before it can do anything, so there is nothing useful to log in as
-    yet. See GENERIC_REGISTER_MESSAGE."""
+    yet. See GENERIC_REGISTER_MESSAGE.
+
+    DA-12bB-1 (F3/OWASP-A07, the TIMING half of user enumeration): the "already registered"
+    and "brand new account" outcomes must cost the same, not just look the same. There is no
+    upfront "does this email exist" SELECT any more -- every call pays the argon2 hash
+    unconditionally and ALWAYS attempts the same three inserts + flush + commit; an address
+    that already has an account only differs in that the unique index on ``users.email``
+    rejects the insert (``IntegrityError``, same branch a genuine registration race already
+    used), discarded by a rollback rather than detected in advance by a cheaper read. The two
+    outcomes are now the literal same code path up to that point, never a cheaper one for an
+    attacker to time against (``test_register_timing_does_not_distinguish_an_existing_account_
+    from_a_new_one``)."""
     ip = http.client.host if http.client else "unknown"
     if is_high_risk(signup_risk_score(request.email, tracker.count(ip))):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "signup blocked by risk check")
 
-    existing = session.scalar(select(User).where(User.email == request.email))
-    if existing is not None:
-        tracker.record(ip)
-        send_already_registered_email(request.email)
-        return MessageResponse(detail=GENERIC_REGISTER_MESSAGE)
-
+    # Paid on EVERY call, whatever the outcome turns out to be below -- same reasoning as
+    # login's dummy_password_hash (T12.4.1): an attacker must not be able to time-distinguish
+    # "already registered" from "new account" by the presence/absence of this argon2 call.
+    password_hash = hash_password(request.password)
     raw_token = generate_verification_token()
     try:
-        user = User(email=request.email, password_hash=hash_password(request.password))
+        user = User(email=request.email, password_hash=password_hash)
         session.add(user)
         session.flush()
         session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
@@ -198,10 +207,11 @@ def register(
         )
         session.commit()
     except IntegrityError:
-        # A concurrent registration of the same address won the race (double click): the
-        # unique index said no. Same generic answer as the "already exists" branch above --
-        # never a different one for the racing case, and nothing is logged (the driver's
-        # message carries the address in Postgres' DETAIL line, DA-G2-1).
+        # The address already has an account, OR a concurrent registration of it just won
+        # the race (double click) -- either way the unique index said no, discovered only
+        # now (never by a cheaper upfront read), and the response plus the email sent are
+        # the same as the race case always used. Nothing is logged (the driver's message
+        # carries the address in Postgres' DETAIL line, DA-G2-1).
         session.rollback()
         tracker.record(ip)
         send_already_registered_email(request.email)
