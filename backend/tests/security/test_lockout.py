@@ -16,6 +16,8 @@ import pytest
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
+from rag_app.db.models import User
+from rag_app.erasure import request_erasure
 from rag_app.lockout import (
     _RECORD_FAILURE_SQL,
     LOCKOUT_MAX_SECONDS,
@@ -181,6 +183,38 @@ def test_locked_until_and_clear_use_the_same_key(db_engine: Engine) -> None:
         clear_lockout(session, SECRET, email)
         session.commit()
         assert locked_until(session, SECRET, email) is None
+
+
+def test_erasure_deletes_the_login_lockouts_row_while_the_email_is_still_known(
+    db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-12bB-2: ``erasure._short_step`` deletes the ``login_lockouts`` row for the live
+    email BEFORE it is scrubbed (T12.4.2, X3_EXEMPTIONS). Unlike the key-reuse check above
+    (which calls ``lockout`` functions directly), this goes through a REAL registered user
+    and ``erasure.request_erasure`` end to end: fail a login (creating the row), erase the
+    account, and check the row for that user's ``email_hmac`` is gone."""
+    monkeypatch.setenv("LOCKOUT_HMAC_SECRET", SECRET)
+    email = _email()
+    with Session(db_engine) as session:
+        user = User(email=email, password_hash="not-a-real-hash-" + uuid.uuid4().hex)
+        session.add(user)
+        session.commit()
+        user_id = user.id
+
+        record_failed_login(session, SECRET, email)
+        session.commit()
+        key = lockout_key(SECRET, email)
+        row_before = session.execute(
+            text("SELECT 1 FROM login_lockouts WHERE email_hmac = :k"), {"k": key}
+        ).first()
+        assert row_before is not None  # sanity: the row exists before erasure
+
+        assert request_erasure(session, user_id) is True
+
+        row_after = session.execute(
+            text("SELECT 1 FROM login_lockouts WHERE email_hmac = :k"), {"k": key}
+        ).first()
+        assert row_after is None
 
 
 # --- retention purge -------------------------------------------------------------------------
