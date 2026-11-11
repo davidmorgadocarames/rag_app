@@ -332,9 +332,11 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         assert server.call("POST", "/auth/login", {"email": email, "password": password})[0] == 401
         time.sleep(0.2)
 
-    # register + resend-verification each issue one token (T12.4.4/T12.4.2 did not change
-    # how many -- only how resend is reached).
-    assert len(issued) == 2
+    # The first register (new account) and resend-verification each issue one REAL token;
+    # the second register (duplicate address, DA-12bB-1 cost-parity fix) also generates one
+    # now -- the same DB-write-shaped attempt the first one made, discarded by the rollback
+    # on the unique-index conflict, never stored or emailed. Three calls, not two.
+    assert len(issued) == 3
     assert len(session_cookies) == 1 and session_cookies[0]  # only the final login opens one
     names = {r.name for r in captured_logs.records}
     assert "uvicorn.access" in names and "sqlalchemy.engine.Engine" in names  # really captured
@@ -354,12 +356,12 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
 def test_a_racing_duplicate_sign_up_still_gets_the_generic_response_and_logs_no_email(
     db_engine: Engine, monkeypatch: pytest.MonkeyPatch, captured_logs: _Collect
 ) -> None:
-    """Two registrations of one address at once (double click): the API's existence check
-    passes for both, the unique index rejects the second INSERT. On Postgres the driver's
-    message carries ``DETAIL: Key (email)=(…) already exists`` — it must end as the SAME
-    generic 202 the "already exists" branch returns (T12.4.4, never a different response for
-    the racing case), never a 500 whose traceback prints the address (SQLite's message has
-    no value, so this runs on the real database)."""
+    """Two registrations of one address at once (double click): both attempt the same
+    insert (DA-12bB-1, no upfront existence check any more), the unique index rejects the
+    second one. On Postgres the driver's message carries ``DETAIL: Key (email)=(…) already
+    exists`` — it must end as the SAME generic 202 the "already exists" branch returns
+    (T12.4.4, never a different response for the racing case), never a 500 whose traceback
+    prints the address (SQLite's message has no value, so this runs on the real database)."""
     from sqlalchemy import create_engine, text
 
     from rag_app.api.app import create_app
