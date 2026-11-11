@@ -445,6 +445,11 @@ def run(args: argparse.Namespace) -> int:
             # the latter); without it this child API process refuses to start
             # ("CSRF_SECRET must be at least 32 characters"), found running --full for real.
             "CSRF_SECRET": secrets.token_urlsafe(48),
+            # LOCKOUT_HMAC_SECRET (T12.4.2): unconditionally required since 12b-B, same
+            # reasoning as JWT_SECRET/CSRF_SECRET above -- missed here on the same pattern
+            # as DEBT-033, found running --full for real ("LOCKOUT_HMAC_SECRET must be at
+            # least 32 characters").
+            "LOCKOUT_HMAC_SECRET": secrets.token_urlsafe(48),
             "ENV": "dev",
             "PYTHONPATH": str(BACKEND / "src"),
         }
