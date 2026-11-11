@@ -20,6 +20,7 @@
 import { expect, test } from "@playwright/test";
 
 import { openVaultDoor, uniqueEmail } from "./helpers.ts";
+import { extractToken, waitForEmailBody } from "./mailpit.ts";
 
 const SECURITY_QUESTION = "How do I prevent SQL injection?";
 // Real pipeline stage labels only (ChatPage's STAGE_LABELS), never chitchat's "Responding…".
@@ -36,6 +37,14 @@ test("register, one streamed chat turn, logout, then login again", async ({ page
   await page.getByPlaceholder("email").fill(email);
   await page.getByPlaceholder(/password/).fill(password);
   await page.getByRole("button", { name: "REGISTER" }).click();
+  // T12.4.4: no session on register any more -- the panel shows the generic response and
+  // switches back to the login form (same email already filled); sign in explicitly. ENV=dev
+  // (REQUIRE_EMAIL_VERIFICATION defaults off) lets an unverified account log in -- the
+  // dedicated Mailpit verify flow is its own test below, not every register here.
+  await expect(page.getByText(/you'll receive an email/i)).toBeVisible();
+  await page.getByPlaceholder("email").fill(email);
+  await page.getByPlaceholder(/password/).fill(password);
+  await page.getByRole("button", { name: "ENTER" }).click();
   await expect(page).toHaveURL(/\/chat$/);
 
   await page.getByPlaceholder("Ask a security question…").fill(SECURITY_QUESTION);
@@ -68,6 +77,43 @@ test("register, one streamed chat turn, logout, then login again", async ({ page
   await page.goto("/chat");
   await expect(page).toHaveURL(/\/login$/);
 
+  await openVaultDoor(page);
+  await page.getByPlaceholder("email").fill(email);
+  await page.getByPlaceholder(/password/).fill(password);
+  await page.getByRole("button", { name: "ENTER" }).click();
+  await expect(page).toHaveURL(/\/chat$/);
+});
+
+// T12.4.4/T12.4.5 ("verification via Mailpit in local/e2e"): register sends a real
+// verification email through the gate's own Mailpit (scripts/gate.sh's e2e_ensure_mailpit);
+// this proves the WHOLE link end to end -- the email actually arrives, its link points at
+// the frontend's /verify page (PUBLIC_APP_URL, not the backend), and the page's own button
+// click (a POST, never the GET that loaded the page) is what actually verifies the account.
+test("register, verify via Mailpit, then login reaches chat", async ({ page }) => {
+  const email = uniqueEmail();
+  const password = "correct-horse-battery-staple";
+  const apiBase = process.env.MAILPIT_API_URL;
+  if (!apiBase) throw new Error("MAILPIT_API_URL not set (scripts/gate.sh's step_e2e)");
+
+  await page.goto("/login");
+  await openVaultDoor(page);
+  await page.getByText("Need access? Register").click();
+  await page.getByPlaceholder("email").fill(email);
+  await page.getByPlaceholder(/password/).fill(password);
+  await page.getByRole("button", { name: "REGISTER" }).click();
+  await expect(page.getByText(/you'll receive an email/i)).toBeVisible();
+
+  const body = await waitForEmailBody(apiBase, email);
+  const token = extractToken(body);
+
+  // The email link's own GET only renders the page -- it is this explicit button click
+  // that issues the POST (T12.4.5: a mail scanner pre-fetching the GET link could never
+  // reach this click).
+  await page.goto(`/verify?token=${token}`);
+  await page.getByRole("button", { name: "VERIFY EMAIL" }).click();
+  await expect(page.getByText("Email verified. You can now log in.")).toBeVisible();
+
+  await page.goto("/login");
   await openVaultDoor(page);
   await page.getByPlaceholder("email").fill(email);
   await page.getByPlaceholder(/password/).fill(password);

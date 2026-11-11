@@ -33,6 +33,17 @@ services:
       timeout: 5s
       retries: 30
 
+  # T12.4.4 ("verification via Mailpit in local/e2e"): a local SMTP sink for the `e2e` step's
+  # register -> verify flow, brought up on demand by `e2e_start_backend` (not every gate step
+  # needs it). Same pinned image/digest as docker-compose.yml's `mailpit` service, different
+  # host ports so this can run alongside the development stack. No volume (ephemeral inbox --
+  # a fresh one each gate run is fine, e2e always registers a fresh throwaway account).
+  mailpit:
+    image: axllent/mailpit@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
+    ports:
+      - "127.0.0.1:${GATE_MAILPIT_SMTP_PORT:-11025}:1025"
+      - "127.0.0.1:${GATE_MAILPIT_API_PORT:-18026}:8025"
+
 volumes:
   gate_pgdata:
     name: secrag_gate_pgdata

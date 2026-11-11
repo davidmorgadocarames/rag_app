@@ -62,6 +62,12 @@ GATE_DB_PORT="${GATE_DB_PORT:-15432}"
 export GATE_DB_PORT
 GATE_DB_USER="secrag_gate"
 GATE_DB_NAME="secrag_gate"
+# T12.4.4: the gate's own Mailpit (compose.gate.yml), brought up on demand by
+# e2e_start_backend -- different host ports from the dev stack's Mailpit (8025/1025) so both
+# can run at once.
+GATE_MAILPIT_SMTP_PORT="${GATE_MAILPIT_SMTP_PORT:-11025}"
+GATE_MAILPIT_API_PORT="${GATE_MAILPIT_API_PORT:-18026}"
+export GATE_MAILPIT_SMTP_PORT GATE_MAILPIT_API_PORT
 FULL_TARGET_SECONDS=1800   # X5: --full target in Phase 11
 
 # name | needs the gate stack: - (no) / db (gate DB) / seed (DB + seed + Ollama) /
@@ -523,6 +529,7 @@ ensure_e2e_env() {
       echo "# Git-ignored; regenerated only when missing (see the comment above in gate.sh)."
       echo "E2E_JWT_SECRET=$(openssl rand -hex 24)"
       echo "E2E_CSRF_SECRET=$(openssl rand -hex 24)"
+      echo "E2E_LOCKOUT_SECRET=$(openssl rand -hex 24)"
       echo "E2E_CLIENT_IP_KEY=$(openssl rand -hex 16)"
       echo "E2E_MASTER_KEY=$("$PY" -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
     } >"$E2E_ENV.tmp" && mv -f "$E2E_ENV.tmp" "$E2E_ENV"
@@ -557,6 +564,14 @@ e2e_wait_healthy() {
   tail -n 20 "$log" | sed 's/^/  /'
   return 1
 }
+# e2e_ensure_mailpit: brings up the gate's own Mailpit (compose.gate.yml) -- idempotent,
+# shared by e2e/security-headers/zap-baseline (all reuse e2e_start_backend). Not healthchecked
+# (same as the dev stack's Mailpit): `up -d` returning means the container is running, not
+# necessarily ready to accept SMTP connections yet -- send_verification_email's own
+# best-effort retry-free send already tolerates a transient refused connection (T12.1.11).
+e2e_ensure_mailpit() {
+  compose up -d mailpit 2>&1 | sed 's/^/  /'
+}
 # e2e_start_backend <log dir>: sets E2E_BACKEND_PID + E2E_CLIENT_IP_KEY.
 e2e_start_backend() {
   local log_dir="$1"
@@ -565,12 +580,19 @@ e2e_start_backend() {
   # shellcheck source=/dev/null
   . "$E2E_ENV"
   set +a
+  e2e_ensure_mailpit || return 1
   echo "  native backend on 127.0.0.1:$E2E_BACKEND_PORT (log: $log_dir/backend.log)"
+  # T12.4.4/T12.4.5: SMTP points at the gate's own Mailpit (not "" any more) and
+  # PUBLIC_APP_URL points at the e2e frontend -- register's verification email actually
+  # sends and its link actually points at a page this run serves, so the dedicated Mailpit
+  # e2e test (auth.spec.ts) can fetch and follow it.
   (cd "$REPO_ROOT/backend" && exec env \
       DATABASE_URL="$DATABASE_URL" ENV=dev JWT_SECRET="$E2E_JWT_SECRET" CSRF_SECRET="$E2E_CSRF_SECRET" \
+      LOCKOUT_HMAC_SECRET="$E2E_LOCKOUT_SECRET" \
       DATA_MASTER_KEY="$E2E_MASTER_KEY" CLIENT_IP_HMAC_KEYS="$E2E_CLIENT_IP_KEY" \
       FRONTEND_ORIGIN="http://localhost:$E2E_FRONTEND_PORT" OLLAMA_HOST="$OLLAMA_HOST" \
-      DAILY_ANSWER_CAP=1000 SMTP_HOST="" \
+      DAILY_ANSWER_CAP=1000 SMTP_HOST=127.0.0.1 SMTP_PORT="$GATE_MAILPIT_SMTP_PORT" \
+      PUBLIC_APP_URL="http://localhost:$E2E_FRONTEND_PORT" \
       "$VENV/bin/uvicorn" rag_app.api.app:create_app --factory \
         --host 127.0.0.1 --port "$E2E_BACKEND_PORT" \
   ) >"$log_dir/backend.log" 2>&1 &
@@ -624,7 +646,10 @@ step_e2e() {
   # auth.spec.ts: the chat-flow walk (T12.1.10/DEBT-035). admin.spec.ts: T12.3.6 case (5)/(6)
   # (client-state tampering buys an ordinary user nothing on /admin). mfa.spec.ts: T12.3.5/
   # DEC-024 (the QR code actually renders from the real backend-issued provisioning URI).
+  # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
+  # verification email through the gate's own Mailpit (e2e_ensure_mailpit, above).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
+    MAILPIT_API_URL="http://127.0.0.1:$GATE_MAILPIT_API_PORT" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/mfa.spec.ts)
 }
 

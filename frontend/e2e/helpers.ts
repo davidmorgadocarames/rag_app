@@ -3,7 +3,7 @@
 // backend+frontend pair (`step_e2e`/`step_security-headers`/`step_zap-baseline` all reuse
 // `e2e_start_backend`/`e2e_start_frontend`) -- never run concurrently, so sharing these pure
 // UI-driving helpers across spec files is safe.
-import type { Page } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 
 export function uniqueEmail(prefix = "e2e"): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
@@ -35,6 +35,12 @@ export async function registerAndReachChat(
   await page.getByPlaceholder("email").fill(email);
   await page.getByPlaceholder(/password/).fill(password);
   await page.getByRole("button", { name: "REGISTER" }).click();
+  // Wait for LoginPanel's post-register message BEFORE refilling: it switches mode and
+  // clears the password field as part of the SAME state update -- filling first and
+  // waiting second would race that clear and silently submit an empty password (the
+  // browser's own `required` validation then blocks the submit with no network request
+  // at all, found running this helper for real).
+  await expect(page.getByText(/you'll receive an email/i)).toBeVisible();
   await page.getByPlaceholder("email").fill(email);
   await page.getByPlaceholder(/password/).fill(password);
   await page.getByRole("button", { name: "ENTER" }).click();
