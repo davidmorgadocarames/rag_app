@@ -14,8 +14,13 @@ export const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   { method: "POST", pattern: /^\/auth\/login$/ },
   { method: "POST", pattern: /^\/auth\/logout$/ },
   { method: "GET", pattern: /^\/auth\/me$/ },
-  { method: "GET", pattern: /^\/auth\/verify$/ },
+  // T12.4.5: POST now (body token), not a GET query param -- a mail scanner pre-fetching
+  // the /verify?token=... page's own GET can never consume the token any more.
+  { method: "POST", pattern: /^\/auth\/verify$/ },
   { method: "POST", pattern: /^\/auth\/resend-verification$/ },
+  // T12.4.6 (12b-C) adds the backend route for this; until then the BFF 404s it (no entry
+  // here yet) and the /reset page surfaces that as an ordinary error -- see lib/api.ts.
+  // { method: "POST", pattern: /^\/auth\/reset$/ },
   { method: "DELETE", pattern: /^\/account$/ },
   { method: "POST", pattern: /^\/chat\/stream$/ },
   { method: "GET", pattern: /^\/conversations$/ },

@@ -16,8 +16,9 @@ export default function AccountPage() {
 
   async function onResend() {
     setVerifyMsg(null);
+    if (!user?.email) return; // the button only renders once `user` is loaded (below)
     try {
-      const res = await resendVerification();
+      const res = await resendVerification(user.email);
       setVerifyMsg(res.detail);
     } catch (err) {
       setVerifyMsg(err instanceof Error ? err.message : "Something went wrong");

@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   ApiError,
+  confirmPasswordReset,
   CSRF_COOKIE_NAME,
   deleteAccount,
   login,
@@ -10,6 +11,8 @@ import {
   me,
   readCookie,
   register,
+  resendVerification,
+  verifyEmail,
 } from "./api.ts";
 
 // --- readCookie (pure) ----------------------------------------------------------------
@@ -144,4 +147,59 @@ test("a non-ok response raises ApiError with the backend's detail and status", a
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// --- T12.4.4/T12.4.5: resend-verification (by email, no session) + verify/reset (by token) ---
+
+test("resendVerification posts the email, not an authenticated session", async () => {
+  const calls: Call[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = stubFetch(
+    calls,
+    () => new Response(JSON.stringify({ detail: "ok" }), { status: 200 }),
+  );
+  try {
+    await resendVerification("alice@example.test");
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(calls[0].url, "/api/auth/resend-verification");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.body, JSON.stringify({ email: "alice@example.test" }));
+});
+
+test("verifyEmail posts the token in the body, never as a query string", async () => {
+  const calls: Call[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = stubFetch(
+    calls,
+    () => new Response(JSON.stringify({ detail: "Email verified. You can now log in." }), {
+      status: 200,
+    }),
+  );
+  try {
+    await verifyEmail("a-real-token");
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(calls[0].url, "/api/auth/verify");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.body, JSON.stringify({ token: "a-real-token" }));
+});
+
+test("confirmPasswordReset posts the token and the new password", async () => {
+  const calls: Call[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = stubFetch(calls, () => new Response(JSON.stringify({}), { status: 404 }));
+  try {
+    await assert.rejects(() => confirmPasswordReset("a-token", "a-new-password-1234"));
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(calls[0].url, "/api/auth/reset");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(
+    calls[0].init.body,
+    JSON.stringify({ token: "a-token", password: "a-new-password-1234" }),
+  );
 });

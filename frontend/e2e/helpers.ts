@@ -24,10 +24,18 @@ export async function registerAndReachChat(
   email: string,
   password: string,
 ): Promise<void> {
+  // T12.4.4: register no longer opens a session -- LoginPanel shows a "check your email"
+  // message and switches back to the login form; every caller of this shared helper just
+  // wants a LOGGED-IN ordinary user (ENV=dev: REQUIRE_EMAIL_VERIFICATION defaults to false,
+  // so an unverified account can still log in -- the dedicated Mailpit verification flow is
+  // exercised by auth.spec.ts's own test, not every caller here).
   await page.goto("/login");
   await openVaultDoor(page);
   await page.getByText("Need access? Register").click();
   await page.getByPlaceholder("email").fill(email);
   await page.getByPlaceholder(/password/).fill(password);
   await page.getByRole("button", { name: "REGISTER" }).click();
+  await page.getByPlaceholder("email").fill(email);
+  await page.getByPlaceholder(/password/).fill(password);
+  await page.getByRole("button", { name: "ENTER" }).click();
 }

@@ -130,7 +130,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function register(email: string, password: string): Promise<void> {
+// T12.4.4: a generic 202, no session/token any more -- the caller never learns whether the
+// address was new or already registered (only the real owner, by email, does).
+export function register(email: string, password: string): Promise<{ detail: string }> {
   return request("/auth/register", { method: "POST", body: JSON.stringify({ email, password }) });
 }
 
@@ -146,8 +148,28 @@ export function me(): Promise<UserInfo> {
   return request("/auth/me");
 }
 
-export function resendVerification(): Promise<{ detail: string }> {
-  return request("/auth/resend-verification", { method: "POST" });
+// T12.4.4: reached by email now, not an authenticated session (a freshly registered,
+// unverified account has none) -- same generic response whatever the outcome.
+export function resendVerification(email: string): Promise<{ detail: string }> {
+  return request("/auth/resend-verification", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+// T12.4.5: the /verify page's button POSTs the token from its URL -- a plain GET (the
+// email link itself) only ever renders the page, so a mail scanner pre-fetching it can
+// never consume the token.
+export function verifyEmail(token: string): Promise<{ detail: string }> {
+  return request("/auth/verify", { method: "POST", body: JSON.stringify({ token }) });
+}
+
+// T12.4.5 (frontend shell) / T12.4.6 (12b-C, the backend route + BFF allow-list entry):
+// the /reset page's button POSTs the token from its URL plus the new password. The
+// backend route this calls does not exist until 12b-C lands -- until then the BFF's own
+// allow-list (lib/bffRoutes.ts) 404s it, which the page surfaces as an ordinary error.
+export function confirmPasswordReset(token: string, password: string): Promise<{ detail: string }> {
+  return request("/auth/reset", { method: "POST", body: JSON.stringify({ token, password }) });
 }
 
 export function deleteAccount(): Promise<{ detail: string }> {

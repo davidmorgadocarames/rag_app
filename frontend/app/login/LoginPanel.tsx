@@ -13,18 +13,29 @@ export default function LoginPanel() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // T12.4.4: register no longer opens a session -- its generic response is shown here
+  // instead, and the panel switches back to the login form.
+  const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setError(null);
+    setMessage(null);
     try {
-      const action = mode === "login" ? login : register;
-      await action(email, password);
-      // The session is a cookie the BFF/backend just set (T12.1.3/T12.1.7) -- nothing to
-      // store client-side; /chat's own guard (middleware + a real API call) takes it from here.
-      router.push("/chat");
+      if (mode === "login") {
+        await login(email, password);
+        // The session is a cookie the BFF/backend just set (T12.1.3/T12.1.7) -- nothing to
+        // store client-side; /chat's own guard (middleware + a real API call) takes it from
+        // here.
+        router.push("/chat");
+        return;
+      }
+      const res = await register(email, password);
+      setMessage(res.detail);
+      setMode("login");
+      setPassword("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -60,13 +71,14 @@ export default function LoginPanel() {
           <input
             type="password"
             required
-            minLength={8}
-            placeholder="password (min 8 characters)"
+            minLength={12}
+            placeholder="password (min 12 characters)"
             autoComplete={mode === "login" ? "current-password" : "new-password"}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             className="border-0 border-b border-vault-steel-dark bg-transparent px-0.5 py-2 text-vault-steel-light outline-none placeholder:text-vault-steel-dark focus:border-vault-amber"
           />
+          {message && <p className="text-xs text-vault-steel">{message}</p>}
           {error && <p className="text-xs text-vault-danger">{error}</p>}
           <button
             type="submit"
