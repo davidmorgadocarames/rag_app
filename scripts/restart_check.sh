@@ -90,11 +90,13 @@ export CLIENT_IP_HMAC_KEYS="${CLIENT_IP_HMAC_KEYS:-$(python3 -c 'import secrets;
 export LOCKOUT_HMAC_SECRET="${LOCKOUT_HMAC_SECRET:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')}"
 export DATA_MASTER_KEY="${DATA_MASTER_KEY:-$(new_master_key)}"
 export ENV="${ENV:-prod}"
-# REQUIRE_EMAIL_VERIFICATION (T12.4.4): defaults to true with ENV=prod unless set
-# explicitly -- this script tests data persistence across a restart, not the email flow
-# (no Mailpit here), so its dedicated throwaway account must be able to log in right after
-# registering without ever verifying.
-export REQUIRE_EMAIL_VERIFICATION="${REQUIRE_EMAIL_VERIFICATION:-false}"
+# T12.4.4: with this script's own ENV=prod default, REQUIRE_EMAIL_VERIFICATION also
+# defaults to true (config.py) -- but docker-compose.yml never maps that bool through from
+# the host shell (unlike the string secrets above: an unset bool there would arrive as an
+# explicit empty string, which fails pydantic's bool parsing and crashes the backend). This
+# script tests data persistence across a restart, not the email flow (no Mailpit here), so
+# its dedicated throwaway account is marked verified directly in the database (step 3,
+# below) right after registering, instead.
 original_key="$DATA_MASTER_KEY"
 
 # resolved_volumes <project> [key]: the volume names compose resolves for that project (all,
@@ -244,8 +246,15 @@ say "migrate one-shot: exited 0, alembic $head"
 res="$(http POST /auth/register - "$creds")"
 [ "$(status_of "$res")" = 202 ] || fail "register" "HTTP $(status_of "$res") on /auth/register"
 say "registered a dedicated throwaway account"
-# T12.4.4: register no longer opens a session -- log in explicitly for the token
-# (REQUIRE_EMAIL_VERIFICATION=false above: this script never verifies the address).
+# T12.4.4: register no longer opens a session, and this script's ENV=prod default makes
+# REQUIRE_EMAIL_VERIFICATION default to true -- mark the throwaway account verified
+# directly (this script tests data persistence, not the email flow), then log in explicitly
+# for the token. Two statements, not one UPDATE ... RETURNING: psql's -t (tuples-only) only
+# drops SELECT's row-count footer, not a DML command's completion tag ("UPDATE 1"), which
+# would otherwise land in $verified alongside the RETURNING value.
+db_sql "$project" "UPDATE users SET email_verified = true WHERE email = '$email'" >/dev/null
+verified="$(db_sql "$project" "SELECT email_verified FROM users WHERE email = '$email'")"
+[ "$verified" = t ] || fail "register" "could not mark the throwaway account verified (email_verified query returned '$verified')"
 res="$(http POST /auth/login - "$creds")"
 [ "$(status_of "$res")" = 200 ] || fail "register" "HTTP $(status_of "$res") on /auth/login right after register"
 token="$(body_of "$res" | json_get access_token)"
