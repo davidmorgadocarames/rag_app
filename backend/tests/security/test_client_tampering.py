@@ -67,6 +67,18 @@ def _credentials() -> dict[str, str]:
     }
 
 
+def _register_and_login(client: TestClient):  # noqa: ANN201
+    """T12.4.4: register no longer opens a session -- every test below that just wants an
+    AUTHENTICATED ordinary-user client registers, then logs in, and uses the LOGIN
+    response (not register's)."""
+    creds = _credentials()
+    register = client.post("/auth/register", json=creds)
+    assert register.status_code == 202, register.text
+    login = client.post("/auth/login", json=creds)
+    assert login.status_code == 200, login.text
+    return login
+
+
 def _stepped_up_admin(db_engine: Engine, client: TestClient) -> dict[str, str]:
     """A fresh admin account, logged in AND MFA-stepped-up -- the only way this backend ever
     grants ``admin:read``+MFA. Returns CSRF headers for the resulting (rotated) session."""
@@ -106,8 +118,8 @@ def test_mass_assignment_on_register_is_rejected(api_env: Engine, extra_field: s
 @pytest.mark.parametrize("extra_field", ["role", "is_admin", "user_id"])
 def test_mass_assignment_on_mfa_confirm_is_rejected(api_env: Engine, extra_field: str) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
-    csrf = _csrf_header(register)
+    login = _register_and_login(client)
+    csrf = _csrf_header(login)
     client.post("/account/mfa/enroll", headers=csrf)
     response = client.post(
         "/account/mfa/confirm", json={"code": "123456", extra_field: "admin"}, headers=csrf
@@ -146,7 +158,7 @@ def test_an_ordinary_user_can_never_reach_role_admin_in_the_database(
 )
 def test_header_tricks_do_not_grant_admin_ping(api_env: Engine, headers: dict[str, str]) -> None:
     client = _client()
-    client.post("/auth/register", json=_credentials())
+    _register_and_login(client)
     response = client.get("/admin/ping", headers=headers)
     assert response.status_code == 403
 
@@ -154,7 +166,7 @@ def test_header_tricks_do_not_grant_admin_ping(api_env: Engine, headers: dict[st
 @pytest.mark.parametrize("query", ["?role=admin", "?admin=true", "?is_admin=1"])
 def test_query_string_tricks_do_not_grant_admin_ping(api_env: Engine, query: str) -> None:
     client = _client()
-    client.post("/auth/register", json=_credentials())
+    _register_and_login(client)
     response = client.get(f"/admin/ping{query}")
     assert response.status_code == 403
 
@@ -164,8 +176,8 @@ def test_query_string_tricks_do_not_grant_admin_ping(api_env: Engine, query: str
 
 def test_an_edited_session_cookie_is_rejected(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
-    raw = register.cookies.get(SESSION_COOKIE_NAME)
+    login = _register_and_login(client)
+    raw = login.cookies.get(SESSION_COOKIE_NAME)
     assert raw
     tampered = raw[:-1] + ("a" if raw[-1] != "a" else "b")
     response = client.get("/auth/me", cookies={SESSION_COOKIE_NAME: tampered})
@@ -202,10 +214,10 @@ def test_a_user_session_calling_admin_ping_directly_gets_403(api_env: Engine) ->
     """Simulates a curl call straight at the backend with a stolen/valid USER session --
     no UI, no middleware.ts involved on this side of the wire at all."""
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    login = _register_and_login(client)
     response = client.get(
         "/admin/ping",
-        cookies={SESSION_COOKIE_NAME: register.cookies.get(SESSION_COOKIE_NAME)},
+        cookies={SESSION_COOKIE_NAME: login.cookies.get(SESSION_COOKIE_NAME)},
     )
     assert response.status_code == 403
 
@@ -246,7 +258,7 @@ def test_the_permission_map_matrix_covers_every_protected_route(
     assert PROTECTED_ROUTES, "no protected route registered -- did /admin/ping lose its gate?"
 
     user_client = _client()
-    user_client.post("/auth/register", json=_credentials())
+    _register_and_login(user_client)
 
     admin_plain_client = _client()  # admin, logged in, but never stepped up
     email = f"admin-{uuid.uuid4().hex[:10]}@example.test"

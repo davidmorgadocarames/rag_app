@@ -48,7 +48,11 @@ def test_the_registry_is_leaf_first_with_users_last() -> None:
     ]
     for step in erasure.PURGE_STEPS:
         assert "SKIP LOCKED" in step.delete_batch and ":uid" in step.delete_batch
-    exempt = {("deletion_requests", "user_id"), ("user_keys", "user_id")}
+    exempt = {
+        ("deletion_requests", "user_id"),
+        ("user_keys", "user_id"),
+        ("login_lockouts", "email_hmac"),
+    }
     assert set(erasure.X3_EXEMPTIONS) == exempt
 
 
@@ -295,6 +299,40 @@ def test_a_lock_timeout_on_delete_account_is_a_retryable_503(
 
 
 @pytest.mark.db
+def test_an_erased_accounts_email_can_re_register_immediately(
+    db_engine: Engine, master_key: str
+) -> None:
+    """T12.4.4 (D-ER): the scrubbed email is free at once -- register, erase, then register
+    the SAME address again right away. A genuinely NEW account is created, not just the same
+    generic response masking the old (scrubbed) one."""
+    from fastapi.testclient import TestClient
+
+    from rag_app.api.app import create_app
+
+    client = TestClient(create_app())
+    email = f"reregister-{uuid.uuid4().hex[:10]}@example.test"
+    creds = {"email": email, "password": "correct horse battery staple " + uuid.uuid4().hex[:6]}
+
+    first = client.post("/auth/register", json=creds)
+    assert first.status_code == 202
+    with db_engine.connect() as conn:
+        first_id = conn.execute(
+            text("SELECT id FROM users WHERE email = :e"), {"e": email}
+        ).scalar_one()
+
+    with Session(db_engine) as session:
+        assert erasure.request_erasure(session, first_id) is True
+
+    second = client.post("/auth/register", json=creds)
+    assert second.status_code == 202
+    with db_engine.connect() as conn:
+        second_id = conn.execute(
+            text("SELECT id FROM users WHERE email = :e"), {"e": email}
+        ).scalar_one()
+    assert second_id != first_id  # a genuinely new row, not the scrubbed old one
+
+
+@pytest.mark.db
 def test_verify_ignores_an_erased_account(db_engine: Engine, master_key: str) -> None:
     """DA-G1-5: a verification link of an erased account (its token row lives until the
     purge) is refused and changes nothing."""
@@ -317,7 +355,7 @@ def test_verify_ignores_an_erased_account(db_engine: Engine, master_key: str) ->
         session.commit()
     _request(db_engine, user_id)
     client = TestClient(create_app())
-    res = client.get("/auth/verify", params={"token": raw})
+    res = client.post("/auth/verify", json={"token": raw})  # T12.4.5: POST, not a GET query param
     assert res.status_code == 400 and res.json()["detail"] == "invalid token"
     with db_engine.connect() as conn:
         verified, used = conn.execute(

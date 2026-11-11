@@ -1,6 +1,8 @@
 """Cookie auth end to end (T12.1.3): cookie and legacy Bearer both authenticate, logout
-invalidates the cookie server-side, erasure revokes every session, and register/login still
-return the JWT (rollback path, TF10) while also setting the `__Host-` cookie.
+invalidates the cookie server-side, erasure revokes every session, and login still returns
+the JWT (rollback path, TF10) while also setting the `__Host-` cookie. Register itself no
+longer opens a session (T12.4.4) -- see `test_register_no_longer_sets_a_session_or_returns_
+a_token` and `_register_and_login` below.
 
 An ``https://`` base_url is required: httpx/TestClient drops a ``Secure`` cookie received over
 plain ``http://`` (B7), and ``__Host-`` always implies ``Secure``.
@@ -63,20 +65,26 @@ def _credentials() -> dict[str, str]:
     }
 
 
-def test_register_sets_a_host_prefixed_secure_cookie_and_still_returns_the_jwt(
-    api_env: Engine,
-) -> None:
+def _register_and_login(client: TestClient, creds: dict[str, str] | None = None):  # noqa: ANN201
+    """T12.4.4: register no longer opens a session -- every test below that just wants an
+    AUTHENTICATED client (as opposed to testing register's own contract) registers, then
+    logs in, and uses the LOGIN response's cookie/token. Returns (creds, login_response)."""
+    creds = creds or _credentials()
+    register = client.post("/auth/register", json=creds)
+    assert register.status_code == 202, register.text
+    login = client.post("/auth/login", json=creds)
+    assert login.status_code == 200, login.text
+    return creds, login
+
+
+def test_register_no_longer_sets_a_session_or_returns_a_token(api_env: Engine) -> None:
+    """T12.4.4: a generic 202, no `access_token`, no session cookie -- an account must be
+    verified by email before it can do anything, so there is nothing to log in as yet."""
     client = _client()
     response = client.post("/auth/register", json=_credentials())
-    assert response.status_code == 201
-    assert response.json()["access_token"]  # rollback path, TF10
-
-    raw_cookie = response.cookies.get(SESSION_COOKIE_NAME)
-    assert raw_cookie
-    set_cookie = response.headers.get("set-cookie", "")
-    assert SESSION_COOKIE_NAME.startswith("__Host-")
-    for attribute in ("Secure", "HttpOnly", "SameSite=lax", "Path=/"):
-        assert attribute.lower() in set_cookie.lower(), set_cookie
+    assert response.status_code == 202
+    assert "access_token" not in response.json()
+    assert response.cookies.get(SESSION_COOKIE_NAME) is None
 
 
 def test_login_also_sets_a_session_cookie(api_env: Engine) -> None:
@@ -91,11 +99,10 @@ def test_login_also_sets_a_session_cookie(api_env: Engine) -> None:
 
 def test_cookie_and_legacy_bearer_both_authenticate(api_env: Engine) -> None:
     client = _client()
-    creds = _credentials()
-    register = client.post("/auth/register", json=creds)
-    access_token = register.json()["access_token"]
+    creds, login = _register_and_login(client)
+    access_token = login.json()["access_token"]
 
-    # The cookie path: the client's jar already holds it from the register response.
+    # The cookie path: the client's jar already holds it from the login response.
     via_cookie = client.get("/auth/me")
     assert via_cookie.status_code == 200
     assert via_cookie.json()["email"] == creds["email"]
@@ -111,8 +118,8 @@ def test_an_unknown_cookie_is_rejected_even_with_a_valid_bearer_present(api_env:
     """get_current_user tries the cookie first and does not fall back to Bearer when the
     cookie is present but invalid (see its docstring)."""
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
-    access_token = register.json()["access_token"]
+    _, login = _register_and_login(client)
+    access_token = login.json()["access_token"]
 
     response = client.get(
         "/auth/me",
@@ -124,13 +131,13 @@ def test_an_unknown_cookie_is_rejected_even_with_a_valid_bearer_present(api_env:
 
 def test_logout_makes_the_cookie_fail_server_side(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
-    raw_cookie = register.cookies.get(SESSION_COOKIE_NAME)
+    _, login = _register_and_login(client)
+    raw_cookie = login.cookies.get(SESSION_COOKIE_NAME)
     assert raw_cookie
 
     assert client.get("/auth/me").status_code == 200
 
-    logout = client.post("/auth/logout", headers=_csrf_header(register))
+    logout = client.post("/auth/logout", headers=_csrf_header(login))
     assert logout.status_code == 200
 
     # Re-present the EXACT old cookie value directly (bypassing whatever the client's own
@@ -147,10 +154,9 @@ def test_logout_without_a_cookie_is_a_no_op_not_an_error(api_env: Engine) -> Non
 
 def test_erasure_revokes_every_session(api_env: Engine) -> None:
     client = _client()
-    creds = _credentials()
-    register = client.post("/auth/register", json=creds)
-    access_token = register.json()["access_token"]
-    first_cookie = register.cookies.get(SESSION_COOKIE_NAME)
+    creds, login = _register_and_login(client)
+    access_token = login.json()["access_token"]
+    first_cookie = login.cookies.get(SESSION_COOKIE_NAME)
     assert first_cookie
     user_id = decode_token(access_token)
     assert user_id

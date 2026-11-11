@@ -451,6 +451,7 @@ def test_api_lifespan_end_to_end(migrated: Engine, monkeypatch: pytest.MonkeyPat
             database_url=url,
             jwt_secret="j" * 40,
             csrf_secret="c" * 40,
+            lockout_hmac_secret="l" * 40,
             client_ip_hmac_keys="k" * 32,
             data_master_key=master,
         )

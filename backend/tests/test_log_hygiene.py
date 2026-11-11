@@ -127,7 +127,12 @@ def test_emailer_with_an_unreachable_smtp_host_does_not_raise(
     ("path", "expected"),
     [
         ("/health", "/health"),
-        ("/auth/verify?token=abc", f"/auth/verify?token={REDACTED}"),
+        # T12.4.5: /auth/verify is a POST (body token) now, not a GET query param -- the
+        # generic query-string redactor itself still has to work on ANY route that happens
+        # to carry a token in its query string (e.g. a future one, or a stray client bug),
+        # so this case keeps exercising it against a synthetic path, not a route that still
+        # behaves this way in production.
+        ("/some-route?token=abc", f"/some-route?token={REDACTED}"),
         ("/x?a=1&b=&c", f"/x?a={REDACTED}&b={REDACTED}&{REDACTED}"),
         ("/x?", f"/x?{REDACTED}"),
     ],
@@ -137,16 +142,16 @@ def test_redact_query(path: str, expected: str) -> None:
 
 
 def test_the_access_log_filter_redacts_uvicorns_record_shape() -> None:
-    record = _uvicorn_access_record("/auth/verify?token=SECRET-TOKEN")
+    record = _uvicorn_access_record("/some-route?token=SECRET-TOKEN")
     assert AccessLogRedactor().filter(record) is True  # never drops the line
     message = record.getMessage()
     assert "SECRET-TOKEN" not in message
-    assert f'"GET /auth/verify?token={REDACTED} HTTP/1.1" 200' in message
+    assert f'"GET /some-route?token={REDACTED} HTTP/1.1" 200' in message
 
 
 def test_the_access_log_filter_redacts_a_preformatted_line() -> None:
     record = logging.LogRecord(
-        "uvicorn.access", logging.INFO, __file__, 0, "GET /auth/verify?token=SECRET 200", None, None
+        "uvicorn.access", logging.INFO, __file__, 0, "GET /some-route?token=SECRET 200", None, None
     )
     AccessLogRedactor().filter(record)
     assert "SECRET" not in record.getMessage()
@@ -300,20 +305,23 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
     session_cookies: list[str] = []
     with _Server(create_app) as server:
         _attach(captured_logs)
-        status, body = server.call("POST", "/auth/register", {"email": email, "password": password})
-        assert status == 201
-        access_tokens.append(body["access_token"])
-        session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
-        jwt = body["access_token"]
         credentials = {"email": email, "password": password}
-        assert server.call("POST", "/auth/register", credentials)[0] == 409
+        # T12.4.4: a generic 202, no session/token on register any more -- same response
+        # whether the address is brand new or already registered (no 409).
+        status, body = server.call("POST", "/auth/register", credentials)
+        assert status == 202
+        assert "access_token" not in body
+        assert server.call("POST", "/auth/register", credentials)[0] == 202
         assert server.call("POST", "/auth/login", {"email": email, "password": "wrong"})[0] == 401
-        assert server.call("POST", "/auth/login", credentials)[0] == 403
-        status, body = server.call("POST", "/auth/resend-verification", token=jwt)
+        assert server.call("POST", "/auth/login", credentials)[0] == 403  # not verified yet
+        # T12.4.4: resend is reached by email now, not by an authenticated session (the
+        # account above has none).
+        status, body = server.call("POST", "/auth/resend-verification", {"email": email})
         assert status == 200 and "verification_link" not in body  # T12.1.11: never in the response
-        assert server.call("GET", "/auth/verify?token=not-a-real-token")[0] == 400
-        assert server.call("GET", f"/auth/verify?token={issued[-1]}")[0] == 200
-        status, body = server.call("POST", "/auth/login", {"email": email, "password": password})
+        # T12.4.5: POST with the token in the body, not a GET query param.
+        assert server.call("POST", "/auth/verify", {"token": "not-a-real-token"})[0] == 400
+        assert server.call("POST", "/auth/verify", {"token": issued[-1]})[0] == 200
+        status, body = server.call("POST", "/auth/login", credentials)
         assert status == 200
         access_tokens.append(body["access_token"])
         session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
@@ -324,11 +332,12 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         assert server.call("POST", "/auth/login", {"email": email, "password": password})[0] == 401
         time.sleep(0.2)
 
+    # register + resend-verification each issue one token (T12.4.4/T12.4.2 did not change
+    # how many -- only how resend is reached).
     assert len(issued) == 2
-    assert len(session_cookies) == 2 and all(session_cookies)  # register + login both set one
+    assert len(session_cookies) == 1 and session_cookies[0]  # only the final login opens one
     names = {r.name for r in captured_logs.records}
     assert "uvicorn.access" in names and "sqlalchemy.engine.Engine" in names  # really captured
-    assert f"/auth/verify?token={REDACTED}" in "\n".join(captured_logs.rendered)
     local_part = email.split("@", 1)[0]
     secrets = [email, local_part, password, *issued, *access_tokens, *session_cookies]
     assert not _leaks(captured_logs.rendered, secrets)
@@ -342,14 +351,15 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
 
 
 @pytest.mark.db
-def test_a_racing_duplicate_sign_up_is_a_409_and_logs_no_email(
+def test_a_racing_duplicate_sign_up_still_gets_the_generic_response_and_logs_no_email(
     db_engine: Engine, monkeypatch: pytest.MonkeyPatch, captured_logs: _Collect
 ) -> None:
     """Two registrations of one address at once (double click): the API's existence check
     passes for both, the unique index rejects the second INSERT. On Postgres the driver's
-    message carries ``DETAIL: Key (email)=(…) already exists`` — it must end as a 409, never
-    as a 500 whose traceback prints the address (SQLite's message has no value, so this runs
-    on the real database)."""
+    message carries ``DETAIL: Key (email)=(…) already exists`` — it must end as the SAME
+    generic 202 the "already exists" branch returns (T12.4.4, never a different response for
+    the racing case), never a 500 whose traceback prints the address (SQLite's message has
+    no value, so this runs on the real database)."""
     from sqlalchemy import create_engine, text
 
     from rag_app.api.app import create_app
@@ -399,8 +409,10 @@ def test_a_racing_duplicate_sign_up_is_a_409_and_logs_no_email(
             call.join(timeout=30)
         racer_engine.dispose()
         time.sleep(0.2)
+    from rag_app.api.auth import GENERIC_REGISTER_MESSAGE
+
     status, body = result["r"]
-    assert status == 409 and body == {"detail": "email already registered"}
+    assert status == 202 and body == {"detail": GENERIC_REGISTER_MESSAGE}
     assert email not in json.dumps(body)
     assert not _leaks(captured_logs.rendered, [email, email.split("@", 1)[0]])
     with db_engine.begin() as conn:
@@ -432,16 +444,17 @@ def test_resend_never_returns_a_verification_link(
     """Old behaviour (pre-T12.1.11): ENV=dev with no SMTP returned ``verification_link`` in
     the body, so the UI could offer a clickable link with no email sent at all. That branch
     is gone -- the link only ever reaches the user by email (Mailpit locally); this response
-    never carries it, in dev or prod, with or without SMTP configured."""
+    never carries it, in dev or prod, with or without SMTP configured. T12.4.4: resend is
+    reached by email now, not an authenticated session."""
     from fastapi.testclient import TestClient
 
     from rag_app.api.app import create_app
     from rag_app.crypto import generate_user_key, wrap_key
     from rag_app.db.models import User, UserKey
-    from rag_app.security import create_token
 
     monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("JWT_SECRET", "t" * 48)
+    monkeypatch.setenv("CSRF_SECRET", "c" * 48)
     monkeypatch.setenv("ENV", env)
     monkeypatch.setenv("SMTP_HOST", "")
     raw_email = f"erin.{uuid.uuid4().hex[:8]}@example.test"
@@ -451,12 +464,8 @@ def test_resend_never_returns_a_verification_link(
         session.flush()
         session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(generate_user_key())))
         session.commit()
-        user_id = user.id
     client = TestClient(create_app())
-    res = client.post(
-        "/auth/resend-verification",
-        headers={"Authorization": f"Bearer {create_token(str(user_id))}"},
-    )
+    res = client.post("/auth/resend-verification", json={"email": raw_email})
     assert res.status_code == 200
     body = res.json()
     assert "verification_link" not in body

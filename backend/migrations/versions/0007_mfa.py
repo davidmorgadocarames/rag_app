@@ -98,9 +98,12 @@ LOGIN_LOCKOUTS_TABLE = """
     )"""
 
 # No secrag_backup UPDATE needed: the retention purge below fully DELETEs stale rows, it
-# never partially updates one. secrag_purger needs only SELECT (to find candidates) + DELETE.
+# never partially updates one. secrag_purger needs SELECT + DELETE, plus UPDATE on a column
+# (never actually updated) because `SELECT ... FOR UPDATE SKIP LOCKED` itself requires the
+# UPDATE privilege on the locked rows -- same reasoning as 0007 part 1's `UPDATE (user_id)`
+# grant on `user_mfa` (comment at the top of this file).
 PART2_GRANTS = (
-    "GRANT SELECT, DELETE ON login_lockouts TO secrag_purger",
+    "GRANT SELECT, DELETE, UPDATE (email_hmac) ON login_lockouts TO secrag_purger",
     "GRANT SELECT ON login_lockouts TO secrag_backup",
 )
 

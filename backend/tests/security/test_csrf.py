@@ -56,10 +56,15 @@ def _credentials() -> dict[str, str]:
 
 
 def _register(client: TestClient) -> str:
-    """Registers a fresh user on ``client`` and returns its CSRF cookie value."""
-    response = client.post("/auth/register", json=_credentials())
-    assert response.status_code == 201
-    csrf = response.cookies.get(CSRF_COOKIE_NAME)
+    """T12.4.4: register no longer opens a session -- registers a fresh user on ``client``
+    THEN logs in, and returns the LOGIN response's CSRF cookie value (every caller below just
+    wants an authenticated session, not to test register's own contract)."""
+    creds = _credentials()
+    register = client.post("/auth/register", json=creds)
+    assert register.status_code == 202, register.text
+    login = client.post("/auth/login", json=creds)
+    assert login.status_code == 200, login.text
+    csrf = login.cookies.get(CSRF_COOKIE_NAME)
     assert csrf
     return csrf
 
@@ -126,7 +131,8 @@ def test_a_bearer_only_request_with_no_session_cookie_is_exempt_from_csrf(
     is nothing for a cross-site form to forge the browser into sending automatically."""
     register_client = _client()
     creds = _credentials()
-    access_token = register_client.post("/auth/register", json=creds).json()["access_token"]
+    register_client.post("/auth/register", json=creds)
+    access_token = register_client.post("/auth/login", json=creds).json()["access_token"]
 
     bearer_client = _client()  # a fresh client: no cookie jar entry at all
     response = bearer_client.delete("/account", headers={"Authorization": f"Bearer {access_token}"})
@@ -138,20 +144,23 @@ def test_delete_account_without_a_csrf_header_is_rejected_when_a_session_cookie_
 ) -> None:
     client = _client()
     creds = _credentials()
-    register = client.post("/auth/register", json=creds)
-    access_token = register.json()["access_token"]
+    client.post("/auth/register", json=creds)
+    login = client.post("/auth/login", json=creds)
+    access_token = login.json()["access_token"]
     # The SAME client: its cookie jar still carries the session cookie, so this request is
     # cookie-authenticated even though an Authorization header is also attached.
     response = client.delete("/account", headers={"Authorization": f"Bearer {access_token}"})
     assert response.status_code == 403
 
 
-def test_resend_verification_needs_a_valid_csrf_token_too(api_env: Engine) -> None:
+def test_resend_verification_needs_no_csrf_token(api_env: Engine) -> None:
+    """T12.4.4: resend is reached by email now, not by an authenticated session (a freshly
+    registered, unverified account has no session to protect any more) -- it uses the same
+    lighter ``require_origin`` check as register/login, not ``require_csrf``."""
     client = _client()
-    csrf = _register(client)
-    missing = client.post("/auth/resend-verification")
-    assert missing.status_code == 403
-    ok = client.post("/auth/resend-verification", headers={CSRF_HEADER_NAME: csrf})
+    creds = _credentials()
+    client.post("/auth/register", json=creds)
+    ok = client.post("/auth/resend-verification", json={"email": creds["email"]})
     assert ok.status_code == 200
 
 
@@ -168,9 +177,9 @@ def test_register_allows_the_correct_origin_or_no_origin_at_all(api_env: Engine)
     response = client.post(
         "/auth/register", json=_credentials(), headers={"Origin": FRONTEND_ORIGIN}
     )
-    assert response.status_code == 201
+    assert response.status_code == 202
     no_origin = client.post("/auth/register", json=_credentials())
-    assert no_origin.status_code == 201
+    assert no_origin.status_code == 202
 
 
 def test_login_rejects_a_wrong_origin(api_env: Engine) -> None:
@@ -185,7 +194,9 @@ def test_the_csrf_cookie_is_host_prefixed_secure_and_readable_by_script(
     api_env: Engine,
 ) -> None:
     client = _client()
-    response = client.post("/auth/register", json=_credentials())
+    creds = _credentials()
+    client.post("/auth/register", json=creds)
+    response = client.post("/auth/login", json=creds)
     set_cookie = response.headers.get("set-cookie", "")
     assert CSRF_COOKIE_NAME.startswith("__Host-")
     assert response.cookies.get(CSRF_COOKIE_NAME)
@@ -203,9 +214,13 @@ def test_the_csrf_cookie_is_host_prefixed_secure_and_readable_by_script(
 
 
 def test_login_also_rotates_the_csrf_cookie(api_env: Engine) -> None:
+    """T12.4.4: register no longer sets a CSRF cookie at all -- the rotation this test
+    proves is across TWO LOGINS (two sessions for the same account) instead of register ->
+    login."""
     client = _client()
     creds = _credentials()
-    first = client.post("/auth/register", json=creds)
+    client.post("/auth/register", json=creds)
+    first = client.post("/auth/login", json=creds)
     first_csrf = first.cookies.get(CSRF_COOKIE_NAME)
     second = client.post("/auth/login", json=creds)
     second_csrf = second.cookies.get(CSRF_COOKIE_NAME)

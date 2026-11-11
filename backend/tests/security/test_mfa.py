@@ -62,6 +62,18 @@ def _credentials() -> dict[str, str]:
     }
 
 
+def _register_and_login(client: TestClient):  # noqa: ANN201
+    """T12.4.4: register no longer opens a session -- every test below that just wants an
+    AUTHENTICATED ordinary-user client registers, then logs in, and uses the LOGIN
+    response's cookies (not register's)."""
+    creds = _credentials()
+    register = client.post("/auth/register", json=creds)
+    assert register.status_code == 202, register.text
+    login = client.post("/auth/login", json=creds)
+    assert login.status_code == 200, login.text
+    return login
+
+
 def _login_as_admin(db_engine: Engine, client: TestClient) -> tuple[str, dict[str, str]]:
     """Creates a FRESH admin account (the bootstrap CLI, T12.3.3 -- no API path does this),
     logs in through the normal endpoint and returns (password, csrf headers)."""
@@ -76,7 +88,7 @@ def _login_as_admin(db_engine: Engine, client: TestClient) -> tuple[str, dict[st
 
 def test_enroll_returns_a_secret_and_a_provisioning_uri(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     assert enroll.status_code == 200
     body = enroll.json()
@@ -86,7 +98,7 @@ def test_enroll_returns_a_secret_and_a_provisioning_uri(api_env: Engine) -> None
 
 def test_confirm_with_a_wrong_code_fails_and_mfa_stays_disabled(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     confirm = client.post(
         "/account/mfa/confirm", json={"code": "000000"}, headers=_csrf_header(register)
@@ -99,7 +111,7 @@ def test_confirm_with_the_right_code_enables_mfa_and_returns_recovery_codes(
     api_env: Engine,
 ) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
     code = pyotp.TOTP(secret).now()
@@ -116,7 +128,7 @@ def test_step_up_with_a_valid_totp_code_rotates_the_session_and_sets_mfa_verifie
     api_env: Engine,
 ) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     old_cookie = register.cookies.get(SESSION_COOKIE_NAME)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
@@ -139,7 +151,7 @@ def test_step_up_with_a_valid_totp_code_rotates_the_session_and_sets_mfa_verifie
 
 def test_step_up_with_an_invalid_code_is_rejected(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
     client.post(
@@ -155,7 +167,7 @@ def test_step_up_with_an_invalid_code_is_rejected(api_env: Engine) -> None:
 
 def test_step_up_requires_mfa_to_be_enabled_first(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     step_up = client.post(
         "/account/mfa/step-up", json={"code": "123456"}, headers=_csrf_header(register)
     )
@@ -164,7 +176,7 @@ def test_step_up_requires_mfa_to_be_enabled_first(api_env: Engine) -> None:
 
 def test_a_recovery_code_steps_up_and_is_then_single_use(api_env: Engine) -> None:
     client = _client()
-    register = client.post("/auth/register", json=_credentials())
+    register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
     confirm = client.post(
@@ -266,7 +278,7 @@ def test_claim_recovery_code_is_a_single_atomic_statement() -> None:
 
 def test_an_ordinary_user_gets_403_on_admin_ping(api_env: Engine) -> None:
     client = _client()
-    client.post("/auth/register", json=_credentials())
+    _register_and_login(client)
     assert client.get("/auth/me").status_code == 200  # sanity: the user IS authenticated
     response = client.get("/admin/ping")
     assert response.status_code == 403

@@ -39,6 +39,7 @@ def _settings(**overrides: str) -> Settings:
         "database_url": GOOD_URL,
         "jwt_secret": "j" * 32,
         "csrf_secret": "c" * 32,
+        "lockout_hmac_secret": "l" * 32,
         "client_ip_hmac_keys": "k" * 32,
         "data_master_key": Fernet.generate_key().decode(),
     }
@@ -57,6 +58,11 @@ def test_valid_settings_pass() -> None:
         ({"jwt_secret": ""}, "JWT_SECRET must be at least 32 characters"),
         ({"csrf_secret": "short-secret-value"}, "CSRF_SECRET must be at least 32 characters"),
         ({"csrf_secret": ""}, "CSRF_SECRET must be at least 32 characters"),
+        (
+            {"lockout_hmac_secret": "short-secret-value"},
+            "LOCKOUT_HMAC_SECRET must be at least 32 characters",
+        ),
+        ({"lockout_hmac_secret": ""}, "LOCKOUT_HMAC_SECRET must be at least 32 characters"),
         ({"data_master_key": "not-a-fernet-key-SECRETVALUE"}, "DATA_MASTER_KEY is not a valid"),
         ({"data_master_key": ""}, "DATA_MASTER_KEY is not a valid"),
         ({"database_url": "mysql://u:pw-not-echoed@h/db"}, "must be a PostgreSQL URL"),
@@ -107,6 +113,7 @@ def test_dev_accepts_the_development_database_default(monkeypatch: pytest.Monkey
         _env_file=None,
         jwt_secret="j" * 32,
         csrf_secret="c" * 32,
+        lockout_hmac_secret="l" * 32,
         data_master_key=Fernet.generate_key().decode(),
     )
     validate_api_settings(settings)
@@ -116,6 +123,7 @@ def test_database_url_from_the_environment_counts_as_set(monkeypatch: pytest.Mon
     monkeypatch.setenv("DATABASE_URL", GOOD_URL)
     monkeypatch.setenv("JWT_SECRET", "j" * 32)
     monkeypatch.setenv("CSRF_SECRET", "c" * 32)
+    monkeypatch.setenv("LOCKOUT_HMAC_SECRET", "l" * 32)
     monkeypatch.setenv("CLIENT_IP_HMAC_KEYS", "k" * 32)
     monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
     validate_api_settings(Settings(_env_file=None))

@@ -197,7 +197,7 @@ tracking IDs like `DEBT-020`, never a private file name — `private-names`).
 | OWASP-A04 | Cryptographic Failures | mitigated | medium | high | 11a | backend/tests/test_crypto.py::test_wrong_key_cannot_decrypt | At-rest encryption + key wrap/unwrap; TLS required to Postgres (reachability is a separate accepted risk, DEBT-016). |
 | OWASP-A05 | Injection | mitigated | low | high | 1 | backend/tests/test_chat_stream.py::test_a_hostile_title_round_trips_through_postgres_unexecuted | ORM/parameterised queries throughout; a `DROP TABLE`-shaped title is written via the real rename endpoint into the real Postgres database and read back unchanged, with the table and row still present. |
 | OWASP-A06 | Insecure Design | planned | high | low | 12a | T12.0.5 | This document and its gate step are the control: every design decision (P12-D1…D4) is written down and checked against a catalogue entry before being considered done. |
-| OWASP-A07 | Authentication Failures | planned | medium | medium | 12b | T12.4.1/T12.4.3/T12.4.4 | **F1 closed in 12a** (JWT no longer in `localStorage` — grepped, zero hits; server-side logout: `backend/tests/security/test_auth_cookies.py::test_logout_makes_the_cookie_fail_server_side`). **Still planned** for F3 (user enumeration via 409 + timing, T12.4.1/T12.4.4) and F10 (weak password policy, NIST 800-63B + NCSC top-100k, P12-D4, T12.4.3) — both 12b (12.4). Phase/Test ID point at 12b since the row as a whole is not yet fully closed. |
+| OWASP-A07 | Authentication Failures | mitigated | medium | medium | 12b | backend/tests/test_security.py::test_login_timing_does_not_distinguish_a_real_account_from_a_missing_one | **F1 closed in 12a** (JWT no longer in `localStorage` — grepped, zero hits; server-side logout: `backend/tests/security/test_auth_cookies.py::test_logout_makes_the_cookie_fail_server_side`). **F3 closed in 12b-B** (T12.4.1: a generic 202 on register whatever the outcome — `rag_app.api.auth.register`, never a 409; constant-time login — `rag_app.security.dummy_password_hash`, same test). **F10 closed in 12b-B** (T12.4.3: `rag_app.password_policy` — length, email-local-part, NCSC/SecLists breach list — `backend/tests/test_password_policy.py`). |
 | OWASP-A08 | Software or Data Integrity Failures | planned | high | low | 15.5 | T15.5.5 | Keyless signing + digest verification; corpus integrity hash manifest (15.4.5). |
 | OWASP-A09 | Logging & Alerting Failures | mitigated | low | medium | 11a | backend/tests/test_log_hygiene.py::test_the_whole_auth_flow_logs_no_email_or_token | No PII/secrets in logs across the whole auth flow. F9 (verification link logged) already removed (11a). Dashboard banner alerts (the "alerting" half) planned 13.5.2. |
 | OWASP-A10 | Mishandling of Exceptional Conditions | mitigated | medium | medium | 11a | backend/tests/test_daily_cap.py::test_stream_fails_closed_when_the_counter_cannot_be_written | Fail-closed on counter/storage failures rather than granting a free answer; the same pattern is reviewed for every new data store the project adds. |
@@ -207,11 +207,11 @@ tracking IDs like `DEBT-020`, never a private file name — `private-names`).
 | ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |
 |---|---|---|---|---|---|---|---|
 | API-1 | Broken Object Level Authorization | mitigated | medium | medium | 11a | backend/tests/test_chat_stream.py::test_someone_elses_conversation_is_a_404_before_streaming | A second user's conversation ID is a 404, not a 403 (no existence leak). |
-| API-2 | Broken Authentication | planned | medium | medium | 12b | T12.4.1/T12.4.3/T12.4.4 | F1 closed in 12a, F3/F10 still planned for 12b — see OWASP-A07. |
+| API-2 | Broken Authentication | mitigated | medium | medium | 12b | backend/tests/test_security.py::test_login_timing_does_not_distinguish_a_real_account_from_a_missing_one | F1 closed in 12a, F3/F10 closed in 12b-B — see OWASP-A07. |
 | API-3 | Broken Object Property Level Authorization | planned | low | low | 15.1 | T15.1.3 | `extra="forbid"` everywhere (mass assignment, e.g. setting `role`). |
 | API-4 | Unrestricted Resource Consumption | mitigated | medium | medium | 11a | backend/tests/test_daily_cap.py::test_chat_at_the_cap_is_a_429_with_retry_after_and_no_llm_call | Global daily answer cap, no LLM call once reached. Rerank concurrency cap without autoscaling is a documented accepted gap until 16.3 (DEBT-010, §5.4). |
 | API-5 | Broken Function Level Authorization | mitigated | medium | low | 12b | backend/tests/security/test_client_tampering.py::test_the_permission_map_matrix_covers_every_protected_route | F6 closed: deny-by-default role -> permission map (`rag_app.authz.require_permission`, T12.3.2b) resolves every protected route (never a role-string comparison); fails closed on a permission unknown to the map; role never writable from any API route (admin bootstrap CLI only, T12.3.3); admin routes also require a fresh MFA step-up (T12.3.5). The matrix test is generated from the live route registry, not a hand-maintained list. |
-| API-6 | Unrestricted Access to Sensitive Business Flows | planned | medium | medium | 12b | T12.4.2 | F5 (no lockout), F11 (anyone can register and chat, no verification) close in 12.4. |
+| API-6 | Unrestricted Access to Sensitive Business Flows | mitigated | medium | medium | 12b | backend/tests/security/test_lockout.py::test_the_next_failure_past_the_threshold_locks_and_back_off_grows | F5 closed (T12.4.2: exponential-back-off lockout, `rag_app.lockout`, REC-05). F11 closed (T12.4.4: `require_email_verification` defaults on with `ENV=prod`; login refuses an unverified account — `backend/tests/security/test_mfa.py` fixtures exercise the generic register/login contract this depends on). |
 | API-7 | Server Side Request Forgery | planned | low | low | 13.1 | T13.1.1 | No endpoint fetches a user-supplied URL server-side today; the route walker formalises the absence of such a surface. |
 | API-8 | Security Misconfiguration | mitigated | low | low | 12a | backend/tests/test_security_headers.py::test_docs_routes_are_404_with_env_prod | F7 (`/docs`/`/redoc`/`/openapi.json` gated to `ENV=dev`) and F8 (CORS narrowed to the old frontend's exact needs: single origin, `GET`/`POST`/`PATCH`/`DELETE`, `Authorization`/`Content-Type`, no credentials — `test_cors_narrowed_to_the_old_frontends_needs`) both close here, provable without a browser (`pytest`, T12.2.4's own gate). The frontend-header half of this entry's original scope is OWASP-A02 (now also mitigated, 12a-E phase 2 — real-browser Playwright proof). |
 | API-9 | Improper Inventory Management | planned | low | low | 13.0 | T13.0.3 | The feature registry becomes the authoritative route/feature inventory. |
@@ -263,9 +263,23 @@ change) or blocks briefly on the row lock and then finds nothing to match once i
 AND used_at IS NULL`, proved single-use under genuine thread concurrency (not just two
 sequential HTTP calls) by
 `backend/tests/security/test_mfa.py::test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through`.
-12b-B's lockout counters (T12.4.2) and 12b-C's reset/verify token consume (T12.4.6) follow
-the exact same shape: the counter/consume update's `WHERE` clause IS the check, never a
-prior SELECT.
+12b-B's lockout counters (T12.4.2, below, REC-05) and 12b-C's reset/verify token consume
+(T12.4.6) follow the exact same shape: the counter/consume update's `WHERE`/`ON CONFLICT`
+clause IS the check, never a prior SELECT.
+
+**DEBT-034 design note (12b-B, does not close DEBT-034 — it closes at T12.6b.5).**
+`rag_app.lockout` keys the counter by `HMAC(LOCKOUT_HMAC_SECRET, email)`, not by `user_id`
+(F5/API-6: an attempt against an email that is not even registered is throttled exactly
+like a real account, so the lockout mechanism itself cannot be used as an existence
+oracle). Exponential back-off (free attempts up to `LOCKOUT_THRESHOLD`, then growing,
+capped at `LOCKOUT_MAX_SECONDS`) plus a reset after `LOCKOUT_RESET_AFTER_SECONDS` of
+silence bounds how long a THIRD PARTY can keep ONE victim account locked out — it does
+**not**, by itself, stop a third party flooding MANY different accounts' counters from the
+SAME shared Azure address, because the public backend URL has no signed real IP yet
+(DA-12aC-2, accepted until 12b). `rag_app.api.deps.rate_limit_login` already adds the
+real-IP axis (keyed by email + IP) as a second, independent defence today. DEBT-034 itself
+is accepted until the backend ingress goes internal (T12.6b.5), which removes the
+shared-address problem — not ticked here.
 
 | ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |
 |---|---|---|---|---|---|---|---|
@@ -273,6 +287,7 @@ prior SELECT.
 | REC-02 | Daily answer cap / per-request rate limits (R6-1) | mitigated | low | medium | 11a | backend/tests/test_daily_cap.py::test_the_default_cap_is_on_and_valid_in_prod | On by default and required positive in `ENV=prod`. |
 | REC-03 | Crypto-shred erasure (per-user data key destroyed on account deletion) | mitigated | high | low | 6/11a | backend/tests/test_key_recovery.py::test_erase_end_to_end_through_the_app_erasure_path | Makes the user's encrypted rows permanently unreadable even where a backup copy still exists; restores replay tombstones (`replay_deletions`). |
 | REC-04 | X10 no-TOCTOU: recovery-code single-use is one atomic `UPDATE … WHERE used_at IS NULL`, never SELECT-then-UPDATE | mitigated | medium | low | 12b | backend/tests/security/test_mfa.py::test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through | `rag_app.api.admin.claim_recovery_code`, proved single-use under 8-thread `threading.Barrier` concurrency at the DB level. Verified to fail/flake against a temporarily-reverted naive SELECT-then-UPDATE (1 failure / 30 runs, about 3.3%) vs. 0 failures / 10 runs on the atomic version — never committed, DA-12bA-3 fix block. **Companion test (DA-12bA2-1):** `backend/tests/security/test_mfa.py::test_claim_recovery_code_is_a_single_atomic_statement` is a deterministic structural check (inspects the function's own source for one `session.execute(update(...))` call, no `select`/`session.query`/`session.get`), added because the concurrency test alone is only ~3.3% likely to catch a regression to SELECT-then-UPDATE — listed here (not in the Test ID cell, which the `threat-catalogue` gate step resolves as exactly one `path::test_function`) so a future reader (12b-B/C) knows it exists and why. Template for 12b-B's lockout counters (T12.4.2) and 12b-C's reset/verify token consume (T12.4.6). |
+| REC-05 | X10 no-TOCTOU: login lockout counter is one atomic `INSERT … ON CONFLICT … DO UPDATE`, never SELECT-then-UPDATE | mitigated | medium | medium | 12b | backend/tests/security/test_lockout.py::test_concurrent_failed_logins_against_the_same_key_lose_no_updates | `rag_app.lockout.record_failed_login`, proved lossless under 8-thread `threading.Barrier` concurrency (the final counter equals the thread count — a lost update would make it lower). **Companion test:** `backend/tests/security/test_lockout.py::test_record_failed_login_is_a_single_atomic_statement` is the same deterministic structural check as REC-04's (exactly one `session.execute`, the SQL is an `INSERT … ON CONFLICT … DO UPDATE SET`, no `select`/`session.query`). See the DEBT-034 design note above (X10 prose) for what this does and does not defend against. |
 
 <!-- threat-catalogue:end -->
 

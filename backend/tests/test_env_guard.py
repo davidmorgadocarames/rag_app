@@ -151,6 +151,7 @@ def _valid(settings_cls: type[Settings]) -> Settings:
         database_url="postgresql+psycopg://u:p@127.0.0.1:15432/lifespan_unit",
         jwt_secret="j" * 40,
         csrf_secret="c" * 40,
+        lockout_hmac_secret="l" * 40,
         client_ip_hmac_keys="k" * 32,
         data_master_key=Fernet.generate_key().decode(),
     )
