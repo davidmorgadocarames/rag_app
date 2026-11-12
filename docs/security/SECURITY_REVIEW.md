@@ -44,11 +44,11 @@ Azure Container Apps. It does **not** cover:
    the backend serves must declare an auth dependency, a permission (never a role string)
    and a rate limit, or be on a closed, named public allow-list — enforced automatically, so
    a new route cannot silently ship without being reviewed against this rule.
-6. **A devil's-advocate review after every block of work** (`ORCHESTRATION.md`): a second,
-   read-only pass over the diff and the gate evidence against the Definition of Done and
-   this threat model, before the user decides what (if anything) needs a follow-up. Findings
-   that were accepted as deferred or as a risk are tracked with an ID in `DEBT_REGISTER.md`
-   and cited below.
+6. **A devil's-advocate review after every block of work**: a second, read-only pass over
+   the diff and the gate evidence against the Definition of Done and this threat model,
+   before the user decides what (if anything) needs a follow-up. Findings that were
+   accepted as deferred or as a risk are tracked with an ID in the project's private debt
+   register and cited below.
 
 ## 3. Findings
 
@@ -119,6 +119,6 @@ never silently dropped. Full detail in `docs/security/THREAT_MODEL.md` §5.4.
 ## 5. Review history
 
 Reviewed by the devil's-advocate pass of each block that touched security-relevant code;
-see `PHASE_STATUS.md`'s block sections (private) for the per-block findings and the user's
-decisions on each. This document itself is reviewed by the devil's-advocate agent before
-the Phase 12 close (T12.5.8).
+see the project's private status record (block sections) for the per-block findings and
+the user's decisions on each. This document itself is reviewed by the devil's-advocate
+agent before the Phase 12 close (T12.5.8).
