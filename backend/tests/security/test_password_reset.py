@@ -444,3 +444,26 @@ def test_forgot_password_mass_assignment_is_rejected(api_env: Engine) -> None:
     client = _client()
     response = client.post("/auth/forgot-password", json={"email": _new_email(), "role": "admin"})
     assert response.status_code == 422
+
+
+# --- DA-12bC-2: wrong-Origin rejection, mirroring test_register_rejects_a_wrong_origin --------
+
+
+def test_forgot_password_rejects_a_wrong_origin(api_env: Engine) -> None:
+    client = _client()
+    response = client.post(
+        "/auth/forgot-password",
+        json={"email": _new_email()},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+
+
+def test_reset_password_rejects_a_wrong_origin(api_env: Engine) -> None:
+    client = _client()
+    response = client.post(
+        "/auth/reset",
+        json={"token": "whatever", "password": _password()},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403

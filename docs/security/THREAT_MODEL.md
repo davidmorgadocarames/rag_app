@@ -281,6 +281,41 @@ real-IP axis (keyed by email + IP) as a second, independent defence today. DEBT-
 is accepted until the backend ingress goes internal (T12.6b.5), which removes the
 shared-address problem — not ticked here.
 
+**Email abuse recipient backstop design note (12b-C fix block, DA-12bC-1/DEC-026 = A,
+2026-11-12).** `rag_app.email_abuse.EmailAbuseLimiter` (T12.4.8) originally had one
+recipient-wide bucket shared across every source IP: a single attacker IP trickling
+requests at just under its refill rate could keep a victim's address permanently drained
+(well under the per-IP/global caps, so neither ever engaged), silently suppressing the
+victim's own forgot-password/resend-verification emails indefinitely — the same class of
+gap as the DEBT-034 note above, just never written down for this feature. The fix adds a
+fourth bucket keyed on `(recipient, requester IP)` (`_RECIPIENT_IP_CAPACITY` = 3/hour); the
+pure-recipient bucket is kept as the backstop against a MANY-IP flood (defence in depth from
+the original design) and is raised to `_RECIPIENT_CAPACITY` = 20/hour — deliberately
+**larger** than what any single IP can ever draw through its own `(recipient, IP)` bucket
+(20 > 3), and with a refill rate (20/hour) well above the 3/hour ceiling one attacker IP is
+held to, so the backstop never runs dry from one source alone: the victim's own request from
+a DIFFERENT IP is never blocked by that attacker (`backend/tests/test_email_abuse.py::
+test_single_attacker_ip_trickling_never_starves_the_victim_from_another_ip`). A coordinated
+**many-IP** flood (enough distinct attacker IPs, each staying under its own 3/hour
+`(recipient, IP)` cap) can still exhaust the 20/hour backstop — this residual risk is
+**accepted**, the same mitigation layering DEBT-034 already accepts for login lockout (a
+second, independent real-IP axis closes the single-actor case; only a shared store across
+every source address would close the many-IP case, out of scope for a single backend
+replica — see the single-replica note right below). Proved still working as a defence by
+`backend/tests/test_email_abuse.py::test_many_ip_flood_still_hits_the_recipient_backstop`.
+The recipient identity itself is HMACed with a random per-process salt before it is ever used
+as a bucket key (`backend/tests/test_email_abuse.py::
+test_recipient_bucket_keys_never_contain_the_raw_email`) — never the raw email in memory or
+in any log line built from one.
+
+**Single-replica limitation (DA-12bC-3).** `EmailAbuseLimiter`'s buckets, like every other
+in-memory limiter in this family (`rag_app.ratelimit.RateLimiter`, the chat rate limiter;
+`rag_app.risk.SignupTracker`), live in ONE process's memory — correct only while the backend
+runs a single replica, exactly the constraint RISK-03/DEBT-010 (§5.4 below) already documents
+for the reranker concurrency cap. Multi-replica support (16.3, KEDA autoscaling) must back
+this whole family with a shared store (e.g. Redis) before the backend can run more than one
+replica; this is not a new gap, just the same one restated for a second subsystem.
+
 | ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |
 |---|---|---|---|---|---|---|---|
 | REC-01 | Internal metrics port (9100) never served on the API port or exposed by any Container Apps ingress | mitigated | low | low | 11a | backend/tests/test_metrics.py::test_api_port_never_serves_metrics | Separate port, scraped only by the local Prometheus; no Azure ingress rule maps to it. |
@@ -289,6 +324,7 @@ shared-address problem — not ticked here.
 | REC-04 | X10 no-TOCTOU: recovery-code single-use is one atomic `UPDATE … WHERE used_at IS NULL`, never SELECT-then-UPDATE | mitigated | medium | low | 12b | backend/tests/security/test_mfa.py::test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through | `rag_app.api.admin.claim_recovery_code`, proved single-use under 8-thread `threading.Barrier` concurrency at the DB level. Verified to fail/flake against a temporarily-reverted naive SELECT-then-UPDATE (1 failure / 30 runs, about 3.3%) vs. 0 failures / 10 runs on the atomic version — never committed, DA-12bA-3 fix block. **Companion test (DA-12bA2-1):** `backend/tests/security/test_mfa.py::test_claim_recovery_code_is_a_single_atomic_statement` is a deterministic structural check (inspects the function's own source for one `session.execute(update(...))` call, no `select`/`session.query`/`session.get`), added because the concurrency test alone is only ~3.3% likely to catch a regression to SELECT-then-UPDATE — listed here (not in the Test ID cell, which the `threat-catalogue` gate step resolves as exactly one `path::test_function`) so a future reader (12b-B/C) knows it exists and why. Template for 12b-B's lockout counters (T12.4.2) and 12b-C's reset/verify token consume (T12.4.6). |
 | REC-05 | X10 no-TOCTOU: login lockout counter is one atomic `INSERT … ON CONFLICT … DO UPDATE`, never SELECT-then-UPDATE | mitigated | medium | medium | 12b | backend/tests/security/test_lockout.py::test_concurrent_failed_logins_against_the_same_key_lose_no_updates | `rag_app.lockout.record_failed_login`, proved lossless under 8-thread `threading.Barrier` concurrency (the final counter equals the thread count — a lost update would make it lower). **Companion test:** `backend/tests/security/test_lockout.py::test_record_failed_login_is_a_single_atomic_statement` is the same deterministic structural check as REC-04's (exactly one `session.execute`, the SQL is an `INSERT … ON CONFLICT … DO UPDATE SET`, no `select`/`session.query`). See the DEBT-034 design note above (X10 prose) for what this does and does not defend against. |
 | REC-06 | X10 no-TOCTOU: email-verification and password-reset token consume are each one atomic `UPDATE … WHERE used_at IS NULL AND expires_at > now()`, never SELECT-then-UPDATE | mitigated | medium | low | 12b | backend/tests/security/test_password_reset.py::test_concurrent_resets_with_the_same_token_let_exactly_one_through | `rag_app.api.auth._consume_password_reset_token`/`_consume_email_verification_token` (T12.4.6 DA re-check), proved single-use under 8-thread `threading.Barrier` concurrency at the DB level, same REC-04 template. **Companion tests (deterministic structural checks):** `backend/tests/security/test_password_reset.py::test_consume_password_reset_token_is_a_single_atomic_statement` and `::test_consume_email_verification_token_is_a_single_atomic_statement` (exactly one `session.execute`, the SQL is the atomic conditional `UPDATE`, no `select`/`session.query` inside the function). Success (`/auth/reset`) also revokes every session of the account and clears any login lockout — proved by `test_reset_password_success_revokes_sessions_and_clears_the_lockout`. |
+| REC-07 | Email abuse recipient backstop cannot be starved by a single trickling attacker IP (DA-12bC-1/DEC-026 = A) | mitigated | medium | low | 12b | backend/tests/test_email_abuse.py::test_single_attacker_ip_trickling_never_starves_the_victim_from_another_ip | `rag_app.email_abuse.EmailAbuseLimiter`'s new `(recipient, IP)` bucket caps one source IP's share of a recipient's traffic well below the pure-recipient backstop's capacity/refill rate (see the design note above for the exact numbers/arithmetic). **Companion tests:** `backend/tests/test_email_abuse.py::test_many_ip_flood_still_hits_the_recipient_backstop` (the accepted many-IP residual still works as a defence) and `::test_recipient_bucket_keys_never_contain_the_raw_email` (HMAC, no raw email in the in-memory key). |
 
 <!-- threat-catalogue:end -->
 

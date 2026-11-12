@@ -251,9 +251,13 @@ catalogue analysis; this is the implementation summary.
   discloses which happened) — the register-style "unconditional DB write" trick does not
   apply (a reset token needs a real `user_id` for its FK), so cost parity instead comes from
   always sending exactly one email via the SAME `_send` call either way.
-  `rag_app.email_abuse.EmailAbuseLimiter` adds three independent in-memory token buckets
-  (per real IP, per recipient, global) for register/resend-verification/forgot-password,
-  each an atomic `RateLimiter.allow` call (X10) — code constants (B6), no new secret.
+  `rag_app.email_abuse.EmailAbuseLimiter` adds four independent in-memory token buckets
+  (per real IP, per `(recipient, real IP)`, per recipient as a many-IP-flood backstop, and
+  global) for register/resend-verification/forgot-password, each an atomic
+  `RateLimiter.allow` call (X10) — code constants (B6), no new secret. The `(recipient, IP)`
+  bucket (DA-12bC-1/DEC-026 = A fix) stops a single trickling attacker IP from starving one
+  victim's address forever; the recipient identity is HMACed with a per-process salt before
+  it is ever used as an in-memory key (see `docs/security/THREAT_MODEL.md` REC-07).
   `rag_app.emailer` (one SMTP implementation, T12.4.7) counts every send attempt by `kind`
   (`secrag_email_sent_total`/`secrag_email_failed_total`, never the recipient). DA re-check:
   `register`'s `except IntegrityError` now treats ONLY the `users.email` unique-constraint
