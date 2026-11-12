@@ -314,12 +314,17 @@ class Load:
         import httpx
 
         from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+        from rag_app.sessions import SESSION_COOKIE_NAME
 
         rng = random.Random(index)
-        # T12.5.3: no Bearer any more -- httpx.Client's own cookie jar carries the session
-        # (and CSRF) cookies the login response sets, exactly like a browser; only the
-        # mutating POST /chat call below needs the X-CSRF-Token header added explicitly
-        # (GET /conversations and GET /conversations/{id} are read-only, no CSRF needed).
+        # T12.5.3: no Bearer any more -- but the `__Host-` session/CSRF cookies are Secure,
+        # and a compliant jar (httpx's own, same RFC 6265 policy as a browser) refuses to
+        # RESEND a Secure cookie over this plain-http loopback connection, so relying on the
+        # client's automatic jar silently drops every request after login (401) -- found
+        # running `--full` for real, same bug as the big-user delete loop above. Read the
+        # cookies back off the login response and resend them explicitly, like
+        # `restart_check.sh` already does; only the mutating POST /chat call also needs the
+        # X-CSRF-Token header (GET /conversations and GET /conversations/{id} are read-only).
         with httpx.Client(base_url=self.base, timeout=30) as client:
             while not self.stop.is_set():
                 email = rng.choice(self.accounts)
@@ -328,21 +333,25 @@ class Load:
                 self._record("login", t, r.status_code)
                 if r.status_code != 200:
                     continue
+                cookies = {SESSION_COOKIE_NAME: r.cookies.get(SESSION_COOKIE_NAME) or ""}
                 csrf = {CSRF_HEADER_NAME: r.cookies.get(CSRF_COOKIE_NAME) or ""}
                 for _ in range(LISTINGS_PER_LOGIN):
                     t = time.monotonic()
-                    r = client.get("/conversations")
+                    r = client.get("/conversations", cookies=cookies)
                     self._record("list", t, r.status_code)
                 if r.status_code == 200 and r.json():
                     t = time.monotonic()
                     conv = rng.choice(r.json())["id"]
-                    status = client.get(f"/conversations/{conv}").status_code
+                    status = client.get(f"/conversations/{conv}", cookies=cookies).status_code
                     self._record("read", t, status)
                 if index == 0 and self.chat_calls < 10:  # chat: a small sample only
                     self.chat_calls += 1
                     t = time.monotonic()
                     r = client.post(
-                        "/chat", json={"question": "What is SQL injection?"}, headers=csrf
+                        "/chat",
+                        json={"question": "What is SQL injection?"},
+                        headers=csrf,
+                        cookies=cookies,
                     )
                     self._record("chat", t, r.status_code)
 
@@ -480,6 +489,7 @@ def run(args: argparse.Namespace) -> int:
             _fail("the API did not answer /health within 120 s")
 
         from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+        from rag_app.sessions import SESSION_COOKIE_NAME
 
         samples: list[dict[str, Any]] = []
         with httpx.Client(base_url=base, timeout=30) as client:
@@ -488,15 +498,24 @@ def run(args: argparse.Namespace) -> int:
                 for email, uid in seed["big"]:
                     # T12.5.3: no Bearer -- login right before this user's own delete (the
                     # SAME client, reused sequentially: one big user at a time, never two at
-                    # once, so overwriting the jar's session/CSRF cookies on each login is
-                    # safe); the concurrent `Load` traffic above uses its OWN client/jar per
+                    # once); the concurrent `Load` traffic above uses its OWN client/jar per
                     # worker thread, so it never races this one.
+                    #
+                    # The session/CSRF cookies are `__Host-` (Secure): a compliant cookie
+                    # jar refuses to RESEND a Secure cookie over this plain-http loopback
+                    # connection (httpx's jar follows RFC 6265's secure-cookie policy same as
+                    # a browser would), so `client`'s automatic jar silently drops them and
+                    # every request after login would get a cookie-less 401 -- found running
+                    # `--full` for real. Fixed the same way `restart_check.sh` already does
+                    # (its own "no Bearer anywhere" section): read the values back off the
+                    # login response and resend them explicitly on every later request.
                     login = client.post("/auth/login", json={"email": email, "password": PASSWORD})
                     if login.status_code != 200:
                         _fail(f"login of a synthetic user: HTTP {login.status_code}")
+                    cookies = {SESSION_COOKIE_NAME: login.cookies.get(SESSION_COOKIE_NAME) or ""}
                     csrf = {CSRF_HEADER_NAME: login.cookies.get(CSRF_COOKIE_NAME) or ""}
                     t = time.monotonic()
-                    r = client.delete("/account", headers=csrf)
+                    r = client.delete("/account", headers=csrf, cookies=cookies)
                     ms = (time.monotonic() - t) * 1000
                     if r.status_code != 202:
                         _fail(f"DELETE /account: HTTP {r.status_code}")
@@ -518,7 +537,10 @@ def run(args: argparse.Namespace) -> int:
                             "commit_ms": server_stats["delete_commit_ms"],
                             "breakdown": server_stats["delete_breakdown"],
                             "message": r.json()["detail"],
-                            "me": client.get("/auth/me").status_code,
+                            # same (now-revoked) session cookie resent on purpose: proves
+                            # the session itself was invalidated server-side, not merely
+                            # that this request happened to carry no cookie at all.
+                            "me": client.get("/auth/me", cookies=cookies).status_code,
                             "key_left": key_left,
                             "email_left": email_left,
                             "tombstone": _tombstone(owner_engine, uid)[0],
