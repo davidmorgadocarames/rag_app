@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
     --restart-project) restart_project="${2:?}"; shift ;;
     --restart-master-key) master_key_step=1 ;;
     --keep) keep=1 ;;
-    -h | --help) sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift

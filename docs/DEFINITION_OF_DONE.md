@@ -161,6 +161,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | | | | `e2e` | gate DB + seed + Ollama | 600 s |
 | | | | `security-headers` | gate DB | 300 s |
 | | | | `zap-baseline` | gate DB | 600 s |
+| | | | `email-e2e` | gate DB | 180 s |
 
 `latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
 questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +
@@ -250,6 +251,17 @@ always printed but never fail it). `rag_app.devtools.zap_report`'s own pure JSON
 unit-tested by the ordinary `pytest` step (`backend/tests/test_zap_report.py`) — no docker/
 ZAP needed for that part.
 
+`email-e2e` (T12.4.9, `--full` only): register → the gate's own Mailpit HTTP API → extract
+the real verification token from the real email → `POST /auth/verify`; the same shape for
+password reset (`forgot-password` → Mailpit → `reset`). A NATIVE backend only (reuses
+`e2e`'s `e2e_start_backend`) — no frontend/Playwright, both flows are exercised at the
+HTTP/JSON level (`rag_app.devtools.email_e2e_check`), like `restart-check`. Cheaper than
+`e2e` (tagged `gate DB`, not `gate DB + seed + Ollama` — neither flow calls the LLM).
+Authenticates with the session cookie only (threaded by hand: httpx's own cookie jar
+enforces `Secure` against the real connection scheme, with no browser-only "localhost is a
+secure context" exception, so it would silently drop the cookie over this native backend's
+plain `http://`).
+
 `migrations-roundtrip` (T11.0.13, T11.2.9): a fresh database on the gate server →
 `db/roles.sql` → `alembic upgrade head` →
 `pg_dump` as `secrag_backup` (only the default privileges can make the new tables readable)
@@ -291,14 +303,20 @@ request, no lock error**; the purger as `secrag_purger` (real login) is SIGKILLe
 
 `restart-check` (T11.2.8, `scripts/restart_check.sh`; not in `--fast`): the **real**
 `docker-compose.yml` plus `scripts/restart_check.compose.yml`, which swaps the external dev
-volume for a throwaway one and publishes only the API on `127.0.0.1:18000` (no DB port), as
-projects `secrag-gate-rc` → `secrag-gate-rc2`: the backend image alone must not migrate →
-`up` (roles → `migrate` one-shot exits 0 → backend) → a dedicated account + one encrypted
-message → `down` (no `-v`) → `up` as the other project → login + decrypted read → `up` with
-a new random `DATA_MASTER_KEY` must be **refused** (fingerprint mismatch) → the original key
-starts again → the account is erased. It refuses the development projects/volumes, an
-existing throwaway volume and a busy API port, and removes everything it created. It can run
-while the development stack is up.
+volume for a throwaway one and publishes only the API on `127.0.0.1:18000` (no DB port) and
+this project's own Mailpit HTTP API on `127.0.0.1:18025` (T12.4.10), as projects
+`secrag-gate-rc` → `secrag-gate-rc2`: the backend image alone must not migrate → `up` (roles
+→ `migrate` one-shot exits 0 → backend) → a dedicated account, verified via the REAL Mailpit
+flow (register → poll Mailpit's HTTP API → `POST /auth/verify` with the real token, never a
+direct `UPDATE users SET email_verified`) → login (session cookie, never the legacy Bearer
+JWT) → one encrypted message → `down` (no `-v`) → `up` as the other project → login +
+decrypted read → `up` with a new random `DATA_MASTER_KEY` must be **refused** (fingerprint
+mismatch) → the original key starts again → the account is erased. Cookies are threaded by
+hand, not via curl's own jar (see `rag_app.devtools.email_e2e_check`'s module docstring for
+why: a jar enforces the session cookie's `Secure` flag against the actual, plain-`http://`
+connection scheme). It refuses the development projects/volumes, an existing throwaway
+volume and a busy API/Mailpit port, and removes everything it created. It can run while the
+development stack is up.
 
 Gate-project setup (up + roles + migrate + seed restore) has its own 300 s budget; building a
 cached venv (below) has 900 s. Measured on the development machine (2026-10-01, end of
