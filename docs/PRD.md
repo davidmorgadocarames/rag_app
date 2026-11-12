@@ -75,6 +75,11 @@ These thresholds are enforced by the **evaluation gate** before any deploy (see 
     (request query strings are redacted; database errors carry no key values). On the
     Azure deployment, questions sent to Azure OpenAI may be retained by Microsoft for abuse
     monitoring for up to 30 days.
+  - *Data residency*: the Azure OpenAI deployment uses the **GlobalStandard** SKU (the
+    EU-only DataZoneStandard quota is 0 in every EU region for this account), so a question
+    may be processed by Azure OpenAI infrastructure **outside the EU** before an answer
+    comes back — disclosed here and accepted as a risk (DEBT-020,
+    `docs/security/THREAT_MODEL.md` RISK-01), re-checked at Phases 14/15.
 
 ### 5.2 Later / optional
 

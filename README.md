@@ -26,18 +26,25 @@ this project is built around them:
 - **Evaluation as a release gate.** Retrieval and generation are measured separately
   against thresholds and a stored baseline. Every push to `main` runs the eval gate in an
   isolated gate stack, and a regression blocks the push before CD can deploy it.
-- **Security and abuse resistance.** The app has its own auth (argon2 + JWT + email
-  verification) and cost-aware token-bucket rate limiting against brute force and
-  Denial-of-Wallet. A **global daily answer cap** (`DAILY_ANSWER_CAP`, 150 a day on Azure)
-  is counted in Postgres before any LLM call, so one day of abuse has a fixed worst-case
-  cost. Signup risk scoring resists Sybil abuse, and the pipeline defends against indirect
-  prompt injection.
+- **Security and abuse resistance.** The app has its own auth (argon2 password hashing,
+  server-side sessions behind a `__Host-` cookie — no client-side token at all — and email
+  verification), role-based access control for admin features (deny-by-default permission
+  map, never a role string, plus admin MFA), and cost-aware token-bucket rate limiting
+  against brute force and Denial-of-Wallet. A **global daily answer cap**
+  (`DAILY_ANSWER_CAP`, 150 a day on Azure) is counted in Postgres before any LLM call, so
+  one day of abuse has a fixed worst-case cost. Signup risk scoring resists Sybil abuse, and
+  the pipeline defends against indirect prompt injection. See
+  [Security](#security) below for the full threat model and review.
 - **Privacy by design.** Each user's data is encrypted with a per-user key. Erasing an
   account **crypto-shreds** the key and scrubs the email in one short transaction (the data
   is unreadable at once, `202 Accepted`); a batched, resumable purger then deletes the
   remaining rows within 24 h without long locks. Tombstones let the deletions be replayed
   after any restore from backup ([ADR phase 6](docs/adr/adr_phase06_gdpr_erasure.md),
-  [ADR phase 11](docs/adr/adr_phase11_stability.md) decision 6).
+  [ADR phase 11](docs/adr/adr_phase11_stability.md) decision 6). The Azure deployment uses
+  Azure OpenAI's **GlobalStandard** SKU (the EU-only DataZoneStandard quota is 0 in every EU
+  region for this account), so a question may be processed outside the EU before an answer
+  comes back — disclosed in [`docs/PRD.md`](docs/PRD.md) and accepted as a risk (DEBT-020,
+  re-checked at Phases 14/15).
 - **Engineering discipline.** A written Definition of Done is enforced by a pre-push gate
   covering lint, strict typing, tests (including DB tests on a throw-away database), secret
   scanning, dependency audit, the frontend build and evals.
@@ -671,6 +678,19 @@ greeting reply makes no LLM call and does not count. Every LLM call has a `max_t
 bound, so the worst-case cost of a day at the cap is known in advance
 ([ADR phase 11 — Costs](docs/adr/adr_phase11_stability.md#costs)). Set `DAILY_ANSWER_CAP`
 (default 150 = the Azure value; `0` switches it off, `ENV=dev` only).
+
+## Security
+
+- [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md) — STRIDE per trust
+  boundary and a vulnerability catalogue cross-referenced against OWASP Top 10:2025, OWASP
+  API Security Top 10:2023 and the OWASP Top 10 for LLM Applications 2025. Every entry
+  carries a status (`mitigated`/`planned`/`accepted`), a defence difficulty, an attack
+  level and a test ID; a `mitigated` entry's test ID is checked by its own gate step
+  (`threat-catalogue`) to resolve to a real, existing test.
+- [`docs/security/SECURITY_REVIEW.md`](docs/security/SECURITY_REVIEW.md) — a portfolio-
+  facing summary: scope, method (threat model, the catalogue, automated tests, OWASP ZAP,
+  devil's-advocate reviews) and every finding with its severity and how it was closed
+  (fix/commit/test) or accepted as a risk, with the debt ID.
 
 ## Architecture decision records
 

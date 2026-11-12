@@ -189,15 +189,16 @@ catalogue analysis; this is the implementation summary.
   forwarded both directions; the upstream fetch's own timeout is ≥ 240 s (`MIN_TIMEOUT_MS`,
   DEC-006) so the Azure ingress's ~240 s cutoff stays the only real limit on a slow/cold
   answer; once headers arrive the response body streams through unbuffered (SSE survives the
-  hop token-by-token). `access_token` is stripped from `/auth/login` and `/auth/register`
-  responses before they reach the browser, so the BFF-fronted UI never sees a bearer token at
-  all (F1 closes on this path; the legacy Bearer rollback, TF10, is unaffected).
+  hop token-by-token). `access_token` stripping from `/auth/login`/`/auth/register`
+  responses is defense in depth only since 12b (T12.5.3): the backend itself stopped
+  issuing one at all (F1 closes on this path; the legacy Bearer rollback, TF10, was
+  removed entirely the same block — see the 12b bullet below).
 - **CSRF** (`rag_app.csrf`, P12-D2): double-submit, `csrf_token = HMAC-SHA256(CSRF_SECRET,
   raw_session_id)`, issued in a **readable** (non-`HttpOnly`) `__Host-secrag_csrf` cookie so
   page script can echo it back as `X-CSRF-Token`. `require_csrf` is attached to every
   cookie-authenticated state-changing route; a request with **no session cookie at all**
-  (the legacy Bearer-only path) is exempt — a bearer token is never sent automatically by the
-  browser, so it cannot be forged cross-site. `require_origin` (lighter: a present-but-wrong
+  (e.g. an already-logged-out `logout`) is exempt — nothing to protect. `require_origin`
+  (lighter: a present-but-wrong
   `Origin` is rejected, a missing one allowed) covers register/login, where no session exists
   yet to bind a token to — DA-12aC's accepted trade-off (a curl/legacy client, or a browser
   that omits `Origin` on some same-origin requests, still gets through; a cross-site forger
@@ -305,11 +306,33 @@ catalogue analysis; this is the implementation summary.
   `report-uri` (Firefox/Safari) and the Reporting API (`Reporting-Endpoints` header,
   Chromium). `CSP_MODE` (`lib/csp.ts`) is a single switch: `"report-only"` until the
   Playwright page walk proves zero `script-src` violations against the real built app in a
-  real browser, then `"enforce"` (T12.2.3's literal Done-when) — **still `"report-only"` as
-  of this document** (12a-E Phase 1; the walk is Phase 2 work). The backend narrows CORS to
-  the old (pre-BFF) frontend's exact needs (single origin, `GET`/`POST`/`PATCH`/`DELETE`,
-  `Authorization`/`Content-Type`, no credentials) and gates `/docs`/`/redoc`/`/openapi.json`
-  behind `ENV=dev` — both removed entirely once the backend goes internal-only in 12b.
+  real browser, then `"enforce"` (T12.2.3's literal Done-when) — enforcing since 12a-E
+  Phase 2 (2026-10-17). The backend narrowed CORS to the old (pre-BFF) frontend's exact
+  needs in 12a (single origin, `GET`/`POST`/`PATCH`/`DELETE`, `Authorization`/
+  `Content-Type`, no credentials), then **removed it entirely in 12b** (T12.5.3 — the
+  BFF-based frontend never triggers a browser CORS preflight at all); `/docs`/`/redoc`/
+  `/openapi.json` stay gated behind `ENV=dev`.
+- **Legacy Bearer path, CORS and route walker removed/added** (12b-D, T12.5.2/T12.5.3):
+  `rag_app.api.auth.get_current_user` is cookie-only now — `HTTPBearer`, the `_bearer_user`
+  fallback and `/auth/login`'s `TokenResponse(access_token=...)` are all gone
+  (`create_token`/`decode_token` stay in `rag_app.security` as plain, independently-tested
+  utility functions until T15.2.5's full cleanup). `CORSMiddleware` is removed from
+  `create_app()` entirely. Every route now declares, directly or transitively, an auth
+  dependency, a **permission** (`rag_app.authz.DECLARED_PERMISSION_ROUTES`, separate from
+  the narrower `PROTECTED_ROUTES` the T12.3.6 tampering matrix uses, see that module's
+  docstring) and a rate limit (`rag_app.api.deps.RATE_LIMIT_DEPENDENCIES`, including the new
+  `rate_limit_account(action)` factory for routes that had none before) — or is on
+  `backend/tests/security/test_route_walker.py`'s closed public allow-list; that same test
+  walks the real app and proves the rule has teeth against two toy routes.
+- **Health checks via the frontend's BFF** (DEC-005/T12.5.6) **and an exposed-files check**
+  (T12.5.7, both 12b-D, user idea 2026-11-09, DEC-023): `cd.yml`'s post-deploy check and
+  `scripts/azure/demo-mode.sh on` now poll the frontend's own `/api/health` route (built in
+  12a-C) instead of a backend-specific FQDN — the backend will have no public URL to poll
+  directly at all once ingress goes internal (T12.6b.5). `scripts/azure/
+  exposed_files_check.sh` probes a frontend URL for `/.git/HEAD`, `/.git/config`, `/.env`,
+  `/.env.local`, a `.next/` server file, a `*.map` source map, `/backend/` and
+  `/docker-compose.yml` (a 200 is the only failure); the backend's own lack of static file
+  serving is checked unconditionally (`backend/tests/security/test_exposed_files.py`).
 
 ## 9. Compliance (data erasure)
 

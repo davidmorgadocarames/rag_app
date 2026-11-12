@@ -37,8 +37,10 @@ are a human/agent checklist.
   validated against human labels; correct-abstention rate on the negative set meets its threshold.
   Enforced by the gate step `eval` (in `--full`).
 - **Phase 10 (cloud)** — the deployed Azure URL responds to a health check — automated from
-  11b (block D): CD's `deploy` job polls the backend's `/health` and the frontend's `/` over
-  their public ingress URLs with a bounded timeout, after the apps are updated, and fails the
+  11b (block D): CD's `deploy` job polls the frontend's `/` and, since 12b (DEC-005/T12.5.6:
+  the backend has no public URL to poll directly once ingress goes internal, T12.6b.5), the
+  backend's health THROUGH the frontend's own `/api/health` BFF route — over the frontend's
+  public ingress URL with a bounded timeout, after the apps are updated, and fails the
   run if either never comes up (`scripts/cd/health_check.sh`); the eval gate
   ran and passed **before** the Azure deploy step (not just before the GHCR push) — the
   pre-push gate blocks the very push that triggers CD, and (from Phase 11a) CD runs only
@@ -69,13 +71,50 @@ are a human/agent checklist.
   `Permissions-Policy` and a per-request nonce CSP; every API response carries
   `X-Content-Type-Options`, `Referrer-Policy`, `Content-Security-Policy: frame-ancestors
   'none'`, `Cache-Control: no-store`; `/docs`/`/redoc`/`/openapi.json` only with `ENV=dev`;
-  CORS narrowed to exactly what a caller needs. `CSP_MODE` (`frontend/lib/csp.ts`) is a
-  single switch: `"report-only"` until the `security-headers` gate step (Playwright walk)
-  proves zero violations, then `"enforce"` — only the latter satisfies T12.2.3's own
-  Done-when. Enforced by the gate steps `security-headers` and `zap-baseline` (both need the
-  gate DB + a running native frontend/backend, `--full` only, never CI — DEBT-029 keeps the 5
-  required job names pinned) and the backend's own `pytest` step (`/docs` gating, CORS,
-  headers — no browser needed for that half).
+  CORS narrowed in 12a to exactly what the pre-BFF frontend needed, **removed entirely in
+  12b** (T12.5.3 — the BFF-based frontend never triggers a browser CORS preflight at all).
+  `CSP_MODE` (`frontend/lib/csp.ts`) is a single switch: `"report-only"` until the
+  `security-headers` gate step (Playwright walk) proves zero violations, then `"enforce"` —
+  only the latter satisfies T12.2.3's own Done-when. Enforced by the gate steps
+  `security-headers` and `zap-baseline` (both need the gate DB + a running native
+  frontend/backend, `--full` only, never CI — DEBT-029 keeps the 5 required job names
+  pinned) and the backend's own `pytest` step (`/docs` gating, CORS, headers — no browser
+  needed for that half).
+- **Phase 12b (route walker, T12.5.2)** — every route the backend serves declares, directly
+  or transitively, an auth dependency (`get_current_user`), a **permission**
+  (`rag_app.authz`, never a role string) and a rate limit, or is on a closed,
+  named-route-by-route public allow-list — never a wildcard/prefix match, so a new route
+  starts "undeclared" until someone adds it on purpose. Enforced by
+  `backend/tests/security/test_route_walker.py` (`security-suite` gate step), which also
+  proves the rule itself has teeth against two toy routes (undeclared entirely; auth
+  declared but permission/rate limit missing).
+- **Phase 12b (no TOCTOU, X10, user idea 2026-11-09, DEC-023)** — a decision that depends on
+  a database row's state is never a SELECT to check it followed by a separate UPDATE; it is
+  one atomic statement (`UPDATE … WHERE <condition> RETURNING`, an `INSERT … ON CONFLICT …
+  DO UPDATE`, or `SELECT … FOR UPDATE` in the same transaction). Each such mitigation states
+  how it complies and has BOTH a genuine multi-thread concurrency test (proves single-use/no
+  lost update under real contention, not just two sequential HTTP calls) and a deterministic
+  structural test (inspects the function's own source for exactly one `session.execute(...)`
+  call, no prior `select`/`session.query`/`session.get`) — the concurrency test alone can be
+  too unlikely to catch a regression to the old SELECT-then-UPDATE shape (REC-04's own
+  measurement: ~3.3% failure rate over 30 runs). `docs/security/THREAT_MODEL.md` §5.5 carries
+  the design note and every template (REC-04 through REC-07).
+- **Phase 12b (cheap staging for migrations, X11, user idea 2026-11-09, DEC-023)** — before
+  any promotion that ships a migration: restore the latest Azure backup into a throw-away
+  local Postgres (the gate project, never the development database), run the new migration
+  **and** its `downgrade` round trip, then an app smoke against the restored copy, then
+  destroy it. No Azure staging environment (cost). Evidence goes into the promotion's own
+  private status record — there is no public automated gate step for this (it runs once,
+  by hand, right before a promotion that ships a migration).
+- **Phase 12b (exposed-files check, T12.5.7, DEC-023)** — the frontend's public URL never
+  serves `/.git/HEAD`, `/.git/config`, `/.env`, `/.env.local`, a `.next/` server file, a
+  `*.map` source map, `/backend/` or `/docker-compose.yml` with real content (a 200 is the
+  only failure; anything else, including a connection-level failure, passes).
+  `scripts/azure/exposed_files_check.sh` is the reusable probe (used at the Azure smoke,
+  T12.6b.6, and locally against any running frontend); its own pass/fail logic is proven by
+  `backend/tests/security/test_exposed_files.py` against a throwaway HTTP server, and the
+  backend's own lack of static file serving is checked unconditionally in the same file.
+  Enforced by the `security-suite` gate step.
 - **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
   it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
   image that is still running (and the previous image in a rollback) keeps working on the

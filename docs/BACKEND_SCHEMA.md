@@ -164,7 +164,8 @@ users 1───∞ query_logs
 **As implemented (11a, asynchronous erasure — ADR phase 11 decision 6; 12a/T12.1.3 adds
 sessions; 12b-A/T12.3.4 adds the MFA tables).** `DELETE /account` runs one short transaction:
 delete `user_keys` (crypto-shred), delete every row of the user's `sessions` (revoke-all — a
-live cookie/Bearer stops authenticating at once), set `users.email` and
+live cookie stops authenticating at once; the legacy Bearer path this used to also cover
+was removed entirely in 12b, T12.5.3), set `users.email` and
 `users.password_hash` to NULL, set `users.deleted_at`, and upsert `deletion_requests`
 (`status = pending`). The purger (`rag_app.purger`, role `secrag_purger`) follows the
 purge-step registry `rag_app.erasure.PURGE_STEPS`, leaf-first — `messages` →

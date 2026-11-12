@@ -101,7 +101,9 @@ Chat (/chat)              [authenticated]
    adds a **signed client-IP header** derived from `X-Forwarded-For` so backend rate limits
    key on the real caller, not the shared Azure address (TRD §8.1). The BFF streams the
    response body through unbuffered, so the SSE events below still arrive progressively. The
-   pre-BFF rollback frontend instead calls the backend directly with a Bearer token. Server:
+   pre-BFF rollback frontend used to call the backend directly with a Bearer token; that
+   path was removed entirely in 12b (T12.5.3) — the cookie, via the BFF, is the only way to
+   authenticate now. Server:
    - Applies the **per-user rate limit / quota** (cost-aware). Over limit → 429.
    - Checks the **global daily answer cap** (`DAILY_ANSWER_CAP` answers per UTC day for all
      users together — a cost guard for the public demo; 150 by default). The answer is
