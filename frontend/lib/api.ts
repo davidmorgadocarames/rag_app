@@ -165,11 +165,16 @@ export function verifyEmail(token: string): Promise<{ detail: string }> {
 }
 
 // T12.4.5 (frontend shell) / T12.4.6 (12b-C, the backend route + BFF allow-list entry):
-// the /reset page's button POSTs the token from its URL plus the new password. The
-// backend route this calls does not exist until 12b-C lands -- until then the BFF's own
-// allow-list (lib/bffRoutes.ts) 404s it, which the page surfaces as an ordinary error.
+// the /reset page's button POSTs the token from its URL plus the new password.
 export function confirmPasswordReset(token: string, password: string): Promise<{ detail: string }> {
   return request("/auth/reset", { method: "POST", body: JSON.stringify({ token, password }) });
+}
+
+// T12.4.6: the forgot-password form's submit -- a generic response whatever the outcome
+// (no account, unverified, or a real reset email sent); see GENERIC_FORGOT_PASSWORD_MESSAGE
+// on the backend.
+export function forgotPassword(email: string): Promise<{ detail: string }> {
+  return request("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
 }
 
 export function deleteAccount(): Promise<{ detail: string }> {

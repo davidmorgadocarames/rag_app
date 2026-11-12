@@ -268,7 +268,10 @@ def test_0007_grants_follow_the_migration_map(db_engine: Engine) -> None:
             )
 
     p = "secrag_purger"
-    for table in ("user_mfa", "mfa_recovery_codes"):
+    # "part 1" (user_mfa, mfa_recovery_codes) + "part 3" (password_reset_tokens, T12.4.6) --
+    # "part 2" (login_lockouts) is keyed differently (email_hmac, no user_id FK) and has no
+    # grant test of its own yet (DA-12bB note), not this function's concern to add.
+    for table in ("user_mfa", "mfa_recovery_codes", "password_reset_tokens"):
         assert can(p, table, "SELECT") and can(p, table, "DELETE"), table
         assert not can(p, table, "INSERT"), table
         assert can("secrag_backup", table, "SELECT"), table

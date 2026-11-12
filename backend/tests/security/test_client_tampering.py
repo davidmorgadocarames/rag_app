@@ -27,9 +27,10 @@ from sqlalchemy.orm import Session
 
 from rag_app.admin import create_admin
 from rag_app.api.app import create_app
-from rag_app.api.deps import get_signup_tracker
+from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.authz import PROTECTED_ROUTES, ROLE_PERMISSIONS
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.risk import SignupTracker
 from rag_app.sessions import SESSION_COOKIE_NAME
 
@@ -51,6 +52,7 @@ def api_env(db_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Engine:
 def _client() -> TestClient:
     app = create_app()
     app.dependency_overrides[get_signup_tracker] = SignupTracker
+    app.dependency_overrides[get_email_abuse_limiter] = EmailAbuseLimiter
     return TestClient(app, base_url=BASE_URL)
 
 

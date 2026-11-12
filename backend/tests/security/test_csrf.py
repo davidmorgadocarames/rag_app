@@ -19,8 +19,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from rag_app.api.app import create_app
-from rag_app.api.deps import get_signup_tracker
+from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.risk import SignupTracker
 from rag_app.sessions import SESSION_COOKIE_NAME
 
@@ -45,6 +46,7 @@ def _client() -> TestClient:
     """A fresh app with its OWN signup-risk tracker (see test_auth_cookies.py for why)."""
     app = create_app()
     app.dependency_overrides[get_signup_tracker] = SignupTracker
+    app.dependency_overrides[get_email_abuse_limiter] = EmailAbuseLimiter
     return TestClient(app, base_url=BASE_URL)
 
 

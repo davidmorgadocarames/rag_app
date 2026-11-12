@@ -239,6 +239,27 @@ catalogue analysis; this is the implementation summary.
   mail scanner pre-fetching the emailed link can no longer consume anything. DEBT-034's
   design note (does not close it — closes at T12.6b.5) and REC-05 are in
   `docs/security/THREAT_MODEL.md`.
+- **Password reset + email abuse limits + `EmailSender`** (12b-C, T12.4.6-T12.4.8, X10,
+  REC-06): `password_reset_tokens` (0007 "part 3") follows `email_verification_tokens`'
+  storage convention exactly (only the SHA-256 hash is stored) and the SAME atomic-consume
+  shape (`UPDATE ... WHERE used_at IS NULL AND expires_at > now()`, never SELECT-then-
+  UPDATE — `rag_app.api.auth._consume_password_reset_token`/`_consume_email_verification_
+  token`); `POST /auth/reset` success revokes every session of the account
+  (`rag_app.sessions.revoke_all`) and clears any login lockout. `POST /auth/forgot-password`
+  is enumeration-safe the same way as register (generic response; a real reset email to the
+  real owner, a harmless "no account" notice to anyone else, so the response/timing never
+  discloses which happened) — the register-style "unconditional DB write" trick does not
+  apply (a reset token needs a real `user_id` for its FK), so cost parity instead comes from
+  always sending exactly one email via the SAME `_send` call either way.
+  `rag_app.email_abuse.EmailAbuseLimiter` adds three independent in-memory token buckets
+  (per real IP, per recipient, global) for register/resend-verification/forgot-password,
+  each an atomic `RateLimiter.allow` call (X10) — code constants (B6), no new secret.
+  `rag_app.emailer` (one SMTP implementation, T12.4.7) counts every send attempt by `kind`
+  (`secrag_email_sent_total`/`secrag_email_failed_total`, never the recipient). DA re-check:
+  `register`'s `except IntegrityError` now treats ONLY the `users.email` unique-constraint
+  violation (SQLSTATE 23505, constraint `users_email_key`) as "already registered" — any
+  other integrity error (e.g. a NOT NULL/FK problem on a different table) re-raises as a 500
+  instead of silently returning the generic 202.
 - **Roles + permission map + admin MFA** (`rag_app.authz`, T12.3.2/T12.3.2b/T12.3.3/T12.3.4/
   T12.3.5): `users.role` stays `user`/`admin` (CHECK constraint, migration 0006); every
   protected route declares a **permission** (`require_permission("admin:read")`), never a

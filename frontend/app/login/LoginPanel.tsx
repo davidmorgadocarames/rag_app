@@ -122,6 +122,15 @@ export default function LoginPanel() {
           >
             {mode === "login" ? "Need access? Register" : "Have access? Sign in"}
           </button>
+          {mode === "login" && (
+            // T12.4.6: the forgot-password request form lives on its own page.
+            <a
+              href="/forgot-password"
+              className="text-xs tracking-[0.1em] text-vault-steel-dark transition-colors hover:text-vault-steel"
+            >
+              Forgot password?
+            </a>
+          )}
         </form>
       </div>
     </>

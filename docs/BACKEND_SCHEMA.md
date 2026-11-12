@@ -168,8 +168,8 @@ live cookie/Bearer stops authenticating at once), set `users.email` and
 `users.password_hash` to NULL, set `users.deleted_at`, and upsert `deletion_requests`
 (`status = pending`). The purger (`rag_app.purger`, role `secrag_purger`) follows the
 purge-step registry `rag_app.erasure.PURGE_STEPS`, leaf-first — `messages` →
-`conversations` → `email_verification_tokens` → `sessions` → `mfa_recovery_codes` →
-`user_mfa` → `users` — in batches with `FOR UPDATE SKIP LOCKED`,
+`conversations` → `email_verification_tokens` → `password_reset_tokens` → `sessions` →
+`mfa_recovery_codes` → `user_mfa` → `users` — in batches with `FOR UPDATE SKIP LOCKED`,
 recording `progress`/`attempts`/`last_error` on the tombstone and one row per run in
 `purger_runs`. The `sessions` step is a backstop (the request path already deletes them all
 immediately): it still needs its own step for the X3 scan and for any session that could
@@ -198,11 +198,10 @@ Corpus tables (`documents`, `chunks`) are shared and not user-owned.
 ## 5. As implemented (migrations 0001-0007)
 
 Source of truth: `backend/src/rag_app/db/models.py` and `backend/migrations/versions/`. Head:
-**`0007_mfa`** (Phase 12b-A, T12.3.4 "part 1"; extended in 12b-B with T12.4.2 "part 2",
-below — expand-only, see the
+**`0007_mfa`** (Phase 12b-A, T12.3.4 "part 1"; extended in 12b-B with T12.4.2 "part 2" and in
+12b-C with T12.4.6 "part 3", below — expand-only, see the
 [Definition of Done](DEFINITION_OF_DONE.md#phase-specific-norms), expand/contract). 0007 is
-extended in place by 12b-C (reset tokens, "part 3") before it is ever merged to `main` —
-see its own module docstring.
+still not promoted to `main` as of 12b-C — see its own module docstring.
 
 | Table | Columns (type; nullable = null) | Notes |
 |---|---|---|
@@ -214,7 +213,8 @@ see its own module docstring.
 | `user_keys` | `user_id` uuid PK → `users` (cascade) · `wrapped_key` bytea · `created_at` | the per-user Fernet key wrapped by `DATA_MASTER_KEY`; deleted in the erasure request (crypto-shred) |
 | `conversations` | `id` · `user_id` → `users` (cascade) · `title_encrypted` bytea null · `created_at` | |
 | `messages` | `id` · `conversation_id` → `conversations` (cascade) · `role` · `content_encrypted` bytea · `prompt_tokens`, `completion_tokens` int null · `created_at` | citations inside the encrypted JSON; failed/interrupted turns are stored as assistant error markers |
-| `email_verification_tokens` | `id` · `user_id` → `users` (cascade) · `token_hash` unique · `expires_at` · `used_at` null · `created_at` | only the hash is stored |
+| `email_verification_tokens` | `id` · `user_id` → `users` (cascade) · `token_hash` unique · `expires_at` · `used_at` null · `created_at` | only the hash is stored; consumed atomically (`UPDATE ... WHERE used_at IS NULL AND expires_at > now()`, X10, REC-06) |
+| `password_reset_tokens` (0007 "part 3", T12.4.6) | `id` uuid PK · `user_id` → `users` (cascade), indexed · `token_hash` varchar unique · `expires_at` (30 min) · `used_at` timestamptz null · `created_at` | only the hash is stored; consumed atomically, same shape as `email_verification_tokens` (X10, REC-06); success (`POST /auth/reset`) revokes every session of the account and clears any login lockout |
 | `deletion_requests` (tombstones) | `id` · `user_id` uuid **unique, no FK** · `requested_at` · **0005:** `status` (`pending`/`running`/`done`/`failed`, default `pending`; rows from before 0005 = `done`) · `progress` jsonb (rows deleted per purge step) · `attempts` int · `last_error` text null (error class only) · `updated_at` · `completed_at` null | partial index `ix_deletion_requests_open` on `requested_at` where the status is open; no personal data; exported to Blob `tombstones/` (local `.tombstones/`) for restores |
 | `purger_runs` (0005) | `id` uuid PK (`gen_random_uuid()`) · `started_at` · `finished_at` null · `requests_processed` · `errors` · `last_error` null | one row per purger run; no personal data |
 | `usage_daily` (0005) | `day` date PK · `answers` int ≥ 0 · `tokens` bigint ≥ 0 | global daily answer cap (R6-1); no user id |
@@ -230,13 +230,13 @@ outside Alembic by `scripts/db/apply_roles.sh` (it sends only a client-side SCRA
 | Role | Grants | Used by |
 |---|---|---|
 | `secrag_backup` | `CONNECT`, `USAGE` on `public`; `SELECT` on every table and sequence, and **default privileges** so every future table is readable too (0005/0006/0007 also grant their new tables explicitly) | `scripts/db/backup.sh` (`pg_dump` → `age`), the backup Job |
-| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`, `sessions` (0006), **`user_mfa`, `mfa_recovery_codes`, `login_lockouts`** (0007): `SELECT, DELETE, UPDATE (id/user_id/email_hmac)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` | `rag_app.purger` (purge Job, compose `purger`) |
+| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`, `sessions` (0006), **`user_mfa`, `mfa_recovery_codes`, `login_lockouts`, `password_reset_tokens`** (0007): `SELECT, DELETE, UPDATE (id/user_id/email_hmac)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` | `rag_app.purger` (purge Job, compose `purger`) |
 
 0005/0006/0007 check that both roles exist (a missing role fails the upgrade with a clear
 message). 0005's downgrade revokes the purger's grants and **refuses** while any user has
 `email`/`password_hash` NULL or `deleted_at` set; 0006's downgrade **refuses** while any user
 has a non-default `role`; 0007's downgrade **refuses** while any MFA enrolment, recovery
-code or login-lockout row exists (leaf-first: lockout rows, "part 2", checked/dropped before
-MFA, "part 1"). None of them is a rollback path once that data exists (roll images back
+code, login-lockout or password-reset-token row exists (leaf-first: reset tokens, "part 3",
+then lockout rows, "part 2", then MFA, "part 1"). None of them is a rollback path once that data exists (roll images back
 instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback); 0006/0007 stay in
 place after the 12a rollback).

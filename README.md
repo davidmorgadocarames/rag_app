@@ -244,7 +244,8 @@ unset locally.
 SMTP is optional. Without it no email is sent and nothing personal is logged; the verification
 link is never returned by `POST /auth/resend-verification` either, in any environment (T12.1.11)
 — `docker compose up` points the backend's SMTP at the bundled Mailpit (http://127.0.0.1:8025),
-so locally the link only ever shows up there. Logs never contain an email address, a password or
+so locally the link only ever shows up there. `POST /auth/forgot-password` (T12.4.6) follows the
+same rule — the reset link never travels in the response, only by email. Logs never contain an email address, a password or
 a token: query
 strings are redacted from the uvicorn access log (the verification link is
 `GET /auth/verify?token=…`), database errors never print bound parameters, a concurrent sign-up
@@ -652,7 +653,8 @@ scripts/azure/demo-mode.sh off      # back to min-replicas 0 right away
 | Endpoint | Purpose |
 |---|---|
 | `POST /auth/register` · `POST /auth/login` · `GET /auth/me` | Account creation (risk-scored), login (rate-limited), current user |
-| `GET /auth/verify` · `POST /auth/resend-verification` | Email verification |
+| `POST /auth/verify` · `POST /auth/resend-verification` | Email verification (POST with the token in the body, T12.4.5) |
+| `POST /auth/forgot-password` · `POST /auth/reset` | Password reset request (enumeration-safe) and consume (single-use, 30 min, T12.4.6) |
 | `POST /chat/stream` | Authenticated SSE stream: pipeline stages, answer tokens, citations, token usage; once the daily answer cap is reached, an `error` event (`daily_cap_reached`) |
 | `POST /chat` | Authenticated one-shot, non-persisting answer with citations and `abstained`/`grounded` flags; `429` + `Retry-After` (until UTC midnight) once the daily answer cap is reached |
 | `GET/PATCH/DELETE /conversations…` | Encrypted conversation history |

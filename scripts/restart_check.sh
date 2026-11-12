@@ -8,8 +8,9 @@
 #   1. `compose -p P up db`; the BACKEND IMAGE ALONE is started once without migrate: it must
 #      exit and leave no `alembic_version` (it never migrates, T11.2.5)
 #   2. `compose -p P up backend`: db → db-roles → migrate (one-shot, exit 0, head) → backend
-#   3. register a dedicated throwaway account → one chat turn ("hello", answered without the
-#      LLM) → note the conversation id
+#   3. register a dedicated throwaway account → verify it via Mailpit (T12.4.10: the real
+#      SMTP/token flow, not a direct SQL UPDATE) → login (cookie, no Bearer) → one chat turn
+#      ("hello", answered without the LLM) → note the conversation id
 #   4. restart: `down` WITHOUT -v, then `up` as project Q (default Q = P) → login → the
 #      conversation's first message must decrypt to "hello"
 #   5. --restart-master-key (DA-D-2): `down`, `up` with a NEW random DATA_MASTER_KEY → the
@@ -25,11 +26,13 @@
 #
 # Safety: runs the REAL docker-compose.yml plus scripts/restart_check.compose.yml, which swaps
 # the external dev volume for a throwaway one (created here, removed at the end) and publishes
-# only the API on 127.0.0.1:$RESTART_CHECK_API_PORT (default 18000; no DB port), so it can run
-# while the development stack is up. Refuses the development projects (rag_ia, rag_app), any
-# resolved development volume, an existing throwaway volume and a busy API port. Fresh
-# random JWT_SECRET / CSRF_SECRET / DATA_MASTER_KEY per run unless set. Removes both projects (containers,
-# network, locally built images) and the throwaway volume at the end unless --keep.
+# only the API on 127.0.0.1:$RESTART_CHECK_API_PORT (default 18000; no DB port) and this
+# project's OWN Mailpit HTTP API on 127.0.0.1:$RESTART_CHECK_MAILPIT_API_PORT (default 18025),
+# so it can run while the development stack is up. Refuses the development projects (rag_ia,
+# rag_app), any resolved development volume, an existing throwaway volume and a busy API/
+# Mailpit port. Fresh random JWT_SECRET / CSRF_SECRET / DATA_MASTER_KEY per run unless set.
+# Removes both projects (containers, network, locally built images) and the throwaway volume
+# at the end unless --keep.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,6 +40,11 @@ COMPOSE_FILE="${RESTART_CHECK_COMPOSE_FILE:-$ROOT/docker-compose.yml}"
 OVERRIDE_FILE="$ROOT/scripts/restart_check.compose.yml"
 export RESTART_CHECK_API_PORT="${RESTART_CHECK_API_PORT:-18000}"
 API="http://127.0.0.1:$RESTART_CHECK_API_PORT"
+# T12.4.10: this project's OWN Mailpit (restart_check.compose.yml publishes its API/web-UI
+# port here) -- distinct from the development stack's Mailpit (127.0.0.1:8025) so both can
+# run at once.
+export RESTART_CHECK_MAILPIT_API_PORT="${RESTART_CHECK_MAILPIT_API_PORT:-18025}"
+MAILPIT_API="http://127.0.0.1:$RESTART_CHECK_MAILPIT_API_PORT"
 DEV_PROJECTS=" rag_ia rag_app "
 DEV_VOLUMES=" rag_ia_pgdata rag_app_pgdata "
 UP_TIMEOUT="${RESTART_CHECK_UP_TIMEOUT:-300}"
@@ -66,6 +74,13 @@ done
 case "$RESTART_CHECK_API_PORT" in
   5432 | 8000 | 3000 | 11434) refuse "port $RESTART_CHECK_API_PORT belongs to the development stack" ;;
 esac
+[[ "${RESTART_CHECK_MAILPIT_API_PORT:-}" =~ ^[0-9]+$ ]] \
+  || refuse "RESTART_CHECK_MAILPIT_API_PORT must be a number"
+case "$RESTART_CHECK_MAILPIT_API_PORT" in
+  5432 | 8000 | 3000 | 11434 | 8025 | 1025) refuse "port $RESTART_CHECK_MAILPIT_API_PORT belongs to the development stack" ;;
+esac
+[ "$RESTART_CHECK_API_PORT" != "$RESTART_CHECK_MAILPIT_API_PORT" ] \
+  || refuse "RESTART_CHECK_API_PORT and RESTART_CHECK_MAILPIT_API_PORT must differ"
 command -v docker >/dev/null || refuse "docker not found"
 command -v curl >/dev/null || refuse "curl not found"
 docker info >/dev/null 2>&1 || refuse "docker is not reachable (start Docker Desktop)"
@@ -202,17 +217,76 @@ up() {
 
 db_sql() { compose "$1" exec -T db psql -U rag -d rag -X -tAc "$2"; }
 
-# http <method> <path> <token|-> [json body] → "<body>\n<status>"
+# Cookie-based auth (T12.4.10, "no Bearer anywhere"): curl's own `-b`/`-c` cookie-jar engine
+# enforces a cookie's Secure flag against the ACTUAL connection scheme, so it would refuse to
+# resend the (Secure) session/CSRF cookies `set_session_cookie`/`set_csrf_cookie` issue over
+# this script's plain http:// API. Cookies are instead captured by hand from each response's
+# Set-Cookie headers (same idea as backend/tests/test_log_hygiene.py's `_Server.
+# last_set_cookie`) and resent as an explicit `Cookie:`/`X-CSRF-Token:` header -- nothing but
+# a compliant jar's OWN policy enforces Secure; a throwaway loopback-only script copying the
+# value itself is not a real-world downgrade (production only ever serves this cookie over
+# HTTPS, through the BFF).
+COOKIE_SESSION="" COOKIE_CSRF=""
+_absorb_set_cookie() {  # <raw "Set-Cookie: name=value; ..." header line>
+  local rest name value
+  rest="$(sed -E 's/^[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]: *//' <<<"$1")"
+  name="${rest%%=*}"
+  value="${rest#*=}"; value="${value%%;*}"
+  case "$name" in
+    __Host-secrag_session) COOKIE_SESSION="$value" ;;
+    __Host-secrag_csrf) COOKIE_CSRF="$value" ;;
+  esac
+}
+
+# http <method> <path> [json body] → "<body>\n<status>"
 http() {
+  local headers_file response line
   local extra=()
-  [ "$3" = - ] || extra+=(-H "Authorization: Bearer $3")
-  [ -z "${4:-}" ] || extra+=(--data "$4")
-  curl -sS -o - -w '\n%{http_code}' -X "$1" "${extra[@]}" \
-    -H 'Content-Type: application/json' "$API$2"
+  headers_file="$(mktemp)"
+  [ -z "${3:-}" ] || extra+=(--data "$3")
+  if [ -n "$COOKIE_SESSION" ]; then
+    local cookie="__Host-secrag_session=$COOKIE_SESSION"
+    [ -z "$COOKIE_CSRF" ] || cookie="$cookie; __Host-secrag_csrf=$COOKIE_CSRF"
+    extra+=(-H "Cookie: $cookie")
+  fi
+  [ -z "$COOKIE_CSRF" ] || extra+=(-H "X-CSRF-Token: $COOKIE_CSRF")
+  response="$(curl -sS -D "$headers_file" -o - -w '\n%{http_code}' -X "$1" "${extra[@]}" \
+    -H 'Content-Type: application/json' "$API$2")"
+  while IFS= read -r line; do
+    _absorb_set_cookie "$line"
+  done < <(grep -i '^set-cookie:' "$headers_file" || true)
+  rm -f "$headers_file"
+  echo "$response"
 }
 status_of() { tail -n1 <<<"$1"; }
 body_of() { sed '$d' <<<"$1"; }
 json_get() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+
+# --- Mailpit (T12.4.10): read the verification/reset link out of the project's OWN Mailpit --
+mailpit_wait_for_body() {  # <to-email> → the message's plain-text/HTML body
+  local to="$1" deadline id query
+  deadline=$((SECONDS + 20))
+  query="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "to:$to")"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    id="$( (curl -sS "$MAILPIT_API/api/v1/search?query=$query" \
+      | python3 -c 'import json,sys; m=json.load(sys.stdin).get("messages") or []; print(m[0]["ID"] if m else "")') 2>/dev/null || true)"
+    if [ -n "$id" ]; then
+      curl -sS "$MAILPIT_API/api/v1/message/$id" \
+        | python3 -c 'import json,sys; b=json.load(sys.stdin); print(b.get("Text") or b.get("HTML") or "")'
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+mailpit_extract_token() {  # <email body> → the token= query value
+  python3 -c '
+import re, sys
+match = re.search(r"token=([^\s&\"\x27<]+)", sys.argv[1])
+if not match:
+    sys.exit(1)
+print(match.group(1))' "$1"
+}
 
 email="restart-check-$(rand 6)@example.com"
 password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
@@ -243,23 +317,28 @@ head="$(db_sql "$project" "SELECT version_num FROM alembic_version")"
 say "migrate one-shot: exited 0, alembic $head"
 
 # --- 3. account + one encrypted message -----------------------------------------------------
-res="$(http POST /auth/register - "$creds")"
+res="$(http POST /auth/register "$creds")"
 [ "$(status_of "$res")" = 202 ] || fail "register" "HTTP $(status_of "$res") on /auth/register"
 say "registered a dedicated throwaway account"
-# T12.4.4: register no longer opens a session, and this script's ENV=prod default makes
-# REQUIRE_EMAIL_VERIFICATION default to true -- mark the throwaway account verified
-# directly (this script tests data persistence, not the email flow), then log in explicitly
-# for the token. Two statements, not one UPDATE ... RETURNING: psql's -t (tuples-only) only
-# drops SELECT's row-count footer, not a DML command's completion tag ("UPDATE 1"), which
-# would otherwise land in $verified alongside the RETURNING value.
-db_sql "$project" "UPDATE users SET email_verified = true WHERE email = '$email'" >/dev/null
-verified="$(db_sql "$project" "SELECT email_verified FROM users WHERE email = '$email'")"
-[ "$verified" = t ] || fail "register" "could not mark the throwaway account verified (email_verified query returned '$verified')"
-res="$(http POST /auth/login - "$creds")"
-[ "$(status_of "$res")" = 200 ] || fail "register" "HTTP $(status_of "$res") on /auth/login right after register"
-token="$(body_of "$res" | json_get access_token)"
+# T12.4.10: verify via the REAL Mailpit flow (register -> Mailpit API -> extract the token
+# from the real email -> POST /auth/verify) -- this script's ENV=prod default makes
+# REQUIRE_EMAIL_VERIFICATION default to true, like a real deployment, so login would
+# otherwise 403. No more direct `UPDATE users SET email_verified = true`.
+verify_body="$(mailpit_wait_for_body "$email")" \
+  || fail "verify" "no verification email arrived at Mailpit ($MAILPIT_API) for the throwaway account"
+verify_token="$(mailpit_extract_token "$verify_body")" \
+  || fail "verify" "the verification email's body had no 'token=' link"
+res="$(http POST /auth/verify "{\"token\": \"$verify_token\"}")"
+[ "$(status_of "$res")" = 200 ] || fail "verify" "HTTP $(status_of "$res") on /auth/verify"
+say "verified via Mailpit (real SMTP send, real token)"
+# T12.4.10 ("no Bearer anywhere"): login now sets the session/CSRF cookies http() tracks --
+# every later call authenticates with them, never an Authorization header.
+res="$(http POST /auth/login "$creds")"
+[ "$(status_of "$res")" = 200 ] || fail "register" "HTTP $(status_of "$res") on /auth/login right after verify"
+[ -n "$COOKIE_SESSION" ] || fail "register" "login did not set the session cookie"
 
-stream="$(curl -sS -N -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+stream="$(curl -sS -N -X POST -H "Cookie: __Host-secrag_session=$COOKIE_SESSION; __Host-secrag_csrf=$COOKIE_CSRF" \
+            -H "X-CSRF-Token: $COOKIE_CSRF" -H 'Content-Type: application/json' \
             --data '{"question": "hello"}' "$API/chat/stream")"
 conv="$(python3 -c '
 import json, sys
@@ -272,10 +351,11 @@ for line in sys.stdin.read().splitlines():
 [ -n "$conv" ] || fail "conversation" "no 'done' event with a conversation id from /chat/stream"
 say "conversation created (one encrypted user message)"
 
-# login_and_read <step>: login with the account, read the conversation, decrypt check.
+# login_and_read <step>: login with the account (cookie, no Bearer), read the conversation,
+# decrypt check.
 login_and_read() {
   local step="$1" res first
-  res="$(http POST /auth/login - "$creds")"
+  res="$(http POST /auth/login "$creds")"
   if [ "$(status_of "$res")" != 200 ]; then
     if [ "$(status_of "$res")" = 401 ] && [ "$vol_before" != "$vol_after" ]; then
       fail "$step" "HTTP 401 on /auth/login — the account is gone: the restarted stack runs on \
@@ -283,8 +363,7 @@ volume $vol_after, the data was written to $vol_before (a project-derived volume
     fi
     fail "$step" "FAIL (unexpected): HTTP $(status_of "$res") on /auth/login (volume $vol_before → $vol_after)"
   fi
-  token="$(body_of "$res" | json_get access_token)"
-  res="$(http GET "/conversations/$conv" "$token")"
+  res="$(http GET "/conversations/$conv")"
   [ "$(status_of "$res")" = 200 ] \
     || fail "$step" "HTTP $(status_of "$res") reading the conversation after the restart (logged in fine: \
 the data is there but cannot be read — e.g. another DATA_MASTER_KEY)"
@@ -308,11 +387,10 @@ if [ "$master_key_step" = 1 ]; then
   DATA_MASTER_KEY="$(new_master_key)"
   export DATA_MASTER_KEY
   if up "$restart_project"; then
-    res="$(http POST /auth/login - "$creds")"
+    res="$(http POST /auth/login "$creds")"
     code="-"
     if [ "$(status_of "$res")" = 200 ]; then
-      token="$(body_of "$res" | json_get access_token)"
-      code="$(status_of "$(http GET "/conversations/$conv" "$token")")"
+      code="$(status_of "$(http GET "/conversations/$conv")")"
     fi
     fail "restart with another master key" "the API STARTED with a different DATA_MASTER_KEY (login \
 HTTP $(status_of "$res"), read HTTP $code): no fingerprint check — the data is silently unreadable"
@@ -330,9 +408,9 @@ mismatch: $(grep -m1 -E 'Error|error' <<<"$UP_LOGS" | cut -c1-200)"
 fi
 
 # --- 6. erase the dedicated account ------------------------------------------------------
-res="$(http DELETE /account "$token")"
+res="$(http DELETE /account)"
 [ "$(status_of "$res")" = 202 ] || fail "erase" "HTTP $(status_of "$res") on DELETE /account"
-res="$(http POST /auth/login - "$creds")"
+res="$(http POST /auth/login "$creds")"
 [ "$(status_of "$res")" = 401 ] || fail "erase" "login still works after DELETE /account (HTTP $(status_of "$res"))"
 say "dedicated account erased (login refused afterwards)"
 

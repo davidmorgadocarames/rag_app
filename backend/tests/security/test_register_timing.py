@@ -16,7 +16,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from rag_app.api.app import create_app
-from rag_app.api.deps import get_signup_tracker
+from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
+from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.risk import SignupTracker
 
 pytestmark = [pytest.mark.db, pytest.mark.security]
@@ -43,6 +44,9 @@ def _client() -> TestClient:
     # before the timing measurement completes -- same override as
     # backend/tests/security/test_client_tampering.py.
     app.dependency_overrides[get_signup_tracker] = SignupTracker
+    # T12.4.8: same reasoning -- a fresh EmailAbuseLimiter per app, not the process-wide
+    # singleton, so this test's many repeated register calls never trip the new per-IP cap.
+    app.dependency_overrides[get_email_abuse_limiter] = EmailAbuseLimiter
     return TestClient(app, base_url=BASE_URL)
 
 

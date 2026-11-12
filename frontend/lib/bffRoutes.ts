@@ -18,9 +18,9 @@ export const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   // the /verify?token=... page's own GET can never consume the token any more.
   { method: "POST", pattern: /^\/auth\/verify$/ },
   { method: "POST", pattern: /^\/auth\/resend-verification$/ },
-  // T12.4.6 (12b-C) adds the backend route for this; until then the BFF 404s it (no entry
-  // here yet) and the /reset page surfaces that as an ordinary error -- see lib/api.ts.
-  // { method: "POST", pattern: /^\/auth\/reset$/ },
+  // T12.4.6 (12b-C): forgot-password request + the reset page's token+password submit.
+  { method: "POST", pattern: /^\/auth\/forgot-password$/ },
+  { method: "POST", pattern: /^\/auth\/reset$/ },
   { method: "DELETE", pattern: /^\/account$/ },
   { method: "POST", pattern: /^\/chat\/stream$/ },
   { method: "GET", pattern: /^\/conversations$/ },

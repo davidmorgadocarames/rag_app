@@ -9,6 +9,7 @@ comes next.
 Landing (/)  — static vault-door hero + "Inside the vault" corpus explainer
   ├─▶ Sign up (/signup) ─▶ Verify email (/verify) ─▶ Login (/login)
   ├─▶ Login (/login) ─────────────────────────────────▶ Chat (/chat)
+  ├─▶ Login (/login) ─▶ Forgot password (/forgot-password) ─▶ Reset (/reset) ─▶ Login (/login)
   └─▶ (public) About / docs links
 
 Chat (/chat)              [authenticated]
@@ -69,6 +70,26 @@ Chat (/chat)              [authenticated]
      body still carries a JWT for the **pre-BFF rollback frontend** (the current,
      BFF-fronted frontend strips it before the browser ever sees it).
    - Failure → generic error (no user enumeration); increment `login_attempts`.
+
+### 2.3b Forgot / reset password (T12.4.6)
+
+1. **`/login`**'s "Forgot password?" link opens **`/forgot-password`** — an email field and
+   a **Send reset link** button.
+2. `POST /auth/forgot-password` — **generic response whatever the outcome** (no account, an
+   unverified account, or a real reset email sent), the same enumeration-safe discipline as
+   sign up (F3/F11): "If that address has an account, you'll receive a password reset
+   email." A live, verified account gets a real reset link; any other address gets a
+   harmless "no account uses this address" notice instead — the caller cannot tell which.
+3. User clicks the emailed link → **`/reset?token=…`** (a GET: it only renders the page,
+   never consumes the token — same pre-fetch-safety reasoning as `/verify`).
+4. The page's own **Set new password** button issues `POST /auth/reset` with the token and
+   the new password in the body. The server validates the token (unexpired, unused, hashed
+   single-use, 30-minute TTL) and the password policy against the token's REAL owner, then
+   consumes it atomically (X10): sets the new password hash, **revokes every session** of the
+   account and **clears any login lockout**.
+5. A link to **`/login`** appears on success. Invalid/expired/already-used token → an error
+   message; the token is NOT consumed by a rejected password (the user can retry with the
+   same link).
 
 ### 2.4 Ask a question (core loop)
 
@@ -159,18 +180,19 @@ Chat (/chat)              [authenticated]
    `Retry-After` and nothing is deleted: the page shows the message, the user stays signed
    in and can try again.
 5. The **purger** (hourly Job on Azure, compose `purger` locally) deletes the remaining rows
-   in small batches, leaf-first — messages → conversations → verification tokens → the user
-   row — and marks the tombstone `done`. Restores replay the tombstones before reopening.
+   in small batches, leaf-first — messages → conversations → verification tokens → password
+   reset tokens → sessions → MFA rows → the user row — and marks the tombstone `done`.
+   Restores replay the tombstones before reopening.
 
 ## 3. Route → auth matrix
 
 | Route | Auth required | Notes |
 |-------|---------------|-------|
 | `/` | no | Landing |
-| `/signup`, `/login`, `/verify`, `/reset` | no | `/verify`/`/reset` (T12.4.5): a GET only renders the page; its own button POSTs the token |
+| `/signup`, `/login`, `/verify`, `/reset`, `/forgot-password` | no | `/verify`/`/reset` (T12.4.5/T12.4.6): a GET only renders the page; its own button POSTs the token |
 | `/chat`, `/account` | yes | Redirect to `/login` if not authenticated |
 | `POST /chat/stream`, `POST /chat`, `GET/PATCH/DELETE /conversations…` | yes | Chat is rate-limited (cost-aware) and counted against the global daily answer cap |
-| `POST /auth/register`, `POST /auth/resend-verification`, `POST /auth/verify` | no | T12.4.4: register/resend-verification never confirm whether an address already has an account (generic response either way); resend is reached by email, not a session |
+| `POST /auth/register`, `POST /auth/resend-verification`, `POST /auth/verify`, `POST /auth/forgot-password`, `POST /auth/reset` | no | T12.4.4/T12.4.6: register/resend-verification/forgot-password never confirm whether an address already has an account (generic response either way); resend/forgot-password are reached by email, not a session; each is rate-limited per real IP, per recipient and globally (T12.4.8) |
 | `DELETE /account` | yes | |
 | `POST /api/csp-report` | no | Unauthenticated, rate-limited by real IP, CSRF-exempt (no session to protect) — the browser's CSP violation reports (Phase 12a, TRD §8.1) |
 

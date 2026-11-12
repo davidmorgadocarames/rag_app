@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator
-from typing import Annotated
+from collections.abc import Callable, Coroutine, Iterator
+from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ from rag_app import metrics
 from rag_app.client_ip import CLIENT_IP_HEADER, classify_client_ip_header
 from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
+from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.generation import Answer, answer_question
 from rag_app.ratelimit import RateLimiter
 from rag_app.reranking import get_shared_reranker
@@ -26,6 +27,7 @@ AnswerFn = Callable[[Session, str, str | None], Answer]
 _session_factory = None
 _rate_limiter: RateLimiter | None = None
 _signup_tracker = SignupTracker()
+_email_abuse_limiter: EmailAbuseLimiter | None = None
 
 
 def get_session() -> Iterator[Session]:
@@ -63,6 +65,13 @@ def get_signup_tracker() -> SignupTracker:
 
 
 SignupTrackerDep = Annotated[SignupTracker, Depends(get_signup_tracker)]
+
+
+def get_email_abuse_limiter() -> EmailAbuseLimiter:
+    global _email_abuse_limiter
+    if _email_abuse_limiter is None:
+        _email_abuse_limiter = EmailAbuseLimiter()
+    return _email_abuse_limiter
 
 
 def _connection_ip(request: Request) -> str:
@@ -155,3 +164,27 @@ async def rate_limit_login(
         pass
     if not limiter.allow(f"login:{email}:{_client_ip(request)}", cost=1.0):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
+def rate_limit_email(action: str) -> Callable[..., Coroutine[Any, Any, None]]:
+    """T12.4.8: a dependency factory (one call site per action -- ``register``,
+    ``resend-verification``, ``forgot-password``) wrapping
+    ``rag_app.email_abuse.EmailAbuseLimiter.allow`` (X10, atomic per bucket). The submitted
+    email is read from the raw body (same reasoning as ``rate_limit_login``: a typed body
+    parameter here would duplicate the route's own Pydantic model); a malformed/missing body
+    degrades to IP+global limiting only, and the route's own 422 still covers it."""
+
+    async def _dependency(
+        request: Request, limiter: Annotated[EmailAbuseLimiter, Depends(get_email_abuse_limiter)]
+    ) -> None:
+        email = "unknown"
+        try:
+            payload = await request.json()
+            if isinstance(payload, dict) and isinstance(payload.get("email"), str):
+                email = payload["email"]
+        except Exception:  # noqa: BLE001 - not JSON / no body: the endpoint's own 422 covers it
+            pass
+        if not limiter.allow(action, _client_ip(request), email):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+    return _dependency

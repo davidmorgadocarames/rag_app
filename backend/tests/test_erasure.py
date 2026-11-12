@@ -41,6 +41,7 @@ def test_the_registry_is_leaf_first_with_users_last() -> None:
         "messages",
         "conversations",
         "email_verification_tokens",
+        "password_reset_tokens",
         "sessions",
         "mfa_recovery_codes",
         "user_mfa",
@@ -356,7 +357,12 @@ def test_verify_ignores_an_erased_account(db_engine: Engine, master_key: str) ->
     _request(db_engine, user_id)
     client = TestClient(create_app())
     res = client.post("/auth/verify", json={"token": raw})  # T12.4.5: POST, not a GET query param
-    assert res.status_code == 400 and res.json()["detail"] == "invalid token"
+    # T12.4.6 DA re-check: the atomic consume (X10, _consume_email_verification_token) checks
+    # the live-account subquery IN THE SAME statement as used_at/expires_at -- an erased
+    # account's still-unused, unexpired token now gets the SAME "invalid or expired token"
+    # message as a genuinely bad one (never the old, more specific "invalid token"), which if
+    # anything discloses LESS (a caller can no longer distinguish "erased" from "expired").
+    assert res.status_code == 400 and res.json()["detail"] == "invalid or expired token"
     with db_engine.connect() as conn:
         verified, used = conn.execute(
             text(
@@ -389,6 +395,7 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "messages": 75,
         "conversations": 3,
         "email_verification_tokens": 1,
+        "password_reset_tokens": 0,
         "sessions": 0,
         "mfa_recovery_codes": 0,
         "user_mfa": 0,
@@ -400,6 +407,7 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "messages",
         "conversations",
         "email_verification_tokens",
+        "password_reset_tokens",
         "sessions",
         "mfa_recovery_codes",
         "user_mfa",

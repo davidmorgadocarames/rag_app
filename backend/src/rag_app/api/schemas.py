@@ -77,6 +77,30 @@ class VerifyEmailRequest(StrictModel):
     token: str = Field(min_length=1, max_length=512)
 
 
+class ForgotPasswordRequest(StrictModel):
+    # Same shape/length bound as RegisterRequest.email/ResendVerificationRequest.email.
+    email: str = Field(min_length=3, max_length=255)
+
+
+class ResetPasswordRequest(StrictModel):
+    # T12.4.6: POST with the token in the body -- same discipline as VerifyEmailRequest (a
+    # mail scanner pre-fetching the frontend's /reset?token=... link can never consume it).
+    token: str = Field(min_length=1, max_length=512)
+    password: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _check_password_length_and_denylist(self) -> ResetPasswordRequest:
+        # The full policy (T12.4.3) also forbids a password containing the ACCOUNT's own
+        # email local part -- not knowable here (the token is not resolved to a user yet),
+        # so the route handler re-checks that one rule against the real email once the
+        # token's owner is known (rag_app.api.auth.reset_password), before consuming the
+        # token. The length/denylist checks are email-independent and run here already.
+        problems = validate_password(self.password, "")
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"

@@ -28,6 +28,7 @@ EXPECTED_TABLES = {
     "sessions",
     "user_mfa",
     "mfa_recovery_codes",
+    "password_reset_tokens",
 }
 
 

@@ -10,8 +10,9 @@ from cryptography.fernet import Fernet
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
-from rag_app.admin import AdminCreateError, create_admin, main
+from rag_app.admin import AdminCreateError, create_admin, create_verified_user, main
 from rag_app.db.models import User, UserKey
+from rag_app.erasure import request_erasure
 
 pytestmark = [pytest.mark.db, pytest.mark.security]
 
@@ -85,3 +86,54 @@ def test_the_cli_never_prints_the_password(
     with Session(db_engine) as session:
         row = session.scalar(select(User).where(User.email == email))
         assert row is not None and row.role == "admin"
+
+
+# --- demo-account (T12.4.11, DEC-007) ------------------------------------------------------
+
+
+def test_create_verified_user_with_role_user_is_a_normal_verified_account(
+    db_engine: Engine, master_key: str
+) -> None:
+    email = _email()
+    with Session(db_engine) as session:
+        user = create_verified_user(session, email, "a-strong-random-password-1234", role="user")
+        assert user.role == "user"
+        assert user.email_verified is True
+
+    with Session(db_engine) as session:
+        row = session.scalar(select(User).where(User.id == user.id))
+        assert row is not None and row.role == "user" and row.email_verified
+        key = session.scalar(select(UserKey).where(UserKey.user_id == user.id))
+        assert key is not None
+
+
+def test_demo_account_cli_shows_the_generated_password_exactly_once_never_logged(
+    db_engine: Engine, master_key: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T12.4.11: unlike `create` (interactive, never shown), `demo-account` GENERATES the
+    password and must print it exactly once on stdout -- the only place the operator can
+    read it from -- while still never printing the email (PII)."""
+    email = _email()
+    assert main(["demo-account", "--email", email]) == 0
+    out = capsys.readouterr().out
+    assert email not in out
+    assert "password (shown once" in out
+
+    with Session(db_engine) as session:
+        row = session.scalar(select(User).where(User.email == email))
+        assert row is not None and row.role == "user" and row.email_verified is True
+        user_id = row.id
+
+    # Erasable through the normal path (D-ER) -- no special-case deletion for demo accounts.
+    with Session(db_engine) as session:
+        assert request_erasure(session, user_id) is True
+        row = session.scalar(select(User).where(User.id == user_id))
+        assert row is not None and row.deleted_at is not None and row.email is None
+
+
+def test_demo_account_refuses_a_duplicate_email(db_engine: Engine, master_key: str) -> None:
+    email = _email()
+    with Session(db_engine) as session:
+        create_verified_user(session, email, "a-strong-random-password-1234", role="user")
+    with Session(db_engine) as session, pytest.raises(AdminCreateError):
+        create_verified_user(session, email, "a-different-password-entirely", role="user")

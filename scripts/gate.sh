@@ -101,6 +101,7 @@ latency          seed 900
 e2e              seed 600
 security-headers db 300
 zap-baseline     db 600
+email-e2e        db 180
 "
 STACK_BUDGET=300   # up + migrate + seed restore
 
@@ -651,6 +652,25 @@ step_e2e() {
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
     MAILPIT_API_URL="http://127.0.0.1:$GATE_MAILPIT_API_PORT" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/mfa.spec.ts)
+}
+
+# T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for
+# password reset -- a NATIVE backend only (no frontend/Playwright needed: both flows are
+# exercised at the HTTP/JSON level, like `restart-check`, never through a browser), against
+# the gate's own Mailpit (`e2e_ensure_mailpit`, called by `e2e_start_backend`). Cheaper than
+# `e2e` (tagged `db`, not `seed` -- no RAG/Ollama call in either flow) despite sharing the
+# same backend-bringup helper.
+step_email-e2e() {
+  need_venv || return 1
+  if ! "$VENV/bin/python" -c 'import uvicorn' 2>/dev/null; then
+    missing_tool "uvicorn (pip install -r backend/requirements.txt)"
+    return
+  fi
+  trap e2e_cleanup EXIT
+  e2e_start_backend "$GATE_STATE/email-e2e" || return 1
+  (cd "$REPO_ROOT/backend" && "$VENV/bin/python" -m rag_app.devtools.email_e2e_check \
+    --backend-url "http://127.0.0.1:$E2E_BACKEND_PORT" \
+    --mailpit-url "http://127.0.0.1:$GATE_MAILPIT_API_PORT")
 }
 
 # T12.2.3/T12.2.5 (E3/E9): the Playwright page walk (frontend/e2e/security-headers.spec.ts)

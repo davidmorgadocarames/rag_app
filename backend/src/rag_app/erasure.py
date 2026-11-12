@@ -125,6 +125,18 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
             DELETE FROM email_verification_tokens WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM email_verification_tokens WHERE user_id = :uid)",
     ),
+    # Password reset tokens (0007 "part 3", T12.4.6): same leaf-table shape as
+    # email_verification_tokens above.
+    PurgeStep(
+        name="password_reset_tokens",
+        table="password_reset_tokens",
+        delete_batch="""
+            WITH victim AS (
+                SELECT id FROM password_reset_tokens WHERE user_id = :uid
+                 LIMIT :n FOR UPDATE SKIP LOCKED)
+            DELETE FROM password_reset_tokens WHERE id IN (SELECT id FROM victim)""",
+        remaining="SELECT EXISTS (SELECT 1 FROM password_reset_tokens WHERE user_id = :uid)",
+    ),
     # Sessions (0006, T12.1.1): the request path already deletes every row of the user
     # immediately (revoke-all, below) — this step is the X3 purge-step registration/
     # defense-in-depth backstop for anything that outlives the short transaction.

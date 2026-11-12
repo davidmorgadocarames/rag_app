@@ -23,6 +23,9 @@ test("the allow-listed backend routes pass", () => {
   assert.equal(isAllowedUpstreamPath("POST", "/account/mfa/confirm"), true);
   assert.equal(isAllowedUpstreamPath("POST", "/account/mfa/step-up"), true);
   assert.equal(isAllowedUpstreamPath("GET", "/admin/ping"), true);
+  // T12.4.6 (12b-C): forgot-password request + the reset page's token+password submit.
+  assert.equal(isAllowedUpstreamPath("POST", "/auth/forgot-password"), true);
+  assert.equal(isAllowedUpstreamPath("POST", "/auth/reset"), true);
 });
 
 test("never /metrics, /docs, /redoc or /openapi.json, whatever the method", () => {
@@ -41,8 +44,9 @@ test("a listed path with the wrong method is refused", () => {
   assert.equal(isAllowedUpstreamPath("GET", "/auth/verify"), false);
 });
 
-test("T12.4.6 (12b-C) has not landed yet: /auth/reset is not allow-listed", () => {
-  assert.equal(isAllowedUpstreamPath("POST", "/auth/reset"), false);
+test("a GET of /auth/reset or /auth/forgot-password is refused (POST-only)", () => {
+  assert.equal(isAllowedUpstreamPath("GET", "/auth/reset"), false);
+  assert.equal(isAllowedUpstreamPath("GET", "/auth/forgot-password"), false);
 });
 
 test("the bare /chat route (legacy, non-stream) is not on the BFF allow-list", () => {

@@ -1,5 +1,6 @@
-"""admin MFA + login lockout (expand): TOTP secret + recovery codes (T12.3.4, "part 1") and
-the login lockout counter (T12.4.2, "part 2").
+"""admin MFA + login lockout + password reset (expand): TOTP secret + recovery codes
+(T12.3.4, "part 1"), the login lockout counter (T12.4.2, "part 2") and password reset
+tokens (T12.4.6, "part 3").
 
 Revision ID: 0007_mfa
 Revises: 0006_sessions_role
@@ -9,13 +10,12 @@ Expand-only (docs/DEFINITION_OF_DONE.md, "Expand/contract"): every change is add
 relaxes a constraint, so the previous image keeps working on the migrated schema.
 
 Authored for 12b-A (T12.3.4, "part 1": TOTP secret + recovery codes); 12b-B (T12.4.2, "part
-2": login lockout) EXTENDS THIS SAME FILE -- 0007 is not promoted to `main` yet, so there is
-no new revision number for part 2 (0008 is reserved for Phase 13). ``0006 is NOT edited``
-(it is 12a's file, already shipped). 12b-C (T12.4.6, "part 3": password reset tokens) will
-extend this same file again before the branch is ever merged to ``main``. Each part adds its
-own ``CREATE TABLE``/grants in ``upgrade()``, its own teardown in ``downgrade()`` (leaf-first,
-mirroring ``upgrade``), and its own purge-step registration (or X3 exemption) -- never
-touching the other parts' statements.
+2": login lockout) and 12b-C (T12.4.6, "part 3": password reset tokens) EXTEND THIS SAME
+FILE -- 0007 is not promoted to `main` yet, so there is no new revision number for either
+part (0008 is reserved for Phase 13). ``0006 is NOT edited`` (it is 12a's file, already
+shipped). Each part adds its own ``CREATE TABLE``/grants in ``upgrade()``, its own teardown
+in ``downgrade()`` (leaf-first, mirroring ``upgrade``), and its own purge-step registration
+(or X3 exemption) -- never touching the other parts' statements.
 
 ``user_mfa`` is a one-row-per-user table (like ``user_keys``): ``secret_encrypted`` is the
 TOTP secret wrapped with ``DATA_MASTER_KEY`` (``rag_app.crypto``, same crypto-shred guarantee
@@ -109,6 +109,27 @@ PART2_GRANTS = (
 
 PART2_REFUSE_DOWNGRADE_SQL = "SELECT EXISTS (SELECT 1 FROM login_lockouts)"
 
+# --- part 3 (T12.4.6, 12b-C): password reset tokens --------------------------------------
+
+# Same storage convention as part 1's mfa_recovery_codes / 0003's email_verification_tokens:
+# only the SHA-256 hash of the raw token is ever stored (rag_app.security.hash_token).
+PASSWORD_RESET_TOKENS_TABLE = """
+    CREATE TABLE password_reset_tokens (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        token_hash varchar NOT NULL UNIQUE,
+        expires_at timestamptz NOT NULL,
+        used_at timestamptz,
+        created_at timestamptz NOT NULL DEFAULT now()
+    )"""
+
+PART3_GRANTS = (
+    "GRANT SELECT, DELETE, UPDATE (id) ON password_reset_tokens TO secrag_purger",
+    "GRANT SELECT ON password_reset_tokens TO secrag_backup",
+)
+
+PART3_REFUSE_DOWNGRADE_SQL = "SELECT EXISTS (SELECT 1 FROM password_reset_tokens)"
+
 
 def _require_roles() -> None:
     bind = op.get_bind()
@@ -143,11 +164,20 @@ def upgrade() -> None:
     for grant in PART2_GRANTS:
         op.execute(grant)
 
-    # 12b-C (part 3, reset tokens) adds its CREATE TABLE/grants here, below this line --
-    # never above (leaf-first ordering of downgrade mirrors it).
+    # --- part 3 (T12.4.6): password reset tokens ---
+    op.execute(PASSWORD_RESET_TOKENS_TABLE)
+    op.execute("CREATE INDEX ix_password_reset_tokens_user_id ON password_reset_tokens (user_id)")
+    for grant in PART3_GRANTS:
+        op.execute(grant)
 
 
 def downgrade() -> None:
+    if op.get_bind().execute(text(PART3_REFUSE_DOWNGRADE_SQL)).scalar_one():
+        raise RuntimeError(
+            "refusing to downgrade 0007: a password reset token exists. The downgrade is not"
+            " a rollback path once that data exists — roll back images instead (ADR phase 11,"
+            " Rollback)."
+        )
     if op.get_bind().execute(text(PART2_REFUSE_DOWNGRADE_SQL)).scalar_one():
         raise RuntimeError(
             "refusing to downgrade 0007: a login lockout row exists. The downgrade is not a"
@@ -161,7 +191,9 @@ def downgrade() -> None:
             " instead (ADR phase 11, Rollback)."
         )
 
-    # Leaf-first, mirroring upgrade() in reverse: part 2 before part 1.
+    # Leaf-first, mirroring upgrade() in reverse: part 3, then part 2, then part 1.
+    op.execute("REVOKE ALL ON password_reset_tokens FROM secrag_purger, secrag_backup")
+    op.execute("DROP TABLE IF EXISTS password_reset_tokens")
     op.execute("REVOKE ALL ON login_lockouts FROM secrag_purger, secrag_backup")
     op.execute("DROP TABLE IF EXISTS login_lockouts")
     op.execute("REVOKE ALL ON mfa_recovery_codes FROM secrag_purger, secrag_backup")

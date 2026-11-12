@@ -18,8 +18,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 
 from rag_app.api.app import create_app
-from rag_app.api.deps import get_signup_tracker
+from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.risk import SignupTracker
 from rag_app.security import decode_token
 from rag_app.sessions import SESSION_COOKIE_NAME
@@ -55,6 +56,10 @@ def _client() -> TestClient:
     block (``rag_app.risk``, >= 5 signups/hour from the same TestClient "IP")."""
     app = create_app()
     app.dependency_overrides[get_signup_tracker] = SignupTracker
+    # T12.4.8: same reasoning as the signup tracker above -- a fresh EmailAbuseLimiter per
+    # app, never the process-wide singleton, so repeated register/resend/forgot calls in
+    # this file never trip the new per-IP/global email-abuse limits.
+    app.dependency_overrides[get_email_abuse_limiter] = EmailAbuseLimiter
     return TestClient(app, base_url=BASE_URL)
 
 

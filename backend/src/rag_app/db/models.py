@@ -309,3 +309,24 @@ class EmailVerificationToken(Base):
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class PasswordResetToken(Base):
+    """Password reset tokens (0007 "part 3", T12.4.6): hashed, single-use, 30-minute TTL --
+    same storage convention as ``EmailVerificationToken`` (only ``token_hash``, SHA-256 via
+    ``rag_app.security.hash_token``, is ever stored). Consumed by exactly ONE atomic
+    ``UPDATE ... WHERE used_at IS NULL AND expires_at > :now`` (X10, see
+    ``rag_app.api.auth._consume_password_reset_token``), never a SELECT-then-UPDATE."""
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

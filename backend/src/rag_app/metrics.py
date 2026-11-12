@@ -49,6 +49,25 @@ CLIENT_IP_SIGNATURE_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+# T12.4.7 (rag_app.emailer): one ``kind`` label, a small fixed vocabulary (verification /
+# already_registered / password_reset / password_reset_unknown) -- never the recipient
+# address (log hygiene). SENT counts a completed SMTP send; FAILED counts a caught
+# ``OSError`` (transient SMTP error, e.g. Mailpit not accepting connections yet) or SMTP not
+# configured at all -- the SAME event emailer.py already logs without the address/exception
+# text (T11.2.15, R6-5).
+EMAIL_SENT_TOTAL = Counter(
+    "secrag_email_sent_total",
+    "Emails successfully handed to the SMTP server, by kind.",
+    ["kind"],
+    registry=REGISTRY,
+)
+EMAIL_FAILED_TOTAL = Counter(
+    "secrag_email_failed_total",
+    "Emails NOT sent (SMTP not configured or a transient SMTP error), by kind.",
+    ["kind"],
+    registry=REGISTRY,
+)
+
 _lock = threading.Lock()
 _server: WSGIServer | None = None
 _server_port: int | None = None
