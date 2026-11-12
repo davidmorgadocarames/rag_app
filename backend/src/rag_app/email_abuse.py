@@ -17,8 +17,9 @@ MANY-IP floods and is deliberately **larger** than what any one IP can draw thro
 constants below for the exact numbers and the arithmetic) -- a lone attacker IP can never
 starve the backstop for everyone else. See ``docs/security/THREAT_MODEL.md`` (the design note
 right before REC-07) for the full reasoning, the companion regression tests, and the residual
-many-IP (botnet) risk this change explicitly accepts, the same way T12.4.2's login-lockout
-design note (DEBT-034) accepts the equivalent gap for that feature.
+many-IP risk this change explicitly accepts -- as few as ~7 distinct source IPs (ceil(20/3))
+trickling in parallel can still exhaust the pure-recipient backstop -- the same way T12.4.2's
+login-lockout design note (DEBT-034) accepts the equivalent gap for that feature.
 
 **X10 (no TOCTOU).** Every check is ``RateLimiter.allow`` (``rag_app.ratelimit``), which
 takes the bucket's own lock and checks-and-decrements the token count in ONE call -- never a
