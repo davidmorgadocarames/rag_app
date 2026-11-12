@@ -8,11 +8,12 @@ itself stays ``HttpOnly`` and is never readable by page script. The BFF forwards
 ``Origin`` header and ``X-CSRF-Token`` unchanged (12a-C, T12.1.5).
 
 ``require_csrf`` is the dependency every cookie-authenticated state-changing route (POST /
-PATCH / PUT / DELETE) adds: a request with NO session cookie at all is the legacy Bearer-only
-rollback path (12a only, TF10) and is exempt -- a Bearer token is never sent automatically by
-the browser, so it cannot be forged cross-site. A request that DOES carry the session cookie
-must also carry a matching ``X-CSRF-Token`` (constant-time compare) and, when an ``Origin``
-header is present, it must match ``FRONTEND_ORIGIN``.
+PATCH / PUT / DELETE) adds: a request with NO session cookie at all (not logged in, or
+already logged out) has nothing to protect and is exempt. A request that DOES carry the
+session cookie must also carry a matching ``X-CSRF-Token`` (constant-time compare) and, when
+an ``Origin`` header is present, it must match ``FRONTEND_ORIGIN``. (T12.5.3: the legacy
+Bearer-only rollback path this exemption also used to cover, 12a TF10, is gone -- cookie
+authentication, via ``rag_app.api.auth.get_current_user``, is the only path left.)
 
 ``require_origin`` is the lighter check for register/login, where no session exists yet: a
 present-but-wrong ``Origin`` is rejected; a missing one is allowed (curl/legacy clients, and
@@ -51,7 +52,7 @@ def require_origin(request: Request) -> None:
 
 def require_csrf(request: Request) -> None:
     """Every cookie-authenticated state-changing route. Exempt when no session cookie is
-    present at all (the legacy Bearer-only rollback path, 12a, TF10)."""
+    present at all -- nothing to protect (e.g. ``logout`` called while already logged out)."""
     raw_session = request.cookies.get(session_service.SESSION_COOKIE_NAME)
     if raw_session is None:
         return

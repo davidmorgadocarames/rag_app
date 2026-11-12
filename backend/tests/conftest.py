@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import URL
+from sqlalchemy.orm import Session
 
 from db_harness import (
     HarnessRefusal,
@@ -138,3 +140,27 @@ def db_engine(db_url: URL) -> Iterator[Engine]:
         yield engine
     finally:
         engine.dispose()
+
+
+def cookie_auth_headers(engine: Engine, user_id: uuid.UUID) -> dict[str, str]:
+    """T12.5.3: the legacy Bearer path is gone -- a test that needs an authenticated call
+    for a user it created directly in the database (bypassing ``/auth/login``, which needs
+    the real plaintext password) opens a real session row the same way
+    ``rag_app.api.auth.login`` does, and returns the ``Cookie``/``X-CSRF-Token`` headers a
+    cookie-only client needs. Headers are returned explicitly (never left in a TestClient's
+    shared cookie jar) so concurrent requests for DIFFERENT users never race on jar state."""
+    from rag_app.config import get_settings
+    from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, csrf_token
+    from rag_app.db.models import User
+    from rag_app.sessions import SESSION_COOKIE_NAME, create_session
+
+    with Session(engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None, f"no such user: {user_id}"
+        raw_session = create_session(session, user)
+        session.commit()
+    csrf = csrf_token(get_settings().csrf_secret, raw_session)
+    return {
+        "Cookie": f"{SESSION_COOKIE_NAME}={raw_session}; {CSRF_COOKIE_NAME}={csrf}",
+        CSRF_HEADER_NAME: csrf,
+    }

@@ -216,18 +216,18 @@ def test_an_unregistered_user_linked_table_fails_the_scan(db_engine: Engine) -> 
 
 
 @pytest.mark.db
-def test_delete_account_is_a_short_step_then_202_and_the_token_dies(
+def test_delete_account_is_a_short_step_then_202_and_the_session_dies(
     db_engine: Engine, master_key: str
 ) -> None:
     from fastapi.testclient import TestClient
 
+    from conftest import cookie_auth_headers
     from rag_app.api.app import create_app
-    from rag_app.security import create_token
 
     user_id, email = _make_user(db_engine)
-    token = create_token(str(user_id))
     client = TestClient(create_app())  # no lifespan: the fingerprint is not under test here
-    auth = {"Authorization": f"Bearer {token}"}
+    # T12.5.3: no Bearer -- a real session (see conftest.cookie_auth_headers).
+    auth = cookie_auth_headers(db_engine, user_id)
     assert client.get("/auth/me", headers=auth).status_code == 200
 
     res = client.delete("/account", headers=auth)
@@ -246,7 +246,7 @@ def test_delete_account_is_a_short_step_then_202_and_the_token_dies(
         ).one()
     assert email_now is None and hash_now is None and deleted_at is not None
 
-    # T11.2b.3: the token issued before the erasure → 401 right after; login fails
+    # T11.2b.3: the session opened before the erasure → 401 right after; login fails
     assert client.get("/auth/me", headers=auth).status_code == 401
     assert client.get("/conversations", headers=auth).status_code == 401
     login = client.post("/auth/login", json={"email": email, "password": "correct horse battery"})
@@ -279,11 +279,12 @@ def test_a_lock_timeout_on_delete_account_is_a_retryable_503(
     generic 500); nothing changed, and the same request succeeds once the lock is gone."""
     from fastapi.testclient import TestClient
 
+    from conftest import cookie_auth_headers
     from rag_app.api.app import create_app
-    from rag_app.security import create_token
 
     user_id, _ = _make_user(db_engine, conversations=1, messages=1)
-    auth = {"Authorization": f"Bearer {create_token(str(user_id))}"}
+    # T12.5.3: no Bearer -- a real session (see conftest.cookie_auth_headers).
+    auth = cookie_auth_headers(db_engine, user_id)
     client = TestClient(create_app(), raise_server_exceptions=False)
     with db_engine.connect() as holder:
         holder.begin()

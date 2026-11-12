@@ -270,7 +270,9 @@ class Settings(JobSettings):
     smtp_from: str = "no-reply@example.com"
 
     # --- Frontend ---
-    frontend_origin: str = "http://localhost:3000"  # CORS: allow the browser app
+    # T12.5.3: no longer a CORS allow-list entry (CORS was removed entirely) -- only the
+    # expected `Origin` header value for `require_origin`/`require_csrf` (`rag_app.csrf`).
+    frontend_origin: str = "http://localhost:3000"
 
     # --- Email verification/reset links (DEBT-035 / DA-12aD-2; renamed T12.4.5) ---
     # Base URL used ONLY to build the links emailer.py puts in verification/reset e-mails —

@@ -192,10 +192,12 @@ def _make_conversation(engine: Engine, user_id: uuid.UUID) -> str:
         return str(conv.id)
 
 
-def _auth(user_id: uuid.UUID) -> dict[str, str]:
-    from rag_app.security import create_token
+def _auth(engine: Engine, user_id: uuid.UUID) -> dict[str, str]:
+    """T12.5.3: no Bearer any more -- a real session row for ``user_id`` (see
+    ``conftest.cookie_auth_headers``)."""
+    from conftest import cookie_auth_headers
 
-    return {"Authorization": f"Bearer {create_token(str(user_id))}"}
+    return cookie_auth_headers(engine, user_id)
 
 
 def _events(res: Any) -> list[dict]:
@@ -252,7 +254,7 @@ def test_concurrent_streams_at_cap_minus_one_let_exactly_one_through(
         res = client.post(
             "/chat/stream",
             json={"question": QUESTION, "conversation_id": conv},
-            headers=_auth(user),
+            headers=_auth(db_engine, user),
         )
         with lock:
             results.append(_events(res))
@@ -322,7 +324,9 @@ def test_a_failed_turn_still_counts(
 
     monkeypatch.setattr(conversations, "answer_question_stream", _FakePipeline(fail=True))
     user = _make_user(db_engine)
-    events = _events(client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user)))
+    events = _events(
+        client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
+    )
     assert events[-1]["code"] == "generation_failed"
     assert _usage(db_engine)[0] == 1
 
@@ -353,7 +357,7 @@ def test_an_interrupted_turn_still_counts(
         conn.execute(text("DELETE FROM usage_daily"))
     user = _make_user(db_engine)
     res = TestClient(create_app()).post(
-        "/chat/stream", json={"question": QUESTION}, headers=_auth(user)
+        "/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user)
     )
     assert res.status_code == 200 and closed
     assert _usage(db_engine)[0] == 1
@@ -369,7 +373,9 @@ def test_a_new_chat_at_the_cap_stores_nothing(
     monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
     user = _make_user(db_engine)
     _set_answers(db_engine, 3)
-    events = _events(client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user)))
+    events = _events(
+        client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
+    )
     assert [e["type"] for e in events] == ["conversation", "error"]
     assert events[-1]["code"] == DAILY_CAP_CODE and events[-1]["conversation_id"] is None
     assert pipeline.calls == 0
@@ -387,7 +393,9 @@ def test_the_canned_greeting_is_not_counted_and_works_at_the_cap(
     """The chit-chat fast path makes no LLM call: it neither counts nor is refused."""
     user = _make_user(db_engine)
     _set_answers(db_engine, 3)
-    events = _events(client.post("/chat/stream", json={"question": "hello"}, headers=_auth(user)))
+    events = _events(
+        client.post("/chat/stream", json={"question": "hello"}, headers=_auth(db_engine, user))
+    )
     assert events[-1]["type"] == "done"
     assert _usage(db_engine) == (3, 0)
 
@@ -426,7 +434,7 @@ def test_the_cap_reached_log_line_has_no_personal_data(
     user = _make_user(db_engine)
     _set_answers(db_engine, 3)
     with caplog.at_level("WARNING", logger="rag_app.usage_cap"):
-        client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user))
+        client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
     lines = [r.getMessage() for r in caplog.records if r.name == "rag_app.usage_cap"]
     assert lines and all("daily answer cap reached" in line for line in lines)
     assert all(str(user) not in line and "@" not in line and QUESTION not in line for line in lines)
@@ -467,7 +475,7 @@ def test_a_key_that_cannot_be_unwrapped_does_not_use_up_an_answer(
     user = _make_user_with_foreign_key(db_engine)
     for _ in range(4):  # the cap is 3
         events = _events(
-            client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user))
+            client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
         )
         assert [e["type"] for e in events] == ["conversation", "error"]
         assert events[-1]["code"] == "key_unavailable"
@@ -493,7 +501,9 @@ def test_a_turn_that_cannot_be_stored_gives_its_answer_back(
     monkeypatch.setattr(conversations, "_start_turn", _down)
     user = _make_user(db_engine)
     _set_answers(db_engine, 1)
-    events = _events(client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user)))
+    events = _events(
+        client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
+    )
     assert events[-1]["code"] == "storage_failed"
     assert pipeline.calls == 0
     assert _usage(db_engine)[0] == 1
@@ -518,7 +528,9 @@ def test_stream_fails_closed_when_the_counter_cannot_be_written(
     monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
     monkeypatch.setattr(conversations, "reserve_answer", _counter_down)
     user = _make_user(db_engine)
-    events = _events(client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(user)))
+    events = _events(
+        client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
+    )
     assert [e["type"] for e in events] == ["conversation", "error"]
     assert events[-1]["code"] == "storage_failed"
     assert pipeline.calls == 0, "an uncounted turn reached the pipeline (fail open)"

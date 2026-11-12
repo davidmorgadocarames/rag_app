@@ -1,8 +1,9 @@
 """CSRF protection end to end (T12.1.4, P12-D2, DEC-010 = A): a cookie-authenticated
 state-changing request without a valid proof (missing / wrong / another session's token /
-bad ``Origin``) is rejected with 403; with a valid one it succeeds; a Bearer-only request
-(no session cookie at all -- the legacy rollback path, TF10) is exempt. Login/register are
-protected by the lighter ``Origin`` check instead (no session exists yet).
+bad ``Origin``) is rejected with 403; with a valid one it succeeds; a request with no session
+cookie at all (nothing to protect) is exempt. Login/register are protected by the lighter
+``Origin`` check instead (no session exists yet). T12.5.3 removed the legacy Bearer-only
+rollback path this exemption used to also cover (12a, TF10).
 
 An ``https://`` base_url is required: httpx/TestClient drops a ``Secure`` cookie received
 over plain ``http://`` (B7 of 12a-B), and the CSRF cookie, like the session cookie, is
@@ -126,19 +127,15 @@ def test_logout_with_a_valid_csrf_token_and_correct_origin_succeeds(api_env: Eng
     assert response.status_code == 200
 
 
-def test_a_bearer_only_request_with_no_session_cookie_is_exempt_from_csrf(
+def test_a_request_with_no_session_cookie_at_all_fails_auth_before_csrf_is_even_checked(
     api_env: Engine,
 ) -> None:
-    """The legacy Bearer-only rollback path (12a, TF10): no session cookie at all, so there
-    is nothing for a cross-site form to forge the browser into sending automatically."""
-    register_client = _client()
-    creds = _credentials()
-    register_client.post("/auth/register", json=creds)
-    access_token = register_client.post("/auth/login", json=creds).json()["access_token"]
-
-    bearer_client = _client()  # a fresh client: no cookie jar entry at all
-    response = bearer_client.delete("/account", headers={"Authorization": f"Bearer {access_token}"})
-    assert response.status_code == 202
+    """T12.5.3: the legacy Bearer-only rollback path (12a, TF10) this used to prove CSRF-
+    exempt is gone -- a request with no session cookie at all now fails authentication
+    itself (401, from ``get_current_user``) well before ``require_csrf`` ever runs."""
+    fresh_client = _client()  # no cookie jar entry at all
+    response = fresh_client.delete("/account")
+    assert response.status_code == 401
 
 
 def test_delete_account_without_a_csrf_header_is_rejected_when_a_session_cookie_is_present(
@@ -147,11 +144,10 @@ def test_delete_account_without_a_csrf_header_is_rejected_when_a_session_cookie_
     client = _client()
     creds = _credentials()
     client.post("/auth/register", json=creds)
-    login = client.post("/auth/login", json=creds)
-    access_token = login.json()["access_token"]
-    # The SAME client: its cookie jar still carries the session cookie, so this request is
-    # cookie-authenticated even though an Authorization header is also attached.
-    response = client.delete("/account", headers={"Authorization": f"Bearer {access_token}"})
+    client.post("/auth/login", json=creds)
+    # The client's cookie jar carries the session cookie from the login response, so this
+    # request is cookie-authenticated -- but no X-CSRF-Token header is attached.
+    response = client.delete("/account")
     assert response.status_code == 403
 
 

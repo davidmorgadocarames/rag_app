@@ -1,4 +1,10 @@
-"""Password hashing (argon2) and JWT tokens."""
+"""Password hashing (argon2) and JWT tokens.
+
+``create_token``/``decode_token`` are no longer called anywhere in the API since T12.5.3
+removed the legacy Bearer path (``rag_app.api.auth.get_current_user`` is cookie-only now,
+and ``/auth/login`` no longer issues a token) -- kept here as plain, independently-tested
+utility functions until T15.2.5's full JWT-infrastructure cleanup (``JWT_SECRET`` stays a
+required setting until then too)."""
 
 from __future__ import annotations
 

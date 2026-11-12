@@ -101,11 +101,6 @@ class ResetPasswordRequest(StrictModel):
         return self
 
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-
 class UserOut(BaseModel):
     id: str
     email: str | None  # None once erasure scrubbed it (0005)

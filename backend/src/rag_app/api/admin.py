@@ -152,8 +152,8 @@ def mfa_step_up(
 ) -> MessageResponse:
     """A valid TOTP code OR an unused recovery code sets ``mfa_verified_at`` on a FRESH
     session (the old session id is rotated away -- T12.3.5) and reissues the session/CSRF
-    cookies. The legacy Bearer path (no session cookie) can never step up: there is no
-    session row to mark."""
+    cookies. Cookie authentication is the only path (T12.5.3): without a session cookie
+    ``get_current_user`` already rejects the call with 401, before this body ever runs."""
     record = session.get(UserMfa, user.id)
     if record is None or not record.enabled:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "MFA is not enabled on this account")

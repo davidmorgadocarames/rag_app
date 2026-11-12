@@ -8,7 +8,6 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -24,7 +23,6 @@ from rag_app.api.schemas import (
     ResendVerificationRequest,
     ResendVerificationResponse,
     ResetPasswordRequest,
-    TokenResponse,
     UserOut,
     VerifyEmailRequest,
 )
@@ -47,8 +45,6 @@ from rag_app.erasure import (
 from rag_app.password_policy import validate_password
 from rag_app.risk import is_high_risk, signup_risk_score
 from rag_app.security import (
-    create_token,
-    decode_token,
     dummy_password_hash,
     generate_verification_token,
     hash_password,
@@ -83,7 +79,6 @@ _DUPLICATE_EMAIL_SQLSTATE = "23505"  # unique_violation
 _DUPLICATE_EMAIL_CONSTRAINT = "users_email_key"
 
 router = APIRouter()
-_bearer = HTTPBearer(auto_error=False)
 
 
 def _is_duplicate_email_conflict(exc: IntegrityError) -> bool:
@@ -152,48 +147,26 @@ def _clear_csrf_cookie(response: Response) -> None:
     )
 
 
-def _bearer_user(session: SessionDep, token: str) -> User:
-    subject = decode_token(token)
-    if subject is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
-    try:
-        user_id = uuid.UUID(subject)
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token") from exc
-    # An erased account (deleted_at set by the request path) is gone for authentication at
-    # once, even while the purger has not removed its row yet: a live token stops working.
-    user = session.scalar(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
-    return user
+def get_current_user(session: SessionDep, http: Request) -> User:
+    """T12.1.3 + T12.5.3: the ``__Host-secrag_session`` cookie is the ONLY way to
+    authenticate -- the legacy Bearer JWT path (the pre-BFF frontend's 12a rollback, TF10)
+    is gone; ``/auth/login`` no longer issues or returns a token at all (``create_token``/
+    ``decode_token`` stay in ``rag_app.security`` as plain, independently-tested utility
+    functions -- full removal is T15.2.5, see the module they live in).
 
-
-def get_current_user(
-    session: SessionDep,
-    http: Request,
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
-) -> User:
-    """T12.1.3: the cookie (``__Host-secrag_session``) and the legacy Bearer JWT both
-    authenticate — during 12a only, for the pre-BFF frontend's rollback path (TF10). The
-    cookie is tried first; when it is present but does not resolve (unknown, idle-expired,
-    absolute-expired or revoked — ``rag_app.sessions.authenticate`` does not distinguish
-    which, by design), the request is rejected outright rather than silently falling back to
-    a Bearer header that might also be present."""
+    No cookie at all, or one that does not resolve (unknown, idle-expired, absolute-expired
+    or revoked -- ``rag_app.sessions.authenticate`` does not distinguish which, by design) —
+    both are rejected the same way, a plain 401."""
     cookie_raw = http.cookies.get(session_service.SESSION_COOKIE_NAME)
-    if cookie_raw:
-        user = session_service.authenticate(session, cookie_raw)
-        session.commit()
-        if user is None:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired session")
-        http.state.user_id = user.id  # T12.1.6: rate_limit_chat keys on this, not just the IP
-        # T12.3.5: admin-grade routes (rag_app.authz.require_permission_and_mfa) read this --
-        # None on the Bearer path below (no server-side session to have stepped up).
-        http.state.mfa_verified_at = session_service.mfa_verified_at(session, cookie_raw)
-        return user
-    if credentials is None:
+    if cookie_raw is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
-    user = _bearer_user(session, credentials.credentials)
-    http.state.user_id = user.id
+    user = session_service.authenticate(session, cookie_raw)
+    session.commit()
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired session")
+    http.state.user_id = user.id  # T12.1.6: rate_limit_chat keys on this, not just the IP
+    # T12.3.5: admin-grade routes (rag_app.authz.require_permission_and_mfa) read this.
+    http.state.mfa_verified_at = session_service.mfa_verified_at(session, cookie_raw)
     return user
 
 
@@ -461,10 +434,10 @@ def reset_password(request: ResetPasswordRequest, session: SessionDep) -> Messag
 
 @router.post(
     "/auth/login",
-    response_model=TokenResponse,
+    response_model=MessageResponse,
     dependencies=[Depends(require_origin), Depends(rate_limit_login)],
 )
-def login(request: LoginRequest, session: SessionDep, response: Response) -> TokenResponse:
+def login(request: LoginRequest, session: SessionDep, response: Response) -> MessageResponse:
     """T12.4.1 (constant-time, F3 user enumeration via timing) + T12.4.2 (lockout, F5/API-6).
 
     A dummy argon2 verify runs on EVERY failing path (no such email, no password hash, or a
@@ -500,20 +473,21 @@ def login(request: LoginRequest, session: SessionDep, response: Response) -> Tok
         raise HTTPException(status.HTTP_403_FORBIDDEN, "email not verified")
 
     lockout.clear_lockout(session, settings.lockout_hmac_secret, request.email)
-    # T12.1.3: login still returns the JWT (rollback path, TF10) and also opens a session.
+    # T12.5.3: login no longer returns a JWT -- only the session + CSRF cookies.
     raw_session = session_service.create_session(session, user)
     session.commit()
     set_session_cookie(response, raw_session)
     set_csrf_cookie(response, raw_session)
-    return TokenResponse(access_token=create_token(str(user.id)))
+    return MessageResponse(detail="Logged in.")
 
 
 @router.post("/auth/logout", response_model=MessageResponse, dependencies=[Depends(require_csrf)])
 def logout(http: Request, session: SessionDep, response: Response) -> MessageResponse:
     """T12.1.3/T12.1.4: deletes the session row named by the cookie (a no-op if there is none,
     or if it does not name a live session — logout is idempotent) and always clears both
-    cookies. CSRF-protected since 12a-C (``require_csrf``) — a Bearer-only request (no
-    session cookie) is exempt, the cookie path needs a matching ``X-CSRF-Token``."""
+    cookies. CSRF-protected since 12a-C (``require_csrf``) — a call with no session cookie at
+    all (already logged out, or never logged in) is exempt: there is nothing to protect, the
+    cookie path needs a matching ``X-CSRF-Token``."""
     cookie_raw = http.cookies.get(session_service.SESSION_COOKIE_NAME)
     if cookie_raw:
         session_service.revoke(session, cookie_raw)

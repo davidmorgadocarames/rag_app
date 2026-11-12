@@ -1,7 +1,9 @@
 // The BFF's core proxy logic (P12-D1, T12.1.5): an explicit allow-list (bffRoutes.ts),
 // cookie forwarding both ways, unbuffered SSE, a timeout well above Azure's ~240s ingress
-// cutoff (DEC-006), access_token stripped from login/register bodies (V15), and a signed
-// client IP header (T5/V7, T12.1.6).
+// cutoff (DEC-006), an access_token stripped from login/register bodies as defense in depth
+// (V15 -- the backend itself stopped returning one at all in T12.5.3, which also removed
+// the Bearer path entirely; this stays a no-op safety net against a future regression), and
+// a signed client IP header (T5/V7, T12.1.6).
 //
 // Kept as a plain, testable module (C5): the actual Next.js route handlers
 // (app/api/[...path]/route.ts, app/api/health/route.ts) are thin wrappers around this file

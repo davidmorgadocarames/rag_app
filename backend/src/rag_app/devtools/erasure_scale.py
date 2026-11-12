@@ -18,7 +18,7 @@ On the gate server (loopback, never port 5432) it creates ``secrag_scale_<hex>``
    (in the server, its transaction, and per statement / COMMIT — kinds and times only);
 3. runs concurrent load (a login followed by conversation listings and a read, a few chat
    calls) while each synthetic user sends ``DELETE /account`` (timed) — 202 and the
-   message, then its token is refused, its key is gone and its email is NULL;
+   message, then its session is refused, its key is gone and its email is NULL;
 4. runs the purger AS ``secrag_purger`` (a real login) during the load: a throttled run is
    SIGKILLed mid-way (first tombstone left ``running`` with its progress), a second run
    started meanwhile is skipped (advisory lock), a third run completes every tombstone;
@@ -313,7 +313,13 @@ class Load:
     def _work(self, index: int) -> None:
         import httpx
 
+        from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+
         rng = random.Random(index)
+        # T12.5.3: no Bearer any more -- httpx.Client's own cookie jar carries the session
+        # (and CSRF) cookies the login response sets, exactly like a browser; only the
+        # mutating POST /chat call below needs the X-CSRF-Token header added explicitly
+        # (GET /conversations and GET /conversations/{id} are read-only, no CSRF needed).
         with httpx.Client(base_url=self.base, timeout=30) as client:
             while not self.stop.is_set():
                 email = rng.choice(self.accounts)
@@ -322,21 +328,21 @@ class Load:
                 self._record("login", t, r.status_code)
                 if r.status_code != 200:
                     continue
-                auth = {"Authorization": f"Bearer {r.json()['access_token']}"}
+                csrf = {CSRF_HEADER_NAME: r.cookies.get(CSRF_COOKIE_NAME) or ""}
                 for _ in range(LISTINGS_PER_LOGIN):
                     t = time.monotonic()
-                    r = client.get("/conversations", headers=auth)
+                    r = client.get("/conversations")
                     self._record("list", t, r.status_code)
                 if r.status_code == 200 and r.json():
                     t = time.monotonic()
                     conv = rng.choice(r.json())["id"]
-                    status = client.get(f"/conversations/{conv}", headers=auth).status_code
+                    status = client.get(f"/conversations/{conv}").status_code
                     self._record("read", t, status)
                 if index == 0 and self.chat_calls < 10:  # chat: a small sample only
                     self.chat_calls += 1
                     t = time.monotonic()
                     r = client.post(
-                        "/chat", json={"question": "What is SQL injection?"}, headers=auth
+                        "/chat", json={"question": "What is SQL injection?"}, headers=csrf
                     )
                     self._record("chat", t, r.status_code)
 
@@ -473,20 +479,24 @@ def run(args: argparse.Namespace) -> int:
         else:
             _fail("the API did not answer /health within 120 s")
 
+        from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+
         samples: list[dict[str, Any]] = []
         with httpx.Client(base_url=base, timeout=30) as client:
-            tokens = []
-            for email, _uid in seed["big"]:
-                r = client.post("/auth/login", json={"email": email, "password": PASSWORD})
-                if r.status_code != 200:
-                    _fail(f"login of a synthetic user: HTTP {r.status_code}")
-                tokens.append({"Authorization": f"Bearer {r.json()['access_token']}"})
-
             with Load(base, seed["accounts"], args.workers) as load:
                 time.sleep(args.warmup)
-                for (_email, uid), auth in zip(seed["big"], tokens, strict=True):
+                for email, uid in seed["big"]:
+                    # T12.5.3: no Bearer -- login right before this user's own delete (the
+                    # SAME client, reused sequentially: one big user at a time, never two at
+                    # once, so overwriting the jar's session/CSRF cookies on each login is
+                    # safe); the concurrent `Load` traffic above uses its OWN client/jar per
+                    # worker thread, so it never races this one.
+                    login = client.post("/auth/login", json={"email": email, "password": PASSWORD})
+                    if login.status_code != 200:
+                        _fail(f"login of a synthetic user: HTTP {login.status_code}")
+                    csrf = {CSRF_HEADER_NAME: login.cookies.get(CSRF_COOKIE_NAME) or ""}
                     t = time.monotonic()
-                    r = client.delete("/account", headers=auth)
+                    r = client.delete("/account", headers=csrf)
                     ms = (time.monotonic() - t) * 1000
                     if r.status_code != 202:
                         _fail(f"DELETE /account: HTTP {r.status_code}")
@@ -508,7 +518,7 @@ def run(args: argparse.Namespace) -> int:
                             "commit_ms": server_stats["delete_commit_ms"],
                             "breakdown": server_stats["delete_breakdown"],
                             "message": r.json()["detail"],
-                            "me": client.get("/auth/me", headers=auth).status_code,
+                            "me": client.get("/auth/me").status_code,
                             "key_left": key_left,
                             "email_left": email_left,
                             "tombstone": _tombstone(owner_engine, uid)[0],

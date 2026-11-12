@@ -79,17 +79,21 @@ def _make_user(engine: Engine, *, foreign_key: bool = False) -> uuid.UUID:
         return user.id
 
 
-def _auth(user_id: uuid.UUID) -> dict[str, str]:
-    from rag_app.security import create_token
+def _auth(engine: Engine, user_id: uuid.UUID) -> dict[str, str]:
+    """T12.5.3: no Bearer any more -- a real session row for ``user_id`` (see
+    ``conftest.cookie_auth_headers``)."""
+    from conftest import cookie_auth_headers
 
-    return {"Authorization": f"Bearer {create_token(str(user_id))}"}
+    return cookie_auth_headers(engine, user_id)
 
 
-def _stream(client: Any, user_id: uuid.UUID, question: str, conv: str | None = None) -> list[dict]:
+def _stream(
+    engine: Engine, client: Any, user_id: uuid.UUID, question: str, conv: str | None = None
+) -> list[dict]:
     body: dict[str, Any] = {"question": question}
     if conv:
         body["conversation_id"] = conv
-    res = client.post("/chat/stream", json=body, headers=_auth(user_id))
+    res = client.post("/chat/stream", json=body, headers=_auth(engine, user_id))
     assert res.status_code == 200
     events = [
         json.loads(frame[len("data: ") :])
@@ -152,19 +156,19 @@ def test_an_embedding_failure_ends_with_an_error_event_and_the_next_message_reus
     client: Any, db_engine: Engine
 ) -> None:
     user = _make_user(db_engine)
-    events = _stream(client, user, "How do I prevent SQL injection?")
+    events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
     conv = _assert_error_contract(events, "retrieval_failed")
     assert conv is not None
     assert [e["stage"] for e in events if e["type"] == "stage"] == ["classifying", "retrieving"]
     assert _turns(db_engine, user) == {conv: (1, 1)}  # user message + error marker
 
     # the next message (chitchat: no Ollama needed) goes into the same conversation
-    events = _stream(client, user, "hello", conv)
+    events = _stream(db_engine, client, user, "hello", conv)
     assert events[0] == {"type": "conversation", "conversation_id": conv}
     assert events[-1]["type"] == "done" and events[-1]["conversation_id"] == conv
     assert _turns(db_engine, user) == {conv: (2, 2)}
 
-    detail = client.get(f"/conversations/{conv}", headers=_auth(user)).json()
+    detail = client.get(f"/conversations/{conv}", headers=_auth(db_engine, user)).json()
     assert [(m["role"], m["error"]) for m in detail["messages"]] == [
         ("user", False),
         ("assistant", True),
@@ -185,14 +189,14 @@ def test_an_llm_failure_ends_with_an_error_event(
         reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
     )
     user = _make_user(db_engine)
-    events = _stream(client, user, "How do I prevent SQL injection?")
+    events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
     conv = _assert_error_contract(events, "generation_failed")
     stages = [e["stage"] for e in events if e["type"] == "stage"]
     assert stages == ["classifying", "retrieving", "reranking", "generating"]
     assert conv is not None and _turns(db_engine, user) == {conv: (1, 1)}
 
     # the id is kept: a second failing message stays in the same conversation
-    events = _stream(client, user, "And XSS?", conv)
+    events = _stream(db_engine, client, user, "And XSS?", conv)
     assert _assert_error_contract(events, "generation_failed") == conv
     assert _turns(db_engine, user) == {conv: (2, 2)}
     _assert_no_orphans(db_engine, user)
@@ -202,7 +206,7 @@ def test_an_unwrappable_data_key_is_an_error_event_and_creates_nothing(
     client: Any, db_engine: Engine
 ) -> None:
     user = _make_user(db_engine, foreign_key=True)
-    events = _stream(client, user, "hello")
+    events = _stream(db_engine, client, user, "hello")
     assert _assert_error_contract(events, "key_unavailable") is None
     assert _turns(db_engine, user) == {}  # nothing could be encrypted: nothing created
 
@@ -214,15 +218,15 @@ def test_an_unwrappable_data_key_is_an_error_event_and_creates_nothing(
         session.add(existing)
         session.commit()
         conv = str(existing.id)
-    events = _stream(client, user, "hello", conv)
+    events = _stream(db_engine, client, user, "hello", conv)
     assert _assert_error_contract(events, "key_unavailable") == conv
     assert _turns(db_engine, user) == {conv: (0, 0)}
 
     # the list does not 500: every row is listed as unreadable; the detail is a clean 409
-    res = client.get("/conversations", headers=_auth(user))
+    res = client.get("/conversations", headers=_auth(db_engine, user))
     assert res.status_code == 200
     assert [(c["id"], c["unreadable"]) for c in res.json()] == [(conv, True)]
-    assert client.get(f"/conversations/{conv}", headers=_auth(user)).status_code == 409
+    assert client.get(f"/conversations/{conv}", headers=_auth(db_engine, user)).status_code == 409
 
 
 def test_a_storage_failure_is_an_error_event(
@@ -237,7 +241,7 @@ def test_a_storage_failure_is_an_error_event(
 
     monkeypatch.setattr(conversations, "_start_turn", _down)
     user = _make_user(db_engine)
-    events = _stream(client, user, "hello")
+    events = _stream(db_engine, client, user, "hello")
     assert _assert_error_contract(events, "storage_failed") is None
     assert _turns(db_engine, user) == {}
 
@@ -246,9 +250,11 @@ def test_someone_elses_conversation_is_a_404_before_streaming(
     client: Any, db_engine: Engine
 ) -> None:
     owner, other = _make_user(db_engine), _make_user(db_engine)
-    conv = _stream(client, owner, "hello")[0]["conversation_id"]
+    conv = _stream(db_engine, client, owner, "hello")[0]["conversation_id"]
     res = client.post(
-        "/chat/stream", json={"question": "hello", "conversation_id": conv}, headers=_auth(other)
+        "/chat/stream",
+        json={"question": "hello", "conversation_id": conv},
+        headers=_auth(db_engine, other),
     )
     assert res.status_code == 404
     assert _turns(db_engine, other) == {}
@@ -264,13 +270,15 @@ def test_a_hostile_title_round_trips_through_postgres_unexecuted(
     it back unchanged; the `conversations` table (and its row for this user) still exists
     afterwards, which it would not if the payload had ever reached raw SQL."""
     user = _make_user(db_engine)
-    conv = _stream(client, user, "hello")[0]["conversation_id"]
+    conv = _stream(db_engine, client, user, "hello")[0]["conversation_id"]
     evil = "'; DROP TABLE conversations;-- \" OR 1=1"
 
-    res = client.patch(f"/conversations/{conv}", json={"title": evil}, headers=_auth(user))
+    res = client.patch(
+        f"/conversations/{conv}", json={"title": evil}, headers=_auth(db_engine, user)
+    )
     assert res.status_code == 200
 
-    detail = client.get(f"/conversations/{conv}", headers=_auth(user)).json()
+    detail = client.get(f"/conversations/{conv}", headers=_auth(db_engine, user)).json()
     assert detail["title"] == evil
     assert _turns(db_engine, user) == {conv: (1, 1)}  # the table (and this row) still exist
 
@@ -280,20 +288,20 @@ def test_a_hostile_title_round_trips_through_postgres_unexecuted(
 
 def test_one_undecryptable_row_does_not_break_the_list(client: Any, db_engine: Engine) -> None:
     user = _make_user(db_engine)
-    good = _stream(client, user, "hello")[0]["conversation_id"]
-    bad = _stream(client, user, "hi")[0]["conversation_id"]
+    good = _stream(db_engine, client, user, "hello")[0]["conversation_id"]
+    bad = _stream(db_engine, client, user, "hi")[0]["conversation_id"]
     with db_engine.begin() as conn:  # damage the first user message of one conversation
         conn.execute(
             text("UPDATE messages SET content_encrypted = :junk WHERE conversation_id = :c"),
             {"junk": b"not a fernet token", "c": bad},
         )
-    res = client.get("/conversations", headers=_auth(user))
+    res = client.get("/conversations", headers=_auth(db_engine, user))
     assert res.status_code == 200
     by_id = {c["id"]: c for c in res.json()}
     assert by_id[good]["unreadable"] is False and by_id[good]["title"] == "hello"
     assert by_id[bad]["unreadable"] is True and by_id[bad]["title"] == "Unreadable conversation"
 
-    detail = client.get(f"/conversations/{bad}", headers=_auth(user))
+    detail = client.get(f"/conversations/{bad}", headers=_auth(db_engine, user))
     assert detail.status_code == 200
     assert all(m["error"] for m in detail.json()["messages"])
     _assert_no_orphans(db_engine, user)
@@ -335,7 +343,9 @@ def test_no_connection_sits_idle_in_transaction_during_a_stream(
     monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
     user = _make_user(db_engine)
     outcome: dict[str, list[dict]] = {}
-    call = threading.Thread(target=lambda: outcome.update(e=_stream(client, user, "hello?")))
+    call = threading.Thread(
+        target=lambda: outcome.update(e=_stream(db_engine, client, user, "hello?"))
+    )
     call.start()
     try:
         assert started.wait(timeout=15), "the stream never reached the generating stage"
@@ -364,7 +374,7 @@ def test_a_long_stage_sends_keep_alive_comments(
     monkeypatch.setattr(conversations, "KEEPALIVE_SECONDS", 0.05)
     monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
     user = _make_user(db_engine)
-    res = client.post("/chat/stream", json={"question": "hi?"}, headers=_auth(user))
+    res = client.post("/chat/stream", json={"question": "hi?"}, headers=_auth(db_engine, user))
     assert res.status_code == 200
     frames = res.text.split("\n\n")
     assert frames.count(": keep-alive") >= 3
@@ -441,13 +451,16 @@ def test_a_real_disconnect_leaves_an_interrupted_marker(
     monkeypatch.setattr(conversations, "answer_question_stream", slow_pipeline)
     user = _make_user(db_engine)
     body = json.dumps({"question": "hi?"}).encode()
-    token = _auth(user)["Authorization"]
+    # T12.5.3: no Bearer -- a raw ``Cookie``/``X-CSRF-Token`` pair, like a real browser's
+    # cookie-authenticated request (see ``_auth``/``conftest.cookie_auth_headers``).
+    auth = _auth(db_engine, user)
     with _Server(create_app) as server:
         host, port = server.base.removeprefix("http://").split(":")
         sock = socket.create_connection((host, int(port)), timeout=10)
         sock.sendall(
             b"POST /chat/stream HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
-            + f"Authorization: {token}\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+            + f"Cookie: {auth['Cookie']}\r\nX-CSRF-Token: {auth['X-CSRF-Token']}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
             + body
         )
         received = b""
@@ -541,7 +554,7 @@ def test_a_real_streamed_answer_logs_every_timing_stage_through_the_threadpool(
 
     caplog.set_level(logging.INFO, logger="rag_app.timing")
     user = _make_user(db_engine)
-    events = _stream(client, user, "How do I prevent SQL injection?")
+    events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
     assert events[-1]["type"] == "done"
     stages = [e["stage"] for e in events if e["type"] == "stage"]
     assert stages == ["classifying", "retrieving", "reranking", "generating", "checking"]
@@ -686,7 +699,7 @@ def test_concurrent_chat_and_chat_stream_requests_use_the_shared_reranker_correc
         try:
             barrier.wait()
             user = _make_user(db_engine)
-            events = _stream(client, user, question)
+            events = _stream(db_engine, client, user, question)
             assert events[-1]["type"] == "done"
             answers[slug] = events[-1]["answer"]
         except BaseException as exc:  # noqa: BLE001
@@ -696,7 +709,7 @@ def test_concurrent_chat_and_chat_stream_requests_use_the_shared_reranker_correc
         try:
             barrier.wait()
             user = _make_user(db_engine)
-            res = client.post("/chat", json={"question": question}, headers=_auth(user))
+            res = client.post("/chat", json={"question": question}, headers=_auth(db_engine, user))
             assert res.status_code == 200, res.text
             answers[slug] = res.json()["answer"]
         except BaseException as exc:  # noqa: BLE001

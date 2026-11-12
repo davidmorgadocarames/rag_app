@@ -1,6 +1,7 @@
 """Backend surface reduction (T12.2.4, E6): docs/redoc/openapi gated to ``ENV=dev``,
-security headers on every API response, CORS narrowed to the old frontend's rollback needs
-(single origin, GET/POST/PATCH/DELETE, ``Authorization``/``Content-Type``, no credentials).
+security headers on every API response. CORS -- narrowed in 12a to the old frontend's
+rollback needs -- was removed ENTIRELY in T12.5.3: the BFF-based frontend is the only
+caller and never triggers a browser CORS preflight (same-origin, server-to-server).
 
 No DB, no LLM: ``TestClient(create_app())`` used WITHOUT the ``with`` context manager never
 runs the lifespan (Starlette only starts it on ``__enter__``), so these tests do not need the
@@ -62,42 +63,17 @@ def test_security_headers_present_even_on_a_404() -> None:
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
 
 
-# --- T12.2.4 / F8: CORS narrowed to the old frontend's rollback needs -----------------------
+# --- T12.5.3 / F8: CORS removed entirely ------------------------------------------------------
 
 
-def test_cors_narrowed_to_the_old_frontends_needs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
-    client = TestClient(create_app())
-    response = client.options(
-        "/auth/login",
-        headers={
-            "Origin": "http://localhost:3000",
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "authorization,content-type",
-        },
-    )
-    assert response.status_code == 200
-    allowed_methods = {
-        m.strip() for m in response.headers["access-control-allow-methods"].split(",")
-    }
-    # Narrowed: no PUT-via-wildcard surprise, no wildcard either.
-    assert allowed_methods == {"GET", "POST", "PATCH", "DELETE"}
-    allowed_headers = {
-        h.strip().lower() for h in response.headers["access-control-allow-headers"].split(",")
-    }
-    # Starlette's CORSMiddleware always adds the CORS-safelisted simple headers (accept,
-    # accept-language, content-language) on top of our own list.
-    assert {"authorization", "content-type"} <= allowed_headers
-    # No credentials: the old frontend sends a Bearer token, never a cookie.
-    assert "access-control-allow-credentials" not in response.headers
-
-
-def test_cors_preflight_rejects_a_header_outside_the_narrowed_list(
+def test_cors_is_removed_entirely_even_for_the_frontends_own_origin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Starlette's ``CORSMiddleware`` fails the WHOLE preflight (400) the moment a
-    requested header is not on the allow-list -- this is what "narrowed" actually buys over
-    the old ``allow_headers=["*"]`` (F8), which echoed back anything asked for."""
+    """No ``CORSMiddleware`` at all any more (contrast with 12a's narrowed-but-present
+    allow-list): an ``OPTIONS`` preflight, even from the frontend's own configured origin,
+    gets back a plain response with NO ``access-control-*`` header at all -- there is no
+    middleware left to add one. (The BFF-based frontend never sends this preflight for
+    real: same-origin, server-to-server -- this just proves the surface is gone.)"""
     monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
     client = TestClient(create_app())
     response = client.options(
@@ -105,13 +81,13 @@ def test_cors_preflight_rejects_a_header_outside_the_narrowed_list(
         headers={
             "Origin": "http://localhost:3000",
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "x-requested-with",
+            "Access-Control-Request-Headers": "content-type",
         },
     )
-    assert response.status_code == 400
+    assert not any(h.lower().startswith("access-control-") for h in response.headers)
 
 
-def test_cors_rejects_a_foreign_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cors_is_removed_entirely_for_a_foreign_origin_too(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
     client = TestClient(create_app())
     response = client.options(
@@ -121,4 +97,4 @@ def test_cors_rejects_a_foreign_origin(monkeypatch: pytest.MonkeyPatch) -> None:
             "Access-Control-Request-Method": "POST",
         },
     )
-    assert "access-control-allow-origin" not in response.headers
+    assert not any(h.lower().startswith("access-control-") for h in response.headers)

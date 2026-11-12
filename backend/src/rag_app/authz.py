@@ -116,8 +116,8 @@ def require_permission_and_mfa(
 ) -> Callable[..., User]:
     """Admin-grade routes (T12.3.5): ``permission`` AND a fresh MFA step-up on THIS session
     (``sessions.mfa_verified_at`` set -- ``rag_app.api.auth.get_current_user`` reads it onto
-    ``request.state.mfa_verified_at``). The legacy Bearer (no server-side session) path can
-    never satisfy this, by construction -- there is no session row to have stepped up.
+    ``request.state.mfa_verified_at``). Cookie authentication is the only path (T12.5.3) --
+    no session cookie means no server-side session, so there is nothing to have stepped up.
 
     ``base`` is called EXPLICITLY in the body (not composed via a nested ``Depends``) so the
     permission check and the MFA check are both exercised by a single, direct call to the

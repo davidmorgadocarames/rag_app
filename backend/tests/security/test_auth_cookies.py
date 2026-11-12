@@ -1,8 +1,9 @@
-"""Cookie auth end to end (T12.1.3): cookie and legacy Bearer both authenticate, logout
-invalidates the cookie server-side, erasure revokes every session, and login still returns
-the JWT (rollback path, TF10) while also setting the `__Host-` cookie. Register itself no
-longer opens a session (T12.4.4) -- see `test_register_no_longer_sets_a_session_or_returns_
-a_token` and `_register_and_login` below.
+"""Cookie auth end to end (T12.1.3, T12.5.3): the ``__Host-`` session cookie is the ONLY way
+to authenticate -- the legacy Bearer JWT path (the pre-BFF frontend's 12a rollback, TF10) was
+removed in T12.5.3, along with returning a token from ``/auth/login`` at all. Logout
+invalidates the cookie server-side, erasure revokes every session. Register itself no longer
+opens a session (T12.4.4) -- see `test_register_no_longer_sets_a_session_or_returns_a_token`
+and `_register_and_login` below.
 
 An ``https://`` base_url is required: httpx/TestClient drops a ``Secure`` cookie received over
 plain ``http://`` (B7), and ``__Host-`` always implies ``Secure``.
@@ -15,14 +16,15 @@ import uuid
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, select, text
+from sqlalchemy.orm import Session
 
 from rag_app.api.app import create_app
 from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from rag_app.db.models import User
 from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.risk import SignupTracker
-from rag_app.security import decode_token
 from rag_app.sessions import SESSION_COOKIE_NAME
 
 pytestmark = [pytest.mark.db, pytest.mark.security]
@@ -98,38 +100,38 @@ def test_login_also_sets_a_session_cookie(api_env: Engine) -> None:
     client.post("/auth/register", json=creds)
     response = client.post("/auth/login", json=creds)
     assert response.status_code == 200
-    assert response.json()["access_token"]
+    assert "access_token" not in response.json()
     assert response.cookies.get(SESSION_COOKIE_NAME)
 
 
-def test_cookie_and_legacy_bearer_both_authenticate(api_env: Engine) -> None:
+def test_the_cookie_authenticates(api_env: Engine) -> None:
     client = _client()
-    creds, login = _register_and_login(client)
-    access_token = login.json()["access_token"]
+    creds, _login = _register_and_login(client)
 
-    # The cookie path: the client's jar already holds it from the login response.
+    # The client's jar already holds the cookie from the login response.
     via_cookie = client.get("/auth/me")
     assert via_cookie.status_code == 200
     assert via_cookie.json()["email"] == creds["email"]
 
-    # The legacy Bearer path, isolated from the cookie by using a client with no jar entry.
-    bearer_client = _client()
-    via_bearer = bearer_client.get("/auth/me", headers={"Authorization": f"Bearer {access_token}"})
-    assert via_bearer.status_code == 200
-    assert via_bearer.json()["email"] == creds["email"]
 
-
-def test_an_unknown_cookie_is_rejected_even_with_a_valid_bearer_present(api_env: Engine) -> None:
-    """get_current_user tries the cookie first and does not fall back to Bearer when the
-    cookie is present but invalid (see its docstring)."""
+def test_a_request_with_no_session_cookie_at_all_is_rejected(api_env: Engine) -> None:
+    """T12.5.3: the legacy Bearer path is gone -- there is no fallback any more when the
+    cookie is absent (contrast with `test_an_unknown_cookie_is_rejected` below, where a
+    cookie IS present but does not resolve)."""
     client = _client()
-    _, login = _register_and_login(client)
-    access_token = login.json()["access_token"]
+    _register_and_login(client)
+    fresh_client = _client()  # a client with no jar entry at all
+    response = fresh_client.get("/auth/me")
+    assert response.status_code == 401
+
+
+def test_an_unknown_cookie_is_rejected(api_env: Engine) -> None:
+    client = _client()
+    _register_and_login(client)
 
     response = client.get(
         "/auth/me",
         cookies={SESSION_COOKIE_NAME: "garbage-not-a-real-session"},
-        headers={"Authorization": f"Bearer {access_token}"},
     )
     assert response.status_code == 401
 
@@ -160,10 +162,12 @@ def test_logout_without_a_cookie_is_a_no_op_not_an_error(api_env: Engine) -> Non
 def test_erasure_revokes_every_session(api_env: Engine) -> None:
     client = _client()
     creds, login = _register_and_login(client)
-    access_token = login.json()["access_token"]
     first_cookie = login.cookies.get(SESSION_COOKIE_NAME)
     assert first_cookie
-    user_id = decode_token(access_token)
+    # T12.5.3: no token to decode the user id from any more -- look it up the same way the
+    # backend itself does, from the database.
+    with Session(api_env) as session:
+        user_id = session.scalar(select(User.id).where(User.email == creds["email"]))
     assert user_id
 
     # A second session for the SAME user (another device/browser): erasure must revoke it
@@ -174,10 +178,7 @@ def test_erasure_revokes_every_session(api_env: Engine) -> None:
 
     # The client's cookie jar now carries the SECOND session's cookie (login overwrote the
     # first one), so this cookie-authenticated DELETE needs ITS CSRF token, not the first's.
-    erase = client.delete(
-        "/account",
-        headers={"Authorization": f"Bearer {access_token}", **_csrf_header(second_login)},
-    )
+    erase = client.delete("/account", headers=_csrf_header(second_login))
     assert erase.status_code == 202
 
     for stale_cookie in (first_cookie, second_cookie):

@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
 
 from rag_app import __version__, csp_report, metrics, reranking, timing
 from rag_app.api import admin, auth, conversations
@@ -26,14 +25,6 @@ from rag_app.csrf import require_csrf
 from rag_app.db.session import make_engine
 from rag_app.keycheck import check_master_key_fingerprint
 from rag_app.logsafe import install_log_redaction
-
-# T12.2.4 (E6): the old frontend (12a rollback, TF10) is the only remaining *browser* CORS
-# caller -- it sends a Bearer token (never cookies), so `allow_credentials` stays False and
-# the method/header lists only need to cover what it actually uses. The BFF-based new
-# frontend never triggers a browser CORS preflight at all (same-origin, server-to-server
-# fetch) -- `test_cors_narrowed_to_the_old_frontends_needs` pins both halves of this.
-CORS_ALLOWED_METHODS = ["GET", "POST", "PATCH", "DELETE"]
-CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type"]
 
 AnswererDep = Annotated[AnswerFn, Depends(get_answerer)]
 ReserverDep = Annotated[ReserveFn, Depends(get_answer_reserver)]
@@ -115,13 +106,9 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json" if docs_enabled else None,
     )
     _add_security_headers(app)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[settings.frontend_origin],
-        allow_methods=CORS_ALLOWED_METHODS,
-        allow_headers=CORS_ALLOWED_HEADERS,
-        allow_credentials=False,
-    )
+    # T12.5.3: CORS removed entirely (the BFF-based frontend is the only caller, same-origin
+    # server-to-server, never a browser preflight) -- the legacy Bearer-only frontend that
+    # needed cross-origin access is gone (see `get_current_user` in `rag_app.api.auth`).
     app.include_router(auth.router)
     app.include_router(conversations.router)
     app.include_router(csp_report.router)

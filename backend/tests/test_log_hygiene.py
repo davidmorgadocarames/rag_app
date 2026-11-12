@@ -28,6 +28,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from rag_app.csrf import CSRF_COOKIE_NAME
 from rag_app.logsafe import REDACTED, AccessLogRedactor, install_log_redaction, redact_query
 from rag_app.sessions import SESSION_COOKIE_NAME
 
@@ -71,13 +72,21 @@ def _leaks(rendered: list[str], secrets: list[str]) -> list[str]:
     return [line for line in rendered for secret in secrets if secret and secret in line]
 
 
-def _cookie_value(set_cookie: str, name: str) -> str:
-    """The raw value of cookie ``name`` out of a ``Set-Cookie`` response header, or ``""``."""
-    for part in set_cookie.split(";"):
-        key, _, value = part.strip().partition("=")
+def _cookie_value(set_cookie_lines: list[str], name: str) -> str:
+    """The raw value of cookie ``name`` out of a list of ``Set-Cookie`` response headers
+    (there are usually two in this file: the session cookie and the CSRF one), or ``""``."""
+    for line in set_cookie_lines:
+        key, _, value = line.split(";", 1)[0].strip().partition("=")
         if key == name:
             return value
     return ""
+
+
+def _cookie_header(set_cookie_lines: list[str], *names: str) -> str:
+    """T12.5.3: a raw ``Cookie`` request-header value carrying the named cookies, the way a
+    real browser (or, since T12.5.3, the only way left to authenticate at all) would send
+    them back."""
+    return "; ".join(f"{name}={_cookie_value(set_cookie_lines, name)}" for name in names)
 
 
 # --- unit: emailer, redactor, engine ------------------------------------------------------
@@ -207,7 +216,7 @@ class _Server:
             time.sleep(0.05)
         port = self.server.servers[0].sockets[0].getsockname()[1]
         self.base = f"http://127.0.0.1:{port}"
-        self.last_set_cookie = ""
+        self.last_set_cookies: list[str] = []
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -215,20 +224,30 @@ class _Server:
         self.thread.join(timeout=20)
 
     def call(
-        self, method: str, path: str, body: dict[str, Any] | None = None, token: str | None = None
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        cookie: str | None = None,
+        csrf: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
+        """T12.5.3: no Bearer -- ``cookie`` is the raw ``Cookie`` header value (built by
+        ``_cookie_header`` below from ``last_set_cookies``) and ``csrf`` the matching
+        ``X-CSRF-Token``, for state-changing calls."""
         # urllib, not httpx: the client itself must not add log records of its own.
         headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        if cookie:
+            headers["Cookie"] = cookie
+        if csrf:
+            headers["X-CSRF-Token"] = csrf
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as res:  # noqa: S310 - local test server
-                self.last_set_cookie = res.headers.get("set-cookie", "")
+                self.last_set_cookies = res.headers.get_all("Set-Cookie") or []
                 return res.status, json.loads(res.read() or b"{}")
         except urllib.error.HTTPError as err:
-            self.last_set_cookie = err.headers.get("set-cookie", "")
+            self.last_set_cookies = err.headers.get_all("Set-Cookie") or []
             return err.code, json.loads(err.read() or b"{}")
 
 
@@ -301,8 +320,8 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
 
     email = f"carol.{uuid.uuid4().hex[:8]}@example.test"
     password = "correct horse battery staple " + uuid.uuid4().hex[:6]
-    access_tokens: list[str] = []
     session_cookies: list[str] = []
+    csrf_tokens: list[str] = []
     with _Server(create_app) as server:
         _attach(captured_logs)
         credentials = {"email": email, "password": password}
@@ -323,12 +342,15 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
         assert server.call("POST", "/auth/verify", {"token": issued[-1]})[0] == 200
         status, body = server.call("POST", "/auth/login", credentials)
         assert status == 200
-        access_tokens.append(body["access_token"])
-        session_cookies.append(_cookie_value(server.last_set_cookie, SESSION_COOKIE_NAME))
-        assert server.call("GET", "/auth/me", token=body["access_token"])[0] == 200
-        assert server.call("GET", "/conversations", token=body["access_token"])[0] == 200
-        assert server.call("DELETE", "/account", token=body["access_token"])[0] == 202
-        assert server.call("GET", "/auth/me", token=body["access_token"])[0] == 401
+        assert "access_token" not in body  # T12.5.3: login no longer returns a token
+        cookie = _cookie_header(server.last_set_cookies, SESSION_COOKIE_NAME, CSRF_COOKIE_NAME)
+        csrf = _cookie_value(server.last_set_cookies, CSRF_COOKIE_NAME)
+        session_cookies.append(_cookie_value(server.last_set_cookies, SESSION_COOKIE_NAME))
+        csrf_tokens.append(csrf)
+        assert server.call("GET", "/auth/me", cookie=cookie)[0] == 200
+        assert server.call("GET", "/conversations", cookie=cookie)[0] == 200
+        assert server.call("DELETE", "/account", cookie=cookie, csrf=csrf)[0] == 202
+        assert server.call("GET", "/auth/me", cookie=cookie)[0] == 401
         assert server.call("POST", "/auth/login", {"email": email, "password": password})[0] == 401
         time.sleep(0.2)
 
@@ -341,7 +363,7 @@ def test_the_whole_auth_flow_logs_no_email_or_token(
     names = {r.name for r in captured_logs.records}
     assert "uvicorn.access" in names and "sqlalchemy.engine.Engine" in names  # really captured
     local_part = email.split("@", 1)[0]
-    secrets = [email, local_part, password, *issued, *access_tokens, *session_cookies]
+    secrets = [email, local_part, password, *issued, *session_cookies, *csrf_tokens]
     assert not _leaks(captured_logs.rendered, secrets)
 
     # the erasure scrubbed the address, so nothing is left to leak later either
