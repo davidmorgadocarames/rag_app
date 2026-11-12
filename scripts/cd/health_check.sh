@@ -2,7 +2,8 @@
 # Post-deploy health check (deferred from 11a, done in 11b block D): poll a URL until it
 # answers the expected HTTP status, within a bounded timeout. Used by cd.yml's `deploy` job,
 # AFTER the Container Apps are updated, so a broken revision fails the CD run instead of
-# silently going live unnoticed (backend `/health`, frontend `/`).
+# silently going live unnoticed (frontend `/api/health` -- its own BFF proxy of the backend's
+# `/health`, DEC-005/T12.5.6 -- and frontend `/`).
 #
 #   health_check.sh <url> [--timeout <seconds>] [--interval <seconds>] [--expect-status <code>]
 #

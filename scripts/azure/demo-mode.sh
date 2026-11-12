@@ -22,9 +22,11 @@
 #            option) via `az tag update --operation merge` (merge: no other tag is ever
 #            touched, and no env var/secret is ever touched by this script at all).
 #         3. Waits for each app's `runningStatus` to become `Running` (bounded), then the
-#            backend's `/health` to answer 200 (`scripts/cd/health_check.sh`).
+#            backend's health through the frontend's own BFF route (`/api/health`,
+#            DEC-005/T12.5.6 -- `scripts/cd/health_check.sh`; the backend has no public
+#            FQDN of its own to poll once ingress goes internal, T12.6b.5).
 #         4. Prints "ready — ask a question in the browser" + the end time.
-#         If step 3 fails (an app never reaches Running, or /health never answers), `on`
+#         If step 3 fails (an app never reaches Running, or /api/health never answers), `on`
 #         rolls back everything it changed — every app it scaled goes back to min-replicas
 #         0, every tag it wrote is removed — then exits non-zero. It never leaves apps up
 #         with a valid future tag but no actually-ready demo (DA-11bH-2).
@@ -112,7 +114,7 @@ if [ "$dry_run" = 1 ]; then
         say "  would run: az tag update --resource-id <id of $app> --operation merge --tags $TAG_KEY=$end"
       done
       say "would wait for each app's runningStatus = Running (<= ${RUNNING_TIMEOUT}s)"
-      say "would run: $HEALTH_CHECK https://<backend fqdn>/health --timeout $HEALTH_TIMEOUT"
+      say "would run: $HEALTH_CHECK https://<frontend fqdn>/api/health --timeout $HEALTH_TIMEOUT"
       say "would print: ready — ask a question in the browser (until $end)"
       say "on failure: would roll back (scale every touched app to 0, remove every tag written)"
       ;;
@@ -215,7 +217,7 @@ rollback_on() {
 # (DA-11bH-2) before dying. Because it is called as `do_on || …`, bash suspends `set -e`
 # for its body: a failing command inside it returns normally instead of aborting the script.
 do_on() {
-  local app current end backend_fqdn
+  local app current end frontend_fqdn
   end="$(plus_3h_iso)"
   for app in "${apps[@]}"; do
     current="$(min_replicas_of "$app")" || { echo "::error::cannot read min-replicas of $app" >&2; return 1; }
@@ -232,10 +234,13 @@ do_on() {
   for app in "${apps[@]}"; do
     wait_running "$app" || return 1
   done
-  backend_fqdn="$(az containerapp show -g "$rg" -n "$backend_app" \
+  # DEC-005/T12.5.6 (2026-11-12): the backend has no public FQDN to poll directly once
+  # ingress goes internal (T12.6b.5) -- /api/health is the frontend's own BFF proxy of the
+  # backend's /health, so this still proves the backend answers.
+  frontend_fqdn="$(az containerapp show -g "$rg" -n "$frontend_app" \
     --query properties.configuration.ingress.fqdn -o tsv)" \
-    || { echo "::error::cannot read the backend's FQDN" >&2; return 1; }
-  bash "$HEALTH_CHECK" "https://$backend_fqdn/health" --timeout "$HEALTH_TIMEOUT" || return 1
+    || { echo "::error::cannot read the frontend's FQDN" >&2; return 1; }
+  bash "$HEALTH_CHECK" "https://$frontend_fqdn/api/health" --timeout "$HEALTH_TIMEOUT" || return 1
   say "ready — ask a question in the browser (demo ends $end)"
 }
 

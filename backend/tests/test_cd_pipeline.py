@@ -1236,6 +1236,32 @@ def test_dry_run_echoes_the_health_check_step(cd: dict) -> None:
     assert "health" in names[4].lower()
 
 
+def test_backend_health_check_goes_through_the_frontends_bff_not_its_own_fqdn(
+    cd: dict,
+) -> None:
+    """DEC-005/T12.5.6 (2026-11-12): once the backend's ingress goes internal (T12.6b.5) it
+    has no public FQDN to poll directly any more -- the backend half of the post-deploy
+    health check must go through the frontend's own `/api/health` BFF route instead, and
+    no step in this job resolves a backend ingress FQDN/URL at all any more."""
+    deploy = cd["jobs"]["deploy"]
+    steps = deploy["steps"]
+    health_runs = [s.get("run", "") for s in steps if "health_check.sh" in s.get("run", "")]
+    assert len(health_runs) == 2, "backend AND frontend must both be polled"
+    assert any("FRONTEND_URL" in r and "/api/health" in r for r in health_runs)
+    assert not any("BACKEND_URL" in r for r in health_runs)
+    fqdn_steps_text = "\n".join(
+        s.get("run", "") for s in steps if "ingress.fqdn" in s.get("run", "")
+    )
+    assert "BACKEND_APP" not in fqdn_steps_text
+    assert "FRONTEND_APP" in fqdn_steps_text
+
+
+def test_dry_run_health_echo_mentions_the_bff_path(cd: dict) -> None:
+    steps = cd["jobs"]["dry-run"]["steps"]
+    health_step = next(s for s in steps if "health" in s.get("name", "").lower())
+    assert "/api/health" in health_step["run"]
+
+
 # --- DA-11bD-2: the 3-app deploy inlineScript must not partially deploy on a failure -----
 
 

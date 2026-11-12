@@ -264,12 +264,15 @@ jobs:
           echo "  2. $BACKEND_APP"
           echo "  3. $FRONTEND_APP"
           echo "(rg $RESOURCE_GROUP)"
-      - name: 4. Post-deploy health check (backend /health, frontend /)
+      - name: 4. Post-deploy health check (backend via the frontend's BFF, frontend /)
         if: steps.plan.outputs.go == 'true'
         run: |
-          echo "Would resolve the backend/frontend public ingress URLs and poll:"
-          echo "  scripts/cd/health_check.sh <backend_url>/health --timeout 180"
+          echo "Would resolve the frontend's public ingress URL and poll:"
+          echo "  scripts/cd/health_check.sh <frontend_url>/api/health --timeout 180"
           echo "  scripts/cd/health_check.sh <frontend_url>/ --timeout 180"
+          echo "DEC-005 (T12.5.6): the backend has no public URL to poll directly any more"
+          echo "once ingress goes internal (T12.6b.5) -- /api/health is the BFF's own"
+          echo "proxy of the backend's /health, so this still proves the backend answers."
           echo "A failed poll fails this run — the apps are already updated, never rolled back."
       - name: 5. Purge and backup Job images (digest; schedules never touched)
         if: steps.plan.outputs.go == 'true'
@@ -508,27 +511,26 @@ jobs:
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --image "ghcr.io/${{ github.repository }}-frontend@${{ needs.images.outputs.frontend_digest }}"
 
-      # Post-deploy health check (deferred from 11a, done in 11b block D): a broken revision
-      # must fail this CD run, not go live unnoticed. Public ingress URLs only (no secret, no
-      # query string); scripts/cd/health_check.sh never prints a response body.
-      - name: Resolve the backend and frontend public URLs
+      # Post-deploy health check (deferred from 11a, done in 11b block D; DEC-005/T12.5.6,
+      # 2026-11-12, routes the backend half through the frontend's own BFF instead of the
+      # backend's public FQDN -- the backend has no public URL to poll directly once ingress
+      # goes internal, T12.6b.5). A broken revision must fail this CD run, not go live
+      # unnoticed. Public ingress URL only (no secret, no query string); scripts/cd/
+      # health_check.sh never prints a response body.
+      - name: Resolve the frontend's public URL
         id: urls
         env:
           RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-          BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
           FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
         run: |
-          backend_fqdn="$(az containerapp show --name "$BACKEND_APP" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)"
           frontend_fqdn="$(az containerapp show --name "$FRONTEND_APP" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)"
-          [ -n "$backend_fqdn" ] || { echo "::error::backend ingress FQDN is empty"; exit 1; }
           [ -n "$frontend_fqdn" ] || { echo "::error::frontend ingress FQDN is empty"; exit 1; }
-          echo "backend_url=https://$backend_fqdn" >> "$GITHUB_OUTPUT"
           echo "frontend_url=https://$frontend_fqdn" >> "$GITHUB_OUTPUT"
 
-      - name: Backend health check (/health)
+      - name: Backend health check (via the frontend's BFF, /api/health)
         env:
-          BACKEND_URL: ${{ steps.urls.outputs.backend_url }}
-        run: bash scripts/cd/health_check.sh "$BACKEND_URL/health" --timeout 180
+          FRONTEND_URL: ${{ steps.urls.outputs.frontend_url }}
+        run: bash scripts/cd/health_check.sh "$FRONTEND_URL/api/health" --timeout 180
 
       - name: Frontend health check (/)
         env:

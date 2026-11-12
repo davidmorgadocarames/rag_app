@@ -95,7 +95,14 @@ json.dump(state, open(state_path, "w"))
 """
 
 # FAKE_CURL_STATUS lets a test make the final /health check fail (default: 200, healthy).
-FAKE_CURL = "#!/bin/sh\nprintf '%s' \"${FAKE_CURL_STATUS:-200}\"\n"
+# FAKE_CURL_LOG (DEC-005/T12.5.6), when set, also records the exact args curl was called
+# with -- a test can then check WHICH url the health check actually polled (frontend's
+# /api/health, never a backend FQDN).
+FAKE_CURL = (
+    "#!/bin/sh\n"
+    '[ -n "$FAKE_CURL_LOG" ] && printf \'%s\\n\' "$*" >> "$FAKE_CURL_LOG"\n'
+    "printf '%s' \"${FAKE_CURL_STATUS:-200}\"\n"
+)
 
 
 def _env(tmp_path: Path, **extra: str) -> dict[str, str]:
@@ -137,6 +144,11 @@ def _state(tmp_path: Path) -> dict:
 
 def _log(tmp_path: Path) -> list[str]:
     path = tmp_path / "az.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def _curl_log(tmp_path: Path) -> list[str]:
+    path = tmp_path / "curl.log"
     return path.read_text().splitlines() if path.exists() else []
 
 
@@ -389,6 +401,29 @@ def test_on_never_restarts_an_already_active_app_only_extends_the_tag_still_hold
     assert _run("on", env=env).returncode == 0
     updates_after = sum(1 for line in _log(tmp_path) if line.startswith("containerapp update"))
     assert updates_after == updates_before
+
+
+@needs_tools
+def test_on_health_checks_through_the_frontends_bff_not_a_backend_fqdn(tmp_path: Path) -> None:
+    """DEC-005/T12.5.6 (2026-11-12): the backend has no public FQDN to poll directly once
+    ingress goes internal (T12.6b.5) -- `on`'s final health check must resolve the
+    FRONTEND app's FQDN and hit its own `/api/health` BFF route, never the backend's."""
+    env = _env(tmp_path, FAKE_CURL_LOG=str(tmp_path / "curl.log"))
+    assert _run("on", env=env).returncode == 0
+    az_log = _log(tmp_path)
+    fqdn_queries = [
+        line
+        for line in az_log
+        if "containerapp show" in line and "properties.configuration.ingress.fqdn" in line
+    ]
+    assert fqdn_queries, "the script never resolved any app's FQDN"
+    assert all(f"-n {APPS['frontend']} " in q for q in fqdn_queries), fqdn_queries
+    assert not any(f"-n {APPS['backend']} " in q for q in fqdn_queries), fqdn_queries
+    curl_calls = _curl_log(tmp_path)
+    assert curl_calls, "curl was never invoked"
+    health_url = curl_calls[-1]
+    assert f"https://{APPS['frontend']}.example.com/api/health" in health_url
+    assert f"{APPS['backend']}.example.com" not in health_url
 
 
 # --- F-H-1: `status`'s "approximate cost so far" assumed start = tag - 3h, which is only
