@@ -666,6 +666,7 @@ step_email-e2e() {
     missing_tool "uvicorn (pip install -r backend/requirements.txt)"
     return
   fi
+  mkdir -p "$GATE_STATE/email-e2e"
   trap e2e_cleanup EXIT
   e2e_start_backend "$GATE_STATE/email-e2e" || return 1
   (cd "$REPO_ROOT/backend" && "$VENV/bin/python" -m rag_app.devtools.email_e2e_check \

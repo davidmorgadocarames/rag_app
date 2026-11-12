@@ -160,6 +160,7 @@ volume_created=0
 teardown() {
   local rc=$?
   trap '' INT TERM
+  [ -n "${COOKIE_DIR:-}" ] && rm -rf "$COOKIE_DIR" 2>/dev/null
   if [ "$keep" = 1 ]; then
     say "--keep: left projects $project/$restart_project and volume $RESTART_CHECK_VOLUME"
   else
@@ -226,30 +227,43 @@ db_sql() { compose "$1" exec -T db psql -U rag -d rag -X -tAc "$2"; }
 # a compliant jar's OWN policy enforces Secure; a throwaway loopback-only script copying the
 # value itself is not a real-world downgrade (production only ever serves this cookie over
 # HTTPS, through the BFF).
-COOKIE_SESSION="" COOKIE_CSRF=""
+#
+# State lives in two FILES, not bash variables: every call site below reads `http()`'s body/
+# status via `res="$(http ...)"`, a command substitution that runs `http` in a SUBSHELL --
+# any plain variable it set would be lost the instant that subshell exits. A file write made
+# inside that same subshell, by contrast, is a real filesystem change and IS still visible to
+# the next `http()` call (found running this for real: the naive plain-variable version always
+# left $COOKIE_SESSION empty in the calling scope).
+COOKIE_DIR="$(mktemp -d)"
+SESSION_COOKIE_FILE="$COOKIE_DIR/session"
+CSRF_COOKIE_FILE="$COOKIE_DIR/csrf"
+: >"$SESSION_COOKIE_FILE"
+: >"$CSRF_COOKIE_FILE"
 _absorb_set_cookie() {  # <raw "Set-Cookie: name=value; ..." header line>
   local rest name value
   rest="$(sed -E 's/^[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]: *//' <<<"$1")"
   name="${rest%%=*}"
   value="${rest#*=}"; value="${value%%;*}"
   case "$name" in
-    __Host-secrag_session) COOKIE_SESSION="$value" ;;
-    __Host-secrag_csrf) COOKIE_CSRF="$value" ;;
+    __Host-secrag_session) printf '%s' "$value" >"$SESSION_COOKIE_FILE" ;;
+    __Host-secrag_csrf) printf '%s' "$value" >"$CSRF_COOKIE_FILE" ;;
   esac
 }
 
 # http <method> <path> [json body] → "<body>\n<status>"
 http() {
-  local headers_file response line
+  local headers_file response line session csrf
   local extra=()
   headers_file="$(mktemp)"
   [ -z "${3:-}" ] || extra+=(--data "$3")
-  if [ -n "$COOKIE_SESSION" ]; then
-    local cookie="__Host-secrag_session=$COOKIE_SESSION"
-    [ -z "$COOKIE_CSRF" ] || cookie="$cookie; __Host-secrag_csrf=$COOKIE_CSRF"
+  session="$(cat "$SESSION_COOKIE_FILE")"
+  csrf="$(cat "$CSRF_COOKIE_FILE")"
+  if [ -n "$session" ]; then
+    local cookie="__Host-secrag_session=$session"
+    [ -z "$csrf" ] || cookie="$cookie; __Host-secrag_csrf=$csrf"
     extra+=(-H "Cookie: $cookie")
   fi
-  [ -z "$COOKIE_CSRF" ] || extra+=(-H "X-CSRF-Token: $COOKIE_CSRF")
+  [ -z "$csrf" ] || extra+=(-H "X-CSRF-Token: $csrf")
   response="$(curl -sS -D "$headers_file" -o - -w '\n%{http_code}' -X "$1" "${extra[@]}" \
     -H 'Content-Type: application/json' "$API$2")"
   while IFS= read -r line; do
@@ -335,10 +349,12 @@ say "verified via Mailpit (real SMTP send, real token)"
 # every later call authenticates with them, never an Authorization header.
 res="$(http POST /auth/login "$creds")"
 [ "$(status_of "$res")" = 200 ] || fail "register" "HTTP $(status_of "$res") on /auth/login right after verify"
-[ -n "$COOKIE_SESSION" ] || fail "register" "login did not set the session cookie"
+[ -s "$SESSION_COOKIE_FILE" ] || fail "register" "login did not set the session cookie"
 
-stream="$(curl -sS -N -X POST -H "Cookie: __Host-secrag_session=$COOKIE_SESSION; __Host-secrag_csrf=$COOKIE_CSRF" \
-            -H "X-CSRF-Token: $COOKIE_CSRF" -H 'Content-Type: application/json' \
+session="$(cat "$SESSION_COOKIE_FILE")"
+csrf="$(cat "$CSRF_COOKIE_FILE")"
+stream="$(curl -sS -N -X POST -H "Cookie: __Host-secrag_session=$session; __Host-secrag_csrf=$csrf" \
+            -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
             --data '{"question": "hello"}' "$API/chat/stream")"
 conv="$(python3 -c '
 import json, sys

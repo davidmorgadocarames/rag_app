@@ -4,9 +4,14 @@ reset -> login with the new password). Exercises a REAL running backend (a nativ
 started by ``scripts/gate.sh``'s ``step_email-e2e``) and a REAL Mailpit (HTTP API), never a
 mock -- the actual SMTP send, token hashing, expiry and single-use path, end to end.
 
-T12.4.10 ("no Bearer anywhere"): authentication after login rides the SAME ``httpx.Client``
-instance's cookie jar (the ``__Host-`` session cookie) for every later call -- never an
-``Authorization`` header.
+T12.4.10 ("no Bearer anywhere"): authentication after login rides the session cookie for
+every later call -- never an ``Authorization`` header. The cookie is threaded BY HAND (read
+off each response's ``Set-Cookie`` and resent as a plain ``Cookie`` header) rather than via
+httpx's own cookie jar: like a browser-less curl, httpx's jar enforces a cookie's ``Secure``
+flag against the ACTUAL connection scheme (RFC 6265) -- it has no "localhost is a secure
+context" exception (that is a BROWSER-only rule), so it would silently refuse to resend the
+Secure session/CSRF cookies ``set_session_cookie``/``set_csrf_cookie`` issue over this native
+backend's plain ``http://``.
 
     python -m rag_app.devtools.email_e2e_check --backend-url URL --mailpit-url URL
 
@@ -24,10 +29,42 @@ import uuid
 import httpx
 
 _TOKEN_RE = re.compile(r"token=([^\s&\"'<]+)")
+_SESSION_COOKIE = "__Host-secrag_session"
+_CSRF_COOKIE = "__Host-secrag_csrf"
 
 
 class EmailE2eError(RuntimeError):
     """A step failed; the message never carries the test account's password."""
+
+
+class CookieAuth:
+    """Manual cookie jar (see the module docstring): tracks the session/CSRF cookie values
+    and provides the headers to send them back on, bypassing httpx's own Secure-flag
+    enforcement."""
+
+    def __init__(self) -> None:
+        self.session: str | None = None
+        self.csrf: str | None = None
+
+    def absorb(self, response: httpx.Response) -> None:
+        for raw in response.headers.get_list("set-cookie"):
+            name, _, rest = raw.partition("=")
+            value = rest.split(";", 1)[0]
+            if name == _SESSION_COOKIE:
+                self.session = value
+            elif name == _CSRF_COOKIE:
+                self.csrf = value
+
+    def headers(self) -> dict[str, str]:
+        if self.session is None:
+            return {}
+        cookie = f"{_SESSION_COOKIE}={self.session}"
+        if self.csrf is not None:
+            cookie = f"{cookie}; {_CSRF_COOKIE}={self.csrf}"
+        headers = {"Cookie": cookie}
+        if self.csrf is not None:
+            headers["X-CSRF-Token"] = self.csrf
+        return headers
 
 
 def _wait_for_email(mailpit_url: str, to_email: str, *, timeout_s: float = 20.0) -> str:
@@ -62,6 +99,7 @@ def run(backend_url: str, mailpit_url: str) -> None:
     email = f"email-e2e-{uuid.uuid4().hex[:12]}@example.test"
     password = "correct horse battery staple " + uuid.uuid4().hex[:6]
     new_password = "correct horse battery staple " + uuid.uuid4().hex[:6]
+    auth = CookieAuth()
 
     with httpx.Client(base_url=backend_url, timeout=10.0) as client:
         # --- register -> Mailpit -> verify --------------------------------------------------
@@ -76,9 +114,12 @@ def run(backend_url: str, mailpit_url: str) -> None:
         login = client.post("/auth/login", json={"email": email, "password": password})
         if login.status_code != 200:
             raise EmailE2eError(f"login after verify: HTTP {login.status_code} ({login.text})")
-        # No Bearer anywhere (T12.4.10): the SAME client's cookie jar now carries the
-        # session -- this call sends no Authorization header at all.
-        me = client.get("/auth/me")
+        auth.absorb(login)
+        if auth.session is None:
+            raise EmailE2eError("login did not set the session cookie")
+        # No Bearer anywhere (T12.4.10): only the cookie (threaded by hand, see the module
+        # docstring) authenticates this call -- no Authorization header at all.
+        me = client.get("/auth/me", headers=auth.headers())
         if me.status_code != 200:
             raise EmailE2eError(f"GET /auth/me with the cookie: HTTP {me.status_code}")
 
@@ -92,8 +133,8 @@ def run(backend_url: str, mailpit_url: str) -> None:
             raise EmailE2eError(f"reset: HTTP {reset.status_code} ({reset.text})")
 
         # Reset must have revoked the earlier session (rag_app.sessions.revoke_all): the
-        # cookie this same client is still carrying must no longer authenticate.
-        me_after_reset = client.get("/auth/me")
+        # cookie this script is still holding must no longer authenticate.
+        me_after_reset = client.get("/auth/me", headers=auth.headers())
         if me_after_reset.status_code != 401:
             raise EmailE2eError(
                 "the pre-reset session cookie still authenticates after /auth/reset"
