@@ -8,9 +8,8 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request, Response
 
-from rag_app import __version__, csp_report, metrics, reranking, timing
+from rag_app import __version__, authz, csp_report, metrics, reranking, timing
 from rag_app.api import admin, auth, conversations
-from rag_app.api.auth import get_current_user
 from rag_app.api.deps import (
     AnswerFn,
     ReserveFn,
@@ -20,6 +19,7 @@ from rag_app.api.deps import (
     rate_limit_chat,
 )
 from rag_app.api.schemas import ChatRequest, ChatResponse, CitationOut, HealthResponse
+from rag_app.authz import require_permission
 from rag_app.config import Settings, check_dev_only_flags, get_settings, validate_api_settings
 from rag_app.csrf import require_csrf
 from rag_app.db.session import make_engine
@@ -110,6 +110,13 @@ def create_app() -> FastAPI:
     # server-to-server, never a browser preflight) -- the legacy Bearer-only frontend that
     # needed cross-origin access is gone (see `get_current_user` in `rag_app.api.auth`).
     app.include_router(auth.router)
+    # T12.5.2 (route walker): `/auth/me` and `DELETE /account` live in `rag_app.api.auth`,
+    # which cannot import `rag_app.authz` itself (a module cycle -- `authz.require_permission`
+    # needs `auth.CurrentUserDep`; see `authz.declare_permission`'s docstring). Both routes
+    # already enforce authentication via `CurrentUserDep`; this only registers the
+    # permission for the walker, there is nothing left to decide at request time.
+    authz.declare_permission("GET", "/auth/me", "user:base")
+    authz.declare_permission("DELETE", "/account", "user:base")
     app.include_router(conversations.router)
     app.include_router(csp_report.router)
     app.include_router(admin.router)
@@ -124,7 +131,7 @@ def create_app() -> FastAPI:
         "/chat",
         response_model=ChatResponse,
         dependencies=[
-            Depends(get_current_user),
+            Depends(require_permission("user:base", route=("POST", "/chat"), matrix=False)),
             Depends(rate_limit_chat),
             Depends(require_csrf),
         ],

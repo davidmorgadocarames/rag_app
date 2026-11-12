@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -296,7 +297,9 @@ def test_chat_at_the_cap_is_a_429_with_retry_after_and_no_llm_call(
 
     app = client.app
     app.dependency_overrides[get_answerer] = answerer
-    app.dependency_overrides[get_current_user] = lambda: object()
+    # T12.5.2: /chat now also checks a permission (always user:base for a real
+    # account) -- the fake user needs a .role, not a bare object() any more.
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
 
     _set_answers(db_engine, 2)
     invalid = client.post("/chat", json={"question": ""})
@@ -562,7 +565,9 @@ def test_chat_fails_closed_when_the_counter_cannot_be_written(
 
     app = client.app
     app.dependency_overrides[deps.get_answerer] = answerer
-    app.dependency_overrides[get_current_user] = lambda: object()
+    # T12.5.2: /chat now also checks a permission (always user:base for a real
+    # account) -- the fake user needs a .role, not a bare object() any more.
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
     monkeypatch.setattr(deps, "reserve_answer", _counter_down)
     res = TestClient(app, raise_server_exceptions=False).post("/chat", json={"question": QUESTION})
     assert 500 <= res.status_code < 600

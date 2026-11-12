@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,7 +45,9 @@ def test_chat_stubbed() -> None:
     app = create_app()
     app.dependency_overrides[get_session] = lambda: None
     app.dependency_overrides[get_answerer] = _stub_answerer
-    app.dependency_overrides[get_current_user] = lambda: object()
+    # T12.5.2: /chat now also checks a permission (always user:base for a real account) --
+    # the fake user needs a .role, not a bare object() any more.
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
     # The daily cap needs the database: covered in test_daily_cap.
     app.dependency_overrides[get_answer_reserver] = lambda: lambda _session: None
     client = TestClient(app)
@@ -70,7 +73,9 @@ def test_chat_requires_authentication() -> None:
 
 def test_chat_validation_rejects_empty_question() -> None:
     app = create_app()
-    app.dependency_overrides[get_current_user] = lambda: object()
+    # T12.5.2: /chat now also checks a permission (always user:base for a real account) --
+    # the fake user needs a .role, not a bare object() any more.
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
     client = TestClient(app)
     response = client.post("/chat", json={"question": ""})
     assert response.status_code == 422
@@ -125,7 +130,9 @@ def test_chat_reuses_the_shared_reranker_across_requests(monkeypatch: pytest.Mon
 
     app = create_app()
     app.dependency_overrides[get_session] = lambda: None
-    app.dependency_overrides[get_current_user] = lambda: object()
+    # T12.5.2: /chat now also checks a permission (always user:base for a real account) --
+    # the fake user needs a .role, not a bare object() any more.
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
     app.dependency_overrides[get_answer_reserver] = lambda: lambda _session: None
     client = TestClient(app)
 

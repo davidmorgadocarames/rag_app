@@ -14,7 +14,13 @@ from sqlalchemy.orm import Session
 
 from rag_app import lockout
 from rag_app import sessions as session_service
-from rag_app.api.deps import SessionDep, SignupTrackerDep, rate_limit_email, rate_limit_login
+from rag_app.api.deps import (
+    SessionDep,
+    SignupTrackerDep,
+    rate_limit_account,
+    rate_limit_email,
+    rate_limit_login,
+)
 from rag_app.api.schemas import (
     ForgotPasswordRequest,
     LoginRequest,
@@ -497,7 +503,11 @@ def logout(http: Request, session: SessionDep, response: Response) -> MessageRes
     return MessageResponse(detail="Logged out.")
 
 
-@router.get("/auth/me", response_model=UserOut)
+@router.get(
+    "/auth/me",
+    response_model=UserOut,
+    dependencies=[Depends(rate_limit_account("auth_me"))],
+)
 def me(user: CurrentUserDep) -> UserOut:
     return UserOut(id=str(user.id), email=user.email, email_verified=user.email_verified)
 
@@ -506,7 +516,7 @@ def me(user: CurrentUserDep) -> UserOut:
     "/account",
     response_model=MessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[Depends(require_csrf), Depends(rate_limit_account("delete_account"))],
 )
 def delete_account(user: CurrentUserDep, session: SessionDep) -> MessageResponse:
     """GDPR erasure, asynchronous (D-ER, T11.2b.2): one short transaction deletes the data key

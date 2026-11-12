@@ -51,8 +51,8 @@ from starlette.concurrency import iterate_in_threadpool
 from starlette.types import Receive, Scope, Send
 
 from rag_app import metrics
-from rag_app.api.auth import CurrentUserDep, get_current_user
-from rag_app.api.deps import SessionDep, rate_limit_chat
+from rag_app.api.auth import CurrentUserDep
+from rag_app.api.deps import SessionDep, rate_limit_account, rate_limit_chat
 from rag_app.api.schemas import (
     ChatStreamRequest,
     ConversationDetailOut,
@@ -61,6 +61,7 @@ from rag_app.api.schemas import (
     MessageResponse,
     RenameRequest,
 )
+from rag_app.authz import require_permission
 from rag_app.config import get_settings
 from rag_app.crypto import decrypt, encrypt, unwrap_key
 from rag_app.csrf import require_csrf
@@ -541,7 +542,7 @@ def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None,
 @router.post(
     "/chat/stream",
     dependencies=[
-        Depends(get_current_user),
+        Depends(require_permission("user:base", route=("POST", "/chat/stream"), matrix=False)),
         Depends(rate_limit_chat),
         Depends(require_csrf),
     ],
@@ -582,7 +583,14 @@ def chat_stream(
 # --- conversation CRUD ------------------------------------------------------
 
 
-@router.get("/conversations", response_model=list[ConversationOut])
+@router.get(
+    "/conversations",
+    response_model=list[ConversationOut],
+    dependencies=[
+        Depends(require_permission("user:base", route=("GET", "/conversations"), matrix=False)),
+        Depends(rate_limit_account("conversations_list")),
+    ],
+)
 def list_conversations(session: SessionDep, user: CurrentUserDep) -> list[ConversationOut]:
     """Never a 500 because of one bad row (T11.2.16): a conversation whose title or first
     message cannot be decrypted — or every one, when the data key cannot be unwrapped — is
@@ -621,7 +629,18 @@ def list_conversations(session: SessionDep, user: CurrentUserDep) -> list[Conver
     return out
 
 
-@router.get("/conversations/{conversation_id}", response_model=ConversationDetailOut)
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationDetailOut,
+    dependencies=[
+        Depends(
+            require_permission(
+                "user:base", route=("GET", "/conversations/{conversation_id}"), matrix=False
+            )
+        ),
+        Depends(rate_limit_account("conversations_get")),
+    ],
+)
 def get_conversation(
     conversation_id: str, session: SessionDep, user: CurrentUserDep
 ) -> ConversationDetailOut:
@@ -661,7 +680,15 @@ def get_conversation(
 @router.patch(
     "/conversations/{conversation_id}",
     response_model=MessageResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(
+            require_permission(
+                "user:base", route=("PATCH", "/conversations/{conversation_id}"), matrix=False
+            )
+        ),
+        Depends(rate_limit_account("conversations_rename")),
+    ],
 )
 def rename_conversation(
     conversation_id: str, request: RenameRequest, session: SessionDep, user: CurrentUserDep
@@ -680,7 +707,15 @@ def rename_conversation(
 @router.delete(
     "/conversations/{conversation_id}",
     response_model=MessageResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(
+            require_permission(
+                "user:base", route=("DELETE", "/conversations/{conversation_id}"), matrix=False
+            )
+        ),
+        Depends(rate_limit_account("conversations_delete")),
+    ],
 )
 def delete_conversation(
     conversation_id: str, session: SessionDep, user: CurrentUserDep

@@ -29,6 +29,15 @@ _rate_limiter: RateLimiter | None = None
 _signup_tracker = SignupTracker()
 _email_abuse_limiter: EmailAbuseLimiter | None = None
 
+# T12.5.2 (route walker): every dependency callable below that enforces a rate limit adds
+# ITSELF here, right after its own definition -- the walker (backend/tests/security/
+# test_route_walker.py) checks a route's full recursive dependency tree for membership
+# here, rather than guessing from a function name (``rate_limit_email``/``rate_limit_account``
+# are FACTORIES, so the actual per-route dependency is a fresh closure each call; only the
+# closure itself, once added here, is recognisable). ``rag_app.api.admin._rate_limit_mfa``
+# adds itself here too (imported from this module).
+RATE_LIMIT_DEPENDENCIES: set[Callable[..., Any]] = set()
+
 
 def get_session() -> Iterator[Session]:
     global _session_factory
@@ -116,6 +125,30 @@ def rate_limit_chat(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
+RATE_LIMIT_DEPENDENCIES.add(rate_limit_chat)
+
+
+def rate_limit_account(action: str) -> Callable[..., None]:
+    """T12.5.2 (route walker): a generic per-account rate limit for an authenticated route
+    that has no more specific bucket of its own (chat has ``rate_limit_chat``, MFA guessing
+    has ``rag_app.api.admin._rate_limit_mfa``, email actions have ``rate_limit_email``).
+    Keyed the same way as ``rate_limit_chat`` -- the authenticated user id (set by
+    ``get_current_user`` on ``request.state.user_id``, which always runs first on every
+    route this guards) plus the real client IP -- reusing the SAME shared token bucket
+    (``get_rate_limiter``); ``action`` only separates one route's bucket from another's."""
+
+    def _dependency(
+        request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
+    ) -> None:
+        user_id = getattr(request.state, "user_id", None)
+        key = f"{action}:{user_id}:{_client_ip(request)}"
+        if not limiter.allow(key, cost=1.0):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+    RATE_LIMIT_DEPENDENCIES.add(_dependency)
+    return _dependency
+
+
 ReserveFn = Callable[[Session], None]
 
 
@@ -148,6 +181,9 @@ def rate_limit_csp_report(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
+RATE_LIMIT_DEPENDENCIES.add(rate_limit_csp_report)
+
+
 async def rate_limit_login(
     request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
 ) -> None:
@@ -164,6 +200,9 @@ async def rate_limit_login(
         pass
     if not limiter.allow(f"login:{email}:{_client_ip(request)}", cost=1.0):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
+RATE_LIMIT_DEPENDENCIES.add(rate_limit_login)
 
 
 def rate_limit_email(action: str) -> Callable[..., Coroutine[Any, Any, None]]:
@@ -187,4 +226,5 @@ def rate_limit_email(action: str) -> Callable[..., Coroutine[Any, Any, None]]:
         if not limiter.allow(action, _client_ip(request), email):
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
+    RATE_LIMIT_DEPENDENCIES.add(_dependency)
     return _dependency

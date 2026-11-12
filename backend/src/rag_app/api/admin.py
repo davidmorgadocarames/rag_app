@@ -20,7 +20,12 @@ from sqlalchemy.orm import Session
 from rag_app import mfa as mfa_service
 from rag_app import sessions as session_service
 from rag_app.api.auth import CurrentUserDep, set_csrf_cookie, set_session_cookie
-from rag_app.api.deps import SessionDep, get_rate_limiter
+from rag_app.api.deps import (
+    RATE_LIMIT_DEPENDENCIES,
+    SessionDep,
+    get_rate_limiter,
+    rate_limit_account,
+)
 from rag_app.api.schemas import (
     MessageResponse,
     MfaConfirmRequest,
@@ -28,7 +33,7 @@ from rag_app.api.schemas import (
     MfaEnrollResponse,
     MfaStepUpRequest,
 )
-from rag_app.authz import require_permission_and_mfa
+from rag_app.authz import require_permission, require_permission_and_mfa
 from rag_app.crypto import unwrap_key, wrap_key
 from rag_app.csrf import require_csrf
 from rag_app.db.models import MfaRecoveryCode, UserMfa
@@ -46,6 +51,9 @@ def _rate_limit_mfa(
     once 12b-B's lockout work (T12.4.2) lands alongside this."""
     if not limiter.allow(f"mfa:{user.id}", cost=1.0):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
+RATE_LIMIT_DEPENDENCIES.add(_rate_limit_mfa)
 
 
 def claim_recovery_code(session: Session, user_id: uuid.UUID, code: str) -> bool:
@@ -78,7 +86,10 @@ def claim_recovery_code(session: Session, user_id: uuid.UUID, code: str) -> bool
 
 @router.get(
     "/admin/ping",
-    dependencies=[Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/ping")))],
+    dependencies=[
+        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/ping"))),
+        Depends(rate_limit_account("admin_ping")),
+    ],
 )
 def admin_ping() -> MessageResponse:
     """Placeholder admin route (T12.3.2/T12.3.2b/T12.3.5), proving the permission map + MFA
@@ -90,7 +101,13 @@ def admin_ping() -> MessageResponse:
 @router.post(
     "/account/mfa/enroll",
     response_model=MfaEnrollResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(
+            require_permission("user:base", route=("POST", "/account/mfa/enroll"), matrix=False)
+        ),
+        Depends(rate_limit_account("mfa_enroll")),
+    ],
 )
 def mfa_enroll(user: CurrentUserDep, session: SessionDep) -> MfaEnrollResponse:
     """(Re-)start enrolment: a fresh, PENDING secret -- MFA is OFF (or off again, if it was
@@ -117,7 +134,13 @@ def mfa_enroll(user: CurrentUserDep, session: SessionDep) -> MfaEnrollResponse:
 @router.post(
     "/account/mfa/confirm",
     response_model=MfaConfirmResponse,
-    dependencies=[Depends(require_csrf), Depends(_rate_limit_mfa)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(
+            require_permission("user:base", route=("POST", "/account/mfa/confirm"), matrix=False)
+        ),
+        Depends(_rate_limit_mfa),
+    ],
 )
 def mfa_confirm(
     request: MfaConfirmRequest, user: CurrentUserDep, session: SessionDep
@@ -141,7 +164,13 @@ def mfa_confirm(
 @router.post(
     "/account/mfa/step-up",
     response_model=MessageResponse,
-    dependencies=[Depends(require_csrf), Depends(_rate_limit_mfa)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(
+            require_permission("user:base", route=("POST", "/account/mfa/step-up"), matrix=False)
+        ),
+        Depends(_rate_limit_mfa),
+    ],
 )
 def mfa_step_up(
     request: MfaStepUpRequest,
