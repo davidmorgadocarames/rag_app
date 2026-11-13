@@ -49,4 +49,4 @@ pyotp==2.9.0
 # setuptools above; DEC-018, 2026-11-07 dependency-advisory fix block):
 certifi==2026.10.23        # via httpx (and requests, in the jobs image)
 filelock==4.2.1            # via huggingface-hub, torch
-opentelemetry-api==1.45.1  # via fastapi (hard dependency since fastapi==0.142.2)
+opentelemetry-api==1.45.2  # via fastapi (hard dependency since fastapi==0.142.2); 1.45.2 fixes CVE-2026-126360 (DEC-027)
