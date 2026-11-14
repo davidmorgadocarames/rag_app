@@ -363,4 +363,9 @@ catalogue analysis; this is the implementation summary.
   the `secrag/gate-full` status, deploys images **by digest**, starts the **migration Job** (slim
   `jobs` image) before the apps and updates the **purge** (hourly) and **backup** (daily, encrypted
   to Blob Storage) Jobs to the same digest; it never rolls back
-  ([ADR phase 11](adr/adr_phase11_stability.md)).
+  ([ADR phase 11](adr/adr_phase11_stability.md)). *From Phase 13 (block 13-0):* `cd.yml` builds and
+  deploys **per image** — the files changed since the last deployed SHA decide which of the 4
+  images (backend, frontend, jobs, ollama) actually need a new build; an app/Job whose image did
+  not change keeps running its currently deployed digest (read from Azure, fail-closed) instead of
+  being redeployed, so an unrelated frontend-only change no longer forces an Ollama cold start
+  ([ADR phase 13](adr/adr_phase13_dashboard.md)).
