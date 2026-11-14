@@ -29,6 +29,7 @@ GATE_STATUS = REPO_ROOT / "scripts" / "cd" / "gate_status.sh"
 PLAN = REPO_ROOT / "scripts" / "cd" / "plan.sh"
 AZURE_JOBS = REPO_ROOT / "scripts" / "cd" / "azure_jobs.sh"
 HEALTH_CHECK = REPO_ROOT / "scripts" / "cd" / "health_check.sh"
+RESOLVE_IMAGE = REPO_ROOT / "scripts" / "cd" / "resolve_image.sh"
 SHA = "a" * 40
 
 needs_tools = pytest.mark.skipif(
@@ -117,6 +118,19 @@ def test_cd_runs_after_ci_on_main_and_never_on_a_raw_push(cd: dict) -> None:
     assert {"base_sha", "head_sha", "skip_tip_check"} <= set(inputs)
 
 
+def test_force_all_input_exists_defaults_false_and_is_allowed_on_real_runs(cd: dict) -> None:
+    """T13.CD.1: unlike base_sha/head_sha/skip_tip_check/simulate_failure, force_all works on
+    BOTH dry runs and real runs — it must never be refused by the "dry runs only" guard."""
+    inputs = _triggers(cd)["workflow_dispatch"]["inputs"]
+    assert inputs["force_all"]["type"] == "boolean"
+    assert inputs["force_all"]["default"] is False
+    mode = cd["jobs"]["plan"]["steps"][0]["run"]
+    assert "FORCE_ALL" not in mode  # never part of the dry-runs-only refusal check
+    plan_step = next(s for s in cd["jobs"]["plan"]["steps"] if s.get("id") == "plan")
+    assert plan_step["env"]["FORCE_ALL"] == "${{ inputs.force_all }}"
+    assert "--force-all" in plan_step["run"]
+
+
 @pytest.mark.parametrize("workflow", ["cd.yml", "ci.yml"])
 def test_no_expression_is_pasted_into_a_run_script(workflow: str) -> None:
     """DA-C2-3: `${{ … }}` in `run:` is template-injected into the shell (a ref name may
@@ -168,11 +182,24 @@ def test_the_migrate_job_checks_the_gate_then_runs_the_migration_job_by_digest(c
     job = cd["jobs"]["migrate"]
     runs = [step.get("run", "") for step in job["steps"]]
     verify = [i for i, run in enumerate(runs) if "gate_status.sh verify" in run]
+    resolve = [i for i, run in enumerate(runs) if "resolve_image.sh job" in run]
     migrate = [i for i, run in enumerate(runs) if "azure_jobs.sh migrate" in run]
-    assert verify and migrate and verify[0] < migrate[0]
-    assert job["env"]["JOBS_IMAGE"].endswith("-jobs@${{ needs.images.outputs.jobs_digest }}")
+    assert verify and resolve and migrate and verify[0] < resolve[0] == migrate[0]
     assert job["env"]["MIGRATE_JOB"] == "${{ vars.AZURE_MIGRATE_JOB }}"
+    assert job["env"]["BUILD_JOBS"] == "${{ needs.plan.outputs.build_jobs }}"
+    assert job["env"]["JOBS_BUILT_DIGEST"] == "${{ needs.images.outputs.jobs_digest }}"
+    assert "JOBS_IMAGE" not in job["env"]  # resolved dynamically, not a static digest
     assert job["permissions"]["id-token"] == "write"
+
+
+def test_the_migrate_job_resolve_call_passes_the_build_flag_and_built_digest(cd: dict) -> None:
+    """T13.CD.2: the jobs image is either the one just built (BUILD_JOBS=true) or the one
+    currently deployed on the migration Job itself, fail-closed if unreadable/unpinned."""
+    job = cd["jobs"]["migrate"]
+    run = next(s["run"] for s in job["steps"] if "resolve_image.sh job" in s.get("run", ""))
+    assert '--rg "$RESOURCE_GROUP"' in run and '--name "$MIGRATE_JOB"' in run
+    assert '--build "$BUILD_JOBS"' in run and '--built-digest "$JOBS_BUILT_DIGEST"' in run
+    assert '--repo "ghcr.io/$GH_REPO-jobs"' in run
 
 
 def test_the_deploy_job_updates_the_job_images_after_the_apps(cd: dict) -> None:
@@ -184,6 +211,9 @@ def test_the_deploy_job_updates_the_job_images_after_the_apps(cd: dict) -> None:
     assert env["PURGE_JOB"] == "${{ vars.AZURE_PURGE_JOB }}"
     assert env["BACKUP_JOB"] == "${{ vars.AZURE_BACKUP_JOB }}"
     assert env["JOBS_IMAGE"].endswith("-jobs@${{ needs.images.outputs.jobs_digest }}")
+    # T13.CD.2: unchanged Job images are never touched (migrate already resolved/verified
+    # the kept digest this same run; no reason to call az again here).
+    assert steps[jobs]["if"] == "needs.plan.outputs.build_jobs == 'true'"
 
 
 def test_images_build_the_jobs_image(cd: dict) -> None:
@@ -203,6 +233,25 @@ def test_images_build_the_ollama_image_with_a_gha_cache(cd: dict) -> None:
     assert cd["jobs"]["images"]["outputs"]["ollama_digest"] == "${{ steps.ollama.outputs.digest }}"
     steps = cd["jobs"]["images"]["steps"]
     assert any(s.get("uses", "").startswith("docker/setup-buildx-action") for s in steps)
+
+
+def test_each_image_build_step_only_runs_when_the_plan_flagged_it(cd: dict) -> None:
+    """T13.CD.2: only the images the plan flagged are built; an unchanged image's build step
+    is skipped — its digest is resolved from Azure instead (migrate/deploy jobs)."""
+    steps = cd["jobs"]["images"]["steps"]
+    expected = {
+        "backend": "needs.plan.outputs.build_backend == 'true'",
+        "frontend": "needs.plan.outputs.build_frontend == 'true'",
+        "jobs": "needs.plan.outputs.build_jobs == 'true'",
+        "ollama": "needs.plan.outputs.build_ollama == 'true'",
+    }
+    for step_id, expected_if in expected.items():
+        step = next(s for s in steps if s.get("id") == step_id)
+        assert step["if"] == expected_if, step_id
+    login_and_setup = [
+        s for s in steps if s.get("uses", "").startswith(("docker/setup-buildx", "docker/login"))
+    ]
+    assert login_and_setup and all("if" not in s for s in login_and_setup)
 
 
 def test_the_dry_run_shows_the_real_order_and_can_simulate_a_migrate_failure(cd: dict) -> None:
@@ -229,11 +278,31 @@ def test_deploy_job_refuses_without_gate_status_and_deploys_by_digest(cd: dict) 
         for s in deploy["steps"]
         if "with" in s and "inlineScript" in s["with"]
     )
-    assert "-backend@${{ needs.images.outputs.backend_digest }}" in script
-    assert "-frontend@${{ needs.images.outputs.frontend_digest }}" in script
-    assert "-ollama@${{ needs.images.outputs.ollama_digest }}" in script
+    # T13.CD.2: the digest itself is resolved in an earlier step (built just now, or kept
+    # from Azure) — the inlineScript only consumes the resolved image per app, conditionally.
+    assert "steps.resolve.outputs.backend_image" in script
+    assert "steps.resolve.outputs.frontend_image" in script
+    assert "steps.resolve.outputs.ollama_image" in script
+    resolve = next(s for s in deploy["steps"] if s.get("id") == "resolve")
+    assert resolve["env"]["BACKEND_BUILT_DIGEST"] == "${{ needs.images.outputs.backend_digest }}"
+    assert resolve["env"]["FRONTEND_BUILT_DIGEST"] == "${{ needs.images.outputs.frontend_digest }}"
+    assert resolve["env"]["OLLAMA_BUILT_DIGEST"] == "${{ needs.images.outputs.ollama_digest }}"
+    assert resolve["env"]["BUILD_BACKEND"] == "${{ needs.plan.outputs.build_backend }}"
+    assert resolve["env"]["BUILD_FRONTEND"] == "${{ needs.plan.outputs.build_frontend }}"
+    assert resolve["env"]["BUILD_OLLAMA"] == "${{ needs.plan.outputs.build_ollama }}"
+    assert "resolve_image.sh app" in resolve["run"]
+    pin_check = next(s for s in deploy["steps"] if s.get("name") == "Images must be pinned by digest")
+    assert pin_check["env"]["BACKEND_IMAGE"] == "${{ steps.resolve.outputs.backend_image }}"
+    assert pin_check["env"]["FRONTEND_IMAGE"] == "${{ steps.resolve.outputs.frontend_image }}"
+    assert pin_check["env"]["OLLAMA_IMAGE"] == "${{ steps.resolve.outputs.ollama_image }}"
     assert deploy["permissions"]["deployments"] == "write"
     assert deploy["permissions"]["id-token"] == "write"
+    # The resolve step must run before the apps step (az needs azure/login first too).
+    resolve_idx = deploy["steps"].index(resolve)
+    apps_idx = next(
+        i for i, s in enumerate(deploy["steps"]) if "inlineScript" in s.get("with", {})
+    )
+    assert resolve_idx < apps_idx
 
 
 def test_ollama_app_is_updated_before_backend_and_frontend(cd: dict) -> None:
@@ -251,8 +320,16 @@ def test_ollama_app_is_updated_before_backend_and_frontend(cd: dict) -> None:
     backend_at = script.index("AZURE_BACKEND_APP")
     frontend_at = script.index("AZURE_FRONTEND_APP")
     assert ollama_at < backend_at < frontend_at
-    ollama_image = deploy["env"]["OLLAMA_IMAGE"]
-    assert ollama_image.endswith("-ollama@${{ needs.images.outputs.ollama_digest }}")
+    # T13.CD.2: the order survives even though each update is now conditional (per-image).
+    ollama_update_at = script.index("steps.resolve.outputs.ollama_image")
+    backend_update_at = script.index("steps.resolve.outputs.backend_image")
+    frontend_update_at = script.index("steps.resolve.outputs.frontend_image")
+    assert ollama_update_at < backend_update_at < frontend_update_at
+    resolve = next(s for s in deploy["steps"] if s.get("id") == "resolve")
+    assert resolve["env"]["OLLAMA_APP"] == "${{ vars.AZURE_OLLAMA_APP }}"
+    assert resolve["run"].index("--name \"$OLLAMA_APP\"") < resolve["run"].index(
+        "--name \"$BACKEND_APP\""
+    )
 
 
 def _commands(path: Path) -> str:
@@ -483,6 +560,151 @@ def test_dry_run_prints_the_order_and_simulates_a_failure(tmp_path: Path) -> Non
     assert real.returncode == 1 and "dry runs only" in real.stderr
 
 
+# --- resolve_image.sh (fake az) ----------------------------------------------------------
+
+FAKE_AZ_RESOLVE = """\
+import os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_AZ_LOG"], "a") as log:
+    log.write(" ".join(args) + "\\n")
+current = os.environ.get("FAKE_AZ_CURRENT_IMAGE")
+if current is None:
+    sys.exit(1)  # simulates an unreadable app/Job (az call itself fails)
+print(current)
+"""
+
+REPO = "ghcr.io/o/r-backend"
+BUILT_DIGEST = "sha256:" + "d" * 64
+
+
+def _fake_az_resolve(tmp_path: Path, current_image: str | None) -> dict[str, str]:
+    bin_dir = tmp_path / "azbin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "fake_az.py").write_text(FAKE_AZ_RESOLVE, encoding="utf-8")
+    az = bin_dir / "az"
+    az.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{bin_dir / "fake_az.py"}" "$@"\n')
+    az.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_AZ_LOG": str(tmp_path / "az.log"),
+    }
+    if current_image is not None:
+        env["FAKE_AZ_CURRENT_IMAGE"] = current_image
+    return env
+
+
+@needs_tools
+@pytest.mark.parametrize("kind", ["app", "job"])
+def test_resolve_image_build_true_uses_the_built_digest_without_calling_az(
+    tmp_path: Path, kind: str
+) -> None:
+    env = _fake_az_resolve(tmp_path, current_image=None)
+    proc = _run(
+        RESOLVE_IMAGE,
+        kind,
+        "--rg",
+        "rg",
+        "--name",
+        "n",
+        "--repo",
+        REPO,
+        "--build",
+        "true",
+        "--built-digest",
+        BUILT_DIGEST,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == f"{REPO}@{BUILT_DIGEST}"
+    assert not (tmp_path / "az.log").exists()  # never calls az when build=true
+
+
+@needs_tools
+def test_resolve_image_build_false_reads_the_currently_deployed_app_image(
+    tmp_path: Path,
+) -> None:
+    kept = f"{REPO}@sha256:" + "e" * 64
+    env = _fake_az_resolve(tmp_path, current_image=kept)
+    proc = _run(
+        RESOLVE_IMAGE, "app", "--rg", "rg", "--name", "myapp", "--repo", REPO, "--build", "false", env=env
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == kept
+    log = (tmp_path / "az.log").read_text()
+    assert "containerapp show" in log and "myapp" in log
+
+
+@needs_tools
+def test_resolve_image_build_false_reads_the_currently_deployed_job_image(
+    tmp_path: Path,
+) -> None:
+    kept = f"{REPO}@sha256:" + "f" * 64
+    env = _fake_az_resolve(tmp_path, current_image=kept)
+    proc = _run(
+        RESOLVE_IMAGE, "job", "--rg", "rg", "--name", "myjob", "--repo", REPO, "--build", "false", env=env
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == kept
+    log = (tmp_path / "az.log").read_text()
+    assert "containerapp job show" in log and "myjob" in log
+
+
+@needs_tools
+def test_resolve_image_fails_closed_when_az_cannot_read_the_current_image(
+    tmp_path: Path,
+) -> None:
+    env = _fake_az_resolve(tmp_path, current_image=None)
+    proc = _run(
+        RESOLVE_IMAGE, "app", "--rg", "rg", "--name", "myapp", "--repo", REPO, "--build", "false", env=env
+    )
+    assert proc.returncode == 1
+    assert "could not read the currently deployed image" in proc.stderr
+    assert proc.stdout == ""
+
+
+@needs_tools
+@pytest.mark.parametrize("not_pinned", ["ghcr.io/o/r-backend:latest", "ghcr.io/o/r-backend:abc", ""])
+def test_resolve_image_fails_closed_when_the_kept_image_is_not_digest_pinned(
+    tmp_path: Path, not_pinned: str
+) -> None:
+    env = _fake_az_resolve(tmp_path, current_image=not_pinned)
+    proc = _run(
+        RESOLVE_IMAGE, "app", "--rg", "rg", "--name", "myapp", "--repo", REPO, "--build", "false", env=env
+    )
+    assert proc.returncode == 1
+    assert "is not pinned by digest" in proc.stderr
+
+
+@needs_tools
+def test_resolve_image_build_true_without_a_built_digest_is_refused(tmp_path: Path) -> None:
+    env = _fake_az_resolve(tmp_path, current_image=None)
+    proc = _run(
+        RESOLVE_IMAGE, "app", "--rg", "rg", "--name", "myapp", "--repo", REPO, "--build", "true", env=env
+    )
+    assert proc.returncode == 1
+    assert "needs --built-digest" in proc.stderr
+    assert not (tmp_path / "az.log").exists()
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["bogus", "--rg", "rg", "--name", "n", "--repo", REPO],
+        ["app", "--name", "n", "--repo", REPO],  # missing --rg
+        ["app", "--rg", "rg", "--repo", REPO],  # missing --name
+        ["app", "--rg", "rg", "--name", "n"],  # missing --repo
+        ["app", "--rg", "rg", "--name", "n", "--repo", REPO, "--build", "maybe"],
+    ],
+)
+def test_resolve_image_usage_errors(tmp_path: Path, args: list[str]) -> None:
+    env = _fake_az_resolve(tmp_path, current_image=None)
+    proc = _run(RESOLVE_IMAGE, *args, env=env)
+    assert proc.returncode == 2
+
+
 # --- gate_status.sh ---------------------------------------------------------------------
 
 
@@ -635,6 +857,122 @@ def test_code_change_deploys(tmp_path: Path, history) -> None:
     proc, out = _plan(tmp_path, repo, "--sha", shas["code"], "--base", shas["docs"])
     assert out["deploy"] == "true", proc.stdout
     assert "backend/app.py" in out["reason"]
+
+
+# --- plan.sh per-image outputs (T13.CD.1) ------------------------------------------------
+
+
+@needs_tools
+def test_backend_change_flags_backend_and_jobs_only(tmp_path: Path, history) -> None:
+    repo, shas = history
+    proc, out = _plan(tmp_path, repo, "--sha", shas["code"], "--base", shas["docs"])
+    assert out["deploy"] == "true", proc.stdout
+    assert out["build_backend"] == "true" and out["build_jobs"] == "true"
+    assert out["build_frontend"] == "false" and out["build_ollama"] == "false"
+
+
+@needs_tools
+def test_docs_only_change_flags_no_image(tmp_path: Path, history) -> None:
+    repo, shas = history
+    proc, out = _plan(tmp_path, repo, "--sha", shas["docs"], "--base", shas["base"])
+    assert out["deploy"] == "false", proc.stdout
+    for image in ("backend", "frontend", "jobs", "ollama"):
+        assert out[f"build_{image}"] == "false", image
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    ("path", "expected_true", "expected_false"),
+    [
+        ("frontend/app/page.tsx", ["frontend"], ["backend", "jobs", "ollama"]),
+        ("ollama/Dockerfile", ["ollama"], ["backend", "frontend", "jobs"]),
+        (
+            ".github/workflows/cd.yml",
+            ["backend", "frontend", "jobs", "ollama"],
+            [],
+        ),
+        (
+            "scripts/cd/plan.sh",
+            ["backend", "frontend", "jobs", "ollama"],
+            [],
+        ),
+        # Unmapped, non-skippable path: fail-safe widens to all four (header comment point 5).
+        (
+            "db/roles.sql",
+            ["backend", "frontend", "jobs", "ollama"],
+            [],
+        ),
+        (
+            "scripts/db/backup.sh",
+            ["backend", "frontend", "jobs", "ollama"],
+            [],
+        ),
+    ],
+    ids=["frontend-only", "ollama-only", "cd-yml", "plan-sh-self", "unmapped-db-roles", "unmapped-scripts-db"],
+)
+def test_per_image_mapping_single_path(
+    tmp_path: Path,
+    base_repo: tuple[Path, str],
+    path: str,
+    expected_true: list[str],
+    expected_false: list[str],
+) -> None:
+    repo, base = base_repo
+    sha = _commit(repo, {path: "x"}, f"touch {path}")
+    proc, out = _plan(tmp_path, repo, "--sha", sha, "--base", base)
+    assert out["deploy"] == "true", proc.stdout
+    for image in expected_true:
+        assert out[f"build_{image}"] == "true", (path, image, proc.stdout)
+    for image in expected_false:
+        assert out[f"build_{image}"] == "false", (path, image, proc.stdout)
+
+
+@needs_tools
+def test_a_backend_and_frontend_change_together_flags_three_images(
+    tmp_path: Path, base_repo: tuple[Path, str]
+) -> None:
+    repo, base = base_repo
+    sha = _commit(repo, {"backend/app.py": "2", "frontend/app/page.tsx": "2"}, "both")
+    proc, out = _plan(tmp_path, repo, "--sha", sha, "--base", base)
+    assert out["deploy"] == "true", proc.stdout
+    assert out["build_backend"] == "true"
+    assert out["build_jobs"] == "true"
+    assert out["build_frontend"] == "true"
+    assert out["build_ollama"] == "false"
+
+
+@needs_tools
+def test_force_all_builds_everything_even_for_a_backend_only_change(
+    tmp_path: Path, history
+) -> None:
+    repo, shas = history
+    proc, out = _plan(
+        tmp_path, repo, "--sha", shas["code"], "--base", shas["docs"], "--force-all"
+    )
+    assert out["deploy"] == "true", proc.stdout
+    for image in ("backend", "frontend", "jobs", "ollama"):
+        assert out[f"build_{image}"] == "true", image
+    assert "--force-all" in proc.stdout
+
+
+@needs_tools
+def test_force_all_never_turns_a_skipped_sha_into_a_deploy(tmp_path: Path, history) -> None:
+    """force_all only widens the per-image mapping once build/deploy is already going ahead
+    — it must never override the no-rollback / docs-only safety skips."""
+    repo, shas = history
+    # docs-only: still skipped even with --force-all.
+    proc, out = _plan(
+        tmp_path, repo, "--sha", shas["docs"], "--base", shas["base"], "--force-all"
+    )
+    assert out["deploy"] == "false", proc.stdout
+    for image in ("backend", "frontend", "jobs", "ollama"):
+        assert out[f"build_{image}"] == "false", image
+    # ancestor of the deployed SHA: never deployed, even with --force-all.
+    proc, out = _plan(
+        tmp_path, repo, "--sha", shas["base"], "--base", shas["code"], "--force-all"
+    )
+    assert out["deploy"] == "false", proc.stdout
+    assert "never rolls back" in out["reason"]
 
 
 # --- plan.sh skippable() (DEBT-023, T11c.E5 option B) ------------------------------------
@@ -1283,6 +1621,14 @@ _RENDER_DEFAULTS = {
     "needs.images.outputs.ollama_digest": "sha256:" + "a" * 64,
     "needs.images.outputs.backend_digest": "sha256:" + "b" * 64,
     "needs.images.outputs.frontend_digest": "sha256:" + "c" * 64,
+    # T13.CD.2: the inlineScript now gates each app update on its own build flag and
+    # consumes the digest resolved by the earlier "Resolve app image digests" step.
+    "needs.plan.outputs.build_ollama": "true",
+    "needs.plan.outputs.build_backend": "true",
+    "needs.plan.outputs.build_frontend": "true",
+    "steps.resolve.outputs.ollama_image": "ghcr.io/o/r-ollama@sha256:" + "a" * 64,
+    "steps.resolve.outputs.backend_image": "ghcr.io/o/r-backend@sha256:" + "b" * 64,
+    "steps.resolve.outputs.frontend_image": "ghcr.io/o/r-frontend@sha256:" + "c" * 64,
 }
 
 
@@ -1373,6 +1719,33 @@ def test_deploy_inline_script_updates_all_three_apps_in_order_when_vars_are_set(
     assert "--name ollama-app" in log[0] and "sha256:" + "a" * 64 in log[0]
     assert "--name backend-app" in log[1] and "sha256:" + "b" * 64 in log[1]
     assert "--name frontend-app" in log[2] and "sha256:" + "c" * 64 in log[2]
+
+
+@needs_tools
+def test_deploy_inline_script_leaves_an_unflagged_app_untouched(
+    cd: dict, tmp_path: Path
+) -> None:
+    """T13.CD.2: an app the plan did not flag (e.g. only frontend changed) is never passed
+    to `az containerapp update` — it keeps running the image resolved earlier (unchanged)."""
+    script = _deploy_inline_script(cd)
+    rendered = _render_inline_script(
+        script,
+        **{
+            "needs.plan.outputs.build_ollama": "false",
+            "needs.plan.outputs.build_backend": "false",
+        },
+    )
+    script_path = tmp_path / "deploy.sh"
+    script_path.write_text(rendered, encoding="utf-8")
+    env = _fake_az_containerapp_update(tmp_path)
+    proc = subprocess.run(
+        ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    log = _az_update_log(tmp_path)
+    assert len(log) == 1  # only frontend (still flagged true by the defaults) was updated
+    assert "--name frontend-app" in log[0] and "sha256:" + "c" * 64 in log[0]
+    assert "ollama-app" not in " ".join(log) and "backend-app" not in " ".join(log)
 
 
 @needs_tools
