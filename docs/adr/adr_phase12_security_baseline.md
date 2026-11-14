@@ -219,7 +219,7 @@ smoke; Container Apps inside November's free grant). Detail in the
 12b is split across four blocks on the same branch (12b-A: RBAC/MFA/admin bootstrap; 12b-B:
 lockout/password policy/register-verify contract; 12b-C: password reset/email abuse limits;
 12b-D: Bearer/CORS removal, route walker, health-via-BFF, exposed-files check). Migration
-**0007** (`user_mfa`, `login_lockouts`) is the one this part of the ADR adds, on top of 12a's
+**0007** (`user_mfa`, `mfa_recovery_codes`, `login_lockouts`, `password_reset_tokens`) is the one this part of the ADR adds, on top of 12a's
 0006 (`sessions`, `users.role`).
 
 ### Context
@@ -234,7 +234,27 @@ will flip — DEBT-034 itself only closes there, not in this ADR's own scope.
 
 ### Decisions
 
-#### P12-D4 — RBAC: role → permission map, never a role-string comparison (T12.3.2b)
+> **Numbering (fixed at the 12b close-out):** the plan's **P12-D4 is the password policy**, as
+> the code already cites it (`rag_app.password_policy`). This section first numbered its 12b
+> decisions P12-D4…D14 starting with RBAC; they are now **P12-D5…D15** (each moved up by one).
+> Commits and reviews written before the close-out use the old numbers.
+
+#### P12-D4 — Password policy: length + breached-password list, no complexity rules (T12.4.3)
+
+**Decision:** `rag_app.password_policy` (NIST 800-63B length rules) accepts 12–256
+characters, rejects a password that contains the account's email local part, and rejects
+anything on the NCSC list of the 100,000 most common/breached passwords. No redistribution
+licence could be confirmed on `ncsc.gov.uk`, so the list is bundled from the **SecLists** copy
+(MIT, `100k-most-used-passwords-NCSC.txt`) as
+`backend/src/rag_app/data/password_denylist_ncsc_top100k.txt.gz` (~420 KB, sha256-pinned by
+`backend/tests/test_password_policy.py`). It is checked offline at register, reset and admin
+creation (`python -m rag_app.admin create`). **Alternatives considered:** an entropy/zxcvbn-style
+score (rejected — NCSC's published guidance prefers a breach-list check, and a list is simpler
+to reason about and test). **Consequences:** the list is static, so it changes only with a
+deliberate commit (pinned hash = a detectable drift); attribution lives in the README's
+"Licences and attribution".
+
+#### P12-D5 — RBAC: role → permission map, never a role-string comparison (T12.3.2b)
 
 **Decision:** `rag_app.authz.require_permission`/`require_permission_and_mfa` resolve every
 protected route against a `ROLE_PERMISSIONS: dict[str, frozenset[str]]` map, not a role-string
@@ -245,14 +265,14 @@ rather than silently granting it (fail-open) or silently denying only some roles
 notice) — proved by `backend/tests/security/test_authz.py::
 test_an_unknown_permission_denies_every_role`. `DECLARED_PERMISSION_ROUTES: dict[tuple[str,
 str], str]` records every route's `(method, path) -> permission`, read later by the T12.5.2
-route walker (P12-D11 below); `PROTECTED_ROUTES` is the narrower, admin-grade subset the
+route walker (P12-D12 below); `PROTECTED_ROUTES` is the narrower, admin-grade subset the
 T12.3.6 client-tampering suite (role × route matrix, generated from the live registry, not a
 hand-maintained list) can safely probe bare. `role` is never accepted from the client and
 never cached anywhere the client can read back — the backend re-reads `user.role` from the
 database on every request (`rag_app.sessions.authenticate`); the **only writer of `role` is
 the admin bootstrap CLI** (`rag_app.admin`, interactive password via `getpass`, no API route
 ever sets it) — no PATCH-the-role endpoint exists to tamper with in the first place. Admin
-routes additionally require a fresh MFA step-up on the current session (P12-D5).
+routes additionally require a fresh MFA step-up on the current session (P12-D6).
 **Alternatives considered:** (a) a per-route role string (`if user.role == "admin"`) —
 rejected, the exact anti-pattern this map exists to avoid (a typo silently fails open, no
 central place to audit who can do what); (b) an API route to change a user's role — rejected,
@@ -261,10 +281,10 @@ only ever be fixed by an operator with shell access. **Consequences:** adding a 
 department role (Phase 21: HR, engineering, software...) is one `ROLE_PERMISSIONS` entry plus
 a migration, never a route-level code change (the map, not the routes, grows) — the explicit
 design goal recorded in `rag_app/authz.py`'s own module docstring; every protected route's
-auth/permission/rate-limit triple is enforced structurally by the walker (P12-D11), not by
+auth/permission/rate-limit triple is enforced structurally by the walker (P12-D12), not by
 code review alone.
 
-#### P12-D5 — MFA: encrypted TOTP secret, hashed recovery codes, step-up rotates the session (T12.3.4/T12.3.5, migration 0007)
+#### P12-D6 — MFA: encrypted TOTP secret, hashed recovery codes, step-up rotates the session (T12.3.4/T12.3.5, migration 0007)
 
 **Decision:** `rag_app.mfa`/`rag_app.api.admin` (`pyotp`): the TOTP secret is encrypted at
 rest with the master key (`rag_app.crypto.wrap_key`, the same primitive other at-rest secrets
@@ -272,7 +292,7 @@ in this project already use) in `user_mfa.secret_encrypted`, never logged. Recov
 generated once, shown once, and stored only as `hash_recovery_code` (`rag_app.security.
 hash_token`, the project's existing token-hashing primitive) — the plaintext code never
 touches the database. Claiming a recovery code (`claim_recovery_code`) is a single atomic
-`UPDATE … WHERE used_at IS NULL` (X10, P12-D9 below). A successful MFA step-up **rotates the
+`UPDATE … WHERE used_at IS NULL` (X10, P12-D10 below). A successful MFA step-up **rotates the
 session id** (`session_service.rotate`, `rag_app.api.admin.mfa_step_up`) and reissues the
 session/CSRF cookies, so a session that was only ever authenticated (not stepped-up) cannot
 be upgraded to admin-grade just by a later cookie leak reusing the same id. Client-side: the
@@ -295,7 +315,7 @@ race (REC-04) and the step-up session rotation both needed their own concurrency
 tests (`backend/tests/security/test_mfa.py`) because a check-then-use shape here would be a
 silent authentication bypass, not just a cosmetic bug.
 
-#### P12-D6 — Authentication hardening: no account-enumeration via timing or response shape (T12.4.1, T12.4.3, T12.4.4, DA-12bB-1)
+#### P12-D7 — Authentication hardening: no account-enumeration via timing or response shape (T12.4.1, T12.4.3, T12.4.4, DA-12bB-1)
 
 **Decision:** Login is constant-time regardless of whether the account exists
 (`rag_app.security.dummy_password_hash`, verified by `backend/tests/test_security.py::
@@ -311,30 +331,24 @@ just two paths tuned to cost the same). `register`/`resend-verification`/`forgot
 all return a **generic 202** whatever the outcome — never a 409 or a "no such account" 404 —
 and register issues no session: the account only becomes usable once the email verification
 link is followed (`require_email_verification` defaults `True` with `ENV=prod`, fail-fast if
-unset, explicit `False` survives the default — `backend/tests/test_startup.py`). Password
-policy (`rag_app.password_policy`, T12.4.3): minimum length, rejects the email local-part as
-the password, and checks against the NCSC/SecLists top-100k breached-password list
-(`backend/src/rag_app/data/password_denylist_ncsc_top100k.txt.gz`, sha256-pinned by
-`backend/tests/test_password_policy.py`) rather than an entropy/zxcvbn-style score.
+unset, explicit `False` survives the default — `backend/tests/test_startup.py`). The password policy itself is P12-D4.
 **Alternatives considered:** an upfront existence check before deciding register's response
 (rejected — DA-12bB-1's whole point, the fastest way to reintroduce the timing side-channel
 F3 closes); a distinct 409 for "already registered" (rejected — the generic 202 is what
 actually removes the enumeration signal, a differently-shaped response would undo it even
-with matched timing); entropy-based password scoring (rejected — NCSC's own published
-guidance for public-sector-grade services prefers a breach-list check, and it is simpler to
-reason about than a scoring heuristic). **Consequences:** every "does this account exist"
+with matched timing). **Consequences:** every "does this account exist"
 question an attacker could ask now gets the same answer in the same time, by construction,
 not by a review checklist; the trade-off is a less informative UI (register never tells a
 user that address is already theirs) — acceptable for this threat model.
 
-#### P12-D7 — Lockout keyed by HMAC(email), exponential back-off (T12.4.2)
+#### P12-D8 — Lockout keyed by HMAC(email), exponential back-off (T12.4.2)
 
 **Decision:** `rag_app.lockout` keys the failed-login counter by `HMAC(LOCKOUT_HMAC_SECRET,
 email)`, not by `user_id` or the raw email — the row must exist and be queryable **before**
 the backend knows whether the account is real (a login attempt against a non-existent email
 still needs a counter to rate-limit guesses against that address), and the raw email must
 never appear in a log or in the table itself. `record_failed_login` is a single atomic
-`INSERT … ON CONFLICT … DO UPDATE` (X10, P12-D9); exceeding the threshold locks the account
+`INSERT … ON CONFLICT … DO UPDATE` (X10, P12-D10); exceeding the threshold locks the account
 with an exponentially growing back-off
 (`backend/tests/security/test_lockout.py::
 test_the_next_failure_past_the_threshold_locks_and_back_off_grows`). A successful
@@ -348,7 +362,7 @@ recorded for login rate limiting (P12-D1 continued / T5-V7 above) — not worse 
 12a keying, and the email-HMAC axis (which does not depend on the client IP at all) still
 applies either way. **Alternatives considered:** keying by `user_id` (rejected — would need
 an existence lookup before the counter can be touched, reopening the exact timing/enumeration
-signal P12-D6 just closed); storing the raw email as the key (rejected — same reasoning as
+signal P12-D7 just closed); storing the raw email as the key (rejected — same reasoning as
 the CSP-report/log-hygiene convention elsewhere in this project, an identifier an attacker
 supplies should never be directly queryable/loggable in plaintext). **Consequences:**
 `LOCKOUT_HMAC_SECRET` joins `CSRF_SECRET`/`CLIENT_IP_HMAC_KEYS` as a devtool/test-harness
@@ -356,7 +370,7 @@ dependency that is easy to forget (two real bugs found and fixed this way during
 `erasure_scale.py` twice) — worth a generic "every devtool that talks to a live API needs
 every required secret" checklist item for future phases, not a code fix here.
 
-#### P12-D8 — Email verification/reset: frontend pages POST the token, four-bucket abuse limiter, X10 everywhere (T12.4.5–10, T12.4.6 DA re-check)
+#### P12-D9 — Email verification/reset: frontend pages POST the token, four-bucket abuse limiter, X10 everywhere (T12.4.5–10, T12.4.6 DA re-check)
 
 **Decision:** The verification/reset links point at the frontend's own `/verify`/`/reset`
 pages (`PUBLIC_APP_URL`, renamed from `EMAIL_LINK_BASE_URL` once these pages existed to need
@@ -368,7 +382,7 @@ a clear success/failure state). Consuming either token
 (`_consume_password_reset_token`/`_consume_email_verification_token`) is, like the recovery
 code and the lockout counter, a single atomic conditional `UPDATE … WHERE used_at IS NULL AND
 expires_at > now()` — never SELECT-then-UPDATE (REC-06, same X10 template as REC-04/05, see
-P12-D9). `rag_app.email_abuse.EmailAbuseLimiter` rate-limits `register`/`resend-verification`/
+P12-D10). `rag_app.email_abuse.EmailAbuseLimiter` rate-limits `register`/`resend-verification`/
 `forgot-password` with **four** independent token buckets checked in order
 `ip → recipient_ip → recipient (backstop) → global`, combined with Python's short-circuit
 `and` so a denial at an earlier bucket never also spends a token it didn't need to in a later
@@ -391,7 +405,7 @@ limiter is **in-memory, single replica** (the project runs one backend replica b
 RISK-03/DEBT-010) — a future multi-replica scale-out needs a shared store (Redis or
 equivalent) for these buckets, tracked as **DEBT-010**'s existing scope, not a new debt row.
 
-#### P12-D9 — X10: every single-use token/counter consume is one atomic statement, never SELECT-then-UPDATE (REC-04..07)
+#### P12-D10 — X10: every single-use token/counter consume is one atomic statement, never SELECT-then-UPDATE (REC-04..07)
 
 **Decision:** Project-wide rule (X10, 2026-11-09) applied consistently across 12b: the MFA
 recovery code (REC-04), the lockout counter (REC-05, `INSERT … ON CONFLICT … DO UPDATE`), and
@@ -412,7 +426,7 @@ as a template for REC-05/REC-06 before either existed) — a new feature with a 
 semantic should write the atomic conditional `UPDATE` first, not retrofit it after a DA
 review finds the race.
 
-#### P12-D10 — Bearer/JWT/CORS removed entirely (T12.5.3, `9ecc692`)
+#### P12-D11 — Bearer/JWT/CORS removed entirely (T12.5.3, `9ecc692`)
 
 **Decision:** The legacy Bearer authentication path kept (narrowed, not removed) through 12a
 as its own rollback path is now gone completely: `HTTPBearer`, the Bearer fallback inside
@@ -428,7 +442,7 @@ is also the precondition for the backend's ingress going internal-only in T12.6b
 outside the BFF can authenticate to it at all once this landed, so there is nothing left for
 an internal-only ingress to break for a legitimate caller).
 
-#### P12-D11 — Route walker: every route declares auth + permission + rate limit, or is public by allow-list (T12.5.2, DEC-023, REC-08)
+#### P12-D12 — Route walker: every route declares auth + permission + rate limit, or is public by allow-list (T12.5.2, DEC-023, REC-08)
 
 **Decision:** `backend/tests/security/test_route_walker.py` walks the real app's full
 recursive FastAPI dependency tree and asserts every registered route either (a) declares a
@@ -448,7 +462,7 @@ backend is checked by this test automatically; no app-level `app.mount()` exists
 (confirmed) and `/metrics` is served on a separate internal port, never a FastAPI route at
 all, so neither is a blind spot for the walker to miss.
 
-#### P12-D12 — Post-deploy/demo health through the frontend's BFF, never a backend FQDN (T12.5.6, DEC-005)
+#### P12-D13 — Post-deploy/demo health through the frontend's BFF, never a backend FQDN (T12.5.6, DEC-005)
 
 **Decision:** `/api/health` (already on the BFF allow-list since 12a's DEC-005/006) is now
 the **only** health check this project's own tooling uses — the CD pipeline, `demo-mode.sh`,
@@ -464,7 +478,7 @@ the tooling against the BFF now means nothing needs to change again at that prom
 repo) still hardcodes the backend FQDN and needs the same rewrite before T12.6b.5 — tracked as
 an orchestrator follow-up item, not a gap in this project's own test suite.
 
-#### P12-D13 — Exposed-files check (T12.5.7, DEC-023, REC-09)
+#### P12-D14 — Exposed-files check (T12.5.7, DEC-023, REC-09)
 
 **Decision:** `scripts/azure/exposed_files_check.sh` + `backend/tests/security/
 test_exposed_files.py` assert, unconditionally (no DB needed), that the backend never serves
@@ -478,7 +492,7 @@ checklist at promotion time (rejected, DEC-023 — same reasoning as the route w
 automated check that also runs in the Azure smoke beats a human remembering to run curl once).
 **Consequences:** the same script is reused unmodified by the Azure smoke at T12.6b.6.
 
-#### P12-D14 — `docs/security/SECURITY_REVIEW.md` (T12.5.8)
+#### P12-D15 — `docs/security/SECURITY_REVIEW.md` (T12.5.8)
 
 **Decision:** A new top-level security review document summarising 12a+12b's threat model,
 decisions and residual/accepted gaps for a reader who does not want to read this whole ADR —
@@ -494,12 +508,25 @@ decisions summarised here.
 
 ### Consequences (12b, overall)
 
-F3/F5/F6/F10/F11 are closed; DEBT-034 narrows (the email-HMAC and signed-client-IP axes both
-apply regardless of ingress) but formally stays open until T12.6b.5's internal ingress; the
-in-memory, single-replica limiters (lockout, email abuse) stay an accepted gap under
-DEBT-010/RISK-03 until any future multi-replica scale-out. 12b adds migration **0007**
-(`user_mfa`, `login_lockouts`) — expand-only, same discipline as 0006; a rollback to a
-pre-0007 backend never reads either new table, same reasoning ADR phase 11 already
-established for 0006. The remaining 12b work before promotion is entirely T12.6b (internal
-ingress, Azure smoke, tag) — no further code-level decision is expected in this ADR before
-that.
+F3/F5/F6/F10/F11 are closed. **DEBT-034 closed at the promotion** (T12.6b.5, 2026-11-14): the
+backend ingress is internal, so every request reaches it through the BFF and is keyed by the
+signed client IP. The in-memory, single-replica limiters (lockout, email abuse) stay an
+accepted gap under DEBT-010/RISK-03 until any future multi-replica scale-out. 12b adds
+migration **0007** (`user_mfa`, `mfa_recovery_codes`, `login_lockouts`,
+`password_reset_tokens`) — expand-only, same discipline as 0006; a rollback to a pre-0007
+backend never reads the new tables, same reasoning ADR phase 11 already established for 0006.
+
+### Promotion, rollback and cost (12b)
+
+Promoted 2026-11-13/14 (`main` `c958992` → `62451dc`, PR #19; tag `phase-12b`). Before the
+merge: a backup Job run, a rehearsal of 0007 (upgrade, downgrade, upgrade) on a restored copy
+of the latest backup, Azure Communication Services email (EU data location, Azure-managed
+domain, SMTP through an Entra app scoped to that one resource) and the new secrets set ahead
+of the merge. After CD (migrate Job = 0007): admin account created interactively, backend
+ingress switched to internal, frontend `BACKEND_URL` set to the internal address. **Rollback**
+is images plus ingress, never the schema: ingress back to external and `BACKEND_URL` back to
+the public address first (the 12a frontend needs it), then the 12a backend, frontend, Ollama
+and Jobs digests together (the 12b backend rejects the 12a frontend's Bearer requests).
+**Cost:** ≈ €0.002 for the promotion days (Azure OpenAI tokens + three ACS emails; Container
+Apps inside the monthly free grant), cap €1. Detail in the
+[phase report](../phases/phase-12b.md).
