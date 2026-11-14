@@ -131,16 +131,22 @@ def test_force_all_input_exists_defaults_false_and_is_allowed_on_real_runs(cd: d
     assert "--force-all" in plan_step["run"]
 
 
+SCRIPT_LIKE_WITH_KEYS = ("inlineScript", "script")
+
+
 @pytest.mark.parametrize("workflow", ["cd.yml", "ci.yml"])
 def test_no_expression_is_pasted_into_a_run_script(workflow: str) -> None:
-    """DA-C2-3: `${{ … }}` in `run:` is template-injected into the shell (a ref name may
-    contain `$(…)`); values reach scripts through `env:` instead."""
+    """DA-C2-3 / DA-13-0-2: `${{ … }}` in `run:` — or in a script-like `with:` key such as
+    azure/cli@v3's `inlineScript` — is template-injected into the shell (a ref name or a
+    digest could in principle contain shell metacharacters); values reach scripts through
+    `env:` instead."""
     wf = yaml.safe_load((CD_YML.parent / workflow).read_text(encoding="utf-8"))
     offenders = [
         f"{job_id}/{step.get('name', step.get('id', '?'))}"
         for job_id, job in wf["jobs"].items()
         for step in job.get("steps", [])
         if "${{" in step.get("run", "")
+        or any("${{" in step.get("with", {}).get(key, "") for key in SCRIPT_LIKE_WITH_KEYS)
     ]
     assert offenders == []
 
@@ -202,6 +208,16 @@ def test_the_migrate_job_resolve_call_passes_the_build_flag_and_built_digest(cd:
     assert '--repo "ghcr.io/$GH_REPO-jobs"' in run
 
 
+def test_the_migrate_job_exposes_its_resolved_jobs_image_as_an_output(cd: dict) -> None:
+    """DA-13-0-1: `deploy` needs this to cross-check the purge/backup Jobs when build_jobs
+    stayed false — the resolved image must be captured, not just consumed locally."""
+    job = cd["jobs"]["migrate"]
+    assert job["outputs"]["jobs_image"] == "${{ steps.resolve.outputs.jobs_image }}"
+    resolve = next(s for s in job["steps"] if "resolve_image.sh job" in s.get("run", ""))
+    assert resolve.get("id") == "resolve"
+    assert 'echo "jobs_image=$JOBS_IMAGE" >> "$GITHUB_OUTPUT"' in resolve["run"]
+
+
 def test_the_deploy_job_updates_the_job_images_after_the_apps(cd: dict) -> None:
     steps = cd["jobs"]["deploy"]["steps"]
     apps = next(i for i, s in enumerate(steps) if "inlineScript" in s.get("with", {}))
@@ -214,6 +230,36 @@ def test_the_deploy_job_updates_the_job_images_after_the_apps(cd: dict) -> None:
     # T13.CD.2: unchanged Job images are never touched (migrate already resolved/verified
     # the kept digest this same run; no reason to call az again here).
     assert steps[jobs]["if"] == "needs.plan.outputs.build_jobs == 'true'"
+
+
+def _cross_check_step(cd: dict) -> dict:
+    return next(
+        s
+        for s in cd["jobs"]["deploy"]["steps"]
+        if "resolve_image.sh job" in s.get("run", "") and "update-image" not in s.get("run", "")
+    )
+
+
+def test_the_deploy_job_cross_checks_job_images_when_build_jobs_is_false(cd: dict) -> None:
+    """DA-13-0-1: when build_jobs stayed false, nothing else in this run re-reads the
+    purge/backup Jobs' own currently deployed image — this step fails closed on drift
+    (e.g. an out-of-band `job update` applied by hand to only one of the three Jobs during
+    an incident), instead of trusting the ADR's "they always move together" assumption."""
+    deploy = cd["jobs"]["deploy"]
+    update_step = next(
+        s for s in deploy["steps"] if "azure_jobs.sh update-image" in s.get("run", "")
+    )
+    cross_check = _cross_check_step(cd)
+    assert update_step["if"] == "needs.plan.outputs.build_jobs == 'true'"
+    assert cross_check["if"] == "needs.plan.outputs.build_jobs != 'true'"
+    assert cross_check["env"]["MIGRATE_IMAGE"] == "${{ needs.migrate.outputs.jobs_image }}"
+    assert cross_check["env"]["PURGE_JOB"] == "${{ vars.AZURE_PURGE_JOB }}"
+    assert cross_check["env"]["BACKUP_JOB"] == "${{ vars.AZURE_BACKUP_JOB }}"
+    assert "--build false" in cross_check["run"]
+    assert "::error::" in cross_check["run"] and "no auto-repair" in cross_check["run"]
+    # No auto-repair: the step never calls `job update` or `azure_jobs.sh update-image`.
+    assert "update-image" not in cross_check["run"] and "job update" not in cross_check["run"]
+    assert cd["jobs"]["deploy"]["needs"] == ["plan", "images", "migrate"]  # jobs_image output
 
 
 def test_images_build_the_jobs_image(cd: dict) -> None:
@@ -273,16 +319,16 @@ def test_deploy_job_refuses_without_gate_status_and_deploys_by_digest(cd: dict) 
     verify = [i for i, run in enumerate(runs) if "gate_status.sh verify" in run]
     record = [i for i, run in enumerate(runs) if "repos/$REPO/deployments" in run]
     assert verify and record and verify[0] < record[0]
-    script = next(
-        s["with"]["inlineScript"]
-        for s in deploy["steps"]
-        if "with" in s and "inlineScript" in s["with"]
-    )
+    apps_step = next(s for s in deploy["steps"] if "with" in s and "inlineScript" in s["with"])
+    script = apps_step["with"]["inlineScript"]
     # T13.CD.2: the digest itself is resolved in an earlier step (built just now, or kept
-    # from Azure) — the inlineScript only consumes the resolved image per app, conditionally.
-    assert "steps.resolve.outputs.backend_image" in script
-    assert "steps.resolve.outputs.frontend_image" in script
-    assert "steps.resolve.outputs.ollama_image" in script
+    # from Azure). DA-13-0-2: it reaches the inlineScript through `env:`, never pasted as a
+    # `${{ }}` expression into the script text itself.
+    assert "${{" not in script
+    assert apps_step["env"]["BACKEND_IMAGE"] == "${{ steps.resolve.outputs.backend_image }}"
+    assert apps_step["env"]["FRONTEND_IMAGE"] == "${{ steps.resolve.outputs.frontend_image }}"
+    assert apps_step["env"]["OLLAMA_IMAGE"] == "${{ steps.resolve.outputs.ollama_image }}"
+    assert "$BACKEND_IMAGE" in script and "$FRONTEND_IMAGE" in script and "$OLLAMA_IMAGE" in script
     resolve = next(s for s in deploy["steps"] if s.get("id") == "resolve")
     assert resolve["env"]["BACKEND_BUILT_DIGEST"] == "${{ needs.images.outputs.backend_digest }}"
     assert resolve["env"]["FRONTEND_BUILT_DIGEST"] == "${{ needs.images.outputs.frontend_digest }}"
@@ -311,19 +357,16 @@ def test_ollama_app_is_updated_before_backend_and_frontend(cd: dict) -> None:
     traffic (same "dependency before dependent" order as the migration Job before the
     apps)."""
     deploy = cd["jobs"]["deploy"]
-    script = next(
-        s["with"]["inlineScript"]
-        for s in deploy["steps"]
-        if "with" in s and "inlineScript" in s["with"]
-    )
-    ollama_at = script.index("AZURE_OLLAMA_APP")
-    backend_at = script.index("AZURE_BACKEND_APP")
-    frontend_at = script.index("AZURE_FRONTEND_APP")
+    apps_step = next(s for s in deploy["steps"] if "with" in s and "inlineScript" in s["with"])
+    script = apps_step["with"]["inlineScript"]
+    ollama_at = script.index("OLLAMA_APP")
+    backend_at = script.index("BACKEND_APP")
+    frontend_at = script.index("FRONTEND_APP")
     assert ollama_at < backend_at < frontend_at
     # T13.CD.2: the order survives even though each update is now conditional (per-image).
-    ollama_update_at = script.index("steps.resolve.outputs.ollama_image")
-    backend_update_at = script.index("steps.resolve.outputs.backend_image")
-    frontend_update_at = script.index("steps.resolve.outputs.frontend_image")
+    ollama_update_at = script.index("$OLLAMA_IMAGE")
+    backend_update_at = script.index("$BACKEND_IMAGE")
+    frontend_update_at = script.index("$FRONTEND_IMAGE")
     assert ollama_update_at < backend_update_at < frontend_update_at
     resolve = next(s for s in deploy["steps"] if s.get("id") == "resolve")
     assert resolve["env"]["OLLAMA_APP"] == "${{ vars.AZURE_OLLAMA_APP }}"
@@ -567,6 +610,10 @@ import os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_AZ_LOG"], "a") as log:
     log.write(" ".join(args) + "\\n")
+if "length(" in " ".join(args):
+    # DA-13-0-3: resolve_image.sh first asks how many containers there are.
+    print(os.environ.get("FAKE_AZ_CONTAINER_COUNT", "1"))
+    sys.exit(0)
 current = os.environ.get("FAKE_AZ_CURRENT_IMAGE")
 if current is None:
     sys.exit(1)  # simulates an unreadable app/Job (az call itself fails)
@@ -577,7 +624,9 @@ REPO = "ghcr.io/o/r-backend"
 BUILT_DIGEST = "sha256:" + "d" * 64
 
 
-def _fake_az_resolve(tmp_path: Path, current_image: str | None) -> dict[str, str]:
+def _fake_az_resolve(
+    tmp_path: Path, current_image: str | None, container_count: str | None = None
+) -> dict[str, str]:
     bin_dir = tmp_path / "azbin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "fake_az.py").write_text(FAKE_AZ_RESOLVE, encoding="utf-8")
@@ -591,6 +640,8 @@ def _fake_az_resolve(tmp_path: Path, current_image: str | None) -> dict[str, str
     }
     if current_image is not None:
         env["FAKE_AZ_CURRENT_IMAGE"] = current_image
+    if container_count is not None:
+        env["FAKE_AZ_CONTAINER_COUNT"] = container_count
     return env
 
 
@@ -716,6 +767,104 @@ def test_resolve_image_fails_closed_when_the_kept_image_is_not_digest_pinned(
     )
     assert proc.returncode == 1
     assert "is not pinned by digest" in proc.stderr
+
+
+@needs_tools
+@pytest.mark.parametrize("kind", ["app", "job"])
+@pytest.mark.parametrize("count", ["0", "2"])
+def test_resolve_image_fails_closed_when_there_is_not_exactly_one_container(
+    tmp_path: Path, kind: str, count: str
+) -> None:
+    """DA-13-0-3: a future sidecar (or a Job/app that never got exactly one container)
+    must not silently make `containers[0]` resolve/compare the wrong image."""
+    kept = f"{REPO}@sha256:" + "e" * 64
+    env = _fake_az_resolve(tmp_path, current_image=kept, container_count=count)
+    proc = _run(
+        RESOLVE_IMAGE,
+        kind,
+        "--rg",
+        "rg",
+        "--name",
+        "n",
+        "--repo",
+        REPO,
+        "--build",
+        "false",
+        env=env,
+    )
+    assert proc.returncode == 1
+    assert f"has {count} containers" in proc.stderr
+    assert proc.stdout == ""
+
+
+# --- DA-13-0-1: the deploy job's purge/backup cross-check (real subprocess, fake az) -----
+
+
+def _run_cross_check_script(
+    cd: dict, tmp_path: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess:
+    script_path = tmp_path / "cross_check.sh"
+    script_path.write_text(_cross_check_step(cd)["run"], encoding="utf-8")
+    # The GitHub-hosted runner's default step shell is `bash --noprofile --norc -eo
+    # pipefail {0}` — replicated here since this step (unlike the deploy inlineScript) has
+    # no explicit `set -euo pipefail` of its own.
+    return subprocess.run(
+        ["bash", "-eo", "pipefail", str(script_path)],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _cross_check_env(
+    tmp_path: Path, current_image: str | None, migrate_image: str
+) -> dict[str, str]:
+    env = _fake_az_resolve(tmp_path, current_image=current_image)
+    env.update(
+        RESOURCE_GROUP="rg",
+        PURGE_JOB="purge-job",
+        BACKUP_JOB="backup-job",
+        REPO="o/r",
+        MIGRATE_IMAGE=migrate_image,
+    )
+    return env
+
+
+@needs_tools
+def test_the_cross_check_step_passes_when_job_images_match_the_migrate_image(
+    cd: dict, tmp_path: Path
+) -> None:
+    kept = "ghcr.io/o/r-jobs@sha256:" + "a" * 64
+    env = _cross_check_env(tmp_path, current_image=kept, migrate_image=kept)
+    proc = _run_cross_check_script(cd, tmp_path, env)
+    assert proc.returncode == 0, proc.stderr
+
+
+@needs_tools
+def test_the_cross_check_step_fails_closed_on_a_mismatch(cd: dict, tmp_path: Path) -> None:
+    """DA-13-0-1: an out-of-band `job update` on only one of the three Jobs must be
+    caught, naming the Job and both digests — never silently repaired."""
+    kept = "ghcr.io/o/r-jobs@sha256:" + "a" * 64
+    drifted = "ghcr.io/o/r-jobs@sha256:" + "b" * 64
+    env = _cross_check_env(tmp_path, current_image=drifted, migrate_image=kept)
+    proc = _run_cross_check_script(cd, tmp_path, env)
+    assert proc.returncode != 0
+    out = proc.stdout + proc.stderr
+    assert "::error::" in out and "purge-job" in out and kept in out and drifted in out
+    assert "no auto-repair" in out
+
+
+@needs_tools
+def test_the_cross_check_step_fails_closed_when_a_job_image_is_unreadable(
+    cd: dict, tmp_path: Path
+) -> None:
+    env = _cross_check_env(
+        tmp_path, current_image=None, migrate_image="ghcr.io/o/r-jobs@sha256:" + "a" * 64
+    )
+    proc = _run_cross_check_script(cd, tmp_path, env)
+    assert proc.returncode != 0
 
 
 @needs_tools
@@ -1665,36 +1814,23 @@ def _deploy_inline_script(cd: dict) -> str:
     )
 
 
-_RENDER_DEFAULTS = {
-    "vars.AZURE_OLLAMA_APP": "ollama-app",
-    "vars.AZURE_BACKEND_APP": "backend-app",
-    "vars.AZURE_FRONTEND_APP": "frontend-app",
-    "vars.AZURE_RESOURCE_GROUP": "rg",
-    "github.repository": "o/r",
-    "needs.images.outputs.ollama_digest": "sha256:" + "a" * 64,
-    "needs.images.outputs.backend_digest": "sha256:" + "b" * 64,
-    "needs.images.outputs.frontend_digest": "sha256:" + "c" * 64,
-    # T13.CD.2: the inlineScript now gates each app update on its own build flag and
-    # consumes the digest resolved by the earlier "Resolve app image digests" step.
-    "needs.plan.outputs.build_ollama": "true",
-    "needs.plan.outputs.build_backend": "true",
-    "needs.plan.outputs.build_frontend": "true",
-    "steps.resolve.outputs.ollama_image": "ghcr.io/o/r-ollama@sha256:" + "a" * 64,
-    "steps.resolve.outputs.backend_image": "ghcr.io/o/r-backend@sha256:" + "b" * 64,
-    "steps.resolve.outputs.frontend_image": "ghcr.io/o/r-frontend@sha256:" + "c" * 64,
+# DA-13-0-2: the inlineScript no longer has any `${{ }}` to render — every value reaches it
+# through `env:` (the same way azure/cli@v3 forwards a step's env into its container), so
+# these tests just set the env vars directly, the way the Actions runner would.
+_INLINE_ENV_DEFAULTS = {
+    "OLLAMA_APP": "ollama-app",
+    "BACKEND_APP": "backend-app",
+    "FRONTEND_APP": "frontend-app",
+    "RESOURCE_GROUP": "rg",
+    # T13.CD.2: the inlineScript gates each app update on its own build flag and consumes
+    # the digest resolved by the earlier "Resolve app image digests" step.
+    "BUILD_OLLAMA": "true",
+    "BUILD_BACKEND": "true",
+    "BUILD_FRONTEND": "true",
+    "OLLAMA_IMAGE": "ghcr.io/o/r-ollama@sha256:" + "a" * 64,
+    "BACKEND_IMAGE": "ghcr.io/o/r-backend@sha256:" + "b" * 64,
+    "FRONTEND_IMAGE": "ghcr.io/o/r-frontend@sha256:" + "c" * 64,
 }
-
-
-def _render_inline_script(script: str, **overrides: str) -> str:
-    """Substitutes the `${{ … }}` GitHub Actions expressions in an inlineScript with
-    plain values, the same way the Actions runner would template them before handing the
-    script to the shell — so the real script text can be executed by a real bash."""
-    mapping = {**_RENDER_DEFAULTS, **overrides}
-
-    def repl(m: re.Match[str]) -> str:
-        return mapping[m.group(1).strip()]
-
-    return re.sub(r"\$\{\{(.+?)\}\}", repl, script)
 
 
 FAKE_AZ_CONTAINERAPP_UPDATE = """\
@@ -1706,7 +1842,7 @@ sys.exit(0)
 """
 
 
-def _fake_az_containerapp_update(tmp_path: Path) -> dict[str, str]:
+def _fake_az_containerapp_update(tmp_path: Path, **overrides: str) -> dict[str, str]:
     bin_dir = tmp_path / "azbin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "fake_az.py").write_text(FAKE_AZ_CONTAINERAPP_UPDATE, encoding="utf-8")
@@ -1715,6 +1851,8 @@ def _fake_az_containerapp_update(tmp_path: Path) -> dict[str, str]:
     az.chmod(0o755)
     return {
         **os.environ,
+        **_INLINE_ENV_DEFAULTS,
+        **overrides,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_AZ_LOG": str(tmp_path / "az.log"),
     }
@@ -1742,10 +1880,9 @@ def test_deploy_inline_script_fails_before_touching_any_app_when_ollama_app_is_m
     `az containerapp update` call — never silently skip ollama and still update
     backend/frontend (a worse partial-deploy state than touching nothing)."""
     script = _deploy_inline_script(cd)
-    rendered = _render_inline_script(script, **{"vars.AZURE_OLLAMA_APP": ""})
     script_path = tmp_path / "deploy.sh"
-    script_path.write_text(rendered, encoding="utf-8")
-    env = _fake_az_containerapp_update(tmp_path)
+    script_path.write_text(script, encoding="utf-8")
+    env = _fake_az_containerapp_update(tmp_path, OLLAMA_APP="")
     proc = subprocess.run(
         ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
     )
@@ -1759,9 +1896,8 @@ def test_deploy_inline_script_updates_all_three_apps_in_order_when_vars_are_set(
     cd: dict, tmp_path: Path
 ) -> None:
     script = _deploy_inline_script(cd)
-    rendered = _render_inline_script(script)
     script_path = tmp_path / "deploy.sh"
-    script_path.write_text(rendered, encoding="utf-8")
+    script_path.write_text(script, encoding="utf-8")
     env = _fake_az_containerapp_update(tmp_path)
     proc = subprocess.run(
         ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
@@ -1779,16 +1915,9 @@ def test_deploy_inline_script_leaves_an_unflagged_app_untouched(cd: dict, tmp_pa
     """T13.CD.2: an app the plan did not flag (e.g. only frontend changed) is never passed
     to `az containerapp update` — it keeps running the image resolved earlier (unchanged)."""
     script = _deploy_inline_script(cd)
-    rendered = _render_inline_script(
-        script,
-        **{
-            "needs.plan.outputs.build_ollama": "false",
-            "needs.plan.outputs.build_backend": "false",
-        },
-    )
     script_path = tmp_path / "deploy.sh"
-    script_path.write_text(rendered, encoding="utf-8")
-    env = _fake_az_containerapp_update(tmp_path)
+    script_path.write_text(script, encoding="utf-8")
+    env = _fake_az_containerapp_update(tmp_path, BUILD_OLLAMA="false", BUILD_BACKEND="false")
     proc = subprocess.run(
         ["bash", str(script_path)], env=env, capture_output=True, text=True, timeout=60
     )
@@ -1807,9 +1936,8 @@ def test_deploy_inline_script_stops_after_the_first_app_if_az_fails(
     fails every call, only the FIRST `containerapp update` (ollama) must run — backend
     and frontend must never be touched after ollama's own update failed."""
     script = _deploy_inline_script(cd)
-    rendered = _render_inline_script(script)
     script_path = tmp_path / "deploy.sh"
-    script_path.write_text(rendered, encoding="utf-8")
+    script_path.write_text(script, encoding="utf-8")
     bin_dir = tmp_path / "azbin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "fake_az.py").write_text(
@@ -1825,6 +1953,7 @@ def test_deploy_inline_script_stops_after_the_first_app_if_az_fails(
     az.chmod(0o755)
     env = {
         **os.environ,
+        **_INLINE_ENV_DEFAULTS,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_AZ_LOG": str(tmp_path / "az.log"),
     }

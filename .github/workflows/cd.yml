@@ -34,8 +34,11 @@ name: CD
 #                synchronously for embeddings on every chat/ingestion request; Ollama must
 #                already be serving the baked-in model before backend's new revision can take
 #                traffic, same "dependency before dependent" order as the migration Job before
-#                the apps) — then the purge and backup Jobs' images, only if the jobs image
-#                itself changed (digest, X1; T11.2.11)
+#                the apps) — then the purge and backup Jobs' images: updated to the new digest
+#                if the jobs image itself changed (digest, X1; T11.2.11), otherwise cross-
+#                checked, read-only and fail-closed, against the migration Job's resolved
+#                image (DA-13-0-1) — an out-of-band fix to only one of the three Jobs during
+#                an incident would otherwise desync them without CD ever noticing
 #
 # Order: images → migrate Job (always) → ollama app → backend/frontend apps → Job images —
 # only the apps/Jobs whose image actually changed are touched (T13.CD.2, "CD per-image
@@ -334,10 +337,17 @@ jobs:
         env:
           PURGE_JOB: ${{ vars.AZURE_PURGE_JOB || '<AZURE_PURGE_JOB>' }}
           BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB || '<AZURE_BACKUP_JOB>' }}
+          BUILD_JOBS: ${{ needs.plan.outputs.build_jobs }}
         run: |
-          for job in "$PURGE_JOB" "$BACKUP_JOB"; do
-            bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE" --dry-run
-          done
+          if [ "$BUILD_JOBS" = true ]; then
+            for job in "$PURGE_JOB" "$BACKUP_JOB"; do
+              bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE" --dry-run
+            done
+          else
+            echo "jobs image unchanged: would cross-check (DA-13-0-1) that $PURGE_JOB and $BACKUP_JOB still carry"
+            echo "the migration Job's resolved image (scripts/cd/resolve_image.sh job --build false), fail-closed"
+            echo "on a mismatch, no auto-repair"
+          fi
           echo "Schedules are never enabled by CD (manual switch, runbook)."
 
   images:
@@ -452,6 +462,10 @@ jobs:
       id-token: write   # OIDC
       contents: read
       statuses: read
+    outputs:
+      # DA-13-0-1: exposed so `deploy` can cross-check the purge/backup Jobs against the
+      # exact image this run just verified for the migration Job, when build_jobs is false.
+      jobs_image: ${{ steps.resolve.outputs.jobs_image }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -483,9 +497,11 @@ jobs:
       # jobs image itself follows the per-image plan: built just now, or (BUILD_JOBS=false)
       # the one already deployed on this Job, fail-closed via scripts/cd/resolve_image.sh.
       - name: Resolve the jobs image, update the migration Job, start it, wait (stop on failure)
+        id: resolve
         run: |
           az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
           JOBS_IMAGE="$(bash scripts/cd/resolve_image.sh job --rg "$RESOURCE_GROUP" --name "$MIGRATE_JOB" --repo "ghcr.io/$GH_REPO-jobs" --build "$BUILD_JOBS" --built-digest "$JOBS_BUILT_DIGEST")"
+          echo "jobs_image=$JOBS_IMAGE" >> "$GITHUB_OUTPUT"
           bash scripts/cd/azure_jobs.sh migrate --rg "$RESOURCE_GROUP" --job "$MIGRATE_JOB" --image "$JOBS_IMAGE"
 
   deploy:
@@ -583,6 +599,23 @@ jobs:
       # update` call) — it already runs the image resolved above.
       - name: Deploy new images to the Container Apps (by digest; only the apps that changed, ollama before backend/frontend)
         uses: azure/cli@v3
+        # DA-13-0-2: every value this script needs reaches it through `env:` below — never
+        # pasted as a `${{ }}` expression into `inlineScript` itself (DA-C2-3; a ref name or
+        # a digest could in principle contain shell metacharacters). azure/cli@v3 forwards
+        # the step's own environment into the container that runs the script (verified
+        # against its source, github.com/Azure/cli `src/main.ts`: it copies `process.env`
+        # into `docker run -e …`), so plain `env:` works the same way `run:` steps use it.
+        env:
+          OLLAMA_APP: ${{ vars.AZURE_OLLAMA_APP }}
+          BACKEND_APP: ${{ vars.AZURE_BACKEND_APP }}
+          FRONTEND_APP: ${{ vars.AZURE_FRONTEND_APP }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          BUILD_OLLAMA: ${{ needs.plan.outputs.build_ollama }}
+          BUILD_BACKEND: ${{ needs.plan.outputs.build_backend }}
+          BUILD_FRONTEND: ${{ needs.plan.outputs.build_frontend }}
+          OLLAMA_IMAGE: ${{ steps.resolve.outputs.ollama_image }}
+          BACKEND_IMAGE: ${{ steps.resolve.outputs.backend_image }}
+          FRONTEND_IMAGE: ${{ steps.resolve.outputs.frontend_image }}
         with:
           azcliversion: latest
           # DA-11bD-2: explicit, not relied on from azure/cli@v3's own (undocumented)
@@ -593,27 +626,27 @@ jobs:
           # never set (defence in depth: the resolve step above already checked this).
           inlineScript: |
             set -euo pipefail
-            [ -n "${{ vars.AZURE_OLLAMA_APP }}" ] || { echo "::error::AZURE_OLLAMA_APP repo variable is not set"; exit 1; }
-            [ -n "${{ vars.AZURE_BACKEND_APP }}" ] || { echo "::error::AZURE_BACKEND_APP repo variable is not set"; exit 1; }
-            [ -n "${{ vars.AZURE_FRONTEND_APP }}" ] || { echo "::error::AZURE_FRONTEND_APP repo variable is not set"; exit 1; }
-            [ -n "${{ vars.AZURE_RESOURCE_GROUP }}" ] || { echo "::error::AZURE_RESOURCE_GROUP repo variable is not set"; exit 1; }
-            if [ "${{ needs.plan.outputs.build_ollama }}" = true ]; then
+            [ -n "${OLLAMA_APP:-}" ] || { echo "::error::AZURE_OLLAMA_APP repo variable is not set"; exit 1; }
+            [ -n "${BACKEND_APP:-}" ] || { echo "::error::AZURE_BACKEND_APP repo variable is not set"; exit 1; }
+            [ -n "${FRONTEND_APP:-}" ] || { echo "::error::AZURE_FRONTEND_APP repo variable is not set"; exit 1; }
+            [ -n "${RESOURCE_GROUP:-}" ] || { echo "::error::AZURE_RESOURCE_GROUP repo variable is not set"; exit 1; }
+            if [ "$BUILD_OLLAMA" = true ]; then
               az containerapp update \
-                --name "${{ vars.AZURE_OLLAMA_APP }}" \
-                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-                --image "${{ steps.resolve.outputs.ollama_image }}"
+                --name "$OLLAMA_APP" \
+                --resource-group "$RESOURCE_GROUP" \
+                --image "$OLLAMA_IMAGE"
             fi
-            if [ "${{ needs.plan.outputs.build_backend }}" = true ]; then
+            if [ "$BUILD_BACKEND" = true ]; then
               az containerapp update \
-                --name "${{ vars.AZURE_BACKEND_APP }}" \
-                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-                --image "${{ steps.resolve.outputs.backend_image }}"
+                --name "$BACKEND_APP" \
+                --resource-group "$RESOURCE_GROUP" \
+                --image "$BACKEND_IMAGE"
             fi
-            if [ "${{ needs.plan.outputs.build_frontend }}" = true ]; then
+            if [ "$BUILD_FRONTEND" = true ]; then
               az containerapp update \
-                --name "${{ vars.AZURE_FRONTEND_APP }}" \
-                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-                --image "${{ steps.resolve.outputs.frontend_image }}"
+                --name "$FRONTEND_APP" \
+                --resource-group "$RESOURCE_GROUP" \
+                --image "$FRONTEND_IMAGE"
             fi
 
       # Post-deploy health check (deferred from 11a, done in 11b block D; DEC-005/T12.5.6,
@@ -659,6 +692,31 @@ jobs:
           for job in "$PURGE_JOB" "$BACKUP_JOB"; do
             bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE"
           done
+
+      # DA-13-0-1: when build_jobs stayed false this run, nothing above re-reads the
+      # purge/backup Jobs' own currently deployed image — an out-of-band `job update` run by
+      # hand on only one of the three Jobs (e.g. during an incident) would otherwise desync
+      # them from the migration Job without CD ever noticing. Cheap, read-only, fail-closed:
+      # resolve each Job's own image the same way `migrate` just did and compare — no
+      # auto-repair, a mismatch stops the run so a human looks at it.
+      - name: Purge/backup Job images must match the migration Job's (DA-13-0-1)
+        if: needs.plan.outputs.build_jobs != 'true'
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PURGE_JOB: ${{ vars.AZURE_PURGE_JOB }}
+          BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB }}
+          MIGRATE_IMAGE: ${{ needs.migrate.outputs.jobs_image }}
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+          [ -n "$MIGRATE_IMAGE" ] || { echo "::error::the migration Job's resolved image is empty — cannot cross-check"; exit 1; }
+          for job in "$PURGE_JOB" "$BACKUP_JOB"; do
+            image="$(bash scripts/cd/resolve_image.sh job --rg "$RESOURCE_GROUP" --name "$job" --repo "ghcr.io/$REPO-jobs" --build false)"
+            if [ "$image" != "$MIGRATE_IMAGE" ]; then
+              echo "::error::Job '$job' image ($image) does not match the migration Job's image ($MIGRATE_IMAGE) — refusing (no auto-repair)"
+              exit 1
+            fi
+          done
+          echo "purge/backup Job images match the migration Job's: $MIGRATE_IMAGE"
 
       - name: Record deployment status
         if: always() && steps.record.outputs.id != ''

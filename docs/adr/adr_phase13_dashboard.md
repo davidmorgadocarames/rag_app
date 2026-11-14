@@ -70,8 +70,15 @@ than silently deploying/keeping a floating tag.
   still read back as digest-pinned, or the run fails). The ollama-before-backend/frontend
   order (T11.4.3, ADR phase 11) is unchanged when ollama is among the apps that do update.
 - **The purge/backup Job image update only runs when `build_jobs` is true** — when the jobs
-  image did not change, `migrate` already resolved and verified that same (unchanged) digest
-  moments earlier in the same pipeline run, so there is nothing new to push to those two Jobs.
+  image did not change there is nothing new to *push*, since `migrate` already resolved and
+  verified that same (unchanged) digest moments earlier in the same pipeline run. That digest
+  is not re-pushed, but it IS cross-checked (DA-13-0-1): `deploy` reads the purge/backup Jobs'
+  own currently deployed image (`resolve_image.sh job --build false`) and fails closed, naming
+  the Job and both digests, if either differs from the migration Job's resolved image — per-
+  image CD means `build_jobs` can stay false across many deploys (e.g. a long frontend-only
+  streak), so an out-of-band fix applied by hand to only one of the three Jobs during an
+  incident must not go unnoticed. No auto-repair: a mismatch stops the run for a human to look
+  at it.
 - The dry-run echo job prints a per-image **BUILD/KEEP** line for all 4 images and a per-app
   **UPDATE/KEEP** line for all 3 apps, so a `workflow_dispatch` dry run against a real commit
   pair shows exactly what a live run would (and would not) touch, with no Azure call needed

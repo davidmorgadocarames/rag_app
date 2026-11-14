@@ -48,15 +48,23 @@ fi
 
 command -v az >/dev/null || die "az not found"
 
-if [ "$kind" = app ]; then
-  current="$(az containerapp show --name "$name" --resource-group "$rg" \
-               --query 'properties.template.containers[0].image' -o tsv 2>/dev/null)" \
-    || die "could not read the currently deployed image of app '$name' (resource group '$rg') — refusing (fail-closed)"
-else
-  current="$(az containerapp job show --name "$name" --resource-group "$rg" \
-               --query 'properties.template.containers[0].image' -o tsv 2>/dev/null)" \
-    || die "could not read the currently deployed image of Job '$name' (resource group '$rg') — refusing (fail-closed)"
-fi
+# $1: JMESPath query, run against the app or the Job named --name (same shape either way).
+_show() {
+  if [ "$kind" = app ]; then
+    az containerapp show --name "$name" --resource-group "$rg" --query "$1" -o tsv 2>/dev/null
+  else
+    az containerapp job show --name "$name" --resource-group "$rg" --query "$1" -o tsv 2>/dev/null
+  fi
+}
+
+# DA-13-0-3: a future sidecar would make the unconditional `containers[0]` below silently
+# resolve/compare the wrong container — fail closed instead of assuming there is only one.
+count="$(_show 'length(properties.template.containers)')" \
+  || die "could not read the currently deployed image of '$name' (resource group '$rg') — refusing (fail-closed)"
+[ "$count" = 1 ] || die "'$name' (resource group '$rg') has $count containers, expected exactly 1 — refusing (fail-closed)"
+
+current="$(_show 'properties.template.containers[0].image')" \
+  || die "could not read the currently deployed image of '$name' (resource group '$rg') — refusing (fail-closed)"
 case "$current" in
   *@sha256:*) echo "$current" ;;
   *) die "kept image '${current:-empty}' for '$name' is not pinned by digest — refusing (fail-closed)" ;;
