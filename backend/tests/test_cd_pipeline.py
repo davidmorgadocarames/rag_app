@@ -262,6 +262,28 @@ def test_the_deploy_job_cross_checks_job_images_when_build_jobs_is_false(cd: dic
     assert cd["jobs"]["deploy"]["needs"] == ["plan", "images", "migrate"]  # jobs_image output
 
 
+def test_the_cross_check_step_runs_before_recording_the_deployment_and_the_app_update(
+    cd: dict,
+) -> None:
+    """DA-13-0F-1: the DA-13-0-1 cross-check used to run AFTER "Deploy new images to the
+    Container Apps" and the health checks, so a drift was only caught once the apps had
+    already changed. It must stop the run BEFORE any deployment is recorded or any app is
+    touched — assert step order by name, not by line number, so a future reorder keeps this
+    invariant honest."""
+    steps = cd["jobs"]["deploy"]["steps"]
+    names = [s.get("name", "") for s in steps]
+    cross_check_i = next(
+        i for i, n in enumerate(names) if n.startswith("Purge/backup Job images must match")
+    )
+    record_i = next(
+        i for i, n in enumerate(names) if n.startswith("Record deployment (GitHub Deployments API)")
+    )
+    deploy_apps_i = next(
+        i for i, n in enumerate(names) if n.startswith("Deploy new images to the Container Apps")
+    )
+    assert cross_check_i < record_i < deploy_apps_i
+
+
 def test_images_build_the_jobs_image(cd: dict) -> None:
     step = next(s for s in cd["jobs"]["images"]["steps"] if s.get("id") == "jobs")
     assert step["with"]["file"] == "./backend/Dockerfile.jobs"
@@ -304,8 +326,12 @@ def test_the_dry_run_shows_the_real_order_and_can_simulate_a_migrate_failure(cd:
     inputs = _triggers(cd)["workflow_dispatch"]["inputs"]
     assert inputs["simulate_failure"]["default"] is False
     names = [s.get("name", "") for s in cd["jobs"]["dry-run"]["steps"] if "name" in s]
-    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5"]
-    assert "Images" in names[1] and "Migration Job" in names[2] and "Apps" in names[3]
+    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5", "6"]
+    assert "Images" in names[1] and "Migration Job" in names[2]
+    # DA-13-0F-1: the drift check (step 3) echoes BEFORE the apps step (step 4), matching the
+    # real `deploy` job's order (cross-check before any app is touched or deployment recorded).
+    assert "drift check" in names[3] and "DA-13-0-1" in names[3]
+    assert "Apps" in names[4]
     migrate = cd["jobs"]["dry-run"]["steps"][3]
     assert "azure_jobs.sh" in migrate["run"] and "--simulate-failure" in migrate["run"]
     # simulate_failure is refused in real runs, like base_sha/head_sha
@@ -1772,8 +1798,8 @@ def test_deploy_job_polls_health_after_updating_the_apps_and_before_the_job_imag
 
 def test_dry_run_echoes_the_health_check_step(cd: dict) -> None:
     names = [s.get("name", "") for s in cd["jobs"]["dry-run"]["steps"] if "name" in s]
-    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5"]
-    assert "health" in names[4].lower()
+    assert [n.split(".")[0] for n in names] == ["0", "1", "2", "3", "4", "5", "6"]
+    assert "health" in names[5].lower()
 
 
 def test_backend_health_check_goes_through_the_frontends_bff_not_its_own_fqdn(

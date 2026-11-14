@@ -27,24 +27,30 @@ name: CD
 #                when the jobs image itself did not change: simpler and safer than a
 #                conditional migration step, and migrations must still run whenever
 #                backend/** changed — which always flags the jobs image too (T13.CD.1)
-#   deploy       re-checks the gate status, records a deployment, resolves each app's image
-#                the same way (built just now, or kept from Azure, fail-closed) and updates
-#                ONLY the apps the plan flagged — `secrag-ollama` BEFORE `secrag-backend`/
-#                `secrag-frontend` when ollama changed too (the backend calls Ollama
-#                synchronously for embeddings on every chat/ingestion request; Ollama must
-#                already be serving the baked-in model before backend's new revision can take
-#                traffic, same "dependency before dependent" order as the migration Job before
-#                the apps) — then the purge and backup Jobs' images: updated to the new digest
-#                if the jobs image itself changed (digest, X1; T11.2.11), otherwise cross-
-#                checked, read-only and fail-closed, against the migration Job's resolved
-#                image (DA-13-0-1) — an out-of-band fix to only one of the three Jobs during
-#                an incident would otherwise desync them without CD ever noticing
+#   deploy       re-checks the gate status, resolves each app's image the same way (built just
+#                now, or kept from Azure, fail-closed) and verifies all three are digest-
+#                pinned; then, when the jobs image itself did NOT change this run, cross-
+#                checks the purge/backup Jobs' own currently deployed image against the
+#                migration Job's resolved image (DA-13-0-1/DA-13-0F-1) — read-only, fail-
+#                closed, and run BEFORE any deployment is recorded or any app is touched, so
+#                an out-of-band fix to only one of the three Jobs during an incident stops
+#                this run instead of going unnoticed; only then records a deployment and
+#                updates ONLY the apps the plan flagged — `secrag-ollama` BEFORE
+#                `secrag-backend`/`secrag-frontend` when ollama changed too (the backend calls
+#                Ollama synchronously for embeddings on every chat/ingestion request; Ollama
+#                must already be serving the baked-in model before backend's new revision can
+#                take traffic, same "dependency before dependent" order as the migration Job
+#                before the apps); finally, after the post-deploy health checks, updates the
+#                purge and backup Jobs' images to the new digest when the jobs image itself
+#                did change (digest, X1; T11.2.11)
 #
-# Order: images → migrate Job (always) → ollama app → backend/frontend apps → Job images —
-# only the apps/Jobs whose image actually changed are touched (T13.CD.2, "CD per-image
-# build"). Job names come from repo variables (AZURE_MIGRATE_JOB, AZURE_PURGE_JOB,
-# AZURE_BACKUP_JOB); the Jobs themselves are created by hand from deploy/azure/jobs/*.yaml
-# (runbook) — CD never applies YAML or enables schedules.
+# Order: images → migrate Job (always) → Job-image drift check (DA-13-0-1/DA-13-0F-1, before
+# any app is touched or deployment recorded) → ollama app → backend/frontend apps → Job
+# images (only pushed if the jobs image itself changed) — only the apps/Jobs whose image
+# actually changed are touched (T13.CD.2, "CD per-image build"). Job names come from repo
+# variables (AZURE_MIGRATE_JOB, AZURE_PURGE_JOB, AZURE_BACKUP_JOB); the Jobs themselves are
+# created by hand from deploy/azure/jobs/*.yaml (runbook) — CD never applies YAML or enables
+# schedules.
 #
 # One SHA everywhere: head_sha of the CI run (workflow_run) or the dispatched commit.
 # Manual runs (workflow_dispatch) default to dry_run=true: plan + gate-status run (read-only)
@@ -299,7 +305,22 @@ jobs:
           args=(migrate --rg "$RESOURCE_GROUP" --job "$MIGRATE_JOB" --image "$JOBS_IMAGE" --dry-run)
           [ "$SIMULATE_FAILURE" != true ] || args+=(--simulate-failure)
           bash scripts/cd/azure_jobs.sh "${args[@]}"
-      - name: 3. Apps (per-app plan — only the apps whose image changed are updated, by digest)
+      - name: 3. Job-image drift check (purge/backup Jobs vs the migration Job's resolved image, DA-13-0-1/DA-13-0F-1)
+        if: steps.plan.outputs.go == 'true'
+        env:
+          PURGE_JOB: ${{ vars.AZURE_PURGE_JOB || '<AZURE_PURGE_JOB>' }}
+          BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB || '<AZURE_BACKUP_JOB>' }}
+          BUILD_JOBS: ${{ needs.plan.outputs.build_jobs }}
+        run: |
+          if [ "$BUILD_JOBS" = true ]; then
+            echo "jobs image changed this run — nothing to cross-check yet; $PURGE_JOB and $BACKUP_JOB"
+            echo "will be pushed the new digest later, after the apps and the health check (step 6)"
+          else
+            echo "jobs image unchanged: would cross-check (DA-13-0-1) that $PURGE_JOB and $BACKUP_JOB still carry"
+            echo "the migration Job's resolved image (scripts/cd/resolve_image.sh job --build false), fail-closed"
+            echo "on a mismatch, BEFORE recording a deployment or touching any app (DA-13-0F-1), no auto-repair"
+          fi
+      - name: 4. Apps (per-app plan — only the apps whose image changed are updated, by digest)
         if: steps.plan.outputs.go == 'true'
         env:
           OLLAMA_APP: ${{ vars.AZURE_OLLAMA_APP || '<AZURE_OLLAMA_APP>' }}
@@ -322,7 +343,7 @@ jobs:
           app_line "$BACKEND_APP" "$BUILD_BACKEND" ""
           app_line "$FRONTEND_APP" "$BUILD_FRONTEND" ""
           echo "(rg $RESOURCE_GROUP)"
-      - name: 4. Post-deploy health check (backend via the frontend's BFF, frontend /)
+      - name: 5. Post-deploy health check (backend via the frontend's BFF, frontend /)
         if: steps.plan.outputs.go == 'true'
         run: |
           echo "Would resolve the frontend's public ingress URL and poll:"
@@ -332,7 +353,7 @@ jobs:
           echo "once ingress goes internal (T12.6b.5) -- /api/health is the BFF's own"
           echo "proxy of the backend's /health, so this still proves the backend answers."
           echo "A failed poll fails this run — the apps are already updated, never rolled back."
-      - name: 5. Purge and backup Job images (digest; schedules never touched)
+      - name: 6. Purge and backup Job images (digest; schedules never touched)
         if: steps.plan.outputs.go == 'true'
         env:
           PURGE_JOB: ${{ vars.AZURE_PURGE_JOB || '<AZURE_PURGE_JOB>' }}
@@ -344,9 +365,7 @@ jobs:
               bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE" --dry-run
             done
           else
-            echo "jobs image unchanged: would cross-check (DA-13-0-1) that $PURGE_JOB and $BACKUP_JOB still carry"
-            echo "the migration Job's resolved image (scripts/cd/resolve_image.sh job --build false), fail-closed"
-            echo "on a mismatch, no auto-repair"
+            echo "jobs image unchanged: already cross-checked above (DA-13-0-1, step 3) — nothing to push"
           fi
           echo "Schedules are never enabled by CD (manual switch, runbook)."
 
@@ -580,6 +599,35 @@ jobs:
             *) echo "::error::missing image digest"; exit 1 ;;
           esac
 
+      # DA-13-0-1: when build_jobs stayed false this run, nothing above re-reads the
+      # purge/backup Jobs' own currently deployed image — an out-of-band `job update` run by
+      # hand on only one of the three Jobs (e.g. during an incident) would otherwise desync
+      # them from the migration Job without CD ever noticing. Cheap, read-only, fail-closed:
+      # resolve each Job's own image the same way `migrate` just did and compare — no
+      # auto-repair, a mismatch stops the run so a human looks at it. DA-13-0F-1: checked
+      # right here, immediately after the apps' own images are resolved and verified pinned,
+      # and BEFORE any deployment is recorded or any app is touched — a drift must stop the
+      # run before anything changes, not after (this step used to run after the app updates
+      # and the post-deploy health checks).
+      - name: Purge/backup Job images must match the migration Job's (DA-13-0-1)
+        if: needs.plan.outputs.build_jobs != 'true'
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          PURGE_JOB: ${{ vars.AZURE_PURGE_JOB }}
+          BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB }}
+          MIGRATE_IMAGE: ${{ needs.migrate.outputs.jobs_image }}
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+          [ -n "$MIGRATE_IMAGE" ] || { echo "::error::the migration Job's resolved image is empty — cannot cross-check"; exit 1; }
+          for job in "$PURGE_JOB" "$BACKUP_JOB"; do
+            image="$(bash scripts/cd/resolve_image.sh job --rg "$RESOURCE_GROUP" --name "$job" --repo "ghcr.io/$REPO-jobs" --build false)"
+            if [ "$image" != "$MIGRATE_IMAGE" ]; then
+              echo "::error::Job '$job' image ($image) does not match the migration Job's image ($MIGRATE_IMAGE) — refusing (no auto-repair)"
+              exit 1
+            fi
+          done
+          echo "purge/backup Job images match the migration Job's: $MIGRATE_IMAGE"
+
       # Recorded through the REST API rather than a job `environment:` key, which would
       # change the OIDC subject and break the federated credential.
       - name: Record deployment (GitHub Deployments API)
@@ -692,31 +740,6 @@ jobs:
           for job in "$PURGE_JOB" "$BACKUP_JOB"; do
             bash scripts/cd/azure_jobs.sh update-image --rg "$RESOURCE_GROUP" --job "$job" --image "$JOBS_IMAGE"
           done
-
-      # DA-13-0-1: when build_jobs stayed false this run, nothing above re-reads the
-      # purge/backup Jobs' own currently deployed image — an out-of-band `job update` run by
-      # hand on only one of the three Jobs (e.g. during an incident) would otherwise desync
-      # them from the migration Job without CD ever noticing. Cheap, read-only, fail-closed:
-      # resolve each Job's own image the same way `migrate` just did and compare — no
-      # auto-repair, a mismatch stops the run so a human looks at it.
-      - name: Purge/backup Job images must match the migration Job's (DA-13-0-1)
-        if: needs.plan.outputs.build_jobs != 'true'
-        env:
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-          PURGE_JOB: ${{ vars.AZURE_PURGE_JOB }}
-          BACKUP_JOB: ${{ vars.AZURE_BACKUP_JOB }}
-          MIGRATE_IMAGE: ${{ needs.migrate.outputs.jobs_image }}
-        run: |
-          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
-          [ -n "$MIGRATE_IMAGE" ] || { echo "::error::the migration Job's resolved image is empty — cannot cross-check"; exit 1; }
-          for job in "$PURGE_JOB" "$BACKUP_JOB"; do
-            image="$(bash scripts/cd/resolve_image.sh job --rg "$RESOURCE_GROUP" --name "$job" --repo "ghcr.io/$REPO-jobs" --build false)"
-            if [ "$image" != "$MIGRATE_IMAGE" ]; then
-              echo "::error::Job '$job' image ($image) does not match the migration Job's image ($MIGRATE_IMAGE) — refusing (no auto-repair)"
-              exit 1
-            fi
-          done
-          echo "purge/backup Job images match the migration Job's: $MIGRATE_IMAGE"
 
       - name: Record deployment status
         if: always() && steps.record.outputs.id != ''

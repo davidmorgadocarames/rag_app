@@ -78,7 +78,11 @@ than silently deploying/keeping a floating tag.
   image CD means `build_jobs` can stay false across many deploys (e.g. a long frontend-only
   streak), so an out-of-band fix applied by hand to only one of the three Jobs during an
   incident must not go unnoticed. No auto-repair: a mismatch stops the run for a human to look
-  at it.
+  at it. DA-13-0F-1: this cross-check runs early in `deploy`, right after each app's image is
+  resolved and verified digest-pinned, and BEFORE the deployment is recorded or any app is
+  updated — a drift must stop the run before anything changes, not after (it originally ran
+  after the app updates and the post-deploy health checks, which only caught drift once the
+  apps had already moved).
 - The dry-run echo job prints a per-image **BUILD/KEEP** line for all 4 images and a per-app
   **UPDATE/KEEP** line for all 3 apps, so a `workflow_dispatch` dry run against a real commit
   pair shows exactly what a live run would (and would not) touch, with no Azure call needed
