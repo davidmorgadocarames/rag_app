@@ -45,9 +45,14 @@ export function generateNonce(randomBytes: Uint8Array): string {
  *
  * `script-src 'nonce-…' 'strict-dynamic'` (plan): only the nonce'd Next.js runtime scripts
  * (and whatever they load) may execute -- no inline/`unsafe-inline` fallback. `style-src
- * 'self' 'unsafe-inline'` (plan, E4): the app writes no inline `style={{}}`/`<style>` itself
- * (grepped by 12a-D's DA review), but Next's OWN CSS-in-JS/`next/font` machinery injects
- * `<style>` tags without a nonce, so `unsafe-inline` on styles ONLY is the plan's documented
+ * 'self' 'unsafe-inline'` (plan, E4): a few components DO use React's `style={{...}}` prop
+ * (`VaultDoor.tsx`, `LatencyPanel.tsx` for Recharts' `ResponsiveContainer` sizing) -- DA-13-C-3
+ * corrected this comment, which previously (wrongly) claimed zero usage. React's `style={{}}`
+ * sets properties on the element's CSSOM `style` object directly (`HTMLElement.style.prop =
+ * value`), never through an HTML `style="..."` attribute string -- `style-src` restricts the
+ * latter (and `<style>` tags), so this usage was never actually a live violation either way;
+ * `unsafe-inline` on styles here is still needed because Next's OWN CSS-in-JS/`next/font`
+ * machinery injects `<style>` tags without a nonce, which the plan already documents as the
  * trade-off. Everything else defaults to `'self'` (defense in depth, not contradicted by any
  * plan row). `report-uri`/`report-to` both point at the SAME backend route (E5) so every
  * browser, old or new, reports to it.

@@ -315,14 +315,16 @@ class Settings(JobSettings):
     # this ordinary runtime setting (same mechanism as every other Settings field) and hands
     # it to the frontend as plain response data (`AdminFeaturesResponse.live_mode`) on every
     # `/admin/features` call -- the CSR dashboard reads THAT field to decide whether to open
-    # an SSE stream or poll, never its own build-time env var. "sse" (default, local): a
-    # long-lived `GET /admin/stream` connection. "polling" (Azure): Container Apps' internal
-    # ingress + scale-to-zero make a long-lived connection unreliable (TF16-style), so the
-    # dashboard instead re-fetches the REST routes on a low-frequency timer + a manual
-    # "Refresh now" button; set `ADMIN_LIVE_MODE=polling` on the Azure Container App only
-    # (private runbook) -- this repo's own `.env`/compose files never set it, so local dev
-    # always defaults to "sse".
-    admin_live_mode: Literal["sse", "polling"] = "sse"
+    # an SSE stream or poll, never its own build-time env var. "sse": a long-lived
+    # `GET /admin/stream` connection, local only. "polling" (DEFAULT, DA-13-C-4): Container
+    # Apps' internal ingress + scale-to-zero make a long-lived connection unreliable
+    # (TF16-style), so the dashboard instead re-fetches the REST routes on a low-frequency
+    # timer + a manual "Refresh now" button -- the SAME "Azure-safe value IS the default"
+    # shape as `prometheus_url`'s own empty default, so Azure needs NO explicit setting to
+    # stay safe. `docker-compose.yml`'s backend service and `scripts/gate.sh`'s e2e/
+    # security-headers/zap-baseline native backends explicitly set `ADMIN_LIVE_MODE=sse`
+    # (local only, where a long-lived connection is reliable); Azure is never set at all.
+    admin_live_mode: Literal["sse", "polling"] = "polling"
 
     @model_validator(mode="after")
     def _default_require_email_verification_with_prod(self) -> Settings:

@@ -174,6 +174,12 @@ services:
       # `prometheus` service below (same compose network) -- never exposed through the BFF.
       # Empty on Azure (R6-4, no managed Prometheus there) -- see config.py's own comment.
       PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      # T13.4.1/T13.4.2 (TF14, DA-13-C-4): the Azure-safe default is now "polling" (Container
+      # Apps' internal ingress + scale-to-zero make a long-lived SSE connection unreliable --
+      # the SAME reasoning PROMETHEUS_URL's own empty-by-default already follows). The local
+      # compose stack explicitly opts into "sse" here; Azure never sets this var, so it keeps
+      # the safe default.
+      ADMIN_LIVE_MODE: ${ADMIN_LIVE_MODE:-sse}
       # T12.1.11: local SMTP sink (Mailpit, no auth/TLS -- a throwaway local inbox, never
       # Azure, which has no SMTP in 12a). Unset (empty host) keeps the old dev no-op path.
       SMTP_HOST: mailpit

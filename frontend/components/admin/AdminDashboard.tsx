@@ -60,6 +60,16 @@ function OverviewPanel({ features, liveMode }: { features: FeatureHealthOut[]; l
         {features.length} registry entries -- {unhealthy} probe(s) not ok -- live updates:{" "}
         <span className="text-vault-amber">{liveMode}</span>
       </p>
+      {/* T13.4.3/R6-4 (DA-13-C-2): no managed Prometheus on Azure -- every metric value on
+          this dashboard is "now" only, never a time series. Shown whenever the backend's own
+          live_mode says "polling" (the Azure indicator, TF14) -- never a frontend build-time
+          check. */}
+      {liveMode === "polling" && (
+        <p data-testid="admin-history-note" className="text-xs text-vault-steel-dark">
+          History: <span className="text-vault-steel-light">Azure: n/a</span> -- every value
+          above is this replica&apos;s current state only, never a cross-replica time series.
+        </p>
+      )}
       <ul className="flex flex-wrap gap-3 text-xs text-vault-steel-dark">
         {Object.entries(byStatus).map(([status, count]) => (
           <li key={status}>

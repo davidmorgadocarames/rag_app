@@ -613,6 +613,7 @@ e2e_start_backend() {
       FRONTEND_ORIGIN="http://localhost:$E2E_FRONTEND_PORT" OLLAMA_HOST="$OLLAMA_HOST" \
       DAILY_ANSWER_CAP=1000 SMTP_HOST=127.0.0.1 SMTP_PORT="$GATE_MAILPIT_SMTP_PORT" \
       PUBLIC_APP_URL="http://localhost:$E2E_FRONTEND_PORT" \
+      ADMIN_LIVE_MODE=sse \
       "$VENV/bin/uvicorn" rag_app.api.app:create_app --factory \
         --host 127.0.0.1 --port "$E2E_BACKEND_PORT" \
   ) >"$log_dir/backend.log" 2>&1 &

@@ -28,3 +28,20 @@ def test_retrieval_limits_are_sane() -> None:
     settings = get_settings()
     assert settings.rerank_top_n <= settings.top_k
     assert settings.max_agent_steps > 0
+
+
+# --- T13.4.1/T13.4.2 (TF14, DA-13-C-4): admin_live_mode -----------------------------------
+
+
+def test_admin_live_mode_defaults_to_polling_the_azure_safe_value(monkeypatch) -> None:
+    """Same shape as `prometheus_url`'s own empty-by-default: the Azure-safe choice IS the
+    default, so a Container App that forgets to set anything stays safe (no long-lived SSE
+    connection against internal ingress + scale-to-zero) -- `docker-compose.yml`/
+    `scripts/gate.sh` explicitly opt INTO "sse" for the local stack instead."""
+    monkeypatch.delenv("ADMIN_LIVE_MODE", raising=False)
+    assert get_settings().admin_live_mode == "polling"
+
+
+def test_admin_live_mode_can_be_set_to_sse(monkeypatch) -> None:
+    monkeypatch.setenv("ADMIN_LIVE_MODE", "sse")
+    assert get_settings().admin_live_mode == "sse"
