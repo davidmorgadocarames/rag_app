@@ -115,3 +115,54 @@ def test_new_metrics_are_served_and_carry_no_pii() -> None:
         assert name in body
     assert "@" not in body
     assert "question" not in body.lower()
+
+
+# --- T13.2.5: stage_latency_summary / _quantile_from_buckets (latency panel) --------------
+
+
+def _fresh_stage_histogram() -> tuple[object, object]:
+    """A throwaway registry + histogram, same name/buckets as the real STAGE_SECONDS --
+    isolated from every other test's calls to ``observe_stage`` in this pytest session."""
+    from prometheus_client import CollectorRegistry, Histogram
+
+    registry = CollectorRegistry()
+    histogram = Histogram(
+        "secrag_chat_stage_seconds",
+        "test",
+        ["stage"],
+        registry=registry,
+        buckets=metrics.STAGE_SECONDS._upper_bounds[:-1],  # exclude the implicit +Inf
+    )
+    return registry, histogram
+
+
+def test_quantile_from_buckets_interpolates_linearly() -> None:
+    # 10 observations spread evenly 0..10 across buckets [0,5), [5,10], +Inf.
+    buckets = [(5.0, 5.0), (10.0, 10.0), (float("inf"), 10.0)]
+    assert metrics._quantile_from_buckets(buckets, 10.0, 0.5) == pytest.approx(5.0)
+    assert metrics._quantile_from_buckets(buckets, 10.0, 0.9) == pytest.approx(9.0)
+
+
+def test_quantile_from_buckets_returns_none_with_no_observations() -> None:
+    assert metrics._quantile_from_buckets([(1.0, 0.0)], 0.0, 0.5) is None
+
+
+def test_stage_latency_summary_computes_p50_p95_count_avg_per_stage() -> None:
+    registry, histogram = _fresh_stage_histogram()
+    for value in (0.05, 0.1, 1.5):
+        histogram.labels(stage="embed").observe(value)
+    histogram.labels(stage="generate").observe(2.0)
+
+    summary = metrics.stage_latency_summary(registry, "secrag_chat_stage_seconds")
+
+    assert summary["embed"]["count"] == 3.0
+    assert summary["embed"]["avg_seconds"] == pytest.approx((0.05 + 0.1 + 1.5) / 3)
+    assert summary["embed"]["p50_seconds"] is not None
+    assert summary["embed"]["p95_seconds"] is not None
+    assert summary["embed"]["p50_seconds"] <= summary["embed"]["p95_seconds"]
+    assert summary["generate"]["count"] == 1.0
+
+
+def test_stage_latency_summary_is_empty_with_no_observations() -> None:
+    registry, _histogram = _fresh_stage_histogram()
+    assert metrics.stage_latency_summary(registry, "secrag_chat_stage_seconds") == {}

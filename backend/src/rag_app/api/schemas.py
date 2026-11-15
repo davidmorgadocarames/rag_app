@@ -210,6 +210,18 @@ class AdminMetricsResponse(BaseModel):
     values: dict[str, float | None]
 
 
+class StageLatencyOut(BaseModel):
+    stage: str
+    count: float
+    avg_seconds: float | None
+    p50_seconds: float | None
+    p95_seconds: float | None
+
+
+class AdminLatencyResponse(BaseModel):
+    stages: list[StageLatencyOut]
+
+
 class EvalMetricOut(BaseModel):
     key: str
     value: float | None

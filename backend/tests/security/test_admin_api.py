@@ -178,6 +178,21 @@ def test_admin_metrics_returns_a_value_per_declared_metric_name(api_env: Engine)
     assert declared <= set(response.json()["values"])
 
 
+def test_admin_latency_reports_per_stage_percentiles(api_env: Engine) -> None:
+    from rag_app import metrics as real_metrics
+
+    real_metrics.observe_stage("embed", 0.2)
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/latency", headers=headers)
+    assert response.status_code == 200, response.text
+    stages = {row["stage"]: row for row in response.json()["stages"]}
+    assert "embed" in stages
+    assert stages["embed"]["count"] >= 1
+    assert stages["embed"]["p50_seconds"] is not None
+    assert stages["embed"]["p95_seconds"] is not None
+
+
 def test_admin_eval_reports_aggregate_metrics_only(api_env: Engine) -> None:
     client = _client()
     headers = _admin_headers(api_env, stepped_up=True)

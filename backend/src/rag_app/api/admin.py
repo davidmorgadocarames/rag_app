@@ -60,6 +60,7 @@ from rag_app.api.schemas import (
     AdminErasureResponse,
     AdminEvalResponse,
     AdminFeaturesResponse,
+    AdminLatencyResponse,
     AdminMetricsResponse,
     ErasureActionResponse,
     ErasureRequestOut,
@@ -71,6 +72,7 @@ from rag_app.api.schemas import (
     MfaConfirmResponse,
     MfaEnrollResponse,
     MfaStepUpRequest,
+    StageLatencyOut,
 )
 from rag_app.authz import ROLE_PERMISSIONS, require_permission, require_permission_and_mfa
 from rag_app.config import get_settings
@@ -286,6 +288,37 @@ def admin_metrics(session: SessionDep, metrics_backend: MetricsBackendDep) -> Ad
     _refresh_erasure_gauges(session)
     names = sorted({name for entry in REGISTRY for name in entry.metrics})
     return AdminMetricsResponse(values=metrics_backend.current_values(names))
+
+
+# --- T13.2.5: latency panel (per-stage p50/p95, in-process -- see metrics.py) --------------
+
+
+@router.get(
+    "/admin/latency",
+    response_model=AdminLatencyResponse,
+    tags=["admin"],
+    dependencies=[
+        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/latency"))),
+        Depends(rate_limit_account("admin_latency")),
+    ],
+)
+def admin_latency() -> AdminLatencyResponse:
+    """``rag_app.metrics.stage_latency_summary`` reads THIS process's own
+    ``secrag_chat_stage_seconds`` histogram directly -- never through ``MetricsBackend``
+    (percentiles are not an unlabelled counter/gauge value); the same computation local and
+    on Azure, "this replica since it last started", no history (R6-4)."""
+    summary = metrics.stage_latency_summary()
+    stages = [
+        StageLatencyOut(
+            stage=stage,
+            count=values["count"] or 0.0,
+            avg_seconds=values["avg_seconds"],
+            p50_seconds=values["p50_seconds"],
+            p95_seconds=values["p95_seconds"],
+        )
+        for stage, values in sorted(summary.items())
+    ]
+    return AdminLatencyResponse(stages=stages)
 
 
 # --- T13.1.4: last eval run vs baseline and floors -----------------------------------------
