@@ -72,6 +72,8 @@ from rag_app.erasure import (
     OPEN_STATUSES,
     PURGE_DEADLINE_HOURS,
     PURGE_STEPS,
+    REQUEST_LOCK_TIMEOUT,
+    REQUEST_STATEMENT_TIMEOUT,
     request_erasure,
 )
 from rag_app.eval.gate import BASELINE_PATH, RESULTS_PATH, THRESHOLDS_PATH
@@ -471,20 +473,27 @@ def admin_erase_user(
         # see DEC-032 in the docstring above: a direct 404 here is a documented, accepted
         # trade-off, not an oversight.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account")
-    if target.role == "admin":
-        # DEC-033 = A: row-lock every live admin BEFORE counting and hold the lock for the
-        # rest of this transaction (through request_erasure's own commit below). Two admins
-        # racing to erase each other therefore serialise on this lock instead of both reading
-        # "2 admins left" and leaving zero -- the second one only re-reads the (now smaller)
-        # locked set once the first has committed its erasure.
-        live_admin_ids = session.scalars(
-            select(User.id).where(User.role == "admin", User.deleted_at.is_(None)).with_for_update()
-        ).all()
-        if len(live_admin_ids) <= 1:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, "cannot erase the only remaining admin account"
-            )
     try:
+        if target.role == "admin":
+            # DEC-033 = A: row-lock every live admin BEFORE counting and hold the lock for the
+            # rest of this transaction (through request_erasure's own commit below). Two admins
+            # racing to erase each other therefore serialise on this lock instead of both reading
+            # "2 admins left" and leaving zero -- the second one only re-reads the (now smaller)
+            # locked set once the first has committed its erasure.
+            # DEC-035 = A (DA-13-BF-1): the same bounded waits as request_erasure, set BEFORE
+            # this blocking lock, so a conflicting lock (e.g. a migration on users) fails fast
+            # as the 503 below instead of hanging the worker.
+            session.execute(text(f"SET LOCAL lock_timeout = '{REQUEST_LOCK_TIMEOUT}'"))
+            session.execute(text(f"SET LOCAL statement_timeout = '{REQUEST_STATEMENT_TIMEOUT}'"))
+            live_admin_ids = session.scalars(
+                select(User.id)
+                .where(User.role == "admin", User.deleted_at.is_(None))
+                .with_for_update()
+            ).all()
+            if len(live_admin_ids) <= 1:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "cannot erase the only remaining admin account"
+                )
         done = request_erasure(session, target.id)
     except OperationalError as exc:
         session.rollback()

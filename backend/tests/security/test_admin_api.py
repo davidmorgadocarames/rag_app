@@ -18,7 +18,7 @@ import uuid
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, select, text, update
 from sqlalchemy.orm import Session
 
 from rag_app.admin import create_admin
@@ -28,6 +28,7 @@ from rag_app.config import get_settings
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, csrf_token
 from rag_app.db.models import AdminAction, DeletionRequest, User
 from rag_app.email_abuse import EmailAbuseLimiter
+from rag_app.erasure import ERASURE_RETRY_AFTER_SECONDS
 from rag_app.risk import SignupTracker
 from rag_app.sessions import SESSION_COOKIE_NAME, create_session, set_mfa_verified
 
@@ -470,6 +471,42 @@ def test_admin_self_erase_is_allowed_when_another_admin_remains(api_env: Engine)
             session.scalar(select(DeletionRequest).where(DeletionRequest.user_id == target_id))
             is not None
         )
+
+
+def test_a_lock_on_an_admin_row_makes_the_last_admin_check_a_retryable_503(
+    api_env: Engine,
+) -> None:
+    """DEC-035 = A (DA-13-BF-1): the last-admin row lock runs under the request path's own
+    lock_timeout, so a conflicting lock fails fast as 503 + Retry-After (never hangs the
+    worker); nothing is erased, and the same request succeeds once the lock is gone."""
+    headers = _admin_headers(api_env, stepped_up=True)
+    email, _ = _admin_session_with_email(api_env, stepped_up=True)
+    with Session(api_env) as session:
+        target_id = session.scalar(select(User.id).where(User.email == email))
+    assert target_id is not None
+
+    client = _client()
+    with api_env.connect() as holder:
+        holder.begin()
+        holder.execute(text("SELECT 1 FROM users WHERE id = :u FOR UPDATE"), {"u": target_id})
+        busy = client.post(
+            "/admin/users/erase", json={"email": email, "confirmation": "ERASE"}, headers=headers
+        )
+        holder.rollback()
+    assert busy.status_code == 503, busy.text
+    assert busy.headers["Retry-After"] == str(ERASURE_RETRY_AFTER_SECONDS)
+    with Session(api_env) as session:
+        reloaded = session.get(User, target_id)
+        assert reloaded is not None and reloaded.deleted_at is None
+        assert (
+            session.scalar(select(DeletionRequest).where(DeletionRequest.user_id == target_id))
+            is None
+        )
+
+    ok = client.post(
+        "/admin/users/erase", json={"email": email, "confirmation": "ERASE"}, headers=headers
+    )
+    assert ok.status_code == 202, ok.text
 
 
 # --- T13.1.7: no-PII responses, scanned across every admin endpoint ------------------------
