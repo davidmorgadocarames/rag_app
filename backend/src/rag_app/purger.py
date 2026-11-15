@@ -51,14 +51,22 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Protocol
 
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from rag_app import metrics
 from rag_app.erasure import OPEN_STATUSES, PURGE_DEADLINE_HOURS, PURGE_STEPS
+
+_metrics: ModuleType | None
+try:  # T13.0.6: the slim jobs image (requirements-jobs.txt) has no prometheus_client at
+    # all -- this module IS the purger CLI the jobs image runs; see
+    # rag_app.erasure's module-level import for the full reasoning.
+    from rag_app import metrics as _metrics
+except ImportError:  # pragma: no cover - exercised by the jobs image, not this venv
+    _metrics = None
 
 # Arbitrary, fixed: every purger (CLI, Job, compose loop) uses the same key.
 ADVISORY_LOCK_KEY = 0x5EC_2A6_11B
@@ -226,11 +234,12 @@ class Purger:
                 ),
                 {"s": status, "e": error, "id": request_id},
             )
-        if status == "failed":
+        if status == "failed" and _metrics is not None:
             # T13.0.6 (D-ER): one event, wherever a tombstone is marked failed (MAX_RETRIES
             # exhausted, a non-transient SQLAlchemyError, or an account not marked deleted) --
-            # see Purger._mark's only two call sites and _run_locked's except branch.
-            metrics.ERASURE_FAILURES_TOTAL.inc()
+            # see Purger._mark's only two call sites and _run_locked's except branch. A no-op
+            # in the slim jobs image (no prometheus_client -- see the module import above).
+            _metrics.ERASURE_FAILURES_TOTAL.inc()
 
     def _backoff(self, attempt: int, result: RunResult) -> None:
         result.backoffs += 1
@@ -370,8 +379,11 @@ class Purger:
             result.last_error = f"count open: {_error_class(exc)}"
             return
         result.overdue, result.open_left = int(overdue), int(open_left)
-        metrics.ERASURE_PENDING.set(result.open_left)
-        metrics.ERASURE_OLDEST_AGE_SECONDS.set(float(oldest_age) if oldest_age is not None else 0.0)
+        if _metrics is not None:  # no-op in the slim jobs image (no prometheus_client)
+            _metrics.ERASURE_PENDING.set(result.open_left)
+            _metrics.ERASURE_OLDEST_AGE_SECONDS.set(
+                float(oldest_age) if oldest_age is not None else 0.0
+            )
 
     def _run_locked(self, result: RunResult, only: uuid.UUID | None) -> None:
         with self.engine.begin() as conn:

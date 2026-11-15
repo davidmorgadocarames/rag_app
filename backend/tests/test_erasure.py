@@ -35,6 +35,54 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 # --- registry (no database) -------------------------------------------------------------
 
 
+def test_erasure_and_purger_import_without_prometheus_client() -> None:
+    """T13.0.6: the slim jobs image (`requirements-jobs.txt`) has no `prometheus_client` at
+    all -- both this module and `rag_app.purger` (the purger CLI the jobs image runs) must
+    stay importable regardless, with the metrics calls degrading to a no-op. Simulates the
+    jobs image's missing dependency (``sys.modules["prometheus_client"] = None`` makes any
+    ``import prometheus_client`` raise ``ImportError`` immediately — a standard trick, simpler
+    and more reliable here than patching ``builtins.__import__``, which an already-imported
+    package's cached submodules can bypass) rather than depending on a real docker build
+    (CI's own "Jobs image" job already does that for real; this catches the same regression
+    locally, in the fast gate, in seconds). This exact regression shipped once in 13-A and
+    was only caught by the jobs-image CI job — this test exists so it fails locally next
+    time."""
+    import importlib
+    import sys
+
+    removed = {
+        name: sys.modules.pop(name)
+        for name in ("prometheus_client", "rag_app.metrics", "rag_app.erasure", "rag_app.purger")
+        if name in sys.modules
+    }
+    # `from rag_app import metrics` first tries `getattr(sys.modules["rag_app"], "metrics")`
+    # -- the submodule attribute the FIRST successful import already set on the parent
+    # package persists there even after `sys.modules["rag_app.metrics"]` is removed above, so
+    # it must be cleared too or this whole test would short-circuit on that stale reference.
+    rag_app_pkg = sys.modules.get("rag_app")
+    for attr in ("metrics", "erasure", "purger"):
+        if rag_app_pkg is not None and hasattr(rag_app_pkg, attr):
+            delattr(rag_app_pkg, attr)
+    sys.modules["prometheus_client"] = None  # type: ignore[assignment]
+    try:
+        erasure_mod = importlib.import_module("rag_app.erasure")
+        purger_mod = importlib.import_module("rag_app.purger")
+        assert erasure_mod._metrics is None
+        assert purger_mod._metrics is None
+        # Both no-ops must not raise either.
+        erasure_mod.refresh_erasure_gauges(
+            create_engine(
+                "postgresql+psycopg://x:x@127.0.0.1:1/x", connect_args={"connect_timeout": 1}
+            )
+        )
+    finally:
+        for name in ("prometheus_client", "rag_app.metrics", "rag_app.erasure", "rag_app.purger"):
+            sys.modules.pop(name, None)
+        sys.modules.update(removed)
+        importlib.import_module("rag_app.erasure")
+        importlib.import_module("rag_app.purger")
+
+
 def test_the_registry_is_leaf_first_with_users_last() -> None:
     names = [step.name for step in erasure.PURGE_STEPS]
     assert names == [

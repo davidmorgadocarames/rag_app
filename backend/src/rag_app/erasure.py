@@ -33,6 +33,7 @@ import datetime as dt
 import sys
 import uuid
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any
 
 from sqlalchemy import (
@@ -51,11 +52,19 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from rag_app import metrics
 from rag_app.config import get_settings
 from rag_app.db.models import DeletionRequest, User, UserKey, UserSession
 from rag_app.lockout import delete_lockout_for_email
 from rag_app.retention import BACKUP_RETENTION_DAYS, TOMBSTONE_EXPORT_RETENTION_DAYS
+
+_metrics: ModuleType | None
+try:  # T13.0.6: the slim jobs image (requirements-jobs.txt) has no prometheus_client at
+    # all (it never serves a metrics port -- see ADR phase 13's registry section, "known
+    # limitation"); this module is imported there too (the purger CLI), so the metrics
+    # import/use must degrade to a no-op rather than make `rag_app.erasure` unimportable.
+    from rag_app import metrics as _metrics
+except ImportError:  # pragma: no cover - exercised by the jobs image, not this venv
+    _metrics = None
 
 # The promise of the 202 message (PHASE_PLANNING 11.2b): the purger removes the remaining
 # encrypted rows within this many hours (an hourly Job, well inside the deadline).
@@ -250,8 +259,11 @@ def refresh_erasure_gauges(engine: Engine) -> None:
     a periodic refresh inside the API process or a scrape-time custom collector; the
     dashboard's own polling tick (T13.4.1/T13.4.2) is the natural place to add it once that
     mechanism exists. Never raises: a failed refresh is best-effort and must not turn an
-    otherwise successful erasure request/purger run into an error.
+    otherwise successful erasure request/purger run into an error. A no-op in the slim jobs
+    image (``_metrics`` is ``None`` there — see the module-level import above).
     """
+    if _metrics is None:
+        return
     try:
         with engine.connect() as conn:
             count, oldest_age = conn.execute(
@@ -259,8 +271,8 @@ def refresh_erasure_gauges(engine: Engine) -> None:
             ).one()
     except SQLAlchemyError:
         return
-    metrics.ERASURE_PENDING.set(count or 0)
-    metrics.ERASURE_OLDEST_AGE_SECONDS.set(float(oldest_age) if oldest_age is not None else 0.0)
+    _metrics.ERASURE_PENDING.set(count or 0)
+    _metrics.ERASURE_OLDEST_AGE_SECONDS.set(float(oldest_age) if oldest_age is not None else 0.0)
 
 
 def _rowcount(result: Result[Any]) -> int:
