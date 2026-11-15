@@ -31,6 +31,7 @@ from rag_app.api.app import create_app
 from rag_app.api.auth import get_current_user
 from rag_app.api.deps import RATE_LIMIT_DEPENDENCIES
 from rag_app.authz import DECLARED_PERMISSION_ROUTES
+from rag_app.features import iter_routes
 
 pytestmark = pytest.mark.security
 
@@ -89,9 +90,23 @@ def _problems(method: str, path: str, calls: set[Callable[..., Any]]) -> list[st
 def _non_public_routes(app: FastAPI) -> list[tuple[str, str, APIRoute]]:
     """Every (method, path, route) the walker actually has to check -- not on
     ``PUBLIC_ALLOWLIST``, HEAD/OPTIONS excluded (Starlette's own auto-added methods, not a
-    real route declaration)."""
+    real route declaration).
+
+    DA-13-A-1 (blocker, found during 13-A's DA review, pre-existing): this used to iterate
+    ``app.routes`` directly with ``isinstance(route, APIRoute)``. With the pinned
+    ``fastapi==0.142.2``, a router registered via ``app.include_router(...)`` is NOT inlined
+    into ``app.routes`` -- it appears as one opaque ``_IncludedRouter`` wrapper instead, which
+    fails that ``isinstance`` check. That silently reduced the walker to checking only the
+    two routes ``create_app()`` defines directly on ``app`` itself (``/health``, on the
+    allow-list, and ``/chat``) -- 19 of 21 real routes (``/auth/*``, every MFA route,
+    ``/admin/ping``, every ``/conversations*`` route, ``DELETE /account``, ``/csp-report``)
+    had ZERO walker coverage while the test still reported green, because its only
+    self-check (``assert checked``) merely required a non-empty list. Fixed by reusing
+    ``rag_app.features.iter_routes`` -- the SAME flattening helper ``check_registry``/
+    ``route_probe`` already rely on for this exact FastAPI quirk -- instead of walking
+    ``app.routes`` directly."""
     found: list[tuple[str, str, APIRoute]] = []
-    for route in app.routes:
+    for route in iter_routes(app):
         if not isinstance(route, APIRoute):
             continue
         for method in (route.methods or set()) - _SKIPPED_METHODS:
@@ -113,7 +128,31 @@ def _walk(app: FastAPI) -> dict[tuple[str, str], list[str]]:
 def test_every_route_declares_auth_and_permission_and_a_rate_limit_or_is_public() -> None:
     app = create_app()
     checked = _non_public_routes(app)
-    assert checked, "the walker found nothing to check -- did route discovery break?"
+    # DA-13-A-1: ``assert checked`` alone ("did route discovery break?") is exactly the
+    # self-check that stayed green while the walker silently shrank from ~19 checkable
+    # routes to 1 (see ``_non_public_routes``'s docstring) -- a non-empty list is not enough
+    # to prove discovery is intact. Two independent floors instead, both measured LIVE
+    # against today's real app rather than hard-coded, so this can never again pass while
+    # seeing only a handful of routes: (1) the raw flattened route count
+    # ``rag_app.features.iter_routes`` returns (includes framework-added routes like
+    # ``/docs`` that are never APIRoute/checkable, so this alone would not have caught the
+    # original bug, but IS the same list ``check_registry``/``route_probe`` rely on, so a
+    # regression there shows up here too); (2) every permission-declared route
+    # (``DECLARED_PERMISSION_ROUTES``, populated independently by route decorators, not by
+    # walking ``app.routes`` at all) must actually be among the routes the walker checks --
+    # this is the assertion that would have caught DA-13-A-1 (it only held 1 of 12 entries
+    # under the old, un-flattened walker).
+    all_flattened = iter_routes(app)
+    assert len(all_flattened) >= 25, (
+        "rag_app.features.iter_routes(app) returned fewer routes than expected -- route"
+        f" discovery may have broken (got {len(all_flattened)})"
+    )
+    checked_keys = {(method, path) for method, path, _route in checked}
+    missing = set(DECLARED_PERMISSION_ROUTES) - checked_keys
+    assert not missing, (
+        "the walker never even looked at these permission-declared routes -- route"
+        f" discovery is vacuous again: {sorted(missing)}"
+    )
     failures = _walk(app)
     assert not failures, "\n".join(f"{m} {p}: {', '.join(ps)}" for (m, p), ps in failures.items())
 
