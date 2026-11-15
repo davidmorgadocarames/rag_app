@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request, Response, status
 
+from rag_app import metrics
 from rag_app.api.deps import rate_limit_csp_report
 
 logger = logging.getLogger("rag_app.csp_report")
@@ -121,6 +122,7 @@ def parse_report_entries(payload: object) -> list[tuple[str, str]]:
     "/csp-report",
     status_code=status.HTTP_204_NO_CONTENT,
     include_in_schema=False,
+    tags=["browser-security"],
     dependencies=[Depends(rate_limit_csp_report)],
 )
 async def csp_report(request: Request) -> Response:
@@ -140,5 +142,6 @@ async def csp_report(request: Request) -> Response:
         return _NO_CONTENT
 
     for directive, origin in parse_report_entries(payload):
+        metrics.CSP_REPORTS_TOTAL.inc()
         logger.warning("csp violation: directive=%s blocked_origin=%s", directive, origin)
     return _NO_CONTENT

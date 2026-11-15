@@ -35,10 +35,23 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import CursorResult, Result, delete, exists, func, literal, select, text, update
+from sqlalchemy import (
+    CursorResult,
+    Engine,
+    Result,
+    delete,
+    exists,
+    func,
+    literal,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from rag_app import metrics
 from rag_app.config import get_settings
 from rag_app.db.models import DeletionRequest, User, UserKey, UserSession
 from rag_app.lockout import delete_lockout_for_email
@@ -217,6 +230,39 @@ def uncovered_user_columns(session: Session) -> list[str]:
     ]
 
 
+_ERASURE_STATE_SQL = """
+    SELECT count(*), extract(epoch FROM now() - min(requested_at))
+      FROM deletion_requests WHERE status = ANY(:open)
+"""
+
+
+def refresh_erasure_gauges(engine: Engine) -> None:
+    """Recompute and publish ``ERASURE_PENDING``/``ERASURE_OLDEST_AGE_SECONDS`` (T13.0.6,
+    D-ER) by querying ``deletion_requests`` directly — called right after ``request_erasure``
+    commits, so the very next scrape of THIS process already reflects it, and by the
+    purger's own bookkeeping (``rag_app.purger.Purger._count_open``).
+
+    **Known limitation (for 13-B/13-C, not fixed here):** Prometheus state is per-process.
+    The purger runs as its own process (a Container Apps Job on Azure, a separate compose
+    service locally) — a value it sets here is never scraped from the API's own `/metrics`
+    port. A continuously fresh value with no triggering event (e.g. a tombstone that has
+    simply been sitting open for a day, with no new erasure request in between) needs either
+    a periodic refresh inside the API process or a scrape-time custom collector; the
+    dashboard's own polling tick (T13.4.1/T13.4.2) is the natural place to add it once that
+    mechanism exists. Never raises: a failed refresh is best-effort and must not turn an
+    otherwise successful erasure request/purger run into an error.
+    """
+    try:
+        with engine.connect() as conn:
+            count, oldest_age = conn.execute(
+                text(_ERASURE_STATE_SQL), {"open": list(OPEN_STATUSES)}
+            ).one()
+    except SQLAlchemyError:
+        return
+    metrics.ERASURE_PENDING.set(count or 0)
+    metrics.ERASURE_OLDEST_AGE_SECONDS.set(float(oldest_age) if oldest_age is not None else 0.0)
+
+
 def _rowcount(result: Result[Any]) -> int:
     return result.rowcount if isinstance(result, CursorResult) else 0
 
@@ -278,6 +324,10 @@ def request_erasure(session: Session, user_id: uuid.UUID) -> bool:
     session.execute(text(f"SET LOCAL statement_timeout = '{REQUEST_STATEMENT_TIMEOUT}'"))
     done = _short_step(session, user_id, dt.datetime.now(dt.UTC))
     session.commit()
+    if done:
+        bind = session.get_bind()
+        if isinstance(bind, Engine):
+            refresh_erasure_gauges(bind)
     return done
 
 

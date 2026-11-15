@@ -541,6 +541,7 @@ def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None,
 
 @router.post(
     "/chat/stream",
+    tags=["rag"],
     dependencies=[
         Depends(require_permission("user:base", route=("POST", "/chat/stream"), matrix=False)),
         Depends(rate_limit_chat),
@@ -586,6 +587,7 @@ def chat_stream(
 @router.get(
     "/conversations",
     response_model=list[ConversationOut],
+    tags=["rag"],
     dependencies=[
         Depends(require_permission("user:base", route=("GET", "/conversations"), matrix=False)),
         Depends(rate_limit_account("conversations_list")),
@@ -632,6 +634,7 @@ def list_conversations(session: SessionDep, user: CurrentUserDep) -> list[Conver
 @router.get(
     "/conversations/{conversation_id}",
     response_model=ConversationDetailOut,
+    tags=["rag"],
     dependencies=[
         Depends(
             require_permission(
@@ -680,6 +683,7 @@ def get_conversation(
 @router.patch(
     "/conversations/{conversation_id}",
     response_model=MessageResponse,
+    tags=["rag"],
     dependencies=[
         Depends(require_csrf),
         Depends(
@@ -707,6 +711,7 @@ def rename_conversation(
 @router.delete(
     "/conversations/{conversation_id}",
     response_model=MessageResponse,
+    tags=["rag"],
     dependencies=[
         Depends(require_csrf),
         Depends(

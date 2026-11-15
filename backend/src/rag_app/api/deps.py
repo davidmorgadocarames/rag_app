@@ -122,6 +122,7 @@ def rate_limit_chat(
     user_id = getattr(request.state, "user_id", None)
     key = f"chat:{user_id}:{_client_ip(request)}" if user_id else f"chat:{_client_ip(request)}"
     if not limiter.allow(key, cost=cost):
+        metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="chat").inc()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
@@ -143,6 +144,7 @@ def rate_limit_account(action: str) -> Callable[..., None]:
         user_id = getattr(request.state, "user_id", None)
         key = f"{action}:{user_id}:{_client_ip(request)}"
         if not limiter.allow(key, cost=1.0):
+            metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="account").inc()
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
     RATE_LIMIT_DEPENDENCIES.add(_dependency)
@@ -178,6 +180,7 @@ def rate_limit_csp_report(
     the real client IP (T12.1.6) alone, so one noisy/hostile reporter cannot drown out
     everyone else's genuine reports either."""
     if not limiter.allow(f"csp-report:{_client_ip(request)}", cost=1.0):
+        metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="csp_report").inc()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
@@ -199,6 +202,7 @@ async def rate_limit_login(
     except Exception:  # noqa: BLE001 - not JSON / no body: the endpoint's own 422 covers it
         pass
     if not limiter.allow(f"login:{email}:{_client_ip(request)}", cost=1.0):
+        metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="login").inc()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
@@ -224,6 +228,7 @@ def rate_limit_email(action: str) -> Callable[..., Coroutine[Any, Any, None]]:
         except Exception:  # noqa: BLE001 - not JSON / no body: the endpoint's own 422 covers it
             pass
         if not limiter.allow(action, _client_ip(request), email):
+            metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="email").inc()
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
     RATE_LIMIT_DEPENDENCIES.add(_dependency)

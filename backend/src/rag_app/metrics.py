@@ -68,6 +68,69 @@ EMAIL_FAILED_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+# T13.0.6 (DEC-028 A5, D-ER): the security panel, banner alerts and the registry's "≥ 1
+# metric per feature" DoD rule need counters/gauges that did not exist before Phase 13 — only
+# the five metrics above did. Every label below is a small, fixed, developer-chosen
+# vocabulary -- never a user id, e-mail address or IP (log hygiene, same reasoning as
+# CLIENT_IP_SIGNATURE_TOTAL's ``result`` label):
+#   route_group  chat / login / email / csp_report / account / mfa (RATE_LIMIT_HITS_TOTAL)
+#   reason       disposable_email / signup_velocity (SIGNUP_BLOCKED_TOTAL)
+#   result       success / failure (MFA_STEP_UP_TOTAL)
+RATE_LIMIT_HITS_TOTAL = Counter(
+    "secrag_rate_limit_hits_total",
+    "Requests rejected (429) by a token-bucket rate limiter, by route group.",
+    ["route_group"],
+    registry=REGISTRY,
+)
+
+LOCKOUT_HITS_TOTAL = Counter(
+    "secrag_lockout_hits_total",
+    "Login attempts rejected (429) because the account is currently locked out (T12.4.2).",
+    registry=REGISTRY,
+)
+
+SIGNUP_BLOCKED_TOTAL = Counter(
+    "secrag_signup_blocked_total",
+    "Registrations rejected by the signup risk check (rag_app.risk), by reason.",
+    ["reason"],
+    registry=REGISTRY,
+)
+
+CSP_REPORTS_TOTAL = Counter(
+    "secrag_csp_reports_total",
+    "CSP violation reports received at /csp-report (one per logged directive/origin entry).",
+    registry=REGISTRY,
+)
+
+MFA_STEP_UP_TOTAL = Counter(
+    "secrag_mfa_step_up_total",
+    "MFA step-up attempts (/account/mfa/step-up), by result.",
+    ["result"],
+    registry=REGISTRY,
+)
+
+# D-ER (asynchronous erasure): published by rag_app.erasure.refresh_erasure_gauges, called
+# right after a request commits and by the purger's own bookkeeping — see that function's
+# docstring for the known cross-process visibility limitation (the purger Job is a separate
+# process on Azure; ADR phase 13 "registry" section).
+ERASURE_PENDING = Gauge(
+    "secrag_erasure_pending",
+    "Open erasure tombstones (pending/running/failed) as of the last refresh (D-ER).",
+    registry=REGISTRY,
+)
+
+ERASURE_OLDEST_AGE_SECONDS = Gauge(
+    "secrag_erasure_oldest_age_seconds",
+    "Age in seconds of the oldest open erasure tombstone, 0 when none is open (D-ER).",
+    registry=REGISTRY,
+)
+
+ERASURE_FAILURES_TOTAL = Counter(
+    "secrag_erasure_failures_total",
+    "Erasure tombstones the purger marked 'failed' (D-ER).",
+    registry=REGISTRY,
+)
+
 _lock = threading.Lock()
 _server: WSGIServer | None = None
 _server_port: int | None = None

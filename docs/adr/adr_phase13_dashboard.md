@@ -1,9 +1,9 @@
 # ADR phase 13 — Admin dashboard + CD per-image build
 
-- **Status:** **13-0 (CD per-image build) code-complete** on `phase-13-dashboard`, not yet
-  promoted. This ADR records decisions as each block of Phase 13 lands; it will gain further
-  sections (feature registry, admin API, dashboard UI, defence lab, live updates) as blocks
-  13-A…13-P complete.
+- **Status:** **13-0 (CD per-image build) and 13-A (feature registry + missing metrics)
+  code-complete** on `phase-13-dashboard`, not yet promoted. This ADR records decisions as
+  each block of Phase 13 lands; it will gain further sections (admin API, dashboard UI,
+  defence lab, live updates) as blocks 13-B…13-P complete.
 - **Related:** the private Phase 13 planning record (P13-D1…D6),
   [ADR phase 11](adr_phase11_stability.md) (the CD pipeline this phase extends — plan,
   gate-status, images, migrate, deploy jobs; the digest-pinning and no-rollback invariants),
@@ -103,3 +103,76 @@ promotion in between would otherwise keep paying the Ollama cold-start cost.
 backend-only change rebuilds backend+jobs and runs migrations, but leaves ollama/frontend (and
 the purge/backup Jobs) untouched; a rollback block only needs to list the digests of the apps
 that actually moved.
+
+## Feature registry (13-A, T13.0.1–6)
+
+### P13-D3 — Typed Python registry (`rag_app.features`)
+
+One `FeatureEntry` dataclass per shipped feature: `id`, `name`, `phase`, `status` (`enabled`
+/ `disabled` / `retained-not-adopted` / `expected-fail`), an optional **health probe**
+(`≤ 2 s`, enforced by `run_health_probe`'s hard deadline — a thread-pool future with
+`.result(timeout=2.0)`, never a probe that can block the caller past it), the Prometheus
+metric names it claims, THREAT_MODEL catalogue IDs (empty until 13-D's defence lab),
+quality-probe ids, a docs/ADR link, `dev_only`/`azure_only` flags. 37 entries cover every
+shipped feature as of 13-A (Stack, RAG, Quality, Identity, Abuse, Privacy, Browser security,
+one Azure-only entry, and the `/admin` placeholder) — read from the real code, not invented;
+`admin-api` only covers `/admin/ping` today (12b's placeholder) since 13.1's real admin
+routes are a later block.
+
+**Two probe kinds, two budgets.** A health probe answers in well under 2 s EVEN WITH NO LIVE
+STACK AT ALL (the normal case for the fast gate and for CI): Postgres/migrations probes use
+a short `connect_timeout` and report `down` gracefully on any failure; embeddings/reranker/
+LLM-provider probes are **configuration-only** checks (never a real embed/rerank/generation
+call — those cost real seconds of model load/inference, or real Azure OpenAI tokens, which
+the task explicitly rules out for a health probe). A quality probe (today: one,
+`quality_probe_misspelling`) measures actual product behaviour and needs a live DB/Ollama;
+with none reachable it reports `skipped`, never a failure — the `registry` gate step only
+requires it to resolve ("answer"), not to succeed, whenever the stack genuinely isn't there.
+
+**The misspelling probe (`quality-misspelling-probe`, `status="expected-fail"`)**
+demonstrates the Phase 14 gap directly rather than merely asserting it: it misspells one word
+of a real golden-set question and runs it through `rag_app.retrieval.hybrid_search` — the
+SAME path production uses — checking whether the expected document is still retrieved. With
+no live DB (the fast gate's normal case) it reports `skipped`; whenever `--full`/`--only
+registry,...` has a reachable gate DB, the `registry` step requires it to report `failed`
+(not `passed`) — a `passed` result there is itself a FAIL, forcing a registry update the day
+Phase 14 actually fixes this, rather than letting the registry silently drift stale.
+
+### `registry` gate step (T13.0.5)
+
+A consistent `tags=` on every FastAPI route (`stack` / `rag` / `identity` / `admin` /
+`browser-security` / `privacy`) lets `check_registry(app, prometheus_registry)` cross-check
+the REAL running app and the REAL Prometheus registry against the REGISTRY: every route tag
+must be claimed by some entry's `router_tags`; every declared metric name must exist in the
+Prometheus registry (base name, or `_total` for a counter — `prometheus_client`'s own
+`collect()` reports a counter's FAMILY name without the suffix, while every entry here names
+the real public `/metrics` line); every module an entry names must import; an `expected-fail`
+entry must name a registered quality probe. `rag_app.devtools.registry_check` (the
+`registry` gate step, fast tier — cheap even with no stack) runs this plus every health probe
+plus the misspelling probe. One FastAPI implementation detail this module had to account
+for: a newer FastAPI wraps an `include_router()`'d router lazily as a single
+`_IncludedRouter` object in `app.router.routes` instead of inlining its routes there — its
+real routes live on `.original_router.routes`; `rag_app.features.iter_routes` flattens this
+for both `route_probe` and `check_registry`.
+
+### Missing metrics (T13.0.6, DEC-028 A5, D-ER)
+
+Only five Prometheus metrics existed before this block. Added, every label a small bounded
+vocabulary (never a user id, e-mail or IP — the same reasoning `CLIENT_IP_SIGNATURE_TOTAL`
+already established): `secrag_rate_limit_hits_total{route_group}` (chat / login / email /
+csp_report / account / mfa — every `rag_app.api.deps`/`rag_app.api.admin` rate-limit
+dependency's own 429 branch); `secrag_lockout_hits_total` (a login blocked by an active
+lockout); `secrag_signup_blocked_total{reason}` (disposable_email / signup_velocity);
+`secrag_csp_reports_total` (one per logged CSP violation entry); `secrag_mfa_step_up_total
+{result}` (success / failure); `secrag_erasure_pending` / `secrag_erasure_oldest_age_seconds`
+/ `secrag_erasure_failures_total` (D-ER).
+
+**Known limitation of the three erasure metrics (for 13-B/13-C):** Prometheus state is
+per-process. `rag_app.erasure.refresh_erasure_gauges` is called right after
+`request_erasure` commits (in the API process — scraped correctly) and from
+`Purger._count_open`/`Purger._mark` (the purger's OWN process — a separate Container Apps
+Job on Azure, a separate compose service locally — never scraped from the API's `/metrics`
+port). A continuously fresh value with no triggering API-process event (e.g. a tombstone
+that has simply been open for a day, with nothing else happening meanwhile) needs either a
+periodic in-process refresh or a scrape-time custom collector; the dashboard's own polling
+tick (T13.4.1/T13.4.2) is the natural place to add it once that mechanism exists.

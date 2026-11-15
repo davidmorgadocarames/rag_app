@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import delete, update
 from sqlalchemy.orm import Session
 
+from rag_app import metrics
 from rag_app import mfa as mfa_service
 from rag_app import sessions as session_service
 from rag_app.api.auth import CurrentUserDep, set_csrf_cookie, set_session_cookie
@@ -50,6 +51,7 @@ def _rate_limit_mfa(
     chat/login limits (T12.3.5). Keyed by user id only here -- the real-IP dimension joins
     once 12b-B's lockout work (T12.4.2) lands alongside this."""
     if not limiter.allow(f"mfa:{user.id}", cost=1.0):
+        metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="mfa").inc()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
@@ -86,6 +88,7 @@ def claim_recovery_code(session: Session, user_id: uuid.UUID, code: str) -> bool
 
 @router.get(
     "/admin/ping",
+    tags=["admin"],
     dependencies=[
         Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/ping"))),
         Depends(rate_limit_account("admin_ping")),
@@ -101,6 +104,7 @@ def admin_ping() -> MessageResponse:
 @router.post(
     "/account/mfa/enroll",
     response_model=MfaEnrollResponse,
+    tags=["identity"],
     dependencies=[
         Depends(require_csrf),
         Depends(
@@ -134,6 +138,7 @@ def mfa_enroll(user: CurrentUserDep, session: SessionDep) -> MfaEnrollResponse:
 @router.post(
     "/account/mfa/confirm",
     response_model=MfaConfirmResponse,
+    tags=["identity"],
     dependencies=[
         Depends(require_csrf),
         Depends(
@@ -164,6 +169,7 @@ def mfa_confirm(
 @router.post(
     "/account/mfa/step-up",
     response_model=MessageResponse,
+    tags=["identity"],
     dependencies=[
         Depends(require_csrf),
         Depends(
@@ -199,6 +205,7 @@ def mfa_step_up(
 
     if not verified:
         session.commit()  # persist the (non-)claim attempt either way
+        metrics.MFA_STEP_UP_TOTAL.labels(result="failure").inc()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid code")
 
     new_raw = session_service.rotate(session, cookie_raw)
@@ -209,4 +216,5 @@ def mfa_step_up(
     session.commit()
     set_session_cookie(response, new_raw)
     set_csrf_cookie(response, new_raw)
+    metrics.MFA_STEP_UP_TOTAL.labels(result="success").inc()
     return MessageResponse(detail="MFA verified.")

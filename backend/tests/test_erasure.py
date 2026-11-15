@@ -272,6 +272,35 @@ def test_the_request_path_never_waits_long_for_a_lock(db_engine: Engine, master_
 
 
 @pytest.mark.db
+def test_request_erasure_refreshes_the_pending_and_oldest_age_gauges(
+    db_engine: Engine, master_key: str
+) -> None:
+    """T13.0.6 (D-ER): a successful ``request_erasure`` call publishes the two gauges in
+    THIS process right away (``rag_app.erasure.refresh_erasure_gauges``), from the same
+    ``deletion_requests`` state the next `--full`-time scrape would also compute."""
+    from rag_app import metrics
+
+    user_id, _ = _make_user(db_engine, conversations=0, token=False)
+    with db_engine.begin() as conn:  # a clean slate: no other open tombstone in this run
+        conn.execute(text("DELETE FROM deletion_requests"))
+    with Session(db_engine) as session:
+        assert erasure.request_erasure(session, user_id) is True
+    assert metrics.ERASURE_PENDING._value.get() == 1
+    assert metrics.ERASURE_OLDEST_AGE_SECONDS._value.get() >= 0.0
+
+
+def test_refresh_erasure_gauges_never_raises_when_the_database_is_unreachable() -> None:
+    """Best-effort (T13.0.6): a transient failure while refreshing must never turn an
+    otherwise-successful erasure request into an error."""
+    unreachable = create_engine(
+        "postgresql+psycopg://nobody:nobody@127.0.0.1:1/nope",
+        connect_args={"connect_timeout": 1},
+    )
+    erasure.refresh_erasure_gauges(unreachable)  # must not raise
+    unreachable.dispose()
+
+
+@pytest.mark.db
 def test_a_lock_timeout_on_delete_account_is_a_retryable_503(
     db_engine: Engine, master_key: str
 ) -> None:
@@ -567,6 +596,7 @@ def test_locked_rows_back_off_then_fail_and_retry_later(
 def test_the_purger_never_removes_an_account_that_is_not_marked_deleted(
     db_engine: Engine, purger_engine: Engine, master_key: str
 ) -> None:
+    from rag_app import metrics
     from rag_app.db.models import DeletionRequest
     from rag_app.purger import Purger
 
@@ -576,12 +606,16 @@ def test_the_purger_never_removes_an_account_that_is_not_marked_deleted(
         session.add(tombstone)
         session.commit()
         request_id = tombstone.id
+    before = metrics.ERASURE_FAILURES_TOTAL._value.get()
     try:
         result = Purger(purger_engine, sleep=_no_sleep).run(only=request_id)
         assert result.failed == 1
         state = _counts(db_engine, user_id)
         assert state["users"] == 1 and state["keys"] == 1 and state["messages"] == 2
         assert state["tombstone"] == "failed"
+        # T13.0.6 (D-ER): every "failed" mark increments the counter, this call site included
+        # (``Purger._mark``).
+        assert metrics.ERASURE_FAILURES_TOTAL._value.get() == before + 1
     finally:
         with db_engine.begin() as conn:  # the shared harness DB: leave no open tombstone
             conn.execute(text("DELETE FROM deletion_requests WHERE id = :i"), {"i": request_id})

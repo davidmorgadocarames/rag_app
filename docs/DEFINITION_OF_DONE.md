@@ -194,7 +194,7 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `pytest` | - | 300 s | `migrations-roundtrip` | gate DB | 180 s |
 | `private-names` | - | 30 s | `backup-drill` | gate DB | 300 s |
 | `threat-catalogue` | - | 30 s | `erasure-scale` | gate DB | 600 s |
-| | | | `security-suite` | gate DB | 180 s |
+| `registry` | - | 60 s | `security-suite` | gate DB | 180 s |
 | | | | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 | | | | `e2e` | gate DB + seed + Ollama | 600 s |

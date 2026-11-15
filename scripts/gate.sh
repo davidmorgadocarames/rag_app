@@ -88,6 +88,7 @@ schema-check     - 30
 adr-links        - 30
 private-names    - 30
 threat-catalogue - 30
+registry         - 60
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
@@ -255,6 +256,12 @@ step_private-names() { need_venv && "$PY" -m rag_app.devtools.private_names --ro
 # T12.0.5: every THREAT_MODEL.md catalogue entry has a phase + test ID; mitigated entries
 # point at a test that exists.
 step_threat-catalogue() { need_venv && "$PY" -m rag_app.devtools.threat_catalogue --root "$REPO_ROOT"; }
+
+# T13.0.5: router tags/metrics/modules match rag_app.features.REGISTRY; every health probe
+# answers <= 2s; the misspelling quality probe (expected-fail) still fails whenever a live
+# DB happens to be reachable (the gate's own DATABASE_URL -- a stopped port in --fast, the
+# real gate DB once --full/--only has brought the stack up).
+step_registry() { need_venv && "$PY" -m rag_app.devtools.registry_check --root "$REPO_ROOT"; }
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 

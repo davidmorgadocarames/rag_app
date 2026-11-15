@@ -13,6 +13,7 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from rag_app import metrics
 from rag_app.api.app import create_app
 from rag_app.api.deps import get_rate_limiter
 from rag_app.csp_report import _sanitize_directive, blocked_origin, parse_report_entries
@@ -261,3 +262,31 @@ def test_rate_limited_per_ip() -> None:
     second = client.post("/csp-report", content=body, headers=headers)
     assert first.status_code == 204
     assert second.status_code == 429
+
+
+def test_rate_limited_report_increments_rate_limit_hits_total_csp_report_group() -> None:
+    """T13.0.6: the SAME 429 as ``test_rate_limited_per_ip`` also counts in the registry's
+    rate-limit metric, labelled ``route_group="csp_report"`` — never an IP or a path."""
+    app = create_app()
+    shared_limiter = RateLimiter(capacity=1, refill_per_second=0.0)
+    app.dependency_overrides[get_rate_limiter] = lambda: shared_limiter
+    client = TestClient(app)
+    body = b'{"csp-report": {"violated-directive": "img-src", "blocked-uri": ""}}'
+    headers = {"Content-Type": "application/csp-report"}
+    before = metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="csp_report")._value.get()
+    client.post("/csp-report", content=body, headers=headers)
+    second = client.post("/csp-report", content=body, headers=headers)
+    assert second.status_code == 429
+    after = metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="csp_report")._value.get()
+    assert after == before + 1
+
+
+def test_an_accepted_report_increments_csp_reports_total() -> None:
+    client = _client()
+    before = metrics.CSP_REPORTS_TOTAL._value.get()
+    body = b'{"csp-report": {"violated-directive": "img-src", "blocked-uri": ""}}'
+    response = client.post(
+        "/csp-report", content=body, headers={"Content-Type": "application/csp-report"}
+    )
+    assert response.status_code == 204
+    assert metrics.CSP_REPORTS_TOTAL._value.get() == before + 1

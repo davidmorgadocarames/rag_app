@@ -12,7 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
-from rag_app import lockout
+from rag_app import lockout, metrics
 from rag_app import sessions as session_service
 from rag_app.api.deps import (
     SessionDep,
@@ -49,7 +49,7 @@ from rag_app.erasure import (
     request_erasure,
 )
 from rag_app.password_policy import validate_password
-from rag_app.risk import is_high_risk, signup_risk_score
+from rag_app.risk import is_disposable, is_high_risk, signup_risk_score
 from rag_app.security import (
     dummy_password_hash,
     generate_verification_token,
@@ -183,6 +183,7 @@ CurrentUserDep = Annotated[User, Depends(get_current_user)]
     "/auth/register",
     response_model=MessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    tags=["identity"],
     dependencies=[Depends(require_origin), Depends(rate_limit_email("register"))],
 )
 def register(
@@ -209,6 +210,11 @@ def register(
     from_a_new_one``)."""
     ip = http.client.host if http.client else "unknown"
     if is_high_risk(signup_risk_score(request.email, tracker.count(ip))):
+        # T13.0.6: "reason" is a 2-value bounded vocabulary, never the address/IP itself
+        # (log hygiene) -- disposable-domain is checked first since it alone is enough to
+        # block regardless of velocity.
+        reason = "disposable_email" if is_disposable(request.email) else "signup_velocity"
+        metrics.SIGNUP_BLOCKED_TOTAL.labels(reason=reason).inc()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "signup blocked by risk check")
 
     # Paid on EVERY call, whatever the outcome turns out to be below -- same reasoning as
@@ -280,7 +286,12 @@ def _consume_email_verification_token(
     ).scalar()
 
 
-@router.post("/auth/verify", response_model=MessageResponse, dependencies=[Depends(require_origin)])
+@router.post(
+    "/auth/verify",
+    response_model=MessageResponse,
+    tags=["identity"],
+    dependencies=[Depends(require_origin)],
+)
 def verify_email(request: VerifyEmailRequest, session: SessionDep) -> MessageResponse:
     """T12.4.5: POST, not a GET query param -- the frontend's `/verify?token=...` page (a
     plain GET, safe to pre-fetch) only renders; this is the request its own button click
@@ -302,6 +313,7 @@ def verify_email(request: VerifyEmailRequest, session: SessionDep) -> MessageRes
 @router.post(
     "/auth/resend-verification",
     response_model=ResendVerificationResponse,
+    tags=["identity"],
     dependencies=[Depends(require_origin), Depends(rate_limit_email("resend"))],
 )
 def resend_verification(
@@ -356,6 +368,7 @@ def _consume_password_reset_token(
 @router.post(
     "/auth/forgot-password",
     response_model=MessageResponse,
+    tags=["identity"],
     dependencies=[Depends(require_origin), Depends(rate_limit_email("forgot"))],
 )
 def forgot_password(request: ForgotPasswordRequest, session: SessionDep) -> MessageResponse:
@@ -389,7 +402,12 @@ def forgot_password(request: ForgotPasswordRequest, session: SessionDep) -> Mess
     return MessageResponse(detail=GENERIC_FORGOT_PASSWORD_MESSAGE)
 
 
-@router.post("/auth/reset", response_model=MessageResponse, dependencies=[Depends(require_origin)])
+@router.post(
+    "/auth/reset",
+    response_model=MessageResponse,
+    tags=["identity"],
+    dependencies=[Depends(require_origin)],
+)
 def reset_password(request: ResetPasswordRequest, session: SessionDep) -> MessageResponse:
     """T12.4.6: POST with the token in the body (same discipline as ``/auth/verify``) --
     atomic consume (X10, ``_consume_password_reset_token``). Success sets the new password,
@@ -441,6 +459,7 @@ def reset_password(request: ResetPasswordRequest, session: SessionDep) -> Messag
 @router.post(
     "/auth/login",
     response_model=MessageResponse,
+    tags=["identity"],
     dependencies=[Depends(require_origin), Depends(rate_limit_login)],
 )
 def login(request: LoginRequest, session: SessionDep, response: Response) -> MessageResponse:
@@ -456,6 +475,7 @@ def login(request: LoginRequest, session: SessionDep, response: Response) -> Mes
     lock = lockout.locked_until(session, settings.lockout_hmac_secret, request.email)
     if lock is not None and lock > dt.datetime.now(dt.UTC):
         retry_after = max(1, int((lock - dt.datetime.now(dt.UTC)).total_seconds()))
+        metrics.LOCKOUT_HITS_TOTAL.inc()
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "too many failed attempts; account temporarily locked",
@@ -487,7 +507,12 @@ def login(request: LoginRequest, session: SessionDep, response: Response) -> Mes
     return MessageResponse(detail="Logged in.")
 
 
-@router.post("/auth/logout", response_model=MessageResponse, dependencies=[Depends(require_csrf)])
+@router.post(
+    "/auth/logout",
+    response_model=MessageResponse,
+    tags=["identity"],
+    dependencies=[Depends(require_csrf)],
+)
 def logout(http: Request, session: SessionDep, response: Response) -> MessageResponse:
     """T12.1.3/T12.1.4: deletes the session row named by the cookie (a no-op if there is none,
     or if it does not name a live session — logout is idempotent) and always clears both
@@ -506,6 +531,7 @@ def logout(http: Request, session: SessionDep, response: Response) -> MessageRes
 @router.get(
     "/auth/me",
     response_model=UserOut,
+    tags=["identity"],
     dependencies=[Depends(rate_limit_account("auth_me"))],
 )
 def me(user: CurrentUserDep) -> UserOut:
@@ -516,6 +542,7 @@ def me(user: CurrentUserDep) -> UserOut:
     "/account",
     response_model=MessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    tags=["privacy"],
     dependencies=[Depends(require_csrf), Depends(rate_limit_account("delete_account"))],
 )
 def delete_account(user: CurrentUserDep, session: SessionDep) -> MessageResponse:

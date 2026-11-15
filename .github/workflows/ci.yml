@@ -343,7 +343,7 @@ jobs:
         run: |
           shellcheck --version | grep -x "version: 0.11.0"
           node --version && npm --version
-      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue
+      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue,registry
         env:
           GATE_VENV: ${{ github.workspace }}/backend/.venv
-        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue
+        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue,registry

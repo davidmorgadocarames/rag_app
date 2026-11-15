@@ -121,7 +121,11 @@ def create_app() -> FastAPI:
     app.include_router(csp_report.router)
     app.include_router(admin.router)
 
-    @app.get("/health", response_model=HealthResponse)
+    # T13.0.5: a consistent `tags=` on every route (not just the ones with an explicit
+    # security dependency) — the `registry` gate step cross-checks every tag that shows up
+    # anywhere in the app against `rag_app.features.REGISTRY`, so a brand-new, untagged (or
+    # mistagged) router fails the gate instead of going unnoticed.
+    @app.get("/health", response_model=HealthResponse, tags=["stack"])
     def health() -> HealthResponse:
         return HealthResponse(status="ok")
 
@@ -130,6 +134,7 @@ def create_app() -> FastAPI:
     @app.post(
         "/chat",
         response_model=ChatResponse,
+        tags=["rag"],
         dependencies=[
             Depends(require_permission("user:base", route=("POST", "/chat"), matrix=False)),
             Depends(rate_limit_chat),
