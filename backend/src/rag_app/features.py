@@ -699,6 +699,12 @@ def check_registry(
     1. every FastAPI route's tag(s) are claimed by at least one registry entry's
        ``router_tags`` -- a brand-new, unclaimed tag (someone added a router and forgot the
        registry) fails here;
+    1b. every ``APIRoute`` declares AT LEAST ONE tag at all (DA-13-A-2) -- without this, a
+        route added with no ``tags=`` contributes nothing to ``used_tags`` and check 1 above
+        passes it vacuously, so a forgotten registry entry would never be caught. Framework
+        routes FastAPI adds itself (``/docs``, ``/redoc``, ``/openapi.json``, the OAuth2
+        redirect) are plain Starlette ``Route``s, not ``APIRoute``s, and have no ``tags``
+        concept at all -- only ``APIRoute``s are checked here;
     2. every metric name an entry declares actually exists in the given Prometheus registry;
     3. every module an entry names is importable.
 
@@ -706,11 +712,22 @@ def check_registry(
     own tests); a test passes a throwaway tuple to exercise one check in isolation without
     depending on the real registry's current contents.
     """
+    from fastapi.routing import APIRoute
+
     problems: list[str] = []
-    used_tags = {tag for route in iter_routes(app) for tag in (getattr(route, "tags", None) or [])}
+    flat_routes = iter_routes(app)
+    used_tags = {tag for route in flat_routes for tag in (getattr(route, "tags", None) or [])}
     claimed_tags = {tag for entry in entries for tag in entry.router_tags}
     for tag in sorted(used_tags - claimed_tags):
         problems.append(f"route tag '{tag}' has no registry entry claiming it (router_tags)")
+
+    for route in flat_routes:
+        if isinstance(route, APIRoute) and not route.tags:
+            methods = ",".join(sorted((route.methods or set()) - {"HEAD", "OPTIONS"}))
+            problems.append(
+                f"route {methods} {route.path} has no tags -- add tags=[...] so a registry"
+                " entry can claim it"
+            )
 
     known_metrics = _known_metric_names(prometheus_registry)
     for entry in entries:

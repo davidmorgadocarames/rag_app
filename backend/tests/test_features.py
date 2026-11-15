@@ -169,6 +169,27 @@ def test_a_new_router_with_an_unclaimed_tag_fails_the_check() -> None:
     assert any("brand-new-unclaimed-tag" in problem for problem in problems)
 
 
+def test_a_route_with_no_tags_at_all_fails_the_check() -> None:
+    """DA-13-A-2: before this test, a route added with NO ``tags=`` at all contributed
+    nothing to ``used_tags``, so check 1 (unclaimed tag) passed vacuously for it -- a
+    forgotten registry entry would never be caught. This proves the independent, dedicated
+    check that every ``APIRoute`` declares at least one tag, regardless of whether anything
+    claims it."""
+    app = FastAPI()
+    router = APIRouter()
+
+    @router.get("/totally-new-thing-with-no-tags")
+    def _new_route() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    app.include_router(router)
+    problems = check_registry(app, metrics.REGISTRY)
+    assert any(
+        "/totally-new-thing-with-no-tags" in problem and "no tags" in problem
+        for problem in problems
+    ), problems
+
+
 def test_a_declared_metric_that_does_not_exist_fails_the_check() -> None:
     bogus_entry = FeatureEntry(
         id="test-only-bogus-entry",
