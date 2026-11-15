@@ -133,19 +133,23 @@ def test_every_route_declares_auth_and_permission_and_a_rate_limit_or_is_public(
     # routes to 1 (see ``_non_public_routes``'s docstring) -- a non-empty list is not enough
     # to prove discovery is intact. Two independent floors instead, both measured LIVE
     # against today's real app rather than hard-coded, so this can never again pass while
-    # seeing only a handful of routes: (1) the raw flattened route count
-    # ``rag_app.features.iter_routes`` returns (includes framework-added routes like
-    # ``/docs`` that are never APIRoute/checkable, so this alone would not have caught the
-    # original bug, but IS the same list ``check_registry``/``route_probe`` rely on, so a
-    # regression there shows up here too); (2) every permission-declared route
+    # seeing only a handful of routes: (1) the number of real ``APIRoute``s
+    # ``rag_app.features.iter_routes`` finds -- counted as ``APIRoute`` only (NOT the raw
+    # flattened list, which also includes FastAPI's own framework routes, ``/docs``/
+    # ``/redoc``/``/openapi.json``/the OAuth2 redirect, registered only with ``ENV=dev``,
+    # T12.2.4 -- a hard-coded floor over the raw list is ENV-dependent and would be flaky in
+    # CI, which runs with the ``ENV=prod`` default); this alone would not have caught the
+    # original bug (an `isinstance` check still ran, just over the wrong, un-flattened list),
+    # but IS the same list ``check_registry``/``route_probe`` rely on, so a flattening
+    # regression there shows up here too; (2) every permission-declared route
     # (``DECLARED_PERMISSION_ROUTES``, populated independently by route decorators, not by
     # walking ``app.routes`` at all) must actually be among the routes the walker checks --
     # this is the assertion that would have caught DA-13-A-1 (it only held 1 of 12 entries
     # under the old, un-flattened walker).
-    all_flattened = iter_routes(app)
-    assert len(all_flattened) >= 25, (
-        "rag_app.features.iter_routes(app) returned fewer routes than expected -- route"
-        f" discovery may have broken (got {len(all_flattened)})"
+    api_routes = [route for route in iter_routes(app) if isinstance(route, APIRoute)]
+    assert len(api_routes) >= 21, (
+        "rag_app.features.iter_routes(app) returned fewer APIRoutes than expected -- route"
+        f" discovery may have broken (got {len(api_routes)})"
     )
     checked_keys = {(method, path) for method, path, _route in checked}
     missing = set(DECLARED_PERMISSION_ROUTES) - checked_keys
