@@ -302,6 +302,14 @@ class Settings(JobSettings):
     # either way — see the runbook / ADR phase 11 decision 8).
     metrics_bind_addr: str = "0.0.0.0"  # noqa: S104 - see the comment above
 
+    # --- Admin dashboard metrics backend (T13.1.3, R6-4) ---
+    # Empty by default: Azure runs no managed Prometheus at all (R6-4) -- the admin API's
+    # local `MetricsBackend` (`rag_app.metrics_backend`) degrades to "unknown" (never raises,
+    # never blocks) whenever this is unset, exactly like every other health probe in
+    # `rag_app.features`. Locally, docker-compose.yml's `prometheus` service sets this to
+    # `http://prometheus:9090` (same compose network as the backend container).
+    prometheus_url: str = ""
+
     @model_validator(mode="after")
     def _default_require_email_verification_with_prod(self) -> Settings:
         """T12.4.4: ``require_email_verification`` defaults to ``True`` with ``ENV=prod`` and

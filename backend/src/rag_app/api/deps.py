@@ -15,6 +15,8 @@ from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
 from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.generation import Answer, answer_question
+from rag_app.metrics_backend import MetricsBackend
+from rag_app.metrics_backend import get_metrics_backend as _get_metrics_backend
 from rag_app.ratelimit import RateLimiter
 from rag_app.reranking import get_shared_reranker
 from rag_app.risk import SignupTracker
@@ -67,6 +69,16 @@ def get_rate_limiter() -> RateLimiter:
             settings.rate_limit_capacity, settings.rate_limit_refill_per_second
         )
     return _rate_limiter
+
+
+def get_metrics_backend() -> MetricsBackend:
+    """T13.1.3: a thin re-export through ``rag_app.api.deps`` so tests can override it the
+    SAME way as every other ``get_*`` dependency here (``app.dependency_overrides``), rather
+    than monkeypatching ``rag_app.metrics_backend`` directly."""
+    return _get_metrics_backend()
+
+
+MetricsBackendDep = Annotated[MetricsBackend, Depends(get_metrics_backend)]
 
 
 def get_signup_tracker() -> SignupTracker:

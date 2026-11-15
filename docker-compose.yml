@@ -170,6 +170,10 @@ services:
       # internal port, never published to the host and never the API port. Only the
       # `prometheus` service (same compose network) reads it.
       METRICS_PORT: ${METRICS_PORT:-9100}
+      # T13.1.3: the admin dashboard's local MetricsBackend reads CURRENT values from the
+      # `prometheus` service below (same compose network) -- never exposed through the BFF.
+      # Empty on Azure (R6-4, no managed Prometheus there) -- see config.py's own comment.
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
       # T12.1.11: local SMTP sink (Mailpit, no auth/TLS -- a throwaway local inbox, never
       # Azure, which has no SMTP in 12a). Unset (empty host) keeps the old dev no-op path.
       SMTP_HOST: mailpit
