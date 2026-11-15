@@ -311,6 +311,52 @@ class EmailVerificationToken(Base):
     )
 
 
+class AdminAction(Base):
+    """Audit trail for every mutating ``/admin/*`` call (0008, T13.1.6): one row per admin
+    POST, written in the SAME request. ``target`` is always an OPAQUE identifier (an erasure
+    request id -- never an email or any other raw value a client submitted) -- the same
+    "no PII in the admin API" rule the dashboard itself upholds (T13.1.7).
+
+    ``admin_user_id`` survives the acting admin's own later erasure: ``ON DELETE SET NULL``
+    here is defence in depth, and ``rag_app.erasure.PURGE_STEPS`` carries the primary,
+    batched "pseudonymisation" step (nulls it leaf-first, before the admin's ``users`` row is
+    removed) -- the audit row itself is KEPT, only the link to the (now-gone) admin account
+    is severed; see ``rag_app.erasure.X3_EXEMPTIONS``' module docstring for why some
+    user-linked columns are handled this way instead of a delete."""
+
+    __tablename__ = "admin_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String)
+    target: Mapped[str | None] = mapped_column(String, nullable=True)
+    result: Mapped[str] = mapped_column(String)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class DefenceRun(Base):
+    """One probe result from the defence lab (0008; the lab itself is 13-D -- this table is
+    created now so 13-D needs no further migration). Keyed by a ``docs/security/
+    THREAT_MODEL.md`` probe id; ``evidence`` is operator-written, PII-free by construction
+    (the lab only ever targets its own dedicated, disposable test accounts). No personal
+    data -- never a ``PURGE_STEPS`` entry."""
+
+    __tablename__ = "defence_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    probe_id: Mapped[str] = mapped_column(String, index=True)
+    git_sha: Mapped[str] = mapped_column(String)
+    expected_outcome: Mapped[str] = mapped_column(String)
+    observed_outcome: Mapped[str] = mapped_column(String)
+    passed: Mapped[bool] = mapped_column(Boolean)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class PasswordResetToken(Base):
     """Password reset tokens (0007 "part 3", T12.4.6): hashed, single-use, 30-minute TTL --
     same storage convention as ``EmailVerificationToken`` (only ``token_hash``, SHA-256 via

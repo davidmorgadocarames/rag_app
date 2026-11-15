@@ -1,5 +1,6 @@
-"""Migrations 0005 (T11.2.3), 0006 (T12.1.1) and 0007 "part 1" (T12.3.4), and the master-key
-fingerprint at start-up (T11.2.4), on harness databases (marker ``db``: gate --full / CI)."""
+"""Migrations 0005 (T11.2.3), 0006 (T12.1.1), 0007 "part 1" (T12.3.4) and 0008 (T13.1.6), and
+the master-key fingerprint at start-up (T11.2.4), on harness databases (marker ``db``: gate
+--full / CI)."""
 
 from __future__ import annotations
 
@@ -226,14 +227,16 @@ def test_0006_downgrade_refuses_while_a_non_default_role_exists(fresh_db: URL) -
 
 
 def test_0007_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    """Targets 0007 directly (not "head", now 0008, T13.1.6): isolates 0007's own round trip
+    from 0008's (see the 0008 tests below)."""
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0007_mfa")
     engine = _engine(fresh_db)
     try:
         assert _version(engine) == "0007_mfa"
         command.downgrade(cfg, "-1")
         assert _version(engine) == "0006_sessions_role"
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0007_mfa")
         assert _version(engine) == "0007_mfa"
     finally:
         engine.dispose()
@@ -241,7 +244,7 @@ def test_0007_round_trip_on_an_empty_database(fresh_db: URL) -> None:
 
 def test_0007_downgrade_refuses_while_mfa_data_exists(fresh_db: URL) -> None:
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0007_mfa")
     engine = _engine(fresh_db)
     try:
         user_id = _seed_user(engine)
@@ -276,6 +279,94 @@ def test_0007_grants_follow_the_migration_map(db_engine: Engine) -> None:
         assert not can(p, table, "INSERT"), table
         assert can("secrag_backup", table, "SELECT"), table
         assert not can("secrag_backup", table, "UPDATE"), table
+
+
+# --- 0008 (T13.1.6: admin_actions + defence_runs) -----------------------------------------
+
+
+def test_0008_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        assert _version(engine) == "0008_admin_dashboard"
+        command.downgrade(cfg, "-1")
+        assert _version(engine) == "0007_mfa"
+        command.upgrade(cfg, "head")
+        assert _version(engine) == "0008_admin_dashboard"
+    finally:
+        engine.dispose()
+
+
+def test_0008_downgrade_refuses_while_an_admin_action_exists(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO admin_actions (action, result) VALUES ('erase_user', 'accepted')")
+            )
+        with pytest.raises(RuntimeError, match="refusing to downgrade 0008"):
+            command.downgrade(cfg, "-1")
+        assert _version(engine) == "0008_admin_dashboard"  # nothing was changed
+    finally:
+        engine.dispose()
+
+
+def test_0008_downgrade_refuses_while_a_defence_run_exists(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO defence_runs (probe_id, git_sha, expected_outcome,"
+                    " observed_outcome, passed) VALUES ('X1', 'deadbeef', 'blocked',"
+                    " 'blocked', true)"
+                )
+            )
+        with pytest.raises(RuntimeError, match="refusing to downgrade 0008"):
+            command.downgrade(cfg, "-1")
+        assert _version(engine) == "0008_admin_dashboard"  # nothing was changed
+    finally:
+        engine.dispose()
+
+
+def test_0008_grants_follow_the_migration_map(db_engine: Engine) -> None:
+    def can(role: str, table: str, privilege: str) -> bool:
+        with db_engine.connect() as conn:
+            return bool(
+                conn.execute(
+                    text("SELECT has_table_privilege(:r, :t, :p)"),
+                    {"r": role, "t": f"public.{table}", "p": privilege},
+                ).scalar_one()
+            )
+
+    def can_column(role: str, table: str, column: str, privilege: str) -> bool:
+        with db_engine.connect() as conn:
+            return bool(
+                conn.execute(
+                    text("SELECT has_column_privilege(:r, :t, :c, :p)"),
+                    {"r": role, "t": f"public.{table}", "c": column, "p": privilege},
+                ).scalar_one()
+            )
+
+    p = "secrag_purger"
+    # admin_actions: pseudonymisation is a COLUMN-scoped UPDATE (admin_user_id only, like
+    # 0005's "id" column grants) -- never a table-level UPDATE, and never DELETE at all: the
+    # audit row itself is always kept.
+    assert can(p, "admin_actions", "SELECT")
+    assert can_column(p, "admin_actions", "admin_user_id", "UPDATE")
+    assert not can_column(p, "admin_actions", "action", "UPDATE")
+    assert not can(p, "admin_actions", "DELETE")
+    assert not can(p, "admin_actions", "INSERT")
+    assert can("secrag_backup", "admin_actions", "SELECT")
+    assert not can("secrag_backup", "admin_actions", "UPDATE")
+    # defence_runs: no purge step at all (no personal data) -- purger has no grant on it.
+    assert not can(p, "defence_runs", "SELECT")
+    assert can("secrag_backup", "defence_runs", "SELECT")
 
 
 def test_0006_grants_follow_the_migration_map(db_engine: Engine) -> None:

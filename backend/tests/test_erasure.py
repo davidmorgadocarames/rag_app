@@ -93,10 +93,12 @@ def test_the_registry_is_leaf_first_with_users_last() -> None:
         "sessions",
         "mfa_recovery_codes",
         "user_mfa",
+        "admin_actions",
         "users",
     ]
     for step in erasure.PURGE_STEPS:
         assert "SKIP LOCKED" in step.delete_batch and ":uid" in step.delete_batch
+        assert ":uid" in step.remaining_count
     exempt = {
         ("deletion_requests", "user_id"),
         ("user_keys", "user_id"),
@@ -258,6 +260,28 @@ def test_an_unregistered_user_linked_table_fails_the_scan(db_engine: Engine) -> 
     finally:
         with db_engine.begin() as conn:
             conn.execute(text("DROP TABLE x3_probe"))
+
+
+@pytest.mark.db
+def test_a_foreign_key_to_users_with_a_non_standard_column_name_fails_the_scan(
+    db_engine: Engine,
+) -> None:
+    """DEBT-017 / DA-G1-6 (13-B): the NAME-based scan above only ever catches a column that
+    happens to be called ``user_id``/``admin_id``/``*_user_id``/``*_hmac`` -- a real foreign
+    key to ``users`` with any OTHER column name (e.g. a future ``owner``) sailed straight
+    through it before this fix (``uncovered_user_columns`` would have returned ``[]`` for
+    this exact table). The FK-TARGET scan (``X3_FK_SCAN_SQL``) catches it regardless of the
+    column's name."""
+    with db_engine.begin() as conn:
+        conn.execute(
+            text("CREATE TABLE x3_fk_probe (id int PRIMARY KEY, owner uuid REFERENCES users(id))")
+        )
+    try:
+        with Session(db_engine) as session:
+            assert erasure.uncovered_user_columns(session) == ["x3_fk_probe.owner"]
+    finally:
+        with db_engine.begin() as conn:
+            conn.execute(text("DROP TABLE x3_fk_probe"))
 
 
 # --- T11.2b.2 + T11.2b.3: request path via the API ----------------------------------------
@@ -477,6 +501,7 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "sessions": 0,
         "mfa_recovery_codes": 0,
         "user_mfa": 0,
+        "admin_actions": 0,
         "users": 1,
     }
     assert result.batches >= 8 + 1 + 1 + 1 and result.max_transaction_seconds < 2
@@ -489,6 +514,7 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
         "sessions",
         "mfa_recovery_codes",
         "user_mfa",
+        "admin_actions",
         "users",
     ]
     gone = _counts(db_engine, user_id)

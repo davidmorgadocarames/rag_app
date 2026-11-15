@@ -97,14 +97,18 @@ OPEN_STATUSES = ("pending", "running", "failed")
 
 @dataclass(frozen=True)
 class PurgeStep:
-    """One leaf-first purge step: deletes up to ``:n`` rows of ``table`` owned by ``:uid``
-    with ``FOR UPDATE SKIP LOCKED`` (never waits for a row another transaction holds);
-    ``remaining`` tells whether rows are left (e.g. skipped because locked)."""
+    """One leaf-first purge step: deletes (or, for ``admin_actions``, pseudonymises -- see
+    below) up to ``:n`` rows of ``table`` owned by ``:uid`` with ``FOR UPDATE SKIP LOCKED``
+    (never waits for a row another transaction holds); ``remaining`` tells whether rows are
+    left (e.g. skipped because locked); ``remaining_count`` (T13.1.5, the admin erasure
+    panel's "rows remaining per table") is the same predicate as an exact count instead of a
+    boolean -- read-only, never used by the purger itself, which only needs ``remaining``."""
 
     name: str
     table: str
     delete_batch: str
     remaining: str
+    remaining_count: str
 
 
 PURGE_STEPS: tuple[PurgeStep, ...] = (
@@ -122,6 +126,10 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
             SELECT EXISTS (SELECT 1 FROM messages m
                              JOIN conversations c ON c.id = m.conversation_id
                             WHERE c.user_id = :uid)""",
+        remaining_count="""
+            SELECT count(*) FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.user_id = :uid""",
     ),
     PurgeStep(
         name="conversations",
@@ -136,6 +144,7 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  LIMIT :n FOR UPDATE SKIP LOCKED)
             DELETE FROM conversations WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM conversations WHERE user_id = :uid)",
+        remaining_count="SELECT count(*) FROM conversations WHERE user_id = :uid",
     ),
     PurgeStep(
         name="email_verification_tokens",
@@ -146,6 +155,7 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  LIMIT :n FOR UPDATE SKIP LOCKED)
             DELETE FROM email_verification_tokens WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM email_verification_tokens WHERE user_id = :uid)",
+        remaining_count="SELECT count(*) FROM email_verification_tokens WHERE user_id = :uid",
     ),
     # Password reset tokens (0007 "part 3", T12.4.6): same leaf-table shape as
     # email_verification_tokens above.
@@ -158,6 +168,7 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  LIMIT :n FOR UPDATE SKIP LOCKED)
             DELETE FROM password_reset_tokens WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM password_reset_tokens WHERE user_id = :uid)",
+        remaining_count="SELECT count(*) FROM password_reset_tokens WHERE user_id = :uid",
     ),
     # Sessions (0006, T12.1.1): the request path already deletes every row of the user
     # immediately (revoke-all, below) — this step is the X3 purge-step registration/
@@ -171,6 +182,7 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  LIMIT :n FOR UPDATE SKIP LOCKED)
             DELETE FROM sessions WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM sessions WHERE user_id = :uid)",
+        remaining_count="SELECT count(*) FROM sessions WHERE user_id = :uid",
     ),
     # MFA (0007 "part 1", T12.3.4): recovery codes before the one-row-per-user secret.
     PurgeStep(
@@ -182,6 +194,7 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  LIMIT :n FOR UPDATE SKIP LOCKED)
             DELETE FROM mfa_recovery_codes WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM mfa_recovery_codes WHERE user_id = :uid)",
+        remaining_count="SELECT count(*) FROM mfa_recovery_codes WHERE user_id = :uid",
     ),
     PurgeStep(
         name="user_mfa",
@@ -192,6 +205,23 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  LIMIT :n FOR UPDATE SKIP LOCKED)
             DELETE FROM user_mfa WHERE user_id IN (SELECT user_id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM user_mfa WHERE user_id = :uid)",
+        remaining_count="SELECT count(*) FROM user_mfa WHERE user_id = :uid",
+    ),
+    # admin_actions (0008, T13.1.6): NOT a delete -- the audit row is KEPT, only the link to
+    # the (now erased) acting admin is severed (set NULL), leaf-first like every other step
+    # here, before the admin's own "users" row below. Matches ``AdminAction.admin_user_id``'s
+    # ``ON DELETE SET NULL`` (defence in depth; this batched step is the primary mechanism —
+    # same split as the "sessions" step above vs. the request path's immediate revoke-all).
+    PurgeStep(
+        name="admin_actions",
+        table="admin_actions",
+        delete_batch="""
+            WITH victim AS (
+                SELECT id FROM admin_actions WHERE admin_user_id = :uid
+                 LIMIT :n FOR UPDATE SKIP LOCKED)
+            UPDATE admin_actions SET admin_user_id = NULL WHERE id IN (SELECT id FROM victim)""",
+        remaining="SELECT EXISTS (SELECT 1 FROM admin_actions WHERE admin_user_id = :uid)",
+        remaining_count="SELECT count(*) FROM admin_actions WHERE admin_user_id = :uid",
     ),
     # Lockout rows join here when 12b-B adds its table.
     PurgeStep(
@@ -204,6 +234,7 @@ PURGE_STEPS: tuple[PurgeStep, ...] = (
                  FOR UPDATE SKIP LOCKED)
             DELETE FROM users WHERE id IN (SELECT id FROM victim)""",
         remaining="SELECT EXISTS (SELECT 1 FROM users WHERE id = :uid)",
+        remaining_count="SELECT count(*) FROM users WHERE id = :uid AND deleted_at IS NOT NULL",
     ),
 )
 
@@ -227,14 +258,38 @@ X3_SCAN_SQL = r"""
             OR column_name LIKE '%\_hmac' ESCAPE '\')
      ORDER BY 1, 2"""
 
+# DEBT-017 / DA-G1-6 (13-B): the scan above only ever catches a COLUMN NAME that happens to
+# look user-linked -- a real foreign key to users/conversations/messages with a differently
+# named column (e.g. a future ``owner_id``) sailed straight through it. This second scan
+# reads ``pg_constraint`` directly for every FOREIGN KEY (``contype = 'f'``) whose target
+# (``confrelid``) is one of those three tables, regardless of what the referencing column is
+# called -- ``unnest(conkey)`` also covers a (today unused) multi-column FK. Combined with
+# the name-based scan above in ``uncovered_user_columns``: either detector finding a column
+# is enough to require a purge step or an exemption for it.
+X3_FK_SCAN_SQL = """
+    SELECT con.conrelid::regclass::text AS table_name, att.attname::text AS column_name
+      FROM pg_constraint con
+      JOIN LATERAL unnest(con.conkey) AS k(attnum) ON true
+      JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = k.attnum
+     WHERE con.contype = 'f'
+       AND con.confrelid = ANY (ARRAY['users'::regclass, 'conversations'::regclass,
+                                       'messages'::regclass])
+     ORDER BY 1, 2"""
+
 
 def uncovered_user_columns(session: Session) -> list[str]:
     """``table.column`` of every user-linked column with neither a purge step nor an
-    exemption (X3). Empty = covered."""
+    exemption (X3) -- found by the column-NAME scan, the FK-TARGET scan (DEBT-017/DA-G1-6),
+    or both. Empty = covered."""
     covered = {step.table for step in PURGE_STEPS}
+    hits: set[tuple[str, str]] = set()
+    for table, column in session.execute(text(X3_SCAN_SQL)).all():
+        hits.add((table, column))
+    for table, column in session.execute(text(X3_FK_SCAN_SQL)).all():
+        hits.add((table, column))
     return [
         f"{table}.{column}"
-        for table, column in session.execute(text(X3_SCAN_SQL)).all()
+        for table, column in sorted(hits)
         if table not in covered and (table, column) not in X3_EXEMPTIONS
     ]
 
