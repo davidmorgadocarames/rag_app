@@ -527,6 +527,9 @@ E2E_CLIENT_IP_KEY=""   # set by e2e_start_backend; e2e_start_frontend must reuse
 # leave little headroom in (found for real: a 6th registration in one run tripped it).
 E2E_ADMIN_EMAIL="e2e-admin@example.test"
 E2E_ERASE_TARGET_EMAIL="e2e-erase-target@example.test"
+# DEC-036 (DA-13-C-6): step_security-headers's own admin for its /admin walk -- separate from
+# step_e2e's so the two steps' real MFA enrolments never collide in one gate DB lifetime.
+E2E_SECHDR_ADMIN_EMAIL="e2e-sechdr-admin@example.test"
 # Local secrets shared by every native backend these three steps start (git-ignored, 0600;
 # same pattern as ROLES_ENV). MUST be identical across e2e/security-headers/zap-baseline
 # within one gate DB lifetime: the master-key fingerprint (T11.2.4) is stored on the gate
@@ -644,8 +647,8 @@ e2e_start_stack() {
   e2e_start_backend "$1" || return 1
   e2e_start_frontend "$1" || return 1
 }
-# e2e_seed_admin: T13.2.10, step_e2e only (not security-headers/zap-baseline, which have no
-# use for either account). Needs DATABASE_URL (exported by the gate's own DB setup, same
+# e2e_seed_admin: T13.2.10, step_e2e only (security-headers seeds its own admin, DEC-036;
+# zap-baseline has no use for either account). Needs DATABASE_URL (exported by the gate's own DB setup, same
 # value e2e_start_backend's native backend already uses) and E2E_ADMIN_PASSWORD (sourced
 # from E2E_ENV by e2e_start_backend's own `. "$E2E_ENV"`, still exported in THIS shell once
 # that function returns -- bash functions share the caller's environment unless run in a
@@ -726,7 +729,12 @@ step_security-headers() {
   fi
 
   e2e_start_stack "$GATE_STATE/security-headers" || return 1
+  # DEC-036: seed this step's own admin (same mechanism as e2e_seed_admin) for the /admin walk.
+  (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_SECHDR_ADMIN_EMAIL" --role admin) \
+    || return 1
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
+    E2E_SECHDR_ADMIN_EMAIL="$E2E_SECHDR_ADMIN_EMAIL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
     npx playwright test e2e/security-headers.spec.ts)
 }
 

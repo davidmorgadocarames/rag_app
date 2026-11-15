@@ -6,8 +6,7 @@
 // works against a real backend.
 import { expect, test } from "@playwright/test";
 
-import { loginAndReachChat } from "./helpers.ts";
-import { totpCode } from "./totp.ts";
+import { enrolAndStepUpMfa, loginAndReachChat } from "./helpers.ts";
 
 const ADMIN_EMAIL = process.env.E2E_ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD;
@@ -21,23 +20,6 @@ test.skip(
   "E2E_ADMIN_EMAIL/E2E_ADMIN_PASSWORD/E2E_ERASE_TARGET_EMAIL not set -- only" +
     " scripts/gate.sh's step_e2e sets these",
 );
-
-async function enrolAndStepUpMfa(page: import("@playwright/test").Page): Promise<void> {
-  await page.goto("/account/security");
-  await page.getByRole("button", { name: "Start enrolment" }).click();
-
-  const secretText = await page.getByText(/^Secret: /).textContent();
-  const secret = secretText?.replace("Secret: ", "").trim();
-  if (!secret) throw new Error("MFA secret was not rendered");
-
-  await page.getByLabel(/6-digit code your app shows/).fill(totpCode(secret));
-  await page.getByRole("button", { name: "CONFIRM" }).click();
-  await expect(page.getByText("Two-factor authentication is enabled.")).toBeVisible();
-
-  await page.getByLabel(/Step up this session now/).fill(totpCode(secret));
-  await page.getByRole("button", { name: "Step up" }).click();
-  await expect(page.getByText("MFA verified.")).toBeVisible();
-}
 
 test("an admin can enrol MFA, step up, and see the full dashboard", async ({ page }) => {
   await loginAndReachChat(page, ADMIN_EMAIL as string, ADMIN_PASSWORD as string);

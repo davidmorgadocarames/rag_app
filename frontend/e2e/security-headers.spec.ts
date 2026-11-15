@@ -13,7 +13,13 @@
 import { expect, test } from "@playwright/test";
 import type { ConsoleMessage, Page, Response } from "@playwright/test";
 
-import { openVaultDoor, registerAndReachChat, uniqueEmail } from "./helpers.ts";
+import {
+  enrolAndStepUpMfa,
+  loginAndReachChat,
+  openVaultDoor,
+  registerAndReachChat,
+  uniqueEmail,
+} from "./helpers.ts";
 
 const CSP_VIOLATION_RE = /content security policy|refused to/i;
 
@@ -95,4 +101,38 @@ test("a fresh login panel still gets the same headers (second vault-door open)",
   assertCsp(response, "/login");
   await openVaultDoor(page);
   await expect(page.getByPlaceholder("email")).toBeVisible();
+});
+
+// DEC-036 = A (DA-13-C-6): the admin dashboard is the one page whose components (Recharts'
+// ResponsiveContainer, LatencyPanel) add inline styles -- walk it for real, as a stepped-up
+// admin, under the same header + zero-violation checks. Its own seeded admin
+// (scripts/gate.sh's step_security-headers), separate from step_e2e's, so the two steps'
+// MFA enrolments never collide.
+const SECHDR_ADMIN_EMAIL = process.env.E2E_SECHDR_ADMIN_EMAIL;
+const SECHDR_ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD;
+
+test("the admin dashboard serves the required headers with zero CSP violations", async ({
+  page,
+}) => {
+  test.skip(
+    !SECHDR_ADMIN_EMAIL || !SECHDR_ADMIN_PASSWORD,
+    "E2E_SECHDR_ADMIN_EMAIL/E2E_ADMIN_PASSWORD not set -- only scripts/gate.sh's" +
+      " step_security-headers sets these",
+  );
+  const violations: string[] = [];
+  page.on("console", (msg: ConsoleMessage) => {
+    if (CSP_VIOLATION_RE.test(msg.text())) violations.push(`${page.url()}: ${msg.text()}`);
+  });
+
+  await loginAndReachChat(page, SECHDR_ADMIN_EMAIL as string, SECHDR_ADMIN_PASSWORD as string);
+  await expect(page).toHaveURL(/\/chat$/);
+  await enrolAndStepUpMfa(page);
+
+  await visit(page, "/admin");
+  await expect(page.getByText("Admin dashboard")).toBeVisible();
+  // The chart must actually have rendered (inline styles applied), not just the shell.
+  await expect(page.getByTestId("admin-latency-panel")).toBeVisible();
+  await expect(page.getByTestId("admin-feature-cards")).toBeVisible();
+
+  expect(violations, `CSP violations:\n${violations.join("\n")}`).toHaveLength(0);
 });

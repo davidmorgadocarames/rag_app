@@ -5,6 +5,8 @@
 // UI-driving helpers across spec files is safe.
 import { expect, type Page } from "@playwright/test";
 
+import { totpCode } from "./totp.ts";
+
 export function uniqueEmail(prefix = "e2e"): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
 }
@@ -59,4 +61,24 @@ export async function loginAndReachChat(
   await page.getByPlaceholder("email").fill(email);
   await page.getByPlaceholder(/password/).fill(password);
   await page.getByRole("button", { name: "ENTER" }).click();
+}
+
+/** T13.2.10: enrol + confirm + step up MFA for real through the UI (a real TOTP code
+ * from the real backend-issued secret, `e2e/totp.ts`). Shared by admin-dashboard.spec.ts
+ * and security-headers.spec.ts's `/admin` walk (DEC-036). */
+export async function enrolAndStepUpMfa(page: Page): Promise<void> {
+  await page.goto("/account/security");
+  await page.getByRole("button", { name: "Start enrolment" }).click();
+
+  const secretText = await page.getByText(/^Secret: /).textContent();
+  const secret = secretText?.replace("Secret: ", "").trim();
+  if (!secret) throw new Error("MFA secret was not rendered");
+
+  await page.getByLabel(/6-digit code your app shows/).fill(totpCode(secret));
+  await page.getByRole("button", { name: "CONFIRM" }).click();
+  await expect(page.getByText("Two-factor authentication is enabled.")).toBeVisible();
+
+  await page.getByLabel(/Step up this session now/).fill(totpCode(secret));
+  await page.getByRole("button", { name: "Step up" }).click();
+  await expect(page.getByText("MFA verified.")).toBeVisible();
 }
