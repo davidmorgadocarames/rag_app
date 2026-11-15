@@ -45,3 +45,18 @@ export async function registerAndReachChat(
   await page.getByPlaceholder(/password/).fill(password);
   await page.getByRole("button", { name: "ENTER" }).click();
 }
+
+/** Logs in an ALREADY-EXISTING account (T13.2.10: the e2e admin, seeded directly in the
+ * database by `scripts/gate.sh`'s `e2e_seed_admin` -- never through a route, T12.3.3) --
+ * `registerAndReachChat` above always registers a brand new one first. */
+export async function loginAndReachChat(
+  page: Page,
+  email: string,
+  password: string,
+): Promise<void> {
+  await page.goto("/login");
+  await openVaultDoor(page);
+  await page.getByPlaceholder("email").fill(email);
+  await page.getByPlaceholder(/password/).fill(password);
+  await page.getByRole("button", { name: "ENTER" }).click();
+}

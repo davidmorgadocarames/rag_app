@@ -516,6 +516,17 @@ E2E_FRONTEND_PORT="${E2E_FRONTEND_PORT:-18101}"
 E2E_BACKEND_PID=""
 E2E_FRONTEND_PID=""
 E2E_CLIENT_IP_KEY=""   # set by e2e_start_backend; e2e_start_frontend must reuse the SAME value
+# T13.2.10: one known admin test account + one known plain-user erasure TARGET, both seeded
+# straight into the database (never a route -- role is never writable through any route,
+# T12.3.3) by step_e2e only (not the other two steps, which have no use for them). Emails
+# are plain fixture constants (not secrets, not real PII); the (shared) password lives in
+# E2E_ENV below, same throwaway-secret pattern as every other E2E_* value there.
+# DA-13-C-1: the erasure target is SEEDED, never registered through the UI -- one more
+# `/auth/register` call would spend more of rag_app.risk.SignupTracker's one-hour, per-IP
+# signup-velocity budget that auth/admin/mfa.spec.ts's own throwaway registrations already
+# leave little headroom in (found for real: a 6th registration in one run tripped it).
+E2E_ADMIN_EMAIL="e2e-admin@example.test"
+E2E_ERASE_TARGET_EMAIL="e2e-erase-target@example.test"
 # Local secrets shared by every native backend these three steps start (git-ignored, 0600;
 # same pattern as ROLES_ENV). MUST be identical across e2e/security-headers/zap-baseline
 # within one gate DB lifetime: the master-key fingerprint (T11.2.4) is stored on the gate
@@ -540,6 +551,7 @@ ensure_e2e_env() {
       echo "E2E_LOCKOUT_SECRET=$(openssl rand -hex 24)"
       echo "E2E_CLIENT_IP_KEY=$(openssl rand -hex 16)"
       echo "E2E_MASTER_KEY=$("$PY" -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+      echo "E2E_ADMIN_PASSWORD=$(openssl rand -hex 24)"
     } >"$E2E_ENV.tmp" && mv -f "$E2E_ENV.tmp" "$E2E_ENV"
   )
 }
@@ -631,6 +643,20 @@ e2e_start_stack() {
   e2e_start_backend "$1" || return 1
   e2e_start_frontend "$1" || return 1
 }
+# e2e_seed_admin: T13.2.10, step_e2e only (not security-headers/zap-baseline, which have no
+# use for either account). Needs DATABASE_URL (exported by the gate's own DB setup, same
+# value e2e_start_backend's native backend already uses) and E2E_ADMIN_PASSWORD (sourced
+# from E2E_ENV by e2e_start_backend's own `. "$E2E_ENV"`, still exported in THIS shell once
+# that function returns -- bash functions share the caller's environment unless run in a
+# `( ... )` subshell, which ensure_e2e_env's write block is, but e2e_start_backend's `set -a`
+# source is not). Seeds BOTH the admin and the plain-user erasure target (DA-13-C-1) --
+# the same password for both, fine for a throwaway pair scoped to one gate run.
+e2e_seed_admin() {
+  (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ADMIN_EMAIL" --role admin) \
+    && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ERASE_TARGET_EMAIL" --role user)
+}
 
 step_e2e() {
   need_venv || return 1
@@ -643,6 +669,7 @@ step_e2e() {
   fi
 
   e2e_start_stack "$GATE_STATE/e2e" || return 1
+  e2e_seed_admin || return 1
 
   # "localhost", not "127.0.0.1": Next.js's own middleware (next start, self-hosted)
   # constructs its redirect Location from `new URL(path, request.url)` using "localhost" as
@@ -652,13 +679,17 @@ step_e2e() {
   # Visiting "localhost" from the start keeps the browser's origin consistent with every
   # middleware redirect; FRONTEND_ORIGIN above is set to match.
   # auth.spec.ts: the chat-flow walk (T12.1.10/DEBT-035). admin.spec.ts: T12.3.6 case (5)/(6)
-  # (client-state tampering buys an ordinary user nothing on /admin). mfa.spec.ts: T12.3.5/
+  # (client-state tampering buys an ordinary user nothing on /admin) + T13.2.10 (the real
+  # admin dashboard, MFA via e2e/totp.ts + e2e_seed_admin above). mfa.spec.ts: T12.3.5/
   # DEC-024 (the QR code actually renders from the real backend-issued provisioning URI).
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
   # verification email through the gate's own Mailpit (e2e_ensure_mailpit, above).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
     MAILPIT_API_URL="http://127.0.0.1:$GATE_MAILPIT_API_PORT" \
-    npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/mfa.spec.ts)
+    E2E_ADMIN_EMAIL="$E2E_ADMIN_EMAIL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    E2E_ERASE_TARGET_EMAIL="$E2E_ERASE_TARGET_EMAIL" \
+    npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
+      e2e/mfa.spec.ts)
 }
 
 # T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for
