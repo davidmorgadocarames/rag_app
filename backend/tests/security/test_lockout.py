@@ -13,10 +13,16 @@ import threading
 import uuid
 
 import pytest
+from cryptography.fernet import Fernet
+from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
+from rag_app import metrics
+from rag_app.api.app import create_app
+from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.db.models import User
+from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.erasure import request_erasure
 from rag_app.lockout import (
     _RECORD_FAILURE_SQL,
@@ -29,6 +35,7 @@ from rag_app.lockout import (
     purge_expired_lockouts,
     record_failed_login,
 )
+from rag_app.risk import SignupTracker
 
 pytestmark = [pytest.mark.db, pytest.mark.security]
 
@@ -116,6 +123,53 @@ def test_the_next_failure_past_the_threshold_locks_and_back_off_grows(db_engine:
         # Exponential: the second lock (one failure further past the threshold) must end
         # strictly later than the first -- 2x the base, not a flat/fixed duration.
         assert second_lock.locked_until > first_lock.locked_until
+
+
+# --- secrag_lockout_hits_total: driven through the real route, not called directly --------
+
+
+def test_login_lockout_increments_the_metric_through_the_real_route(
+    db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-13-A-3: ``secrag_lockout_hits_total`` is wired at its real call site
+    (``rag_app.api.auth.login``) but, before this test, was only ever exercised by calling
+    the metric directly (``test_metrics.py``), not through ``/auth/login`` with a real
+    account against a real DB. Note the counter only increments on the request that finds
+    an ALREADY-locked account at the START of ``login()`` -- the request that itself tips
+    the account past ``LOCKOUT_THRESHOLD`` still returns 401 (the lock state is read before
+    ``record_failed_login`` runs), so this drives the threshold attempts first and then one
+    more."""
+    monkeypatch.setenv("DATA_MASTER_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("JWT_SECRET", "t" * 48)
+    monkeypatch.setenv("CSRF_SECRET", "c" * 48)
+    monkeypatch.setenv("LOCKOUT_HMAC_SECRET", SECRET)
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("SMTP_HOST", "")
+
+    app = create_app()
+    app.dependency_overrides[get_signup_tracker] = SignupTracker
+    app.dependency_overrides[get_email_abuse_limiter] = EmailAbuseLimiter
+    client = TestClient(app, base_url="https://testserver")
+
+    email = _email()
+    register = client.post(
+        "/auth/register",
+        json={"email": email, "password": "correct horse battery staple " + uuid.uuid4().hex[:6]},
+    )
+    assert register.status_code == 202, register.text
+
+    wrong = {"email": email, "password": "definitely-the-wrong-password"}
+    # LOCKOUT_THRESHOLD free failures, plus one more that SETS the lock -- all still 401,
+    # the lock is only checked at the start of the NEXT request.
+    for _ in range(LOCKOUT_THRESHOLD + 1):
+        attempt = client.post("/auth/login", json=wrong)
+        assert attempt.status_code == 401, attempt.text
+
+    before = metrics.LOCKOUT_HITS_TOTAL._value.get()
+    locked_attempt = client.post("/auth/login", json=wrong)
+    assert locked_attempt.status_code == 429
+    after = metrics.LOCKOUT_HITS_TOTAL._value.get()
+    assert after == before + 1
 
 
 def test_back_off_is_capped(db_engine: Engine) -> None:

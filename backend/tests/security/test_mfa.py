@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
+from rag_app import metrics
 from rag_app.admin import create_admin
 from rag_app.api.admin import claim_recovery_code
 from rag_app.api.app import create_app
@@ -165,6 +166,54 @@ def test_step_up_with_an_invalid_code_is_rejected(api_env: Engine) -> None:
         "/account/mfa/step-up", json={"code": "000000"}, headers=_csrf_header(register)
     )
     assert step_up.status_code == 403
+
+
+# --- secrag_mfa_step_up_total: driven through the real route, not called directly ---------
+
+
+def test_step_up_failure_increments_the_mfa_step_up_metric(api_env: Engine) -> None:
+    """DA-13-A-3: ``secrag_mfa_step_up_total`` (``rag_app.api.admin.mfa_step_up``) is wired
+    at its real call site but, before this test, was only ever exercised by calling the
+    metric directly (``test_metrics.py``). Drives the real ``/account/mfa/step-up`` route
+    with a wrong code and proves the ``result="failure"`` counter actually increments."""
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    client.post(
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
+    before = metrics.MFA_STEP_UP_TOTAL.labels(result="failure")._value.get()
+    step_up = client.post(
+        "/account/mfa/step-up", json={"code": "000000"}, headers=_csrf_header(register)
+    )
+    assert step_up.status_code == 403
+    after = metrics.MFA_STEP_UP_TOTAL.labels(result="failure")._value.get()
+    assert after == before + 1
+
+
+def test_step_up_success_increments_the_mfa_step_up_metric(api_env: Engine) -> None:
+    """Same reasoning as the failure case above, for the ``result="success"`` label."""
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    client.post(
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
+    before = metrics.MFA_STEP_UP_TOTAL.labels(result="success")._value.get()
+    step_up = client.post(
+        "/account/mfa/step-up",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
+    assert step_up.status_code == 200
+    after = metrics.MFA_STEP_UP_TOTAL.labels(result="success")._value.get()
+    assert after == before + 1
 
 
 def test_step_up_requires_mfa_to_be_enabled_first(api_env: Engine) -> None:
