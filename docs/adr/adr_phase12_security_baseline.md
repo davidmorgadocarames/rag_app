@@ -462,6 +462,23 @@ backend is checked by this test automatically; no app-level `app.mount()` exists
 (confirmed) and `/metrics` is served on a separate internal port, never a FastAPI route at
 all, so neither is a blind spot for the walker to miss.
 
+**Correction (DA-13-A-1, 2026-11-15, fix block 13-A-F):** between this decision and Phase
+13, a `fastapi` upgrade changed how `app.include_router(...)` is represented: a router is
+wrapped as one opaque `_IncludedRouter` object in `app.routes` instead of being inlined
+there, which `_non_public_routes`'s `isinstance(route, APIRoute)` filter did not recognise.
+The walker had silently shrunk to checking only the 1-2 routes `create_app()` registers
+directly on `app` itself (effectively just `/chat`) — 19 of 21 real routes had zero walker
+coverage while the test still reported green, because its only self-check (a non-empty
+list) does not notice the list shrinking. "Closed a real, pre-existing gap" above is still
+true of the ORIGINAL fix (12b); it is the walker's OWN coverage that regressed later and
+silently, independent of this decision. Fixed by reusing `rag_app.features.iter_routes` (the
+same flattening helper `check_registry`/`route_probe` already use for the identical FastAPI
+quirk, T13.0.5) and replacing the weak self-check with two floors that would have caught the
+regression: `iter_routes(app)` returns at least 25 raw routes, and every route in
+`rag_app.authz.DECLARED_PERMISSION_ROUTES` is among the routes the walker actually checked.
+Verified, with the fix applied, that all 12 non-public routes it now sees still pass (no
+route was actually left under-protected on Azure).
+
 #### P12-D13 — Post-deploy/demo health through the frontend's BFF, never a backend FQDN (T12.5.6, DEC-005)
 
 **Decision:** `/api/health` (already on the BFF allow-list since 12a's DEC-005/006) is now

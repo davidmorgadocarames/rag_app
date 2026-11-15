@@ -155,6 +155,14 @@ for: a newer FastAPI wraps an `include_router()`'d router lazily as a single
 real routes live on `.original_router.routes`; `rag_app.features.iter_routes` flattens this
 for both `route_probe` and `check_registry`.
 
+**Fix (DA-13-A-2, block 13-A-F):** the tag-claim check above only ever looked at tags that
+EXIST (`used_tags - claimed_tags`) — a route added with no `tags=` at all contributed
+nothing to `used_tags` and passed vacuously, so "a new router without an entry fails the
+gate" was not actually true for that case. `check_registry` now also asserts every
+`APIRoute` `iter_routes` finds declares at least one tag, independent of whether anything
+claims it (framework routes like `/docs` are plain Starlette `Route`s with no tags concept
+and stay excluded, same as the existing check).
+
 ### Missing metrics (T13.0.6, DEC-028 A5, D-ER)
 
 Only five Prometheus metrics existed before this block. Added, every label a small bounded
@@ -166,6 +174,14 @@ lockout); `secrag_signup_blocked_total{reason}` (disposable_email / signup_veloc
 `secrag_csp_reports_total` (one per logged CSP violation entry); `secrag_mfa_step_up_total
 {result}` (success / failure); `secrag_erasure_pending` / `secrag_erasure_oldest_age_seconds`
 / `secrag_erasure_failures_total` (D-ER).
+
+**Behaviour tests (DA-13-A-3, block 13-A-F):** `secrag_lockout_hits_total` and
+`secrag_mfa_step_up_total` were wired at their real call sites but only ever exercised by
+calling the metric directly (`test_metrics.py`'s label-shape checks). `test_lockout.py`
+and `test_mfa.py` now each drive the real route (`POST /auth/login` past the lockout
+threshold; `POST /account/mfa/step-up` with a wrong and a valid code) and assert the
+counter increments by exactly 1 — DB-marked, run in `--full`/the `security-suite` gate
+step.
 
 **Known limitation of the three erasure metrics (for 13-B/13-C):** Prometheus state is
 per-process. `rag_app.erasure.refresh_erasure_gauges` is called right after
