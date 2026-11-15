@@ -178,3 +178,87 @@ class MfaConfirmResponse(BaseModel):
 class MfaStepUpRequest(StrictModel):
     # A 6-digit TOTP code OR a recovery code ("XXXX-XXXX-XXXX", generous upper bound).
     code: str = Field(min_length=6, max_length=64)
+
+
+# --- Admin dashboard API (T13.1.1-T13.1.8) -----------------------------------------------
+# Every response model below is aggregate/system state only (PHASE_PLANNING Phase 13
+# "Privacy rule") -- never conversation content, an email address or any other value a
+# client submitted verbatim (T13.1.7). A request model's own field (e.g. the target email
+# on the erase-account action) is never echoed back in the response.
+
+
+class FeatureHealthOut(BaseModel):
+    id: str
+    name: str
+    phase: str
+    status: str
+    probe_status: str | None
+    probe_detail: str | None
+    metrics: dict[str, float | None]
+    dev_only: bool
+    azure_only: bool
+
+
+class AdminFeaturesResponse(BaseModel):
+    features: list[FeatureHealthOut]
+
+
+class AdminMetricsResponse(BaseModel):
+    values: dict[str, float | None]
+
+
+class EvalMetricOut(BaseModel):
+    key: str
+    value: float | None
+    floor: float | None
+    baseline: float | None
+    below_floor: bool
+    regressed: bool
+
+
+class AdminEvalResponse(BaseModel):
+    last_run_at: dt.datetime | None
+    metrics: list[EvalMetricOut]
+    passed: bool
+
+
+class ErasureRequestOut(BaseModel):
+    id: str
+    requested_at: dt.datetime
+    age_seconds: float
+    seconds_left: float
+    status: str
+    rows_remaining: dict[str, int]
+    attempts: int
+    last_error_class: str | None
+    overdue: bool
+
+
+class LastPurgerRunOut(BaseModel):
+    started_at: dt.datetime
+    finished_at: dt.datetime | None
+    requests_processed: int
+    errors: int
+
+
+class AdminErasureResponse(BaseModel):
+    requests: list[ErasureRequestOut]
+    last_purger_run: LastPurgerRunOut | None
+
+
+class ErasureActionResponse(BaseModel):
+    detail: str
+    request_id: str
+
+
+class AdminEraseUserRequest(StrictModel):
+    email: str = Field(min_length=3, max_length=320)
+    # T13.1.8: a fixed typed phrase, not a re-typed email -- the email is already the one
+    # field that identifies the target; requiring it twice would duplicate PII in the body
+    # for no extra safety. Checked server-side, case-sensitive.
+    confirmation: str = Field(min_length=1, max_length=32)
+
+
+class AdminEraseUserResponse(BaseModel):
+    detail: str
+    request_id: str

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import logging
 import os
 import sys
 import tempfile
@@ -59,6 +60,8 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from rag_app.erasure import OPEN_STATUSES, PURGE_DEADLINE_HOURS, PURGE_STEPS
+
+logger = logging.getLogger("rag_app.purger")
 
 _metrics: ModuleType | None
 try:  # T13.0.6: the slim jobs image (requirements-jobs.txt) has no prometheus_client at
@@ -451,6 +454,27 @@ class Purger:
                         "id": run_id,
                     },
                 )
+
+
+def run_one_in_background(request_id: uuid.UUID) -> None:
+    """Admin "purge now" / "retry" (T13.1.5): meant to be scheduled as a FastAPI
+    ``BackgroundTask`` -- runs AFTER the response is sent, with its OWN engine (the
+    request's own DB session is closed by the time this runs). TF16: if the process is
+    killed mid-way (e.g. a scale-to-zero on Azure), the batch-level checkpointing already in
+    ``Purger.purge_one`` leaves the tombstone resumable exactly where it stopped -- the next
+    hourly Job run finishes it (the admin panel says so). Never raises: a ``BackgroundTask``
+    exception is only logged by Starlette and nothing here retries it, so a failure here is
+    not worse than never having triggered it manually at all -- the hourly Job still owns
+    eventual completion either way."""
+    from rag_app.db.session import make_engine
+
+    engine = make_engine()
+    try:
+        Purger(engine).run(only=request_id)
+    except Exception:  # noqa: BLE001 - best-effort manual trigger; the hourly Job retries
+        logger.exception("admin-triggered purge of %s failed", request_id)
+    finally:
+        engine.dispose()
 
 
 # --- CLI ------------------------------------------------------------------------------
