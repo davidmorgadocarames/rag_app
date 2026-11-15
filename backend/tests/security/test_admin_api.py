@@ -2,19 +2,23 @@
 purge-now/retry, and the admin erase-account action (DEBT-002). The role x route tampering
 matrix (``test_client_tampering.py``) already proves 403/MFA for every ``matrix=True`` route
 registered here (``GET /admin/features`` etc, T13.1.1's "no hand-written 403 tests") -- the
-tests below cover: the actual response shape, the no-PII rule (T13.1.7), and the three
-mutating routes that need a path parameter or a body (``matrix=False``), whose own Gate line
-(T13.1.5/T13.1.8) asks for explicit 403 coverage.
+tests below cover: the actual response shape, the no-PII rule (T13.1.7), the three mutating
+routes that need a path parameter or a body (``matrix=False``), whose own Gate line
+(T13.1.5/T13.1.8) asks for explicit 403 coverage, their CSRF protection specifically
+(DA-13-B-1, fix block 13-B-F -- ``test_csrf.py`` is scoped to ``/auth/logout``/``/account``
+only, never these three), and the last-remaining-admin guard on ``/admin/users/erase``
+(DEC-033, same block).
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 
 from rag_app.admin import create_admin
@@ -63,6 +67,42 @@ def _admin_headers(db_engine: Engine, *, stepped_up: bool) -> dict[str, str]:
         "Cookie": f"{SESSION_COOKIE_NAME}={raw}; {CSRF_COOKIE_NAME}={csrf}",
         CSRF_HEADER_NAME: csrf,
     }
+
+
+def _admin_session_with_email(
+    engine: Engine, *, stepped_up: bool = True
+) -> tuple[str, dict[str, str]]:
+    """Like ``_admin_headers`` but also returns the created admin's own email -- needed for
+    the self-erase tests below, where the caller must submit its own address as the target."""
+    creds = _creds()
+    with Session(engine) as session:
+        user = create_admin(session, creds["email"], creds["password"])
+        raw = create_session(session, user)
+        if stepped_up:
+            set_mfa_verified(session, raw)
+        session.commit()
+    csrf = csrf_token(get_settings().csrf_secret, raw)
+    headers = {
+        "Cookie": f"{SESSION_COOKIE_NAME}={raw}; {CSRF_COOKIE_NAME}={csrf}",
+        CSRF_HEADER_NAME: csrf,
+    }
+    return creds["email"], headers
+
+
+def _retire_every_live_admin(engine: Engine) -> None:
+    """Test-only clean slate for the last-admin-guard tests: ``db_url`` is session-scoped (one
+    physical database for the whole pytest run), so by the time these tests run, earlier tests
+    in this file have already created several admin accounts that are still "live" (never
+    erased). Marks them as already gone -- ``deleted_at`` only, NOT a real erasure (no email
+    scrub, no session revoke, no tombstone row) -- so "only remaining admin" is deterministic
+    regardless of execution order or how many other admin accounts exist."""
+    with Session(engine) as session:
+        session.execute(
+            update(User)
+            .where(User.role == "admin", User.deleted_at.is_(None))
+            .values(deleted_at=dt.datetime.now(dt.UTC))
+        )
+        session.commit()
 
 
 def _user_headers(client: TestClient) -> dict[str, str]:
@@ -247,6 +287,40 @@ def test_an_admin_without_mfa_stepup_gets_403_on_every_erasure_action(api_env: E
         assert response.status_code == 403, (path, response.text)
 
 
+# --- DA-13-B-1: all 3 mutating routes need a valid CSRF token, not merely a valid, stepped- -
+# --- up admin session (fix block 13-B-F). Every existing test above always goes through ----
+# --- ``_admin_headers``, which always attaches a VALID CSRF cookie+header -- there was no ---
+# --- "admin, stepped-up, missing/wrong CSRF" case anywhere before this. ---------------------
+
+
+def _mutating_admin_routes(request_id: str) -> tuple[tuple[str, dict[str, str] | None], ...]:
+    return (
+        (f"/admin/erasure/{request_id}/purge-now", None),
+        (f"/admin/erasure/{request_id}/retry", None),
+        ("/admin/users/erase", {"email": "whoever-csrf@example.test", "confirmation": "ERASE"}),
+    )
+
+
+def test_admin_mutating_routes_reject_a_missing_csrf_token(api_env: Engine) -> None:
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    request_id = _open_request_id(api_env, f"csrf-missing-{uuid.uuid4().hex[:8]}@example.test")
+    cookie_only = {"Cookie": headers["Cookie"]}  # no X-CSRF-Token header at all
+    for path, body in _mutating_admin_routes(request_id):
+        response = client.post(path, headers=cookie_only, json=body)
+        assert response.status_code == 403, (path, response.text)
+
+
+def test_admin_mutating_routes_reject_a_wrong_csrf_token(api_env: Engine) -> None:
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    request_id = _open_request_id(api_env, f"csrf-wrong-{uuid.uuid4().hex[:8]}@example.test")
+    wrong = {"Cookie": headers["Cookie"], CSRF_HEADER_NAME: "not-the-real-token"}
+    for path, body in _mutating_admin_routes(request_id):
+        response = client.post(path, headers=wrong, json=body)
+        assert response.status_code == 403, (path, response.text)
+
+
 # --- POST /admin/users/erase (T13.1.8, DEBT-002) -------------------------------------------
 
 
@@ -330,6 +404,72 @@ def test_an_admin_without_mfa_stepup_gets_403_on_erase_user(api_env: Engine) -> 
         headers=headers,
     )
     assert response.status_code == 403
+
+
+# --- DEC-033: refuse to erase the only remaining admin account; self-erase stays allowed ---
+# --- whenever another admin remains (fix block 13-B-F) -------------------------------------
+
+
+def test_erasing_the_only_remaining_admin_is_refused_and_nothing_is_erased(
+    api_env: Engine,
+) -> None:
+    """Refuses even a SELF-erase once the target is the only live admin account left --
+    409, no identifying detail in the message, nothing erased, no deletion request created."""
+    _retire_every_live_admin(api_env)
+    headers = _admin_headers(api_env, stepped_up=True)
+    with Session(api_env) as session:
+        remaining = session.scalars(
+            select(User).where(User.role == "admin", User.deleted_at.is_(None))
+        ).all()
+        assert len(remaining) == 1, remaining  # the ONLY live admin, by construction above
+        target_id = remaining[0].id
+        target_email = remaining[0].email
+
+    client = _client()
+    response = client.post(
+        "/admin/users/erase",
+        json={"email": target_email, "confirmation": "ERASE"},
+        headers=headers,
+    )
+    assert response.status_code == 409, response.text
+    assert target_email not in response.text  # no PII in the refusal either
+
+    with Session(api_env) as session:
+        reloaded = session.get(User, target_id)
+        assert reloaded is not None and reloaded.deleted_at is None
+        assert (
+            session.scalar(select(DeletionRequest).where(DeletionRequest.user_id == target_id))
+            is None
+        )
+        assert (
+            session.scalar(select(AdminAction).where(AdminAction.target == str(target_id))) is None
+        )
+
+
+def test_admin_self_erase_is_allowed_when_another_admin_remains(api_env: Engine) -> None:
+    """DEC-033 = A: with (at least) two live admins, self-erase through the admin panel is
+    allowed -- the same outcome the self-service ``DELETE /account`` path already permits."""
+    _admin_headers(api_env, stepped_up=True)  # another LIVE admin, so the one below is not alone
+    email, headers = _admin_session_with_email(api_env, stepped_up=True)
+    with Session(api_env) as session:
+        target_id = session.scalar(select(User.id).where(User.email == email))
+    assert target_id is not None
+
+    client = _client()
+    response = client.post(
+        "/admin/users/erase",
+        json={"email": email, "confirmation": "ERASE"},
+        headers=headers,
+    )
+    assert response.status_code == 202, response.text
+
+    with Session(api_env) as session:
+        reloaded = session.get(User, target_id)
+        assert reloaded is not None and reloaded.deleted_at is not None
+        assert (
+            session.scalar(select(DeletionRequest).where(DeletionRequest.user_id == target_id))
+            is not None
+        )
 
 
 # --- T13.1.7: no-PII responses, scanned across every admin endpoint ------------------------

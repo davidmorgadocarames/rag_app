@@ -442,17 +442,48 @@ def admin_erase_user(
 ) -> AdminEraseUserResponse:
     """Email + typed confirmation -> server-side lookup -> the SAME asynchronous erasure as
     self-service (``rag_app.erasure.request_erasure``, exactly what ``DELETE /account``
-    calls). The response is the opaque request id ONLY -- never whether the email matched an
-    account with data, how much, or anything else about it (T13.1.7); ``admin_actions`` gets
-    a row with that SAME opaque id as its pseudonymised target, never the submitted email."""
+    calls). The response BODY never reveals how much data existed or anything else about the
+    match (T13.1.7); ``admin_actions`` gets a row with the opaque request id as its
+    pseudonymised target, never the submitted email.
+
+    **DEC-032 = A (accepted trade-off, documented):** the STATUS CODE does distinguish a
+    match from a miss -- 404 on an unmatched email, 202 on a match -- which is a real
+    account-existence oracle. Accepted because (a) the actor is already an authenticated,
+    MFA-stepped-up admin, not a public probe surface, and (b) the confirmation-phrase check
+    above runs BEFORE the lookup, so a match is always ALSO erased on the same request --
+    there is no way to silently check many emails without actually deleting every hit, which
+    substantially limits real-world abuse of the oracle (see DA-13-B-2 / DEC-032 in
+    ``DEBT_REGISTER.md`` for the full analysis).
+
+    **DEC-033 = A:** refuses (409, no identifying detail) to erase the target if it is the
+    ONLY remaining non-erased ``role='admin'`` account -- erasing every admin would leave no
+    in-API recovery path (only the offline ``rag_app.admin`` CLI with direct DB access).
+    Self-erase of an admin account stays ALLOWED whenever at least one OTHER admin remains
+    (self-service ``DELETE /account`` already allows an admin to erase themselves, so
+    blocking the exact same outcome here too would only be inconsistent UX, not a real
+    safety gain) -- the guard only ever counts how many live admin rows are left, never who
+    the acting admin is."""
     if request.confirmation != ERASE_CONFIRMATION_PHRASE:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "type ERASE to confirm")
     target = session.scalar(select(User).where(User.email == request.email))
     if target is None:
         # Authenticated admin action (already MFA-stepped-up), not a public probe surface --
-        # unlike register/login, a direct 404 here carries no enumeration risk worth a
-        # generic-response trade-off (T12.4.4's reasoning does not apply to this route).
+        # see DEC-032 in the docstring above: a direct 404 here is a documented, accepted
+        # trade-off, not an oversight.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account")
+    if target.role == "admin":
+        # DEC-033 = A: row-lock every live admin BEFORE counting and hold the lock for the
+        # rest of this transaction (through request_erasure's own commit below). Two admins
+        # racing to erase each other therefore serialise on this lock instead of both reading
+        # "2 admins left" and leaving zero -- the second one only re-reads the (now smaller)
+        # locked set once the first has committed its erasure.
+        live_admin_ids = session.scalars(
+            select(User.id).where(User.role == "admin", User.deleted_at.is_(None)).with_for_update()
+        ).all()
+        if len(live_admin_ids) <= 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "cannot erase the only remaining admin account"
+            )
     try:
         done = request_erasure(session, target.id)
     except OperationalError as exc:
