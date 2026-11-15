@@ -5,9 +5,14 @@ docstring); every case below proves the "never raises, degrade to None" contract
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from rag_app import metrics_backend as mb
+
+if TYPE_CHECKING:
+    from prometheus_client import CollectorRegistry
 
 
 def test_an_empty_base_url_never_attempts_a_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -95,3 +100,91 @@ def test_get_metrics_backend_reads_the_current_setting(monkeypatch: pytest.Monke
     backend = mb.get_metrics_backend()
     assert isinstance(backend, mb.PrometheusMetricsBackend)
     assert backend.base_url == "http://example-prometheus:9090"
+
+
+def test_get_metrics_backend_falls_back_to_in_process_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T13.4.3 (R6-4): no managed Prometheus on Azure -- PROMETHEUS_URL stays unset there, so
+    the dependency factory must hand back the in-process implementation, not silently
+    degrade every metric to "unknown"."""
+    monkeypatch.setenv("PROMETHEUS_URL", "")
+    backend = mb.get_metrics_backend()
+    assert isinstance(backend, mb.InProcessMetricsBackend)
+
+
+# --- InProcessMetricsBackend (T13.4.3, Azure: no managed Prometheus, R6-4) -----------------
+
+
+def _registry_with(counter_total: float, gauge_value: float) -> CollectorRegistry:
+    from prometheus_client import CollectorRegistry, Counter, Gauge
+
+    registry = CollectorRegistry()
+    counter = Counter("fake_counter_total", "test", registry=registry)
+    counter.inc(counter_total)
+    gauge = Gauge("fake_gauge", "test", registry=registry)
+    gauge.set(gauge_value)
+    return registry
+
+
+def test_in_process_backend_reads_a_counter_and_a_gauge_from_its_own_registry() -> None:
+    backend = mb.InProcessMetricsBackend(registry=_registry_with(3, 7))
+    assert backend.current_value("fake_counter_total") == 3.0
+    assert backend.current_value("fake_gauge") == 7.0
+
+
+def test_in_process_backend_sums_across_label_combinations() -> None:
+    from prometheus_client import CollectorRegistry, Counter
+
+    registry = CollectorRegistry()
+    counter = Counter("fake_labelled_total", "test", ["kind"], registry=registry)
+    counter.labels(kind="a").inc(2)
+    counter.labels(kind="b").inc(5)
+    backend = mb.InProcessMetricsBackend(registry=registry)
+    # Matches PrometheusMetricsBackend's own sum(metric_name) PromQL semantics.
+    assert backend.current_value("fake_labelled_total") == 7.0
+
+
+def test_in_process_backend_reports_an_unregistered_metric_as_unknown_not_zero() -> None:
+    backend = mb.InProcessMetricsBackend(registry=_registry_with(0, 0))
+    assert backend.current_value("secrag_never_registered_total") is None
+
+
+def test_in_process_backend_defaults_to_the_real_process_registry() -> None:
+    from rag_app import metrics as real_metrics
+
+    real_metrics.LOCKOUT_HITS_TOTAL.inc()
+    before = real_metrics.REGISTRY.get_sample_value("secrag_lockout_hits_total") or 0.0
+    backend = mb.InProcessMetricsBackend()
+    assert backend.current_value("secrag_lockout_hits_total") == before
+
+
+def test_in_process_backend_current_values_queries_every_name() -> None:
+    backend = mb.InProcessMetricsBackend(registry=_registry_with(3, 7))
+    values = backend.current_values(["fake_counter_total", "fake_gauge", "unknown_metric"])
+    assert values == {"fake_counter_total": 3.0, "fake_gauge": 7.0, "unknown_metric": None}
+
+
+# --- Contract: both implementations return the SAME SHAPE for the SAME input (T13.4.3) ----
+
+
+def test_both_backends_return_the_same_shape_for_the_same_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get(url: str, params: dict[str, str], timeout: float) -> _FakeResponse:
+        # Discriminates by query, like the real Prometheus server would: "unknown_metric"
+        # genuinely has no series, exactly like the in-process registry below.
+        if params["query"] == "sum(fake_counter_total)":
+            return _FakeResponse({"data": {"result": [{"value": [0, "3"]}]}})
+        return _FakeResponse({"data": {"result": []}})
+
+    monkeypatch.setattr(mb.httpx, "get", fake_get)
+    prometheus_backend = mb.PrometheusMetricsBackend(base_url="http://prometheus:9090")
+    in_process_backend = mb.InProcessMetricsBackend(registry=_registry_with(3, 3))
+
+    names = ["fake_counter_total", "unknown_metric"]
+    prometheus_values = prometheus_backend.current_values(names)
+    in_process_values = in_process_backend.current_values(names)
+    expected = {"fake_counter_total": 3.0, "unknown_metric": None}
+    assert set(prometheus_values) == set(in_process_values) == set(names)
+    assert prometheus_values == in_process_values == expected

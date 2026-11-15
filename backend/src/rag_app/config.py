@@ -302,13 +302,27 @@ class Settings(JobSettings):
     # either way — see the runbook / ADR phase 11 decision 8).
     metrics_bind_addr: str = "0.0.0.0"  # noqa: S104 - see the comment above
 
-    # --- Admin dashboard metrics backend (T13.1.3, R6-4) ---
+    # --- Admin dashboard metrics backend (T13.1.3, T13.4.3, R6-4) ---
     # Empty by default: Azure runs no managed Prometheus at all (R6-4) -- the admin API's
-    # local `MetricsBackend` (`rag_app.metrics_backend`) degrades to "unknown" (never raises,
-    # never blocks) whenever this is unset, exactly like every other health probe in
-    # `rag_app.features`. Locally, docker-compose.yml's `prometheus` service sets this to
-    # `http://prometheus:9090` (same compose network as the backend container).
+    # `MetricsBackend` factory (`rag_app.metrics_backend.get_metrics_backend`) falls back to
+    # reading THIS process's own in-process registry whenever this is unset (T13.4.3), rather
+    # than a remote PromQL query. Locally, docker-compose.yml's `prometheus` service sets this
+    # to `http://prometheus:9090` (same compose network as the backend container).
     prometheus_url: str = ""
+
+    # --- Admin dashboard live updates (T13.4.1/T13.4.2, TF14) ---
+    # Decided SERVER-SIDE, never a frontend build-time variable (TF14): the backend reads
+    # this ordinary runtime setting (same mechanism as every other Settings field) and hands
+    # it to the frontend as plain response data (`AdminFeaturesResponse.live_mode`) on every
+    # `/admin/features` call -- the CSR dashboard reads THAT field to decide whether to open
+    # an SSE stream or poll, never its own build-time env var. "sse" (default, local): a
+    # long-lived `GET /admin/stream` connection. "polling" (Azure): Container Apps' internal
+    # ingress + scale-to-zero make a long-lived connection unreliable (TF16-style), so the
+    # dashboard instead re-fetches the REST routes on a low-frequency timer + a manual
+    # "Refresh now" button; set `ADMIN_LIVE_MODE=polling` on the Azure Container App only
+    # (private runbook) -- this repo's own `.env`/compose files never set it, so local dev
+    # always defaults to "sse".
+    admin_live_mode: Literal["sse", "polling"] = "sse"
 
     @model_validator(mode="after")
     def _default_require_email_verification_with_prod(self) -> Settings:

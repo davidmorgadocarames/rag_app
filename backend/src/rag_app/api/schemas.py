@@ -201,6 +201,9 @@ class FeatureHealthOut(BaseModel):
 
 class AdminFeaturesResponse(BaseModel):
     features: list[FeatureHealthOut]
+    # T13.4.1/T13.4.2 (TF14): the server-side decision ("sse" | "polling") the dashboard's
+    # CSR code reads to pick its live-update strategy -- never a frontend build-time variable.
+    live_mode: str
 
 
 class AdminMetricsResponse(BaseModel):

@@ -16,18 +16,28 @@ hand-written 403 test (T13.1.1). The three mutating actions below (purge-now, re
 erase-account) need either a path parameter or a request body a bare matrix probe cannot
 supply, so they declare ``matrix=False`` (still covered by the walker -- see
 ``rag_app.authz.DECLARED_PERMISSION_ROUTES`` -- just not by the generic bare-probe matrix)
-and get their own explicit 403 tests instead (T13.1.5/T13.1.8's own Gate line)."""
+and get their own explicit 403 tests instead (T13.1.5/T13.1.8's own Gate line).
+
+**T13.4.1 (SSE, local only):** ``GET /admin/stream`` is also ``matrix=False`` -- not because
+it needs a body/path parameter, but because the client-tampering matrix's bare probe
+(``client.request(method, path)``) blocks until the response completes, which would hang
+forever against this route's open-ended body. Explicit 403 tests cover it instead."""
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
+import time
 import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
-from sqlalchemy import delete, select, text, update
+from fastapi.responses import StreamingResponse
+from sqlalchemy import Engine, delete, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -41,6 +51,7 @@ from rag_app.api.deps import (
     MetricsBackendDep,
     SessionDep,
     get_rate_limiter,
+    get_session_factory,
     rate_limit_account,
 )
 from rag_app.api.schemas import (
@@ -61,7 +72,8 @@ from rag_app.api.schemas import (
     MfaEnrollResponse,
     MfaStepUpRequest,
 )
-from rag_app.authz import require_permission, require_permission_and_mfa
+from rag_app.authz import ROLE_PERMISSIONS, require_permission, require_permission_and_mfa
+from rag_app.config import get_settings
 from rag_app.crypto import unwrap_key, wrap_key
 from rag_app.csrf import require_csrf
 from rag_app.db.models import DeletionRequest, MfaRecoveryCode, PurgerRun, User, UserMfa
@@ -74,10 +86,12 @@ from rag_app.erasure import (
     PURGE_STEPS,
     REQUEST_LOCK_TIMEOUT,
     REQUEST_STATEMENT_TIMEOUT,
+    refresh_erasure_gauges,
     request_erasure,
 )
 from rag_app.eval.gate import BASELINE_PATH, RESULTS_PATH, THRESHOLDS_PATH
 from rag_app.features import REGISTRY, run_health_probe
+from rag_app.metrics_backend import MetricsBackend
 from rag_app.mfa import hash_recovery_code
 from rag_app.purger import run_one_in_background
 from rag_app.ratelimit import RateLimiter
@@ -94,6 +108,34 @@ EVAL_REGRESSION_EPSILON = 0.02
 ERASE_CONFIRMATION_PHRASE = "ERASE"
 
 router = APIRouter()
+
+
+# --- T13.4.1: SSE (local) tuning -----------------------------------------------------------
+# Code constants (B6 precedent, rag_app.sessions): a connection budget/cadence is a resource
+# policy, not an Azure configuration value -- SSE is local-only (T13.4.2's Azure path is
+# polling, never this route). Overridable per-test via `app.dependency_overrides[
+# get_admin_stream_settings]` (the same pattern as every other `get_*` dependency in this
+# codebase), so expiry/idle-close/cap tests run in well under a second.
+
+
+@dataclass(frozen=True)
+class AdminStreamSettings:
+    tick_seconds: float = 5.0
+    idle_close_seconds: float = 15 * 60
+    max_connections: int = 10
+
+
+def get_admin_stream_settings() -> AdminStreamSettings:
+    return AdminStreamSettings()
+
+
+AdminStreamSettingsDep = Annotated[AdminStreamSettings, Depends(get_admin_stream_settings)]
+
+# A per-PROCESS connection count (Azure never runs this route at all -- T13.4.2 is polling --
+# so "per-process" never differs from "per-replica" in practice). Not a prometheus_client
+# metric on purpose: an attacker-visible *count* of currently-connected admins is not
+# information this dashboard needs to publish, even internally.
+_admin_stream_connections = 0
 
 
 def _rate_limit_mfa(
@@ -156,20 +198,21 @@ def admin_ping() -> MessageResponse:
 # --- T13.0.2/T13.1.2: feature registry (list + detail in one response) --------------------
 
 
-@router.get(
-    "/admin/features",
-    response_model=AdminFeaturesResponse,
-    tags=["admin"],
-    dependencies=[
-        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/features"))),
-        Depends(rate_limit_account("admin_features")),
-    ],
-)
-def admin_features(metrics_backend: MetricsBackendDep) -> AdminFeaturesResponse:
-    """T13.1.2: list AND detail in the same response (health, metrics summary, enabled
-    flags) -- the registry is small enough (``rag_app.features.REGISTRY``) that a separate
-    by-id detail route would only add a path-parameterised route the client-tampering
-    matrix cannot bare-probe (see this module's docstring) for no real benefit."""
+def _refresh_erasure_gauges(session: Session) -> None:
+    """DEBT-046: ``session.get_bind()`` is typed ``Engine | Connection`` -- ``refresh_
+    erasure_gauges`` only ever wants the former (same ``isinstance`` guard as its other
+    caller, ``rag_app.erasure.request_erasure``); a ``Connection`` (e.g. a test running
+    inside one shared transaction) is never seen here since every admin route gets its own
+    session off the plain engine-backed factory, but the guard keeps this honest either way
+    rather than asserting."""
+    bind = session.get_bind()
+    if isinstance(bind, Engine):
+        refresh_erasure_gauges(bind)
+
+
+def _features_payload(metrics_backend: MetricsBackend) -> list[FeatureHealthOut]:
+    """Shared by the REST route below and the T13.4.1 SSE stream's snapshot/heartbeat (so
+    the two never drift into two different shapes of "what a feature card shows")."""
     out = []
     for entry in REGISTRY:
         probe = run_health_probe(entry.health_probe) if entry.health_probe is not None else None
@@ -187,7 +230,37 @@ def admin_features(metrics_backend: MetricsBackendDep) -> AdminFeaturesResponse:
                 azure_only=entry.azure_only,
             )
         )
-    return AdminFeaturesResponse(features=out)
+    return out
+
+
+@router.get(
+    "/admin/features",
+    response_model=AdminFeaturesResponse,
+    tags=["admin"],
+    dependencies=[
+        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/features"))),
+        Depends(rate_limit_account("admin_features")),
+    ],
+)
+def admin_features(
+    session: SessionDep, metrics_backend: MetricsBackendDep
+) -> AdminFeaturesResponse:
+    """T13.1.2: list AND detail in the same response (health, metrics summary, enabled
+    flags) -- the registry is small enough (``rag_app.features.REGISTRY``) that a separate
+    by-id detail route would only add a path-parameterised route the client-tampering
+    matrix cannot bare-probe (see this module's docstring) for no real benefit.
+
+    DEBT-046: refreshes the D-ER erasure gauges from the database on every call, same as
+    ``admin_erasure``/``admin_metrics`` below -- see ``refresh_erasure_gauges``'s own
+    docstring for why a value the purger Job sets in ITS process never reaches this one
+    without a trigger like this.
+
+    ``live_mode`` (T13.4.1/T13.4.2, TF14): the server-side decision the CSR dashboard reads
+    to pick SSE vs. polling -- never a frontend build-time variable."""
+    _refresh_erasure_gauges(session)
+    return AdminFeaturesResponse(
+        features=_features_payload(metrics_backend), live_mode=get_settings().admin_live_mode
+    )
 
 
 # --- T13.1.3: MetricsBackend (local), exposed as one admin route --------------------------
@@ -202,11 +275,15 @@ def admin_features(metrics_backend: MetricsBackendDep) -> AdminFeaturesResponse:
         Depends(rate_limit_account("admin_metrics")),
     ],
 )
-def admin_metrics(metrics_backend: MetricsBackendDep) -> AdminMetricsResponse:
+def admin_metrics(session: SessionDep, metrics_backend: MetricsBackendDep) -> AdminMetricsResponse:
     """Every metric name any registry entry declares, queried through ``MetricsBackend``
     (never Prometheus exposed through the BFF directly, PHASE_PLANNING 13.1) -- unlabelled
     counters/gauges only; the latency panel's per-stage histogram is a 13-C concern with its
-    own query shape."""
+    own query shape.
+
+    DEBT-046: refreshes the D-ER erasure gauges from the database first -- see
+    ``admin_features``'s docstring."""
+    _refresh_erasure_gauges(session)
     names = sorted({name for entry in REGISTRY for name in entry.metrics})
     return AdminMetricsResponse(values=metrics_backend.current_values(names))
 
@@ -289,16 +366,8 @@ def _rows_remaining(session: Session, user_id: uuid.UUID) -> dict[str, int]:
     }
 
 
-@router.get(
-    "/admin/erasure",
-    response_model=AdminErasureResponse,
-    tags=["admin"],
-    dependencies=[
-        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/erasure"))),
-        Depends(rate_limit_account("admin_erasure")),
-    ],
-)
-def admin_erasure(session: SessionDep) -> AdminErasureResponse:
+def _erasure_payload(session: Session) -> AdminErasureResponse:
+    """Shared by the REST route below and the T13.4.1 SSE stream's snapshot/heartbeat."""
     now = dt.datetime.now(dt.UTC)
     rows = session.scalars(
         select(DeletionRequest).order_by(DeletionRequest.requested_at.desc()).limit(500)
@@ -334,6 +403,22 @@ def admin_erasure(session: SessionDep) -> AdminErasureResponse:
         else None
     )
     return AdminErasureResponse(requests=out, last_purger_run=last_run_out)
+
+
+@router.get(
+    "/admin/erasure",
+    response_model=AdminErasureResponse,
+    tags=["admin"],
+    dependencies=[
+        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/erasure"))),
+        Depends(rate_limit_account("admin_erasure")),
+    ],
+)
+def admin_erasure(session: SessionDep) -> AdminErasureResponse:
+    """DEBT-046: refreshes the D-ER erasure gauges from the database first -- see
+    ``admin_features``'s docstring."""
+    _refresh_erasure_gauges(session)
+    return _erasure_payload(session)
 
 
 @router.post(
@@ -418,6 +503,110 @@ def admin_erasure_retry(
         detail="Retry started in the background; the hourly job finishes it if this process"
         " stops first.",
         request_id=str(request_id),
+    )
+
+
+# --- T13.4.1: SSE (local only) --------------------------------------------------------------
+
+
+def _sse_frame(event: str, data: dict[str, Any]) -> str:
+    # default=str: datetimes (requested_at, last_run.started_at, ...) are not JSON-native --
+    # the REST routes above get this for free from FastAPI's own response encoder, this is
+    # the SSE generator's equivalent. `default=str` renders them as ISO-ish Python reprs,
+    # not quite RFC 3339 -- acceptable for an admin-only diagnostic stream; a polished format
+    # would route through the same pydantic ``.model_dump(mode="json")`` as the dict's
+    # values already do (see ``_stream_snapshot`` below), which this merely backstops for
+    # any other datetime one of them might someday grow.
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def _stream_snapshot(session: Session, metrics_backend: MetricsBackend) -> dict[str, Any]:
+    _refresh_erasure_gauges(session)  # DEBT-046, same as every REST route above
+    return {
+        "features": [f.model_dump(mode="json") for f in _features_payload(metrics_backend)],
+        "erasure": _erasure_payload(session).model_dump(mode="json"),
+    }
+
+
+async def _admin_stream_events(
+    cookie_raw: str, stream_settings: AdminStreamSettings, metrics_backend: MetricsBackend
+) -> AsyncIterator[str]:
+    """One snapshot immediately, then a "heartbeat" (fresh data, doubling as the
+    liveness ping -- TF14/T13.4.1 "snapshot + heartbeat") every ``tick_seconds``.
+
+    Every tick opens a FRESH, short-lived session (never one held open for the stream's
+    whole lifetime -- would starve the pool) and re-checks, WITHOUT refreshing
+    ``last_seen_at`` (``rag_app.sessions.check_still_valid``, a read-only twin of
+    ``authenticate``): the session is still live, the role still grants ``admin:read``, and
+    the MFA step-up is still set. Any of the three failing sends a terminal ``closed`` event
+    and ends the generator -- the browser's own ``EventSource`` reconnect logic then re-runs
+    the full page load, which re-proves all three for real. Idle-closes after
+    ``idle_close_seconds`` regardless (bounds one connection's lifetime even if everything
+    above keeps checking out)."""
+    global _admin_stream_connections
+    started = time.monotonic()
+    first = True
+    try:
+        while True:
+            if time.monotonic() - started >= stream_settings.idle_close_seconds:
+                yield _sse_frame("closed", {"reason": "idle_timeout"})
+                return
+            factory = get_session_factory()
+            with factory() as session:
+                user = session_service.check_still_valid(session, cookie_raw)
+                if user is None:
+                    yield _sse_frame("closed", {"reason": "session_expired"})
+                    return
+                if "admin:read" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
+                    yield _sse_frame("closed", {"reason": "role_lost"})
+                    return
+                if session_service.mfa_verified_at(session, cookie_raw) is None:
+                    yield _sse_frame("closed", {"reason": "mfa_step_up_lost"})
+                    return
+                payload = _stream_snapshot(session, metrics_backend)
+            yield _sse_frame("snapshot" if first else "heartbeat", payload)
+            first = False
+            await asyncio.sleep(stream_settings.tick_seconds)
+    finally:
+        _admin_stream_connections -= 1
+
+
+@router.get(
+    "/admin/stream",
+    tags=["admin"],
+    dependencies=[
+        Depends(
+            require_permission_and_mfa("admin:read", route=("GET", "/admin/stream"), matrix=False)
+        ),
+        Depends(rate_limit_account("admin_stream")),
+    ],
+)
+async def admin_stream(
+    http: Request,
+    stream_settings: AdminStreamSettingsDep,
+    metrics_backend: MetricsBackendDep,
+) -> StreamingResponse:
+    """T13.4.1: SSE, local only -- T13.4.2's Azure path polls the REST routes above instead
+    (TF14: which of the two a session uses is decided server-side, see ``admin_features``'s
+    ``live_mode`` field, never a frontend build-time variable).
+
+    ``matrix=False`` despite being a bare GET -- see this module's docstring: the
+    client-tampering matrix's bare probe blocks on the full response body, which this
+    route's open-ended stream would never deliver."""
+    cookie_raw = http.cookies.get(session_service.SESSION_COOKIE_NAME)
+    if not cookie_raw:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+    global _admin_stream_connections
+    if _admin_stream_connections >= stream_settings.max_connections:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "too many live admin connections open right now; please try again shortly",
+        )
+    _admin_stream_connections += 1
+    return StreamingResponse(
+        _admin_stream_events(cookie_raw, stream_settings, metrics_backend),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

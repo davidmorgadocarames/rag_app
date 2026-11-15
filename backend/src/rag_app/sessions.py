@@ -114,6 +114,23 @@ def authenticate(session: Session, raw: str, *, now: dt.datetime | None = None) 
     return user
 
 
+def check_still_valid(session: Session, raw: str, *, now: dt.datetime | None = None) -> User | None:
+    """Read-only twin of ``authenticate`` (T13.4.1): the admin SSE stream re-checks auth on
+    every tick WITHOUT extending the session's idle timeout just because the stream is still
+    open in a background tab -- a stream a user walked away from must still idle-expire on
+    schedule. Same unknown / idle-expired / absolute-expired / revoked(row missing) / erased
+    -> ``None`` collapse as ``authenticate``, but never writes ``last_seen_at``/
+    ``idle_expires_at`` and never deletes an expired row (no side effects at all; the lazy
+    cleanup ``authenticate`` does is still reachable through a real request or the purger)."""
+    moment = now if now is not None else _now()
+    row = _row(session, raw)
+    if row is None:
+        return None
+    if moment >= row.idle_expires_at or moment >= row.absolute_expires_at:
+        return None
+    return session.scalar(select(User).where(User.id == row.user_id, User.deleted_at.is_(None)))
+
+
 def mfa_verified_at(session: Session, raw: str) -> dt.datetime | None:
     """The live session's ``mfa_verified_at`` (T12.3.5): ``None`` when the session never
     stepped up, or does not name a live row. A read-only lookup -- ``get_current_user``

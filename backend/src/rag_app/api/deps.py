@@ -41,11 +41,22 @@ _email_abuse_limiter: EmailAbuseLimiter | None = None
 RATE_LIMIT_DEPENDENCIES: set[Callable[..., Any]] = set()
 
 
-def get_session() -> Iterator[Session]:
+def get_session_factory() -> Callable[[], Session]:
+    """The one process-wide session factory, built on first use (same lazy singleton as
+    every other ``get_*`` dependency here). ``get_session`` is the ordinary per-request
+    dependency; T13.4.1's admin SSE stream calls this directly instead -- a long-lived
+    generator cannot hold ONE request-scoped session open for its whole lifetime (it opens
+    a short-lived one per tick), so it needs the factory itself, not the `Depends`-wrapped
+    generator."""
     global _session_factory
     if _session_factory is None:
         _session_factory = make_session_factory()
-    with _session_factory() as session:
+    return _session_factory
+
+
+def get_session() -> Iterator[Session]:
+    factory = get_session_factory()
+    with factory() as session:
         yield session
 
 

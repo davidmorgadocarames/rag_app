@@ -170,3 +170,98 @@ def test_admin_role_gets_the_shorter_p12_d3_timeouts(db_engine: Engine) -> None:
         # the wrong reason.
         assert sessions.ADMIN_IDLE_TIMEOUT_MINUTES < sessions.IDLE_TIMEOUT_MINUTES
         assert sessions.ADMIN_ABSOLUTE_TIMEOUT_HOURS < sessions.ABSOLUTE_TIMEOUT_HOURS
+
+
+# --- check_still_valid (T13.4.1): read-only twin of authenticate, never touches last_seen ---
+
+
+def test_check_still_valid_accepts_a_fresh_session_without_touching_last_seen(
+    db_engine: Engine,
+) -> None:
+    user_id = _make_user(db_engine)
+    with Session(db_engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None
+        t0 = dt.datetime.now(dt.UTC).replace(microsecond=0)
+        raw = sessions.create_session(session, user, now=t0)
+        session.commit()
+
+        # Over the LAST_SEEN_THROTTLE_SECONDS window that authenticate() would normally
+        # touch -- proves this call did NOT do that, not merely that it ran before it would.
+        later = t0 + dt.timedelta(seconds=sessions.LAST_SEEN_THROTTLE_SECONDS + 30)
+        checked = sessions.check_still_valid(session, raw, now=later)
+        assert checked is not None and checked.id == user_id
+        row = session.scalar(select(UserSession).where(UserSession.id == hash_token(raw)))
+        assert row is not None
+        assert row.last_seen_at == t0  # unchanged
+        assert row.idle_expires_at == t0 + dt.timedelta(minutes=sessions.IDLE_TIMEOUT_MINUTES)
+
+
+def test_check_still_valid_rejects_an_unknown_session(db_engine: Engine) -> None:
+    with Session(db_engine) as session:
+        assert sessions.check_still_valid(session, "not-a-real-session-token") is None
+
+
+def test_check_still_valid_rejects_an_idle_expired_session_without_deleting_it(
+    db_engine: Engine,
+) -> None:
+    user_id = _make_user(db_engine)
+    with Session(db_engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None
+        raw = sessions.create_session(session, user)
+        session.commit()
+        session.execute(
+            update(UserSession)
+            .where(UserSession.id == hash_token(raw))
+            .values(idle_expires_at=dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1))
+        )
+        session.commit()
+        assert sessions.check_still_valid(session, raw) is None
+        # Unlike authenticate(), a read-only check never does the lazy cleanup delete.
+        row = session.scalar(select(UserSession).where(UserSession.id == hash_token(raw)))
+        assert row is not None
+
+
+def test_check_still_valid_rejects_an_absolute_expired_session(db_engine: Engine) -> None:
+    user_id = _make_user(db_engine)
+    with Session(db_engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None
+        raw = sessions.create_session(session, user)
+        session.commit()
+        session.execute(
+            update(UserSession)
+            .where(UserSession.id == hash_token(raw))
+            .values(absolute_expires_at=dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1))
+        )
+        session.commit()
+        assert sessions.check_still_valid(session, raw) is None
+
+
+def test_check_still_valid_rejects_a_revoked_session(db_engine: Engine) -> None:
+    user_id = _make_user(db_engine)
+    with Session(db_engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None
+        raw = sessions.create_session(session, user)
+        session.commit()
+        sessions.revoke(session, raw)
+        session.commit()
+        assert sessions.check_still_valid(session, raw) is None
+
+
+def test_check_still_valid_rejects_an_erased_user(db_engine: Engine) -> None:
+    user_id = _make_user(db_engine)
+    with Session(db_engine) as session:
+        user = session.get(User, user_id)
+        assert user is not None
+        raw = sessions.create_session(session, user)
+        session.commit()
+        # Simulates the user being erased after the session was created (authenticate()'s
+        # own "erased since" case) -- check_still_valid must collapse this to None too.
+        session.execute(
+            update(User).where(User.id == user_id).values(deleted_at=dt.datetime.now(dt.UTC))
+        )
+        session.commit()
+        assert sessions.check_still_valid(session, raw) is None
