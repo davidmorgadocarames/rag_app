@@ -26,6 +26,24 @@ test("the allow-listed backend routes pass", () => {
   // T12.4.6 (12b-C): forgot-password request + the reset page's token+password submit.
   assert.equal(isAllowedUpstreamPath("POST", "/auth/forgot-password"), true);
   assert.equal(isAllowedUpstreamPath("POST", "/auth/reset"), true);
+  // T13.2.9: the admin dashboard.
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/features"), true);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/metrics"), true);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/latency"), true);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/eval"), true);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/erasure"), true);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/stream"), true);
+  assert.equal(isAllowedUpstreamPath("POST", "/admin/erasure/abc-123/purge-now"), true);
+  assert.equal(isAllowedUpstreamPath("POST", "/admin/erasure/abc-123/retry"), true);
+  assert.equal(isAllowedUpstreamPath("POST", "/admin/users/erase"), true);
+});
+
+test("the admin allow-list is /admin/* only -- no wider (T13.2.9)", () => {
+  assert.equal(isAllowedUpstreamPath("GET", "/admin"), false);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/users"), false);
+  assert.equal(isAllowedUpstreamPath("DELETE", "/admin/users/erase"), false);
+  assert.equal(isAllowedUpstreamPath("POST", "/admin/erasure/abc-123/delete-forever"), false);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/erasure/abc-123/purge-now"), false);
 });
 
 test("never /metrics, /docs, /redoc or /openapi.json, whatever the method", () => {

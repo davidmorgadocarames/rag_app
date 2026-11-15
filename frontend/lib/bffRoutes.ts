@@ -37,6 +37,20 @@ export const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   { method: "POST", pattern: /^\/account\/mfa\/confirm$/ },
   { method: "POST", pattern: /^\/account\/mfa\/step-up$/ },
   { method: "GET", pattern: /^\/admin\/ping$/ },
+  // T13.2.9: the admin dashboard -- `/admin/*` ONLY (never a wider prefix; each route is
+  // still its own explicit entry here, matching this file's own rule that nothing reaches
+  // the backend without being named). The backend gates every one of these with
+  // require_permission_and_mfa (admin:read / admin:users) -- this allow-list only decides
+  // what reaches it at all, same as the MFA routes above.
+  { method: "GET", pattern: /^\/admin\/features$/ },
+  { method: "GET", pattern: /^\/admin\/metrics$/ },
+  { method: "GET", pattern: /^\/admin\/latency$/ },
+  { method: "GET", pattern: /^\/admin\/eval$/ },
+  { method: "GET", pattern: /^\/admin\/erasure$/ },
+  { method: "GET", pattern: /^\/admin\/stream$/ },
+  { method: "POST", pattern: /^\/admin\/erasure\/[^/]+\/purge-now$/ },
+  { method: "POST", pattern: /^\/admin\/erasure\/[^/]+\/retry$/ },
+  { method: "POST", pattern: /^\/admin\/users\/erase$/ },
 ];
 
 /** Whether ``method path`` (upstream path, no "/api" prefix) is on the allow-list. */

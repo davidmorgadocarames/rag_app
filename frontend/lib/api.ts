@@ -208,6 +208,132 @@ export function adminPing(): Promise<{ detail: string }> {
   return request("/admin/ping");
 }
 
+// --- admin dashboard (T13.1-T13.4): typed responses, same shapes as the backend's --------
+
+export interface FeatureHealthOut {
+  id: string;
+  name: string;
+  phase: string;
+  status: string;
+  probe_status: string | null;
+  probe_detail: string | null;
+  metrics: Record<string, number | null>;
+  dev_only: boolean;
+  azure_only: boolean;
+}
+
+// TF14: the server-side decision the dashboard reads to pick SSE vs. polling -- never a
+// frontend build-time variable.
+export type AdminLiveMode = "sse" | "polling";
+
+export interface AdminFeaturesResponse {
+  features: FeatureHealthOut[];
+  live_mode: AdminLiveMode;
+}
+
+export interface AdminMetricsResponse {
+  values: Record<string, number | null>;
+}
+
+export interface StageLatencyOut {
+  stage: string;
+  count: number;
+  avg_seconds: number | null;
+  p50_seconds: number | null;
+  p95_seconds: number | null;
+}
+
+export interface AdminLatencyResponse {
+  stages: StageLatencyOut[];
+}
+
+export interface EvalMetricOut {
+  key: string;
+  value: number | null;
+  floor: number | null;
+  baseline: number | null;
+  below_floor: boolean;
+  regressed: boolean;
+}
+
+export interface AdminEvalResponse {
+  last_run_at: string | null;
+  metrics: EvalMetricOut[];
+  passed: boolean;
+}
+
+export interface ErasureRequestOut {
+  id: string;
+  requested_at: string;
+  age_seconds: number;
+  seconds_left: number;
+  status: string;
+  rows_remaining: Record<string, number>;
+  attempts: number;
+  last_error_class: string | null;
+  overdue: boolean;
+}
+
+export interface LastPurgerRunOut {
+  started_at: string;
+  finished_at: string | null;
+  requests_processed: number;
+  errors: number;
+}
+
+export interface AdminErasureResponse {
+  requests: ErasureRequestOut[];
+  last_purger_run: LastPurgerRunOut | null;
+}
+
+export interface ErasureActionResponse {
+  detail: string;
+  request_id: string;
+}
+
+export interface AdminEraseUserResponse {
+  detail: string;
+  request_id: string;
+}
+
+export function adminFeatures(): Promise<AdminFeaturesResponse> {
+  return request("/admin/features");
+}
+
+export function adminMetrics(): Promise<AdminMetricsResponse> {
+  return request("/admin/metrics");
+}
+
+export function adminLatency(): Promise<AdminLatencyResponse> {
+  return request("/admin/latency");
+}
+
+export function adminEval(): Promise<AdminEvalResponse> {
+  return request("/admin/eval");
+}
+
+export function adminErasure(): Promise<AdminErasureResponse> {
+  return request("/admin/erasure");
+}
+
+export function adminErasurePurgeNow(requestId: string): Promise<ErasureActionResponse> {
+  return request(`/admin/erasure/${requestId}/purge-now`, { method: "POST" });
+}
+
+export function adminErasureRetry(requestId: string): Promise<ErasureActionResponse> {
+  return request(`/admin/erasure/${requestId}/retry`, { method: "POST" });
+}
+
+export function adminEraseUser(
+  email: string,
+  confirmation: string,
+): Promise<AdminEraseUserResponse> {
+  return request("/admin/users/erase", {
+    method: "POST",
+    body: JSON.stringify({ email, confirmation }),
+  });
+}
+
 // --- conversations -------------------------------------------------------
 
 export function listConversations(): Promise<ConversationSummary[]> {

@@ -1,19 +1,21 @@
-// Admin placeholder page (T12.3.2/T12.3.5): a server-side role + MFA check BEFORE anything
+// Admin dashboard shell (T13.2.1): a server-side role + MFA check BEFORE anything
 // admin-shaped is ever rendered -- never a client-side decision (T12.3.6 case 5). Reuses the
-// exact same BFF proxy logic (`lib/bffProxy.ts`) the real `/api/admin/ping` route uses, so
-// this check is not a second, possibly-drifting implementation of "is this user an admin".
-//
-// Written in 12b-A; NOT run through `npm run build`/Playwright this session (PC constraint)
-// -- verification is phase 2 work.
+// exact same BFF proxy logic (`lib/bffProxy.ts`) every other route uses, so this check is
+// not a second, possibly-drifting implementation of "is this user an admin" -- and doubles
+// as the dashboard's own "first data load" (T13.2 rendering rule: SSR shell + server-side
+// role/MFA check + first data load; everything live after that is CSR, see
+// components/admin/AdminDashboard.tsx).
 
 import { headers } from "next/headers";
 
+import type { AdminFeaturesResponse } from "@/lib/api";
 import { bffConfig } from "@/lib/bffConfig";
 import { proxyToBackend } from "@/lib/bffProxy";
+import AdminDashboard from "@/components/admin/AdminDashboard";
 
 export const dynamic = "force-dynamic"; // never statically generated (D12.2) -- a fresh check every time
 
-async function isSteppedUpAdmin(): Promise<boolean> {
+async function loadFeatures(): Promise<AdminFeaturesResponse | null> {
   // next/headers' ReadonlyHeaders only differs from DOM Headers in being read-only --
   // proxyToBackend only ever calls .get() on it, so this cast is structurally safe.
   const incoming = (await headers()) as unknown as Headers;
@@ -21,23 +23,24 @@ async function isSteppedUpAdmin(): Promise<boolean> {
     const response = await proxyToBackend(
       {
         method: "GET",
-        path: "/admin/ping",
+        path: "/admin/features",
         search: "",
         headers: incoming,
         body: null,
       },
       bffConfig(),
     );
-    return response.ok;
+    if (!response.ok) return null; // not an admin, no MFA step-up, or the backend is down
+    return (await response.json()) as AdminFeaturesResponse;
   } catch {
-    return false; // backend unreachable: fail closed, never render admin content
+    return null; // backend unreachable: fail closed, never render admin content
   }
 }
 
 export default async function AdminPage() {
-  const allowed = await isSteppedUpAdmin();
+  const initial = await loadFeatures();
 
-  if (!allowed) {
+  if (initial === null) {
     return (
       <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 px-6">
         <h1 className="text-2xl font-bold tracking-[0.12em] text-vault-steel-light">Admin</h1>
@@ -53,13 +56,5 @@ export default async function AdminPage() {
     );
   }
 
-  return (
-    <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 px-6">
-      <h1 className="text-2xl font-bold tracking-[0.12em] text-vault-steel-light">Admin</h1>
-      <p className="text-sm text-vault-steel">
-        Placeholder (T12.3.2/T12.3.5) -- confirms the permission map + MFA step-up gate a real
-        page end to end. Real admin features arrive in Phase 13.
-      </p>
-    </main>
-  );
+  return <AdminDashboard initial={initial} />;
 }
