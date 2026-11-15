@@ -474,7 +474,9 @@ true of the ORIGINAL fix (12b); it is the walker's OWN coverage that regressed l
 silently, independent of this decision. Fixed by reusing `rag_app.features.iter_routes` (the
 same flattening helper `check_registry`/`route_probe` already use for the identical FastAPI
 quirk, T13.0.5) and replacing the weak self-check with two floors that would have caught the
-regression: `iter_routes(app)` returns at least 25 raw routes, and every route in
+regression: `iter_routes(app)` yields at least 21 `APIRoute`s (ENV-independent; a first
+version counted at least 25 raw flattened routes, which includes 4 `ENV=dev`-only framework
+routes and failed in CI's `ENV=prod`, corrected in the same fix block), and every route in
 `rag_app.authz.DECLARED_PERMISSION_ROUTES` is among the routes the walker actually checked.
 Verified, with the fix applied, that all 12 non-public routes it now sees still pass (no
 route was actually left under-protected on Azure).
