@@ -597,6 +597,20 @@ def run(args: argparse.Namespace) -> int:
             runs = conn.execute(
                 text("SELECT count(*) FROM purger_runs WHERE finished_at IS NOT NULL")
             ).scalar_one()
+            # DEBT-005: the killed run's OWN row (inserted at the start of `_run_locked`,
+            # before SIGKILL ever lands) never reaches the `finished_at` UPDATE in its
+            # `finally` block -- it stays in `purger_runs` forever with `finished_at IS
+            # NULL`. A fresh throwaway database starts with zero rows, so "both runs in
+            # purger_runs" is exactly: 2 total (the killed one + the one that completed),
+            # of which exactly 1 is still unfinished. The "overlap" run above never inserts a
+            # row at all (it is skipped at the advisory-lock stage, before `_run_locked`
+            # runs) -- so this count is never inflated by it.
+            total_runs, unfinished_runs = conn.execute(
+                text(
+                    "SELECT count(*), count(*) FILTER (WHERE finished_at IS NULL)"
+                    " FROM purger_runs"
+                )
+            ).one()
         longest = re.search(r"longest ([0-9.]+) s", final.stdout)
         longest_s = float(longest.group(1)) if longest else float("inf")
 
@@ -644,6 +658,10 @@ def run(args: argparse.Namespace) -> int:
             f" {purge_seconds:.1f} s -> tombstones {'/'.join(d[0] for d in done)}, rows left"
             f" {rows_left}, longest transaction {longest_s:.3f} s; purger_runs finished {runs}"
         )
+        print(
+            f"  purger_runs (DEBT-005): {total_runs} total, {unfinished_runs} unfinished"
+            " (the killed run's own row, left with finished_at NULL)"
+        )
         print("  " + final.stdout.strip().replace("\n", "\n  "))
 
         n = len(samples)
@@ -669,6 +687,10 @@ def run(args: argparse.Namespace) -> int:
             and all(d[0] == "done" and d[1].get("messages", 0) == MESSAGES for d in done)
             and rows_left == 0,
             f"purger transactions < {PURGER_TXN_LIMIT_S:.0f} s": longest_s < PURGER_TXN_LIMIT_S,
+            # DEBT-005: both the killed run and the one that finished it are visible in
+            # purger_runs -- never lost, never double-counted (a fresh throwaway database
+            # starts at 0; the skipped "overlap" attempt above never inserts a row at all).
+            "purger_runs has both runs (DEBT-005)": total_runs == 2 and unfinished_runs == 1,
         }
         failed = [name for name, ok in checks.items() if not ok]
         for name, ok in checks.items():
