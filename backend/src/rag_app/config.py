@@ -326,6 +326,20 @@ class Settings(JobSettings):
     # (local only, where a long-lived connection is reliable); Azure is never set at all.
     admin_live_mode: Literal["sse", "polling"] = "polling"
 
+    # --- Defence lab (T13.3.1, local only — DEC-028) ---
+    # Off by default (``dev_only_flag``, same backstop as every other development-only
+    # feature in this file): with ``ENV=prod`` the start-up guard (``check_dev_only_flags``)
+    # refuses to serve at all while this is on, and ``rag_app.api.app.create_app`` only
+    # includes ``rag_app.api.lab``'s router when it is set, so a production/Azure deployment
+    # never even registers the ``/admin/lab/*`` routes (a 404, not merely a 403) regardless
+    # of ``ENV``. The field name itself already matches ``DEV_ONLY_NAME`` (starts with
+    # ``lab_``), so the generic name-based backstop would catch a missing ``dev_only_flag``
+    # too -- declared explicitly anyway, the project's own convention.
+    lab_enabled: bool = dev_only_flag(
+        "Defence lab (13-D): exposes /admin/lab/* probe-run routes. Off by default; refused"
+        " with ENV=prod."
+    )
+
     @model_validator(mode="after")
     def _default_require_email_verification_with_prod(self) -> Settings:
         """T12.4.4: ``require_email_verification`` defaults to ``True`` with ``ENV=prod`` and

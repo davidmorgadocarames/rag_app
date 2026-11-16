@@ -38,7 +38,7 @@ class _SettingsWithUndeclaredFlag(Settings):
 @pytest.fixture(autouse=True)
 def _no_env_from_outside(monkeypatch: pytest.MonkeyPatch) -> None:
     # Tests decide ENV themselves; the developer's shell or .env must not leak in.
-    for name in ("ENV", "SANDBOX_FEATURE", "FAKE_LLM", "DEFENCE_LAB"):
+    for name in ("ENV", "SANDBOX_FEATURE", "FAKE_LLM", "DEFENCE_LAB", "LAB_ENABLED"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -76,8 +76,27 @@ def test_prod_without_dev_flags_starts() -> None:
 
 
 def test_the_registry_is_derived_from_the_field_declarations() -> None:
-    assert dev_only_flags(_SettingsWithDummyFlag) == ["sandbox_feature"]
-    assert dev_only_flags(Settings) == []  # none has landed yet (Phases 13/16/19/20)
+    # 13-D (T13.3.1) is the first dev-only flag to actually land (Phases 16/19/20 still don't
+    # have one) -- inherited by every `Settings` subclass, including this test's own stand-in.
+    assert dev_only_flags(_SettingsWithDummyFlag) == ["lab_enabled", "sandbox_feature"]
+    assert dev_only_flags(Settings) == ["lab_enabled"]
+
+
+def test_lab_enabled_with_prod_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T13.3.1: the real field, not a stand-in -- ``ENV=prod`` (the default) refuses to start
+    with the defence lab on."""
+    monkeypatch.setenv("LAB_ENABLED", "true")
+    settings = Settings(_env_file=None)
+    assert settings.env == "prod"
+    assert settings.lab_enabled is True
+    with pytest.raises(DevOnlyFlagInProdError, match="lab_enabled"):
+        check_dev_only_flags(settings)
+
+
+def test_lab_enabled_is_allowed_with_dev(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENV", "dev")
+    monkeypatch.setenv("LAB_ENABLED", "true")
+    check_dev_only_flags(Settings(_env_file=None))
 
 
 def test_an_undeclared_flag_with_a_dev_only_name_is_still_refused_in_prod(
@@ -85,7 +104,9 @@ def test_an_undeclared_flag_with_a_dev_only_name_is_still_refused_in_prod(
 ) -> None:
     """Backstop: forgetting `dev_only_flag` on e.g. `fake_llm` cannot open it in prod."""
     monkeypatch.setenv("FAKE_LLM", "true")
-    assert dev_only_flags(_SettingsWithUndeclaredFlag) == ["fake_llm"]
+    # 13-D added the real `lab_enabled` field to `Settings` itself, so every subclass
+    # inherits it too (`dev_only_flags` reads `model_fields`, which includes inherited ones).
+    assert dev_only_flags(_SettingsWithUndeclaredFlag) == ["fake_llm", "lab_enabled"]
     with pytest.raises(DevOnlyFlagInProdError, match="fake_llm"):
         check_dev_only_flags(_SettingsWithUndeclaredFlag(_env_file=None))
 
@@ -102,11 +123,14 @@ class _SettingsWithWrappedBools(Settings):
 
 
 def test_bool_wrappers_with_a_dev_only_name_are_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 13-D's real `lab_enabled` field is inherited too (see the comment above on the
+    # undeclared-flag test).
     assert dev_only_flags(_SettingsWithWrappedBools) == [
         "data_explorer",
         "debug_endpoints",
         "defence_lab",
         "fake_llm",
+        "lab_enabled",
     ]
     monkeypatch.setenv("DEFENCE_LAB", "true")
     with pytest.raises(DevOnlyFlagInProdError, match="defence_lab"):
