@@ -192,3 +192,72 @@ port). A continuously fresh value with no triggering API-process event (e.g. a t
 that has simply been open for a day, with nothing else happening meanwhile) needs either a
 periodic in-process refresh or a scrape-time custom collector; the dashboard's own polling
 tick (T13.4.1/T13.4.2) is the natural place to add it once that mechanism exists.
+
+## Defence lab (13-D, T13.3.1–T13.3.6, local only — DEC-028)
+
+**LAB_ENABLED (T13.3.1).** A plain `dev_only_flag` field, same mechanism every other
+development-only feature in `rag_app.config` uses: off by default, the start-up guard
+refuses to serve at all with `ENV=prod` whatever the setting says. `create_app` registers
+`rag_app.api.lab`'s router only when the flag is on, so the lab's routes are genuinely
+ABSENT with it off — a 404, not a 403.
+
+**Probe framework (T13.3.2/T13.3.3).** Rather than duplicating the assertion a
+security-suite test already makes ("one implementation" — the auth/CSRF/session probes
+specifically must reuse the existing security-suite cases, not re-type their logic),
+`rag_app.defence_lab` keys every probe to a real
+`docs/security/THREAT_MODEL.md` catalogue id and re-runs that entry's own Test ID through
+ONE batched `pytest -v` subprocess (the pyproject-wide `addopts = "-q"` had to be overridden
+per invocation, or no per-test result lines are printed at all). A parametrized test
+(REC-09) selected by its bare node id runs every variant — the parser matches `nodeid` or
+`nodeid[...]` and requires every matched variant to pass, never partial credit.
+`CATALOGUE_PROBE_IDS` curates 19 ids across the Phase 11–12 categories named in T13.3.3;
+CSRF and server-side sessions had no catalogue id at all before this block (only prose in
+section 4's STRIDE tables) — added as REC-11/REC-12 so the lab can address them by id.
+Results persist into the existing `defence_runs` table (created in 0008, 13-B, specifically
+for this block) via the CALLING session — a persistent history in whatever long-lived
+database that is, independent of the catalogue probes' own disposable per-run test-DB-
+harness database (`TEST_DATABASE_URL`, the "fixed local target": the gate project,
+`127.0.0.1:15432`, same mechanism `security-suite`/`db-tests` already rely on).
+
+**Erasure at scale (DEBT-005) stays its own gate step.** The erasure-at-scale probe is
+deliberately NOT part of the catalogue-driven set: it needs a throwaway Postgres
+SUPERUSER connection (`SCALE_ADMIN_URL`) only the gate project hands out, a different
+operational shape from the admin-button/CLI path. `rag_app.devtools.erasure_scale`
+(unchanged entry point) already killed a purger run mid-way and proved the next run
+finishes — the one addition is the explicit DEBT-005 assertion: a fresh throwaway database
+ends with exactly 2 `purger_runs` rows, 1 still unfinished (the killed run's own row,
+`finished_at` forever `NULL` since `SIGKILL` bypasses its `finally` block) — both runs
+visible, nothing lost or duplicated.
+
+**Negative control (DEBT-017 part 2, DA-G1-7).** `rag_app.devtools.negative_control` is a
+one-off, never-gated proof that the erasure-scale latency criterion has teeth: it patches a
+THROWAWAY `git worktree`'s `DELETE /account` route to call the existing synchronous
+`rag_app.erasure.erase_user` (today only used by the offline `key_recovery.sh` tool)
+instead of the real asynchronous `request_erasure` path, then measures one big user's
+erasure latency. The first real run (100,000 messages, the same size `erasure-scale` uses)
+still passed the 200 ms criterion — Postgres' own FK `ON DELETE CASCADE` is a fast,
+set-based operation, not the batched/checkpointed work the real purger does — scaling to
+1,000,000 messages (`NEGCTL_MESSAGES`) reliably failed it (717 ms median, real run). The
+worktree and its throwaway database are always removed, success or failure.
+
+**Admin routes + gate step (T13.3.4/T13.3.5/T13.3.6).** `POST /admin/lab/run` (runs every
+catalogue probe, records the results, logs an `admin_actions` row) and `GET /admin/lab/runs`
+(history) follow the same `require_permission_and_mfa` + `rate_limit_account` + CSRF
+conventions as the rest of `/admin/*` — "CLI + button, same code" (T13.3.5) refers
+specifically to these catalogue probes, which are the only ones that make sense against a
+live admin session; the erasure-scale/negative-control tools stay gate/devtools-only, for
+the operational reasons above. The `defence-suite` gate step (T13.3.6) runs the same CLI
+and fails unless 100% of probes match their expected outcome.
+
+**Found running `security-suite` for real, fixed before relying on it (folded into this
+block).** `rag_app.api.lab`'s module-level `route=` registrations populate
+`authz.DECLARED_PERMISSION_ROUTES` at IMPORT time, independent of whether `create_app` ever
+mounts the router. Once any test in a pytest session imports the module (as the lab's own
+tests must), `test_route_walker.py`'s "walker discovery is vacuous" floor saw a route no
+`create_app()` built with the flag off actually serves — a false positive the very first
+dev-only conditionally-mounted feature in this codebase tripped. Fixed by intersecting the
+declared routes against the CURRENT app's own mounted routes first; a regression test
+proves the pre-fix formula really did flag a declared-but-unmounted route and the fix does
+not. The same pattern will recur for Phase 16/19/20's own dev-only features (fake LLM
+provider, data explorer, code-fix) — the fix is in the shared walker test, not specific to
+the lab.
