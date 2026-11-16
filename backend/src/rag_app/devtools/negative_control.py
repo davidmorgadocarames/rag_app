@@ -14,11 +14,18 @@ Never run by any gate step on purpose -- it is SUPPOSED to fail. Run by hand, on
 collect evidence for DEBT-017's closure, then thrown away:
 
     SCALE_ADMIN_URL=postgresql://<superuser>:<pw>@127.0.0.1:<port>/postgres \\
-    python -m rag_app.devtools.negative_control run
+    NEGCTL_MESSAGES=1000000 python -m rag_app.devtools.negative_control run
 
 Same environment rules as ``rag_app.devtools.erasure_scale`` (loopback, never port 5432).
 The worktree is created under a temp directory and removed again at the end (success or
 failure) -- `git worktree list` must show nothing left over once this exits.
+
+``NEGCTL_MESSAGES`` (default: ``erasure_scale.MESSAGES``, 100,000 -- the same size
+``erasure-scale`` uses): a single unbatched cascading ``DELETE`` (FK ``ON DELETE CASCADE``)
+of 100,000 messages turned out to still be fast enough on a real run (72 ms, under the
+200 ms limit) -- Postgres' own cascade is a set-based operation, not the batched,
+checkpointed work the real purger does. 1,000,000 messages reliably exceeded it (717 ms,
+real run, DEBT-017 evidence) -- large enough to make the point without taking long to seed.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import rag_app.devtools.erasure_scale as erasure_scale_module
 from rag_app.devtools.erasure_scale import (
     MESSAGES,
     PASSWORD,
@@ -133,9 +141,16 @@ def run() -> int:
         )
         master = Fernet.generate_key().decode()
         os.environ["DATA_MASTER_KEY"] = master
+        # A single unbatched cascading DELETE (FK ON DELETE CASCADE) of the SAME 100,000
+        # messages erasure-scale uses turned out to be fast enough on this machine to still
+        # pass the 200 ms criterion (first run, evidence below) -- scaled up via
+        # NEGCTL_MESSAGES (module-global override, same pattern `_seed` always reads) until
+        # the synchronous path's cost genuinely shows through.
+        messages = int(os.environ.get("NEGCTL_MESSAGES", MESSAGES))
+        erasure_scale_module.MESSAGES = messages
         seed = _seed(owner_url, load_users=0, big_users=1)
         _settle(owner_url, admin_engine)
-        print(f"  seeded 1 synthetic user x {MESSAGES} messages in {seed['seed_seconds']:.1f} s")
+        print(f"  seeded 1 synthetic user x {messages} messages in {seed['seed_seconds']:.1f} s")
 
         port = _free_port()
         server_env = {
