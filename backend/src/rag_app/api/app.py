@@ -120,6 +120,16 @@ def create_app() -> FastAPI:
     app.include_router(conversations.router)
     app.include_router(csp_report.router)
     app.include_router(admin.router)
+    # T13.3.1: the defence lab's routes are registered ONLY when LAB_ENABLED is on -- the
+    # default is off, and the start-up guard (check_dev_only_flags, called from `lifespan`
+    # below) refuses to serve AT ALL with ENV=prod whatever this setting says, so a
+    # production/Azure deployment never reaches a request against `/admin/lab/*` either way.
+    # Conditional registration (rather than a permission check inside the route) means the
+    # routes are genuinely ABSENT with the lab off -- a 404, not a 403.
+    if settings.lab_enabled:
+        from rag_app.api import lab as lab_routes
+
+        app.include_router(lab_routes.router)
 
     # T13.0.5: a consistent `tags=` on every route (not just the ones with an explicit
     # security dependency) — the `registry` gate step cross-checks every tag that shows up

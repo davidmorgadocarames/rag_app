@@ -277,3 +277,33 @@ class AdminEraseUserRequest(StrictModel):
 class AdminEraseUserResponse(BaseModel):
     detail: str
     request_id: str
+
+
+# --- T13.3.5: defence lab (local only, DEC-028) --------------------------------------------
+
+
+class DefenceProbeResultOut(BaseModel):
+    probe_id: str
+    expected_outcome: str
+    observed_outcome: str
+    passed: bool
+
+
+class DefenceLabRunResponse(BaseModel):
+    detail: str
+    git_sha: str
+    results: list[DefenceProbeResultOut]
+    all_matched: bool
+
+
+class DefenceRunOut(BaseModel):
+    probe_id: str
+    git_sha: str
+    expected_outcome: str
+    observed_outcome: str
+    passed: bool
+    run_at: dt.datetime
+
+
+class DefenceRunsResponse(BaseModel):
+    runs: list[DefenceRunOut]

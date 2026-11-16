@@ -152,10 +152,27 @@ def test_every_route_declares_auth_and_permission_and_a_rate_limit_or_is_public(
         f" discovery may have broken (got {len(api_routes)})"
     )
     checked_keys = {(method, path) for method, path, _route in checked}
-    missing = set(DECLARED_PERMISSION_ROUTES) - checked_keys
+    # 13-D (found running security-suite for real, fixed before relying on it): intersect
+    # with routes THIS app instance actually mounts first. `DECLARED_PERMISSION_ROUTES` is
+    # populated once, process-wide, the moment a route-declaring module is first IMPORTED
+    # (the `@router.post(..., dependencies=[Depends(require_permission_and_mfa(..., route=...))
+    # ])` decorator runs at module import, not at `include_router()` time) -- a dev-only
+    # feature whose router is only conditionally included (`rag_app.api.lab`, T13.3.1) can get
+    # imported by an UNRELATED test elsewhere in the same pytest session (module imports
+    # never un-import) without ever being mounted on a `create_app()` built with the feature
+    # off. Without this intersection, the very first test in a session to import such a
+    # module would make EVERY LATER call of this walker test fail with a false "route
+    # discovery is vacuous" positive, for a route this app never serves at all.
+    app_route_keys = {
+        (method, route.path)
+        for route in iter_routes(app)
+        if isinstance(route, APIRoute)
+        for method in (route.methods or set()) - _SKIPPED_METHODS
+    }
+    missing = (set(DECLARED_PERMISSION_ROUTES) & app_route_keys) - checked_keys
     assert not missing, (
-        "the walker never even looked at these permission-declared routes -- route"
-        f" discovery is vacuous again: {sorted(missing)}"
+        "the walker never even looked at these permission-declared, actually-mounted routes"
+        f" -- route discovery is vacuous again: {sorted(missing)}"
     )
     failures = _walk(app)
     assert not failures, "\n".join(f"{m} {p}: {', '.join(ps)}" for (m, p), ps in failures.items())
@@ -175,6 +192,32 @@ def test_an_undeclared_route_fails_the_walker() -> None:
     assert ("GET", "/__walker_probe__") in failures
     reported = failures[("GET", "/__walker_probe__")]
     assert len(reported) == 3  # auth + permission + rate limit, all three missing
+
+
+def test_a_declared_route_never_mounted_on_this_app_is_not_a_false_positive() -> None:
+    """13-D regression: a route another module declared (e.g. a dev-only feature's router,
+    imported but not included because the flag is off on THIS app) must never trip the
+    "walker discovery is vacuous" floor -- only a declared route this app actually SERVES
+    counts. Verified to fail against the PRE-fix formula (``set(DECLARED_PERMISSION_ROUTES)
+    - checked_keys``, with no intersection against the app's own routes first)."""
+    phantom = ("GET", "/__never_mounted_on_this_app__")
+    DECLARED_PERMISSION_ROUTES[phantom] = "some:permission"
+    try:
+        app = create_app()
+        checked_keys = {(method, path) for method, path, _route in _non_public_routes(app)}
+        app_route_keys = {
+            (method, route.path)
+            for route in iter_routes(app)
+            if isinstance(route, APIRoute)
+            for method in (route.methods or set()) - _SKIPPED_METHODS
+        }
+        fixed_missing = (set(DECLARED_PERMISSION_ROUTES) & app_route_keys) - checked_keys
+        assert phantom not in fixed_missing
+
+        pre_fix_missing = set(DECLARED_PERMISSION_ROUTES) - checked_keys
+        assert phantom in pre_fix_missing
+    finally:
+        del DECLARED_PERMISSION_ROUTES[phantom]
 
 
 def test_a_route_with_only_auth_still_fails_for_the_missing_permission_and_rate_limit() -> None:

@@ -93,6 +93,7 @@ frontend         - 600
 dependency-audit - 240
 db-tests         db 300
 security-suite   db 180
+defence-suite    db 240
 migrations-roundtrip db 180
 backup-drill     db 300
 erasure-scale    db 600
@@ -300,6 +301,17 @@ step_db-tests() {
 step_security-suite() {
   need_venv || return 1
   (cd backend && SECRAG_REQUIRE_DB_TESTS=1 "$VENV/bin/pytest" -m security -p no:cacheprovider -rs)
+}
+
+# T13.3.6: every THREAT_MODEL-catalogue-keyed defence probe (rag_app.defence_lab) must match
+# its expected outcome -- 100%, no partial credit. Same TEST_DATABASE_URL/DATABASE_URL the
+# gate stack already exports for security-suite/db-tests above (rag_app.defence_lab's own
+# module docstring has the full "fixed local target" reasoning); the erasure-at-scale probe
+# (DEBT-005) is deliberately its OWN separate step (erasure-scale, below) -- it needs a
+# throwaway Postgres SUPERUSER connection this step does not have.
+step_defence-suite() {
+  need_venv || return 1
+  (cd "$REPO_ROOT" && "$PY" -m rag_app.devtools.defence_lab_cli run 2>&1 | sed 's/^/  /'; exit "${PIPESTATUS[0]}")
 }
 
 # Fresh database → roles.sql twice (catalog identical) → the roles log in with the gate

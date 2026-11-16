@@ -668,6 +668,41 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         router_tags=("admin",),
         docs="docs/adr/adr_phase13_dashboard.md",
     ),
+    # --- Defence lab (13-D, local only -- DEC-028) --------------------------------------
+    FeatureEntry(
+        id="admin-defence-lab",
+        name="Defence lab (THREAT_MODEL-catalogue probes, CLI + admin button)",
+        phase="13",
+        status="enabled",
+        # Honestly reflects LAB_ENABLED: the route is only REGISTERED when the flag is on
+        # (T13.3.1), so this probe reports "down" (route absent) with the lab off -- the
+        # dashboard hides the lab tab on exactly that signal, never a separate flag lookup.
+        health_probe=route_probe("GET", "/admin/lab/runs"),
+        defence_probes=(
+            "OWASP-A02",
+            "OWASP-A05",
+            "OWASP-A07",
+            "API-1",
+            "API-2",
+            "API-4",
+            "API-5",
+            "API-6",
+            "API-8",
+            "API-10",
+            "LLM-10",
+            "REC-02",
+            "REC-04",
+            "REC-05",
+            "REC-06",
+            "REC-08",
+            "REC-09",
+            "REC-11",
+            "REC-12",
+        ),  # fmt: skip
+        router_tags=("admin-lab",),
+        dev_only=True,
+        docs="docs/adr/adr_phase13_dashboard.md",
+    ),
 )
 
 
