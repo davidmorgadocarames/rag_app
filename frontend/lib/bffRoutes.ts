@@ -51,6 +51,11 @@ export const ALLOWED_ROUTES: readonly AllowedRoute[] = [
   { method: "POST", pattern: /^\/admin\/erasure\/[^/]+\/purge-now$/ },
   { method: "POST", pattern: /^\/admin\/erasure\/[^/]+\/retry$/ },
   { method: "POST", pattern: /^\/admin\/users\/erase$/ },
+  // T13.3.5 (13-D, local only -- DEC-028): the defence lab's routes exist on the backend
+  // only when LAB_ENABLED is on; this allow-list entry just decides what COULD reach the
+  // backend -- the backend itself is a 404 when the lab is off, same as everything else.
+  { method: "POST", pattern: /^\/admin\/lab\/run$/ },
+  { method: "GET", pattern: /^\/admin\/lab\/runs$/ },
 ];
 
 /** Whether ``method path`` (upstream path, no "/api" prefix) is on the allow-list. */

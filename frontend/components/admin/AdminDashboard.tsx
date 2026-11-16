@@ -21,6 +21,7 @@ import {
 } from "@/lib/api";
 import { closedReasonMessage, parseAdminStreamData } from "@/lib/adminStream";
 
+import DefenceLabPanel from "./DefenceLabPanel";
 import ErasurePanel from "./ErasurePanel";
 import LatencyPanel from "./LatencyPanel";
 import QualityPanel from "./QualityPanel";
@@ -209,6 +210,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       <SecurityPanel features={features} />
       <QualityPanel evalResult={evalResult} features={features} />
       <ErasurePanel erasure={erasure} onChanged={refreshErasure} />
+      <DefenceLabPanel features={features} />
     </main>
   );
 }

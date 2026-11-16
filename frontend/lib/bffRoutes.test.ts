@@ -36,6 +36,9 @@ test("the allow-listed backend routes pass", () => {
   assert.equal(isAllowedUpstreamPath("POST", "/admin/erasure/abc-123/purge-now"), true);
   assert.equal(isAllowedUpstreamPath("POST", "/admin/erasure/abc-123/retry"), true);
   assert.equal(isAllowedUpstreamPath("POST", "/admin/users/erase"), true);
+  // T13.3.5 (13-D, local only): the defence lab's routes.
+  assert.equal(isAllowedUpstreamPath("POST", "/admin/lab/run"), true);
+  assert.equal(isAllowedUpstreamPath("GET", "/admin/lab/runs"), true);
 });
 
 test("the admin allow-list is /admin/* only -- no wider (T13.2.9)", () => {

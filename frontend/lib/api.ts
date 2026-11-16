@@ -334,6 +334,43 @@ export function adminEraseUser(
   });
 }
 
+// --- defence lab (T13.3.5, local only -- DEC-028) -------------------------
+
+export interface DefenceProbeResultOut {
+  probe_id: string;
+  expected_outcome: string;
+  observed_outcome: string;
+  passed: boolean;
+}
+
+export interface DefenceLabRunResponse {
+  detail: string;
+  git_sha: string;
+  results: DefenceProbeResultOut[];
+  all_matched: boolean;
+}
+
+export interface DefenceRunOut {
+  probe_id: string;
+  git_sha: string;
+  expected_outcome: string;
+  observed_outcome: string;
+  passed: boolean;
+  run_at: string;
+}
+
+export interface DefenceRunsResponse {
+  runs: DefenceRunOut[];
+}
+
+export function adminLabRun(): Promise<DefenceLabRunResponse> {
+  return request("/admin/lab/run", { method: "POST" });
+}
+
+export function adminLabRuns(): Promise<DefenceRunsResponse> {
+  return request("/admin/lab/runs");
+}
+
 // --- conversations -------------------------------------------------------
 
 export function listConversations(): Promise<ConversationSummary[]> {
