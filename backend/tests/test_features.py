@@ -271,6 +271,25 @@ def test_check_dod_compliance_has_no_problems_against_the_real_registry() -> Non
     assert check_dod_compliance() == []
 
 
+# DEC-039 (DA-13-E-1): the grandfather list may only SHRINK. Without this pin a future change
+# could quietly add a new, non-compliant entry's id to it and every DoD test above would stay
+# green. Closing a grandfathered entry -> remove its id AND lower this number in the same
+# change; raising it is never allowed (a new entry must follow the DoD rule instead).
+DOD_GRANDFATHERED_COUNT = 29
+
+
+def test_the_dod_grandfather_list_is_frozen_and_only_lists_real_entries() -> None:
+    from rag_app.features import _DOD_GRANDFATHERED_IDS
+
+    assert len(_DOD_GRANDFATHERED_IDS) == DOD_GRANDFATHERED_COUNT, (
+        "the DoD grandfather list changed size -- it may only shrink (lower"
+        " DOD_GRANDFATHERED_COUNT with the id you closed); never add a new entry to it"
+    )
+    registry_ids = {entry.id for entry in REGISTRY}
+    stale = sorted(_DOD_GRANDFATHERED_IDS - registry_ids)
+    assert not stale, f"grandfathered ids that are no longer in the registry: {stale}"
+
+
 def test_a_new_entry_with_no_probe_and_no_metric_fails_the_check() -> None:
     """Done-when (T13.5.1): a brand-new feature that skips the DoD rule entirely (no probe,
     no metric) fails -- proven here with a throwaway entry rather than waiting for someone

@@ -199,11 +199,25 @@ class FeatureHealthOut(BaseModel):
     azure_only: bool
 
 
+class AdminAlertOut(BaseModel):
+    """T13.5.2: one banner condition, pre-computed server-side (never a client-side
+    threshold) so the same business logic covers both live-update modes (SSE snapshot/
+    heartbeat, local; the REST route below, Azure polling). ``severity`` is a small, fixed
+    vocabulary -- never free text that could carry PII."""
+
+    code: str
+    severity: str  # "amber" | "red"
+    message: str
+
+
 class AdminFeaturesResponse(BaseModel):
     features: list[FeatureHealthOut]
     # T13.4.1/T13.4.2 (TF14): the server-side decision ("sse" | "polling") the dashboard's
     # CSR code reads to pick its live-update strategy -- never a frontend build-time variable.
     live_mode: str
+    # DA-13-E-2: the banner alerts computed from the SAME probe sweep as `features`, so the
+    # Azure polling tick (and the SSR first load) never runs a second registry sweep.
+    alerts: list[AdminAlertOut] = []
 
 
 class AdminMetricsResponse(BaseModel):
@@ -264,17 +278,6 @@ class AdminErasureResponse(BaseModel):
 class ErasureActionResponse(BaseModel):
     detail: str
     request_id: str
-
-
-class AdminAlertOut(BaseModel):
-    """T13.5.2: one banner condition, pre-computed server-side (never a client-side
-    threshold) so the same business logic covers both live-update modes (SSE snapshot/
-    heartbeat, local; the REST route below, Azure polling). ``severity`` is a small, fixed
-    vocabulary -- never free text that could carry PII."""
-
-    code: str
-    severity: str  # "amber" | "red"
-    message: str
 
 
 class AdminAlertsResponse(BaseModel):

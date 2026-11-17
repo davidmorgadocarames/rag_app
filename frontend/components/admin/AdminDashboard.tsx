@@ -9,7 +9,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-  adminAlerts,
   adminErasure,
   adminEval,
   adminFeatures,
@@ -141,23 +140,23 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   const [erasure, setErasure] = useState<AdminErasureResponse | null>(null);
   const [latency, setLatency] = useState<AdminLatencyResponse | null>(null);
   const [evalResult, setEvalResult] = useState<AdminEvalResponse | null>(null);
-  const [alerts, setAlerts] = useState<AdminAlertOut[]>([]);
+  const [alerts, setAlerts] = useState<AdminAlertOut[]>(initial.alerts ?? []);
   const [banner, setBanner] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   const refreshAll = useCallback(async () => {
-    const [f, e, l, ev, al] = await Promise.all([
+    // DA-13-E-2: alerts come with /admin/features (same probe sweep) -- no separate poll.
+    const [f, e, l, ev] = await Promise.all([
       adminFeatures(),
       adminErasure(),
       adminLatency(),
       adminEval(),
-      adminAlerts(),
     ]);
     setFeatures(f.features);
     setErasure(e);
     setLatency(l);
     setEvalResult(ev);
-    setAlerts(al.alerts);
+    setAlerts(f.alerts ?? []);
   }, []);
 
   const refreshErasure = useCallback(async () => {
@@ -169,9 +168,6 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
     adminErasure().then(setErasure).catch(() => undefined);
     adminLatency().then(setLatency).catch(() => undefined);
     adminEval().then(setEvalResult).catch(() => undefined);
-    adminAlerts()
-      .then((response) => setAlerts(response.alerts))
-      .catch(() => undefined);
   }, []);
 
   // T13.4.1: SSE, local only.

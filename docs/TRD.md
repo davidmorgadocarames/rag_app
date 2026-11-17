@@ -400,7 +400,8 @@ catalogue analysis; this is the implementation summary.
   managed Prometheus on Azure) are a dedicated ADR decision — see [ADR phase 13, "Live
   updates + metrics backends"](adr/adr_phase13_dashboard.md#live-updates--metrics-backends-13-c-t1341t1343-r6-4).
 - **Banner alerts** (T13.5.2, R6-1, P13-D4): `rag_app.api.admin._banner_alerts` is the ONE
-  implementation behind both `GET /admin/alerts` (Azure polling) and the SSE snapshot/
+  implementation behind `GET /admin/features`' `alerts` field (what the dashboard polls on
+  Azure — one probe sweep per tick, DA-13-E-2), the stand-alone `GET /admin/alerts` and the SSE snapshot/
   heartbeat's `alerts` field (local) — an open erasure request past 24 h (amber past 20 h),
   a lockout-hit count past a fixed floor, any non-`dev_only`/non-`azure_only` probe
   reporting `down`, any email send failure, and the daily answer cap (R6-1) reached (read

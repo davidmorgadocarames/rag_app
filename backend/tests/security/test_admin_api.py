@@ -229,6 +229,39 @@ def test_admin_erasure_lists_an_open_request_with_rows_remaining(api_env: Engine
     assert mine[0]["overdue"] is False
 
 
+def test_admin_features_carries_the_alerts_from_a_single_probe_sweep(
+    api_env: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-13-E-2: ``/admin/features`` returns the banner alerts too, built from the SAME probe
+    sweep -- so the dashboard's polling tick runs the registry probes once, not twice (it used
+    to call ``/admin/features`` and ``/admin/alerts`` in parallel, each sweeping on its own)."""
+    from rag_app.api import admin as admin_module
+
+    _close_every_open_erasure_request(api_env)
+    request_id = _open_erasure_request_id(
+        api_env, f"feat-alert-{uuid.uuid4().hex[:8]}@example.test"
+    )
+    _age_request(api_env, request_id, 25)
+
+    sweeps = 0
+    real_sweep = admin_module._features_payload
+
+    def counting_sweep(metrics_backend):  # noqa: ANN001, ANN202
+        nonlocal sweeps
+        sweeps += 1
+        return real_sweep(metrics_backend)
+
+    monkeypatch.setattr(admin_module, "_features_payload", counting_sweep)
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/features", headers=headers)
+    assert response.status_code == 200, response.text
+    assert sweeps == 1
+    alerts = {a["code"]: a for a in response.json()["alerts"]}
+    assert alerts["erasure_overdue"]["severity"] == "red"
+    _close_every_open_erasure_request(api_env)
+
+
 # --- GET /admin/alerts (T13.5.2, R6-1, P13-D4): banner alerts, matrix=True ----------------
 
 

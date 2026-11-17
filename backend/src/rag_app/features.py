@@ -815,6 +815,9 @@ REGISTRY: tuple[FeatureEntry, ...] = (
 # fail CI the moment a NEW entry skips the rule, without rewriting 29 historical entries in
 # one block. Closing one of these (adding the missing probe/metric) is ordinary product
 # work -- remove its id from this set in the same change.
+# DEC-039 (DA-13-E-1): this set is FROZEN -- `test_features.py` pins its exact size, so it
+# can only ever shrink (lower the pinned number in the same change). Never add an id here:
+# a new entry must satisfy the DoD rule instead.
 _DOD_GRANDFATHERED_IDS: frozenset[str] = frozenset(
     {
         "stack-health-endpoint",

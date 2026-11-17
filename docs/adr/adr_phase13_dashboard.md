@@ -239,7 +239,9 @@ catching most real incidents (an admin who looks reasonably often) is the actual
 a complete audit trail (that already lives in `admin_actions`/structured logs, 15.3).
 Re-evaluate only if Azure spend genuinely allows a managed option later (not planned).
 
-**Banner alerts (T13.5.2, R6-1, P13-D4).** `GET /admin/alerts` and the SSE snapshot/
+**Banner alerts (T13.5.2, R6-1, P13-D4).** `GET /admin/features` (its `alerts` field — what
+the dashboard's polling tick reads, one probe sweep per tick, DA-13-E-2), the stand-alone
+`GET /admin/alerts` and the SSE snapshot/
 heartbeat's own `alerts` field share ONE implementation (`rag_app.api.admin.
 _banner_alerts`) over the SAME five conditions regardless of live mode: an open erasure
 request past 24 h (amber past 20 h, D-ER's own promise); a lockout-hit count past a fixed,

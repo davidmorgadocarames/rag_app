@@ -229,6 +229,8 @@ export type AdminLiveMode = "sse" | "polling";
 export interface AdminFeaturesResponse {
   features: FeatureHealthOut[];
   live_mode: AdminLiveMode;
+  // DA-13-E-2: banner alerts from the same probe sweep (one sweep per polling tick).
+  alerts: AdminAlertOut[];
 }
 
 export interface AdminMetricsResponse {

@@ -261,10 +261,17 @@ def admin_features(
     without a trigger like this.
 
     ``live_mode`` (T13.4.1/T13.4.2, TF14): the server-side decision the CSR dashboard reads
-    to pick SSE vs. polling -- never a frontend build-time variable."""
+    to pick SSE vs. polling -- never a frontend build-time variable.
+
+    ``alerts`` (DA-13-E-2): the T13.5.2 banner alerts built from the SAME ``features``
+    sweep, so the dashboard's polling tick (Azure) runs the registry probes once, not once
+    here and again in ``/admin/alerts``."""
     _refresh_erasure_gauges(session)
+    features = _features_payload(metrics_backend)
     return AdminFeaturesResponse(
-        features=_features_payload(metrics_backend), live_mode=get_settings().admin_live_mode
+        features=features,
+        live_mode=get_settings().admin_live_mode,
+        alerts=_banner_alerts(session, metrics_backend, features),
     )
 
 
@@ -572,7 +579,11 @@ def admin_alerts(session: SessionDep, metrics_backend: MetricsBackendDep) -> Adm
     """T13.5.2 (R6-1, P13-D4): erasure > 24h (amber > 20h), lockout spikes, probe failures,
     email send failures, daily answer cap reached -- the same ``_banner_alerts`` the SSE
     stream's snapshot/heartbeat also calls (below), so local (SSE) and Azure (polling,
-    T13.4.2) show identical alerts for identical underlying state."""
+    T13.4.2) show identical alerts for identical underlying state.
+
+    DA-13-E-2: the dashboard itself no longer polls this route -- it reads ``alerts`` from
+    ``/admin/features`` (one probe sweep per tick); kept as the stand-alone read for API/CLI
+    consumers."""
     _refresh_erasure_gauges(session)
     features = _features_payload(metrics_backend)
     return AdminAlertsResponse(alerts=_banner_alerts(session, metrics_backend, features))
