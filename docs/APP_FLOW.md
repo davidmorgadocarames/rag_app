@@ -16,6 +16,12 @@ Chat (/chat)              [authenticated]
   ├─ ask a question ─▶ answer with citations  OR  abstention
   ├─▶ History (/history)
   └─▶ Account (/account) ─▶ Delete my data (confirm) ─▶ Landing
+
+Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
+  ├─ overview + feature cards + banner alerts (erasure/lockout/probe/email/daily-cap)
+  ├─▶ Latency / Security / Quality panels (read-only, "now" on Azure — R6-4)
+  ├─▶ Erasure panel ─▶ Purge now / Retry / Erase an account (DEBT-002)
+  └─▶ Defence lab tab (local only, LAB_ENABLED — absent, not just hidden, elsewhere)
 ```
 
 ## 2. Flows
@@ -186,6 +192,49 @@ Chat (/chat)              [authenticated]
    reset tokens → sessions → MFA rows → the user row — and marks the tombstone `done`.
    Restores replay the tombstones before reopening.
 
+### 2.7 Admin dashboard (`/admin`, Phase 13)
+
+1. An ordinary user visiting **`/admin`** sees a plain "you do not have access" placeholder
+   — never the admin content, never even a flash of it: the SSR shell
+   (`app/admin/page.tsx`) does a server-side role + MFA check through the SAME BFF proxy
+   every other route uses BEFORE anything admin-shaped is rendered (T13.2.1, no
+   client-side decision — T12.3.6 case 5). Tampering with `localStorage`/the DOM before
+   visiting has no effect (it is never consulted).
+2. An **admin whose session has no MFA step-up yet** sees the same placeholder, with a
+   link to **Account security** to enrol/step up. "MFA set" — not "recently set"
+   (DA-13-C-5): there is no step-up TTL, only logout/rotation/a fresh session ever clears
+   `sessions.mfa_verified_at`.
+3. Once in, the **Overview** panel shows registry entry counts by status, the probe-health
+   count, and the live-update mode (`sse` locally, `polling` on Azure — server-decided,
+   never a frontend build-time flag, TF14); on Azure a note explains every value is "this
+   replica's current state only", never a time series (R6-4).
+4. **Banner alerts** (T13.5.2, R6-1) sit above every panel, worst-first (red before amber):
+   an open erasure request past 24 h (amber past 20 h), a lockout-hit spike, any health
+   probe down (excluding a feature switched off here by design — the defence lab locally,
+   or an Azure-only check run off-Azure), an email send failure, or the daily answer cap
+   reached. Empty when nothing is wrong — no banner at all.
+5. **Feature cards** list every registry entry (id, phase, status, probe result if any).
+   **Latency** shows per-stage p50/p95 from this replica's own histogram. **Security**
+   summarises the identity/abuse/browser-security feature group. **Quality** shows the
+   last eval run vs baseline/floors — aggregate metrics only, never a per-question
+   golden-set text (T13.1.7).
+6. **Erasure panel**: every open/closed request (opaque id, age, time left to 24 h,
+   status, rows remaining, last purger run) with **Purge now**/**Retry** actions (run the
+   batched purger in the background; if the replica scales to zero mid-way the hourly Job
+   finishes it) and an **Erase an account** form (email + typed `ERASE` confirmation,
+   DEBT-002) — refuses to erase the LAST remaining admin account (409, DEC-033) but allows
+   self-erase (documented, consistent with the self-service `DELETE /account` already
+   allowing it).
+7. **Defence lab tab** (local only, `LAB_ENABLED` — DEC-028): a **Run probes** button
+   re-runs every THREAT_MODEL-catalogue probe's own test and shows pass/fail per id, with
+   history. With the flag off (always true on Azure) the tab itself is absent — the lab's
+   routes are genuinely not mounted, a 404, not a hidden-but-present 403.
+8. Live updates: locally the page holds one SSE connection open (snapshot, then a
+   heartbeat every few seconds, re-checking auth/role/MFA each tick without resetting the
+   idle timer) and shows a banner + prompts a reload if it closes (session expired, role
+   lost, MFA lost, idle timeout); on Azure the page polls at a low frequency with a manual
+   **Refresh now** button instead (Container Apps internal ingress + scale-to-zero, TF16).
+
 ## 3. Route → auth matrix
 
 | Route | Auth required | Notes |
@@ -197,6 +246,10 @@ Chat (/chat)              [authenticated]
 | `POST /auth/register`, `POST /auth/resend-verification`, `POST /auth/verify`, `POST /auth/forgot-password`, `POST /auth/reset` | no | T12.4.4/T12.4.6: register/resend-verification/forgot-password never confirm whether an address already has an account (generic response either way); resend/forgot-password are reached by email, not a session; each is rate-limited per real IP, per recipient and globally (T12.4.8) |
 | `DELETE /account` | yes | |
 | `POST /api/csp-report` | no | Unauthenticated, rate-limited by real IP, CSRF-exempt (no session to protect) — the browser's CSP violation reports (Phase 12a, TRD §8.1) |
+| `/admin` | yes + role=admin + MFA set on the session | SSR shell proves this server-side before any admin content renders (T13.2.1); an ordinary user or a non-stepped-up admin sees a plain denied placeholder |
+| `GET /admin/features`, `GET /admin/metrics`, `GET /admin/latency`, `GET /admin/eval`, `GET /admin/erasure`, `GET /admin/alerts`, `GET /admin/stream` (local only) | yes + role=admin + MFA set | `admin:read`; read-only, no PII in any response (T13.1.7) |
+| `POST /admin/erasure/{id}/purge-now`, `POST /admin/erasure/{id}/retry`, `POST /admin/users/erase` | yes + role=admin + MFA set | `admin:users`; audited in `admin_actions` (migration 0008) |
+| `GET /admin/lab/runs`, `POST /admin/lab/run` | yes + role=admin + MFA set, **local only** | Absent (404) with `LAB_ENABLED` off or `ENV=prod` — never a 403 (DEC-028) |
 
 Every path above the backend actually serves is also on the BFF's explicit allow-list
 (`frontend/lib/bffRoutes.ts`) under `/api/...` — a path not listed there is a 404 from the
@@ -208,3 +261,7 @@ frontend itself, before it would ever reach the backend.
   daily answer cap reached (`daily_cap_reached` / 429 — the bubble shows the server's message),
   unverified-email, erasure accepted (202) or busy (503 + `Retry-After`), unreadable
   conversation (409), and error states — each screen must handle these explicitly.
+- Admin dashboard: denied placeholder (no role / no MFA step-up), clean state (no banner
+  alerts at all), one or more banner alerts (worst severity first), live connection closed
+  (SSE, local — a reload prompt) vs. a manual "Refresh now" (polling, Azure), defence lab
+  tab present vs. genuinely absent (`LAB_ENABLED`).

@@ -369,3 +369,48 @@ catalogue analysis; this is the implementation summary.
   not change keeps running its currently deployed digest (read from Azure, fail-closed) instead of
   being redeployed, so an unrelated frontend-only change no longer forces an Ollama cold start
   ([ADR phase 13](adr/adr_phase13_dashboard.md)).
+
+## 12. Admin dashboard (Phase 13)
+
+- **Feature registry** (`rag_app.features.REGISTRY`, P13-D3): one typed, importable list —
+  every feature names its phase, status (`enabled` / `disabled` / `retained-not-adopted` /
+  `expected-fail`), an optional health probe (≤ 2 s, degrades gracefully with no live
+  stack), the Prometheus metrics it claims, defence-catalogue ids
+  ([`THREAT_MODEL.md`](security/THREAT_MODEL.md)) and quality-probe ids. The `registry`
+  gate step (`rag_app.devtools.registry_check`) cross-checks every claim against the real
+  app/Prometheus registry and runs every quality probe with a real DB session once one is
+  reachable (`--full`). **DoD rule (T13.5.1):** a feature added from 13-E onward needs a
+  registry entry, a probe and ≥ 1 metric (structurally enforced,
+  `rag_app.features.check_dod_compliance`; entries predating the rule are an explicit,
+  reviewed exception) and a defence-catalogue probe if actually catalogued (review). Every
+  metric label name is checked against a reviewed allow-list
+  (`rag_app.metrics.check_no_pii_labels`) so a new PII-shaped label fails automatically.
+- **Admin API** (`/admin/*`, `rag_app.api.admin`): every route resolves through
+  `require_permission_and_mfa` (permission map + MFA set on the session, T12.3.2/T12.3.5)
+  and a per-account rate limit. `GET /admin/features` (registry + live health + metrics
+  summary), `GET /admin/metrics` (every declared metric's current value through
+  `MetricsBackend`), `GET /admin/latency` (per-stage p50/p95 from the chat-pipeline
+  histogram), `GET /admin/eval` (last eval run vs baseline/floors, aggregate metrics only —
+  never a per-question golden-set text, T13.1.7), `GET /admin/erasure` (open erasure
+  requests, rows remaining, last purger run) + `POST .../purge-now` / `.../retry`, `POST
+  /admin/users/erase` (DEBT-002, last-admin guard, DEC-033/DEC-035), and `GET
+  /admin/alerts` (T13.5.2, below). Every mutating call is audited in `admin_actions`
+  (migration 0008, [BACKEND_SCHEMA §5](BACKEND_SCHEMA.md#5-as-implemented-migrations-0001-0008)).
+- **Live updates** (T13.4.1/T13.4.2) and **metrics backends** (T13.4.3, R6-4: why no
+  managed Prometheus on Azure) are a dedicated ADR decision — see [ADR phase 13, "Live
+  updates + metrics backends"](adr/adr_phase13_dashboard.md#live-updates--metrics-backends-13-c-t1341t1343-r6-4).
+- **Banner alerts** (T13.5.2, R6-1, P13-D4): `rag_app.api.admin._banner_alerts` is the ONE
+  implementation behind both `GET /admin/alerts` (Azure polling) and the SSE snapshot/
+  heartbeat's `alerts` field (local) — an open erasure request past 24 h (amber past 20 h),
+  a lockout-hit count past a fixed floor, any non-`dev_only`/non-`azure_only` probe
+  reporting `down`, any email send failure, and the daily answer cap (R6-1) reached (read
+  from `usage_daily` directly, never a Prometheus metric). The frontend
+  (`components/admin/AdminDashboard.tsx`) sorts red before amber and renders nothing when
+  the list is empty.
+- **Defence lab** (13-D, local only — DEC-028, `rag_app.defence_lab`): re-runs every
+  THREAT_MODEL-catalogue probe's own Test ID as a real CLI/admin-button action (`POST
+  /admin/lab/run`), persisting history in `defence_runs` (migration 0008); `LAB_ENABLED`
+  genuinely removes the router with it off (a 404, not a 403) and `ENV=prod` refuses to
+  serve it regardless of the flag. See [ADR phase 13, "Defence
+  lab"](adr/adr_phase13_dashboard.md#defence-lab-13-d-t1331t1336-local-only--dec-028) for
+  the probe-framework/erasure-at-scale/negative-control detail.
