@@ -9,8 +9,33 @@ paths = [
   '''\.env\.example$''',
   '''docker-compose\.yml$''',
 ]
-# Local dev credentials for the throwaway Postgres container (user:pass = rag:rag).
+# Local dev credentials for the throwaway Postgres container (user:pass = rag:rag); the
+# generic git remote address (not a secret); one deliberate "real, non-disposable
+# provider" test fixture (backend/tests/test_risk.py::test_disposable_detection et al. --
+# `is_disposable("a@gmail.com")` must be False, contrasted with the `mailinator.com` cases;
+# changing the fixture to a non-real-provider domain would defeat the test's own point).
 regexes = [
   '''rag:rag@''',
   '''POSTGRES_PASSWORD:\s*rag''',
+  '''git@github\.com''',
+  '''a@gmail\.com''',
 ]
+
+# DEBT-042 (2026-11-14, user request): the project's OWN sender mailbox (SMTP_FROM / ACS
+# sender) must never reach the public repo. The address itself is never written here --
+# only the shape of a "real free-mail provider" address, which a project's own throwaway
+# sender realistically would be. `example.com`/`example.org`/`example.test`/`example.net`
+# (RFC 2606 reserved, this repo's own fixture convention), GitHub's own noreply address
+# format and the LICENSE author line are the only intended exceptions -- allow-listed above
+# (specific strings) or structurally excluded below (the regex never matches those TLDs or
+# the `users.noreply.github.com` domain). `backend/.env`/`.env.local` are already
+# git-ignored (norm #2); this rule is the backstop for a mistake, not the primary control.
+[[rules]]
+id = "secrag-real-sender-mailbox"
+description = "A real free-mail-provider address committed to a tracked file (DEBT-042): the project's own SMTP/ACS sender must never reach the public repo -- use SMTP_* / ACS env vars, never a literal address"
+# Non-capturing groups only (?:...): a regex with a CAPTURING group makes gitleaks treat
+# the captured text, not the whole match, as the "secret" the allowlist regexes below are
+# checked against -- found for real while writing this rule (the allowlist silently never
+# matched until this was fixed).
+regex = '''[A-Za-z0-9._%+-]+@(?:gmail|googlemail|outlook|hotmail|live|yahoo|icloud|me|aol|protonmail|proton|gmx|yandex|zoho)\.(?:com|net|org|co\.uk)'''
+tags = ["email", "pii"]

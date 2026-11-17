@@ -248,6 +248,8 @@ database was initialised with (a stored key fingerprint) — see
 `CLIENT_IP_HMAC_KEYS` (T12.1.6, signed client IP) is required only with `ENV=prod` — leave it
 unset locally.
 
+#### Email setup
+
 SMTP is optional. Without it no email is sent and nothing personal is logged; the verification
 link is never returned by `POST /auth/resend-verification` either, in any environment (T12.1.11)
 — `docker compose up` points the backend's SMTP at the bundled Mailpit (http://127.0.0.1:8025),
@@ -259,6 +261,27 @@ strings are redacted from the uvicorn access log (the verification link is
 of the same address is a plain 409 (never a traceback with the driver's `DETAIL` line), and the
 local and gate Postgres run with `log_error_verbosity=terse` (no `DETAIL` lines in the server
 log).
+
+**Plugging in your own sender (DEBT-042).** This repo's own demo sender mailbox is never
+committed — `SMTP_FROM` in `.env.example` is the RFC 2606 reserved `no-reply@example.com`
+placeholder, and `.gitleaks.toml`'s `secrag-real-sender-mailbox` rule fails the gate/CI if a
+real free-mail-provider address (Gmail, Outlook, Yahoo, …) ever lands in a tracked file. If
+you run your own fork/deployment:
+
+- **Local dev:** leave `SMTP_HOST` unset (no-op) or use the bundled Mailpit — no real
+  mailbox needed.
+- **Your own real sender:** set `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`/`SMTP_FROM`
+  in your **git-ignored** `backend/.env` (never in `.env.example` or any tracked file) to any
+  SMTP relay you control — a Gmail/Outlook account with an app password, or a dedicated
+  transactional-email provider.
+- **Azure deployment:** [Azure Communication Services](https://learn.microsoft.com/azure/communication-services/concepts/email/prepare-email-communication-services)
+  issues an SMTP username/password per Email Communication resource — the SAME `SMTP_*`
+  settings above, just pointed at ACS's SMTP host; there is no separate ACS-specific config
+  key. Store the value as an Azure Container App **secret** (`SMTP_PASSWORD`, `SMTP_FROM`,
+  …), never a GitHub Actions secret (CI/CD never needs to send real email).
+- Commit author email is public in every commit regardless of the above (a GitHub `git log`
+  fact, unrelated to SMTP) — switch to your own GitHub noreply address
+  (`git config user.email`) if you would rather not publish your real one in future commits.
 
 Keep `ENV=dev` (from `.env.example`) on a local machine. When `ENV` is unset the app assumes
 `prod`, and in `prod` it refuses to start if any development-only feature flag is enabled.
