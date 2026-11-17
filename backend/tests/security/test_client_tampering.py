@@ -21,6 +21,7 @@ import uuid
 import pyotp
 import pytest
 from cryptography.fernet import Fernet
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
@@ -31,6 +32,7 @@ from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.authz import PROTECTED_ROUTES, ROLE_PERMISSIONS
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
 from rag_app.email_abuse import EmailAbuseLimiter
+from rag_app.features import iter_routes
 from rag_app.risk import SignupTracker
 from rag_app.sessions import SESSION_COOKIE_NAME
 
@@ -54,6 +56,24 @@ def _client() -> TestClient:
     app.dependency_overrides[get_signup_tracker] = SignupTracker
     app.dependency_overrides[get_email_abuse_limiter] = EmailAbuseLimiter
     return TestClient(app, base_url=BASE_URL)
+
+
+def _mounted_protected_routes() -> list:
+    """``PROTECTED_ROUTES`` restricted to the routes a fresh ``create_app()`` actually mounts.
+
+    DEC-038 / DA-13-D-1: ``PROTECTED_ROUTES`` is filled process-wide the moment a
+    route-declaring module is first IMPORTED, not when ``create_app()`` includes its router.
+    A dev-only, conditionally-mounted router (``rag_app.api.lab``, T13.3.1, off here) imported
+    by an unrelated test earlier in the same session would otherwise put a route in the matrix
+    that this app never serves (404, not 403) -- the same blind spot ``test_route_walker.py``
+    fixed in 13-D. Order-independent by construction."""
+    mounted = {
+        (method, route.path)
+        for route in iter_routes(create_app())
+        if isinstance(route, APIRoute)
+        for method in route.methods or set()
+    }
+    return [route for route in PROTECTED_ROUTES if (route.method, route.path) in mounted]
 
 
 def _csrf_header(response) -> dict[str, str]:  # noqa: ANN001
@@ -240,7 +260,7 @@ def test_an_admin_session_without_stepup_is_403_on_every_mfa_gated_route(
     with Session(db_engine) as session:
         create_admin(session, email, password)
     client.post("/auth/login", json={"email": email, "password": password})
-    for route in PROTECTED_ROUTES:
+    for route in _mounted_protected_routes():
         if not route.requires_mfa:
             continue
         response = client.request(route.method, route.path)
@@ -257,7 +277,8 @@ def test_the_permission_map_matrix_covers_every_protected_route(
     the route also needs MFA, stepped up) -> allowed; everything else -> denied. Built from
     ``PROTECTED_ROUTES`` so a FUTURE admin route is covered automatically, with no new test
     code -- only a new entry appears in the matrix below."""
-    assert PROTECTED_ROUTES, "no protected route registered -- did /admin/ping lose its gate?"
+    routes = _mounted_protected_routes()
+    assert routes, "no protected route registered -- did /admin/ping lose its gate?"
 
     user_client = _client()
     _register_and_login(user_client)
@@ -279,7 +300,7 @@ def test_the_permission_map_matrix_covers_every_protected_route(
     ]
 
     exercised = 0
-    for route in PROTECTED_ROUTES:
+    for route in routes:
         for label, client, stepped_up in scenarios:
             role = "admin" if label.startswith("admin") else "user"
             granted = route.permission in ROLE_PERMISSIONS.get(role, frozenset())
@@ -292,4 +313,4 @@ def test_the_permission_map_matrix_covers_every_protected_route(
             exercised += 1
     # Sanity: the matrix actually ran something (never a silent no-op if the registry were
     # ever emptied by a refactor).
-    assert exercised == len(PROTECTED_ROUTES) * len(scenarios)
+    assert exercised == len(routes) * len(scenarios)

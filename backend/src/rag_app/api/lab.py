@@ -50,6 +50,10 @@ router = APIRouter()
     tags=["admin-lab"],
     dependencies=[
         Depends(require_csrf),
+        # matrix=False (DA-13-D-2): unlike the other matrix=False admin routes this one needs
+        # no path id or body; it is excluded because an allowed matrix probe would start a
+        # real, slow `pytest` subprocess that re-runs the security suite from inside it.
+        # Still covered by the route walker + the explicit tests in tests/security/test_lab_api.py.
         Depends(
             require_permission_and_mfa(
                 "admin:users", route=("POST", "/admin/lab/run"), matrix=False
