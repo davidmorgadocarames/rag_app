@@ -20,6 +20,7 @@ from rag_app.features import (
     REGISTRY,
     FeatureEntry,
     HealthProbeResult,
+    check_dod_compliance,
     check_registry,
     module_probe,
     quality_probe_misspelling,
@@ -46,9 +47,13 @@ def test_every_entry_status_is_one_of_the_four_values() -> None:
         assert entry.status in allowed, entry.id
 
 
-def test_the_misspelling_entry_is_the_only_expected_fail() -> None:
+def test_there_is_no_expected_fail_entry_today() -> None:
+    """DEC-037 = A / DEBT-049 (13-E): `quality-misspelling-probe` was the only
+    `expected-fail` entry; it flipped to `enabled` once the live-DB probe genuinely passed
+    (verified, not an artefact -- see ``quality_probe_misspelling``'s docstring). Nothing
+    else is registered `expected-fail` today."""
     expected_fail = [e for e in REGISTRY if e.status == "expected-fail"]
-    assert [e.id for e in expected_fail] == ["quality-misspelling-probe"]
+    assert expected_fail == []
 
 
 def test_the_agentic_router_is_retained_not_adopted() -> None:
@@ -133,6 +138,22 @@ def test_quality_probe_misspelling_skips_with_no_session() -> None:
     assert result.outcome == "skipped"
 
 
+def test_quality_probe_misspelling_variants_skips_with_no_session() -> None:
+    """DEBT-049: same no-stack contract as the single-item probe."""
+    from rag_app.features import quality_probe_misspelling_variants
+
+    result = quality_probe_misspelling_variants(None)
+    assert result.outcome == "skipped"
+
+
+def test_misspelling_tolerance_variants_is_registered() -> None:
+    assert "misspelling-tolerance-variants" in QUALITY_PROBES
+    entry = next(e for e in REGISTRY if e.id == "quality-misspelling-probe")
+    assert entry.status == "enabled"
+    assert "misspelling-tolerance" in entry.quality_probes
+    assert "misspelling-tolerance-variants" in entry.quality_probes
+
+
 def test_misspell_question_changes_the_longest_word() -> None:
     from rag_app.features import _misspell_question
 
@@ -140,6 +161,28 @@ def test_misspell_question_changes_the_longest_word() -> None:
     typo = _misspell_question(original)
     assert typo != original
     assert len(typo.split()) == len(original.split())
+
+
+def test_each_typo_strategy_changes_a_long_enough_word() -> None:
+    """DEBT-049: every strategy from easiest to hardest actually mutates a word with room
+    for it (``len >= 4``) -- a strategy that silently no-ops would make the variants probe
+    report a false "tolerated" (the ``typo_question == item.question`` skip exists in the
+    probe precisely to avoid that, but the strategies themselves must still do something)."""
+    from rag_app.features import _TYPO_STRATEGIES
+
+    word = "injection"
+    for name, strategy in _TYPO_STRATEGIES.items():
+        mutated = strategy(word)
+        assert mutated != word, name
+        assert len(mutated) >= len(word) - 1, name  # deletion is the only length-shrinking one
+
+
+def test_short_words_are_left_alone_by_every_strategy() -> None:
+    from rag_app.features import _TYPO_STRATEGIES
+
+    word = "SQL"  # len 3, below every strategy's len >= 4 floor
+    for name, strategy in _TYPO_STRATEGIES.items():
+        assert strategy(word) == word, name
 
 
 # --- check_registry: structural cross-checks ---------------------------------------------
@@ -216,6 +259,55 @@ def test_a_declared_module_that_does_not_exist_fails_the_check() -> None:
     app = create_app()
     problems = check_registry(app, metrics.REGISTRY, entries=(bogus_entry,))
     assert any("rag_app.this_module_does_not_exist" in problem for problem in problems)
+
+
+# --- check_dod_compliance: T13.5.1's DoD rule, enforced for every NEW entry ---------------
+
+
+def test_check_dod_compliance_has_no_problems_against_the_real_registry() -> None:
+    """Every entry added since 13-E follows the DoD rule; every entry that predates it is
+    explicitly grandfathered (see ``_DOD_GRANDFATHERED_IDS``'s docstring) -- so the real
+    registry, as-is, has no problems today."""
+    assert check_dod_compliance() == []
+
+
+def test_a_new_entry_with_no_probe_and_no_metric_fails_the_check() -> None:
+    """Done-when (T13.5.1): a brand-new feature that skips the DoD rule entirely (no probe,
+    no metric) fails -- proven here with a throwaway entry rather than waiting for someone
+    to actually forget."""
+    bogus_entry = FeatureEntry(
+        id="test-only-dod-bogus-entry",
+        name="bogus",
+        phase="13",
+        status="enabled",
+        docs="docs/TRD.md",
+    )
+    problems = check_dod_compliance(entries=(bogus_entry,))
+    assert any("needs a health_probe or a quality_probes" in p for p in problems)
+    assert any("needs >= 1 metric" in p for p in problems)
+
+
+def test_a_new_entry_with_a_probe_and_a_metric_passes_the_check() -> None:
+    bogus_entry = FeatureEntry(
+        id="test-only-dod-compliant-entry",
+        name="compliant",
+        phase="13",
+        status="enabled",
+        docs="docs/TRD.md",
+        health_probe=module_probe("rag_app.metrics"),
+        metrics=("secrag_chat_stage_seconds",),
+    )
+    assert check_dod_compliance(entries=(bogus_entry,)) == []
+
+
+def test_a_grandfathered_entry_is_exempt_even_without_a_probe_or_metric() -> None:
+    """``azure-internal-ingress`` has neither a probe nor a metric (by design -- it is not
+    reachable at all outside Azure) and predates the DoD rule: still no problems."""
+    grandfathered = next(e for e in REGISTRY if e.id == "azure-internal-ingress")
+    assert grandfathered.health_probe is None
+    assert not grandfathered.quality_probes
+    assert not grandfathered.metrics
+    assert check_dod_compliance(entries=(grandfathered,)) == []
 
 
 def test_expected_fail_without_a_quality_probe_fails_the_check() -> None:

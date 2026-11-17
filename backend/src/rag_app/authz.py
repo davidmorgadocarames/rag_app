@@ -155,10 +155,12 @@ def require_role(
 def require_permission_and_mfa(
     permission: str, *, route: tuple[str, str] | None = None, matrix: bool = True
 ) -> Callable[..., User]:
-    """Admin-grade routes (T12.3.5): ``permission`` AND a fresh MFA step-up on THIS session
-    (``sessions.mfa_verified_at`` set -- ``rag_app.api.auth.get_current_user`` reads it onto
-    ``request.state.mfa_verified_at``). Cookie authentication is the only path (T12.5.3) --
-    no session cookie means no server-side session, so there is nothing to have stepped up.
+    """Admin-grade routes (T12.3.5): ``permission`` AND MFA set, not recent, on THIS session
+    (``sessions.mfa_verified_at`` is just set/not-set -- DA-13-C-5: there is no step-up TTL,
+    only logout/rotation/a fresh session ever clears it; ``rag_app.api.auth.get_current_user``
+    reads it onto ``request.state.mfa_verified_at``). Cookie authentication is the only path
+    (T12.5.3) -- no session cookie means no server-side session, so there is nothing to have
+    stepped up.
 
     ``base`` is called EXPLICITLY in the body (not composed via a nested ``Depends``) so the
     permission check and the MFA check are both exercised by a single, direct call to the

@@ -91,6 +91,40 @@ def test_erasure_gauges_and_counter_have_no_labels() -> None:
     assert metrics.ERASURE_FAILURES_TOTAL._labelnames == ()
 
 
+# --- T13.5.1: registry-wide no-PII-label check (catches metric N+1 automatically) --------
+
+
+def test_check_no_pii_labels_passes_on_the_real_module() -> None:
+    """Every metric actually declared in ``rag_app.metrics`` today only uses labels already
+    reviewed into ``SAFE_METRIC_LABELS`` -- the per-metric tests above already proved this
+    one metric at a time; this proves it once, generically, over the whole module."""
+    assert metrics.check_no_pii_labels() == []
+
+
+def test_check_no_pii_labels_catches_an_unreviewed_label() -> None:
+    """Done-when (T13.5.1): a NEW metric with a PII-shaped label fails the check without
+    anyone having to write a dedicated per-metric test for it first -- this is exactly the
+    gap the per-metric tests above cannot close on their own (they only ever cover a metric
+    someone remembered to add a test for)."""
+    from prometheus_client import CollectorRegistry, Counter
+
+    throwaway_registry = CollectorRegistry()
+    unsafe_counter = Counter(
+        "secrag_test_only_total",
+        "test only",
+        ["user_email"],
+        registry=throwaway_registry,
+    )
+    problems = metrics.check_no_pii_labels({"unsafe_counter": unsafe_counter})
+    assert any("user_email" in problem for problem in problems)
+
+
+def test_check_no_pii_labels_ignores_non_metric_objects() -> None:
+    """A plain value with no ``_labelnames`` attribute (most of a module's globals) is
+    silently skipped, never a crash."""
+    assert metrics.check_no_pii_labels({"not_a_metric": 42, "also_not": "hello"}) == []
+
+
 def test_new_metrics_are_served_and_carry_no_pii() -> None:
     port = metrics.start_metrics_server(0, addr="127.0.0.1")
     metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="chat").inc()

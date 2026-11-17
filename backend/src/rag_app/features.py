@@ -268,7 +268,17 @@ def probe_exposed_files() -> HealthProbeResult:
     return HealthProbeResult("ok", "no StaticFiles mount on the backend")
 
 
-# --- the Phase-14 gap, demonstrated rather than merely asserted -----------------------------
+# --- misspelling tolerance (DEC-037 = A, DEBT-049) -------------------------------------------
+#
+# 13-A registered this probe `expected-fail`, assuming hybrid retrieval would not survive a
+# typo until some future Phase-14 fix. 13-E's `--full` run (live DB + Ollama) showed the
+# single golden-set item below actually PASSES today -- `bge-m3`'s embeddings are
+# subword/character-robust enough that a one-swap typo barely moves the query vector, and
+# RRF fusion with BM25 still surfaces the right chunk. DEC-037 = A (user, 2026-11-16 23:34):
+# verify this is real (not a seed/golden-set artefact) and flip the entry off
+# `expected-fail` -- done below -- then add typo variants across several items/harder typos
+# (`quality_probe_misspelling_variants`) so "one item passes" is never read as "the feature
+# is 100% done"; any variant that FAILS is recorded in DEBT-049, not silently dropped.
 
 
 def _misspell(word: str) -> str:
@@ -281,25 +291,67 @@ def _misspell(word: str) -> str:
     return "".join(chars)
 
 
-def _misspell_question(question: str) -> str:
+def _delete_middle_char(word: str) -> str:
+    """Drop one character -- a slightly harder typo than a swap (changes word length)."""
+    if len(word) < 4:
+        return word
+    i = len(word) // 2
+    return word[:i] + word[i + 1 :]
+
+
+def _double_middle_char(word: str) -> str:
+    """Repeat one character -- another common fat-finger typo (changes word length)."""
+    if len(word) < 4:
+        return word
+    i = len(word) // 2
+    return word[:i] + word[i] + word[i:]
+
+
+def _scramble_word(word: str) -> str:
+    """Shuffle every character -- a deliberately HARD, unrealistic-but-illustrative typo:
+    the word keeps its length and character set but not necessarily its recognisability.
+    Deterministic (fixed seed) so the probe's result does not flap between runs."""
+    import random
+
+    if len(word) < 4:
+        return word
+    chars = list(word)
+    random.Random(1337).shuffle(chars)
+    shuffled = "".join(chars)
+    return shuffled if shuffled != word else word[::-1]
+
+
+# Ordered easiest -> hardest; the registered single-item probe below only ever exercises the
+# first (easiest) one, matching its original, narrower claim.
+_TYPO_STRATEGIES: dict[str, Callable[[str], str]] = {
+    "adjacent-swap": _misspell,
+    "deleted-char": _delete_middle_char,
+    "doubled-char": _double_middle_char,
+    "scrambled": _scramble_word,
+}
+
+
+def _apply_typo(question: str, strategy: Callable[[str], str]) -> str:
     words = question.split()
     if not words:
         return question
     longest = max(range(len(words)), key=lambda i: len(words[i]))
-    words[longest] = _misspell(words[longest])
+    words[longest] = strategy(words[longest])
     return " ".join(words)
 
 
+def _misspell_question(question: str) -> str:
+    return _apply_typo(question, _misspell)
+
+
 def quality_probe_misspelling(session: Session | None) -> QualityProbeResult:
-    """Demonstrates the Phase 14 gap directly: a single-typo version of a real golden-set
-    question, run through the SAME retrieval path production uses
-    (``rag_app.retrieval.hybrid_search``), checked against whether the expected document is
-    still retrieved. ``session=None`` (no live DB -- the normal case for the fast ``registry``
-    gate step) returns ``skipped`` without attempting a connection, keeping this probe cheap
-    whenever there genuinely is nothing to exercise; a ``--full``/``--only registry,db-tests``
-    run (DB reachable) passes a real session and must see ``failed`` today -- a ``passed``
-    result there means Phase 14 landed and this entry's ``status`` must move off
-    ``expected-fail``."""
+    """A single-typo version of a real golden-set question, run through the SAME retrieval
+    path production uses (``rag_app.retrieval.hybrid_search``), checked against whether the
+    expected document is still retrieved. ``session=None`` (no live DB -- the normal case
+    for the fast ``registry`` gate step) returns ``skipped`` without attempting a
+    connection. Verified genuinely passing in 13-E (DEC-037 = A): this ONE item does not
+    prove general typo tolerance -- see ``quality_probe_misspelling_variants``/DEBT-049 for
+    the broader check and the recorded remaining gap."""
     if session is None:
         return QualityProbeResult("skipped", "no live DB in this run")
     try:
@@ -316,14 +368,54 @@ def quality_probe_misspelling(session: Session | None) -> QualityProbeResult:
         if item.expected_doc in retrieved_docs:
             return QualityProbeResult("passed", "typo-tolerant retrieval already works")
         return QualityProbeResult(
-            "failed", "expected document not retrieved for a misspelled query (Phase 14 gap)"
+            "failed", "expected document not retrieved for a misspelled query"
         )
+    except Exception as exc:  # noqa: BLE001 - DB/Ollama unreachable mid-probe: skip, don't fail
+        return QualityProbeResult("skipped", f"stack unreachable ({type(exc).__name__})")
+
+
+def quality_probe_misspelling_variants(session: Session | None) -> QualityProbeResult:
+    """DEBT-049: the single-item probe above passing is not proof hybrid retrieval tolerates
+    typos IN GENERAL -- this exercises several golden-set items x several typo strategies
+    (easiest ``adjacent-swap`` up to a full ``scrambled`` word) through the same
+    ``hybrid_search`` path and reports how many combinations still retrieve the expected
+    document. ``outcome`` is ``failed`` the moment any combination misses (this entry's
+    ``status`` stays ``enabled`` regardless -- a partial gap is recorded in DEBT-049, not a
+    registry-blocking failure); ``session=None`` returns ``skipped``, same as the probe
+    above."""
+    if session is None:
+        return QualityProbeResult("skipped", "no live DB in this run")
+    try:
+        from rag_app.eval.dataset import load_golden_set
+        from rag_app.retrieval import hybrid_search
+
+        items = [item for item in load_golden_set() if item.answerable and item.expected_doc][:5]
+        if not items:
+            return QualityProbeResult("skipped", "golden set has no answerable item")
+        passed: list[str] = []
+        failed: list[str] = []
+        for item in items:
+            for strategy_name, strategy in _TYPO_STRATEGIES.items():
+                typo_question = _apply_typo(item.question, strategy)
+                if typo_question == item.question:
+                    continue  # longest word too short for this strategy to change anything
+                chunks = hybrid_search(session, typo_question, version=item.version)
+                retrieved_docs = {c.chunk_uid.rsplit("::", 1)[0] for c in chunks}
+                tag = f"{item.id}/{strategy_name}"
+                (passed if item.expected_doc in retrieved_docs else failed).append(tag)
+        total = len(passed) + len(failed)
+        if total == 0:
+            return QualityProbeResult("skipped", "no (item, strategy) pair produced a typo")
+        failing = ", ".join(failed) if failed else "none"
+        detail = f"{len(passed)}/{total} tolerated; failing: {failing}"
+        return QualityProbeResult("failed" if failed else "passed", detail)
     except Exception as exc:  # noqa: BLE001 - DB/Ollama unreachable mid-probe: skip, don't fail
         return QualityProbeResult("skipped", f"stack unreachable ({type(exc).__name__})")
 
 
 QUALITY_PROBES: dict[str, Callable[[Session | None], QualityProbeResult]] = {
     "misspelling-tolerance": quality_probe_misspelling,
+    "misspelling-tolerance-variants": quality_probe_misspelling_variants,
 }
 
 
@@ -488,9 +580,14 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         id="quality-misspelling-probe",
         name="Misspelling tolerance (query typo robustness)",
         phase="13",
-        status="expected-fail",
+        # DEC-037 = A (user, 2026-11-16 23:34): flipped off `expected-fail` -- verified in
+        # 13-E that the single golden-set item genuinely passes with a live DB + Ollama
+        # (bge-m3 embeddings + RRF tolerate a one-swap typo). NOT a claim that typo
+        # tolerance is complete: `misspelling-tolerance-variants` exercises harder typos
+        # across more items and some of those fail -- tracked, not hidden, in DEBT-049.
+        status="enabled",
         health_probe=None,
-        quality_probes=("misspelling-tolerance",),
+        quality_probes=("misspelling-tolerance", "misspelling-tolerance-variants"),
         docs="docs/adr/adr_phase13_dashboard.md",
     ),
     # --- Identity ------------------------------------------------------------------------
@@ -704,6 +801,72 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         docs="docs/adr/adr_phase13_dashboard.md",
     ),
 )
+
+
+# --- T13.5.1: the DoD rule, enforced for every entry added from here on --------------------
+
+# Every entry here PREDATES the T13.5.1 DoD rule (checked 2026-11-17, 13-E): a registry
+# entry needs a probe (health or quality) and >= 1 Prometheus metric; a `defence_probes`
+# entry is required too whenever the feature is actually catalogued in
+# `docs/security/THREAT_MODEL.md` (judged by review, not by this function -- there is no
+# reliable, generic way to tell "should be catalogued but isn't" apart from "genuinely has
+# no security-relevant behaviour" without a human reading THREAT_MODEL.md). Listed here as
+# an explicit, reviewed exception rather than a silent gap so `check_dod_compliance` can
+# fail CI the moment a NEW entry skips the rule, without rewriting 29 historical entries in
+# one block. Closing one of these (adding the missing probe/metric) is ordinary product
+# work -- remove its id from this set in the same change.
+_DOD_GRANDFATHERED_IDS: frozenset[str] = frozenset(
+    {
+        "stack-health-endpoint",
+        "stack-postgres",
+        "stack-migrations",
+        "stack-embeddings",
+        "stack-reranker",
+        "stack-llm-provider",
+        "rag-hybrid-retrieval",
+        "rag-rerank",
+        "rag-generation-groundedness",
+        "rag-abstention",
+        "rag-chitchat",
+        "rag-sse-token-usage",
+        "rag-agentic-router",
+        "quality-eval-vs-baseline",
+        "quality-judge-kappa",
+        "quality-per-stage-latency",
+        "quality-misspelling-probe",
+        "identity-registration-verification",
+        "identity-login-sessions",
+        "identity-password-policy-reset",
+        "identity-permission-map",
+        "abuse-email-abuse-limits",
+        "privacy-encrypted-conversations",
+        "privacy-deletion-replay",
+        "browser-security-headers",
+        "browser-exposed-files",
+        "azure-internal-ingress",
+        "admin-api",
+        "admin-defence-lab",
+    }
+)
+
+
+def check_dod_compliance(entries: tuple[FeatureEntry, ...] = REGISTRY) -> list[str]:
+    """T13.5.1: structural half of the DoD rule -- every entry NOT in
+    ``_DOD_GRANDFATHERED_IDS`` must declare a probe (``health_probe`` or ``quality_probes``)
+    and at least one metric (``entry.metrics``). The "defence probe if the catalogue lists
+    it" half of the rule is a review-time judgment call (see the module-level comment above)
+    and is intentionally not checked here."""
+    problems: list[str] = []
+    for entry in entries:
+        if entry.id in _DOD_GRANDFATHERED_IDS:
+            continue
+        if entry.health_probe is None and not entry.quality_probes:
+            problems.append(
+                f"{entry.id}: DoD rule (T13.5.1) needs a health_probe or a quality_probes" " entry"
+            )
+        if not entry.metrics:
+            problems.append(f"{entry.id}: DoD rule (T13.5.1) needs >= 1 metric")
+    return problems
 
 
 def entries_by_status(status: FeatureStatus) -> tuple[FeatureEntry, ...]:

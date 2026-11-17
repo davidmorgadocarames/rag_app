@@ -131,6 +131,39 @@ ERASURE_FAILURES_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+# T13.5.1: the reviewed, explicit allow-list of label NAMES any metric in this module may
+# ever declare -- every per-metric no-PII-label test above/below (and in
+# ``backend/tests/test_metrics.py``) only catches a label on a metric someone remembered to
+# write a test for; this allow-list + ``check_no_pii_labels`` instead catches metric N+1
+# automatically, the moment a new ``Counter``/``Gauge``/``Histogram`` module-level object
+# declares a label name that was never reviewed, without anyone having to add a new test.
+SAFE_METRIC_LABELS: frozenset[str] = frozenset({"stage", "result", "kind", "route_group", "reason"})
+
+
+def check_no_pii_labels(namespace: dict[str, object] | None = None) -> list[str]:
+    """Registry-wide no-PII-label check (T13.5.1). Walks every object in ``namespace`` (this
+    module's own globals by default -- every production caller) and, for anything exposing a
+    ``prometheus_client`` metric's private ``_labelnames`` tuple (every ``Counter``/``Gauge``/
+    ``Histogram`` has one, labelled or not), flags any label name not in
+    ``SAFE_METRIC_LABELS``. A test passes a throwaway ``dict`` with a deliberately unsafe
+    label instead, so it never has to mutate the real module-level metrics to prove this
+    catches something."""
+    if namespace is None:
+        namespace = globals()
+    problems: list[str] = []
+    for name, obj in namespace.items():
+        labelnames = getattr(obj, "_labelnames", None)
+        if not labelnames:
+            continue
+        for label in labelnames:
+            if label not in SAFE_METRIC_LABELS:
+                problems.append(
+                    f"metric '{name}': label '{label}' is not in the reviewed"
+                    " SAFE_METRIC_LABELS allow-list (possible PII -- review before adding)"
+                )
+    return problems
+
+
 _lock = threading.Lock()
 _server: WSGIServer | None = None
 _server_port: int | None = None

@@ -1,8 +1,9 @@
 """Admin SSE stream (T13.4.1, local only): ``GET /admin/stream`` sends an immediate
 "snapshot", then a "heartbeat" (fresh data, doubling as the liveness ping) every tick --
-re-checking auth AND MFA step-up freshness on EVERY tick WITHOUT refreshing the session's
-``last_seen_at`` (a background tab must still idle out on schedule), idle-closing after a
-bound regardless, and capping concurrent connections. DEBT-046 (the erasure gauges the
+re-checking auth AND that MFA is set (not recent -- DA-13-C-5: ``mfa_verified_at`` is only
+ever ``None``/not-``None``, there is no step-up TTL) on EVERY tick WITHOUT refreshing the
+session's ``last_seen_at`` (a background tab must still idle out on schedule), idle-closing
+after a bound regardless, and capping concurrent connections. DEBT-046 (the erasure gauges the
 purger Job sets never reach the API's own ``/metrics``) is proven fixed here too: a tick
 recomputes them from the database directly.
 

@@ -8,6 +8,9 @@ Always runs, with or without a live stack (DATABASE_URL is the gate's — a stop
    declared metric exists in the Prometheus registry, every module importable, every
    ``expected-fail`` entry names a registered quality probe. A brand-new router with an
    unclaimed tag fails here.
+1b. the T13.5.1 DoD rule (``rag_app.features.check_dod_compliance``) — every entry added
+    since 13-E must declare a probe and >= 1 metric (grandfathered entries are exempt, see
+    that function's docstring).
 2. every entry's health probe, each under its own ``≤ 2 s`` deadline (never a build-time
    failure if the stack happens to be down — a probe that returns ``down`` gracefully is
    fine; one that cannot even ANSWER within 2 s is a FAIL).
@@ -25,7 +28,13 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from rag_app.features import QUALITY_PROBES, REGISTRY, check_registry, run_health_probe
+from rag_app.features import (
+    QUALITY_PROBES,
+    REGISTRY,
+    check_dod_compliance,
+    check_registry,
+    run_health_probe,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
@@ -72,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
 
     app = create_app()
     problems = check_registry(app, PROM_REGISTRY)
+    problems.extend(check_dod_compliance())
 
     print(f"registry: {len(REGISTRY)} entries")
     not_ok = 0
