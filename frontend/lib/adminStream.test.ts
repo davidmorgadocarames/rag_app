@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { closedReasonMessage, parseAdminStreamData } from "./adminStream.ts";
+import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "./adminStream.ts";
 
 test("parseAdminStreamData parses a real snapshot payload", () => {
   const data = parseAdminStreamData('{"features": [], "erasure": {"requests": []}}');
@@ -29,5 +29,44 @@ test("closedReasonMessage falls back to a generic message for an unknown reason"
   assert.equal(
     closedReasonMessage("something-new"),
     "The live connection closed. Reload the page to reconnect.",
+  );
+});
+
+test("sortAlertsBySeverity puts every red alert before every amber one", () => {
+  const alerts = [
+    { code: "lockout_spike", severity: "amber" },
+    { code: "erasure_overdue", severity: "red" },
+    { code: "email_failures", severity: "amber" },
+    { code: "daily_cap_reached", severity: "red" },
+  ];
+  const sorted = sortAlertsBySeverity(alerts);
+  assert.deepEqual(
+    sorted.map((a) => a.code),
+    ["erasure_overdue", "daily_cap_reached", "lockout_spike", "email_failures"],
+  );
+});
+
+test("sortAlertsBySeverity is stable within the same severity", () => {
+  const alerts = [
+    { code: "a", severity: "amber" },
+    { code: "b", severity: "amber" },
+  ];
+  assert.deepEqual(
+    sortAlertsBySeverity(alerts).map((a) => a.code),
+    ["a", "b"],
+  );
+});
+
+test("sortAlertsBySeverity never mutates its input and sorts an unknown severity last", () => {
+  const alerts = [
+    { code: "weird", severity: "mystery" },
+    { code: "red-one", severity: "red" },
+  ];
+  const original = [...alerts];
+  const sorted = sortAlertsBySeverity(alerts);
+  assert.deepEqual(alerts, original); // input untouched
+  assert.deepEqual(
+    sorted.map((a) => a.code),
+    ["red-one", "weird"],
   );
 });

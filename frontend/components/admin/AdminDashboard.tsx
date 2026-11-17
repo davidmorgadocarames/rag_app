@@ -9,17 +9,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  adminAlerts,
   adminErasure,
   adminEval,
   adminFeatures,
   adminLatency,
+  type AdminAlertOut,
   type AdminErasureResponse,
   type AdminEvalResponse,
   type AdminFeaturesResponse,
   type AdminLatencyResponse,
   type FeatureHealthOut,
 } from "@/lib/api";
-import { closedReasonMessage, parseAdminStreamData } from "@/lib/adminStream";
+import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "@/lib/adminStream";
 
 import DefenceLabPanel from "./DefenceLabPanel";
 import ErasurePanel from "./ErasurePanel";
@@ -107,26 +109,55 @@ function FeatureCards({ features }: { features: FeatureHealthOut[] }) {
   );
 }
 
+const ALERT_SEVERITY_CLASS: Record<string, string> = {
+  red: "border-vault-danger text-vault-danger",
+  amber: "border-vault-amber text-vault-amber",
+};
+
+// T13.5.2 (R6-1, P13-D4): the alerts array is already pre-computed server-side (one shared
+// implementation for SSE local and polling Azure) -- this component only sorts for display
+// (red before amber, sortAlertsBySeverity) and renders. Empty -> renders nothing, same as
+// the SSE-closed-reason banner above it.
+function AlertBanner({ alerts }: { alerts: AdminAlertOut[] }) {
+  if (alerts.length === 0) return null;
+  return (
+    <div data-testid="admin-alert-banner" className="flex flex-col gap-1">
+      {sortAlertsBySeverity(alerts).map((alert) => (
+        <p
+          key={alert.code}
+          data-testid={`admin-alert-${alert.code}`}
+          className={`border p-2 text-xs ${ALERT_SEVERITY_CLASS[alert.severity] ?? "border-vault-steel-dark text-vault-steel"}`}
+        >
+          {alert.message}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 export default function AdminDashboard({ initial }: AdminDashboardProps) {
   const [features, setFeatures] = useState<FeatureHealthOut[]>(initial.features);
   const [liveMode] = useState(initial.live_mode);
   const [erasure, setErasure] = useState<AdminErasureResponse | null>(null);
   const [latency, setLatency] = useState<AdminLatencyResponse | null>(null);
   const [evalResult, setEvalResult] = useState<AdminEvalResponse | null>(null);
+  const [alerts, setAlerts] = useState<AdminAlertOut[]>([]);
   const [banner, setBanner] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   const refreshAll = useCallback(async () => {
-    const [f, e, l, ev] = await Promise.all([
+    const [f, e, l, ev, al] = await Promise.all([
       adminFeatures(),
       adminErasure(),
       adminLatency(),
       adminEval(),
+      adminAlerts(),
     ]);
     setFeatures(f.features);
     setErasure(e);
     setLatency(l);
     setEvalResult(ev);
+    setAlerts(al.alerts);
   }, []);
 
   const refreshErasure = useCallback(async () => {
@@ -138,6 +169,9 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
     adminErasure().then(setErasure).catch(() => undefined);
     adminLatency().then(setLatency).catch(() => undefined);
     adminEval().then(setEvalResult).catch(() => undefined);
+    adminAlerts()
+      .then((response) => setAlerts(response.alerts))
+      .catch(() => undefined);
   }, []);
 
   // T13.4.1: SSE, local only.
@@ -151,10 +185,12 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       if (!data) return;
       const parsedFeatures = data.features;
       const parsedErasure = data.erasure;
+      const parsedAlerts = data.alerts;
       if (Array.isArray(parsedFeatures)) setFeatures(parsedFeatures as FeatureHealthOut[]);
       if (parsedErasure && typeof parsedErasure === "object") {
         setErasure(parsedErasure as AdminErasureResponse);
       }
+      if (Array.isArray(parsedAlerts)) setAlerts(parsedAlerts as AdminAlertOut[]);
     }
 
     source.addEventListener("snapshot", applySnapshot);
@@ -203,6 +239,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
           {banner}
         </p>
       )}
+      <AlertBanner alerts={alerts} />
 
       <OverviewPanel features={features} liveMode={liveMode} />
       <FeatureCards features={features} />

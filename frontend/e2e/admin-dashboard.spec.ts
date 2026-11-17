@@ -30,6 +30,9 @@ test("an admin can enrol MFA, step up, and see the full dashboard", async ({ pag
   await page.goto("/admin");
   await expect(page.getByText("Admin dashboard")).toBeVisible();
 
+  // T13.5.2: a freshly seeded e2e stack has nothing to alert on -- no banner at all.
+  await expect(page.getByTestId("admin-alert-banner")).toHaveCount(0);
+
   // Every card (T13.2.10's own "every card" requirement).
   for (const testId of [
     "admin-overview-panel",

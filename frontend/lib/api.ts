@@ -286,6 +286,21 @@ export interface AdminErasureResponse {
   last_purger_run: LastPurgerRunOut | null;
 }
 
+// T13.5.2 (R6-1, P13-D4): pre-computed server-side (never a client-side threshold) -- the
+// same alerts shape whether read via /admin/alerts (polling, Azure T13.4.2) or the SSE
+// snapshot/heartbeat (local).
+export type AdminAlertSeverity = "amber" | "red";
+
+export interface AdminAlertOut {
+  code: string;
+  severity: AdminAlertSeverity;
+  message: string;
+}
+
+export interface AdminAlertsResponse {
+  alerts: AdminAlertOut[];
+}
+
 export interface ErasureActionResponse {
   detail: string;
   request_id: string;
@@ -314,6 +329,10 @@ export function adminEval(): Promise<AdminEvalResponse> {
 
 export function adminErasure(): Promise<AdminErasureResponse> {
   return request("/admin/erasure");
+}
+
+export function adminAlerts(): Promise<AdminAlertsResponse> {
+  return request("/admin/alerts");
 }
 
 export function adminErasurePurgeNow(requestId: string): Promise<ErasureActionResponse> {

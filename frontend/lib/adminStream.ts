@@ -16,6 +16,26 @@ export interface AdminStreamClosedReason {
   reason: string;
 }
 
+// --- T13.5.2 banner alerts: rendering-order helper, pure logic (no DOM) -------------------
+
+interface SeverityRankable {
+  severity: string;
+}
+
+const SEVERITY_RANK: Record<string, number> = { red: 0, amber: 1 };
+
+/** Red alerts (erasure overdue, probe failures, daily cap reached) before amber ones
+ * (lockout spike, email failures, erasure approaching) -- the backend's own array order is
+ * the order the five checks happen to run in, not a deliberate severity ranking, so the
+ * dashboard sorts before rendering rather than assuming the backend already did. Stable
+ * (`Array.prototype.sort` is stable since ES2019): two alerts of the same severity keep the
+ * backend's own relative order. An unknown severity sorts last, never crashes. */
+export function sortAlertsBySeverity<T extends SeverityRankable>(alerts: T[]): T[] {
+  return [...alerts].sort(
+    (a, b) => (SEVERITY_RANK[a.severity] ?? 99) - (SEVERITY_RANK[b.severity] ?? 99),
+  );
+}
+
 /** Safe `JSON.parse` of one SSE frame's `data:` payload -- `null` on anything malformed
  * (a backend bug or a transparent proxy mangling the stream must never crash the dashboard). */
 export function parseAdminStreamData(raw: string): Record<string, unknown> | null {
