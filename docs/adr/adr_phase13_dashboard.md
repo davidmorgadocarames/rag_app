@@ -193,6 +193,65 @@ that has simply been open for a day, with nothing else happening meanwhile) need
 periodic in-process refresh or a scrape-time custom collector; the dashboard's own polling
 tick (T13.4.1/T13.4.2) is the natural place to add it once that mechanism exists.
 
+## Live updates + metrics backends (13-C, T13.4.1–T13.4.3, R6-4)
+
+**Decision: mode is decided server-side, never a frontend build-time variable.** Locally
+the dashboard holds open one SSE connection (`GET /admin/stream`, T13.4.1): an immediate
+"snapshot", then a "heartbeat" every tick, re-checking auth and that MFA is set on the
+session (not recent — DA-13-C-5, there is no step-up TTL) WITHOUT refreshing
+`last_seen_at` (a background admin tab must still idle out on schedule), idle-closing after
+a bound regardless, and capping concurrent connections. On Azure the dashboard instead
+polls at a LOW frequency plus a manual "Refresh now" button (T13.4.2) — Container Apps'
+**internal ingress + scale-to-zero** (TF16) make a long-lived, always-open SSE connection
+exactly the class of resource a scale-to-zero replica should not hold: it would pin the
+replica awake, fight the platform's own idle-scale-down, and (being internal-ingress-only)
+gains nothing a low-frequency poll through the frontend's own BFF does not already give an
+admin. `ADMIN_LIVE_MODE` (`config.py`) is the one flag that decides which: default
+`"sse"` is right for every local/compose/CI context, so it must be set explicitly to
+`"polling"` on the live Azure Container App (an explicit required-env-var, never left to
+an implicit "Azure-safe default" — unlike most other Azure-vs-local settings in this
+project).
+
+**Decision: why no managed Prometheus on Azure (R6-4).** Azure Monitor managed
+Prometheus/Grafana (or a self-run Prometheus container/sidecar) is real extra cost and
+operational surface — another resource to provision, secure and keep patched — for a
+single-replica, scale-to-zero demo app where "this replica's current numbers" is already
+enough signal for an admin to act on; the $86 student-credit budget (DEBT-021) has no room
+for it either. Decision: **no managed Prometheus, no sidecar, on Azure** — `rag_app.
+metrics_backend.MetricsBackend` has two implementations instead, contract-tested to return
+the exact same shape for the same input (`test_metrics_backend.py::
+test_both_backends_return_the_same_shape_for_the_same_names`):
+
+- **local** (`PrometheusMetricsBackend`): one instant PromQL query per metric against the
+  compose `prometheus` container (history available — the local dashboard's latency panel
+  can show real p50/p95 trends).
+- **Azure** (`InProcessMetricsBackend`): reads the CURRENT value straight out of THIS
+  replica's own `prometheus_client` registry — the exact numbers its internal `/metrics`
+  port would otherwise expose, with no network call and no sidecar. **History is never
+  available this way** (only ever "now"; a scale-to-zero restart resets every counter to
+  0) — the dashboard shows "Azure: n/a" for it (`OverviewPanel`, frontend concern only).
+
+**Consequence.** Every Azure metric value on the dashboard — including the T13.5.2 banner
+alerts below, which read the SAME `MetricsBackend` — is "this replica, since it last
+started" only, never cross-replica or historical; a lockout spike or an email-failure count
+can reset to 0 on a cold start that happened moments before an admin looks. Accepted:
+catching most real incidents (an admin who looks reasonably often) is the actual goal, not
+a complete audit trail (that already lives in `admin_actions`/structured logs, 15.3).
+Re-evaluate only if Azure spend genuinely allows a managed option later (not planned).
+
+**Banner alerts (T13.5.2, R6-1, P13-D4).** `GET /admin/alerts` and the SSE snapshot/
+heartbeat's own `alerts` field share ONE implementation (`rag_app.api.admin.
+_banner_alerts`) over the SAME five conditions regardless of live mode: an open erasure
+request past 24 h (amber past 20 h, D-ER's own promise); a lockout-hit count past a fixed,
+documented floor (an absolute count, never a rate — no history on Azure to compute a rate
+from, same R6-4 reasoning); any non-`dev_only`/non-`azure_only` registry entry's health
+probe reporting `down` (a `dev_only`/`azure_only` entry reporting `down` is the EXPECTED
+signal of a feature switched off here by design, e.g. the defence lab locally off or an
+Azure-only check run off-Azure — excluded, never a false alarm); any email send failure;
+and the daily answer cap (R6-1) reached, read directly from `usage_daily` (never a
+Prometheus metric — the counter is per-UTC-day, not per-process, so an in-process-only
+Azure replica would otherwise show a wrong, reset-on-restart value for THIS one condition).
+
 ## Defence lab (13-D, T13.3.1–T13.3.6, local only — DEC-028)
 
 **LAB_ENABLED (T13.3.1).** A plain `dev_only_flag` field, same mechanism every other

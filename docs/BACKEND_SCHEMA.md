@@ -7,8 +7,8 @@ Sections 1–3 are the **target design** from the planning phase (some tables �
 resets, login attempts, query logs — arrive in later phases; `sessions` arrived in 0006,
 `user_mfa`/`mfa_recovery_codes` arrived in 0007 "part 1", each with a narrower column set
 than the target design below — see section 5). What the migrations create **today** (head
-`0007_mfa`), including the database roles and their grants, is in
-[section 5](#5-as-implemented-migrations-0001-0007).
+`0008_admin_dashboard`), including the database roles and their grants, is in
+[section 5](#5-as-implemented-migrations-0001-0008).
 
 ## 1. Authentication flow
 
@@ -196,13 +196,11 @@ Deleting a user removes/renders-unrecoverable, at minimum:
 `messages`, `citations`, `query_logs` — **plus** any per-user cache entries and external trace records.
 Corpus tables (`documents`, `chunks`) are shared and not user-owned.
 
-## 5. As implemented (migrations 0001-0007)
+## 5. As implemented (migrations 0001-0008)
 
 Source of truth: `backend/src/rag_app/db/models.py` and `backend/migrations/versions/`. Head:
-**`0007_mfa`** (Phase 12b-A, T12.3.4 "part 1"; extended in 12b-B with T12.4.2 "part 2" and in
-12b-C with T12.4.6 "part 3", below — expand-only, see the
-[Definition of Done](DEFINITION_OF_DONE.md#phase-specific-norms), expand/contract). 0007 is
-still not promoted to `main` as of 12b-C — see its own module docstring.
+**`0008_admin_dashboard`** (Phase 13, T13.0.1/T13.1.6/T13.3.2 — expand-only, see the
+[Definition of Done](DEFINITION_OF_DONE.md#phase-specific-norms), expand/contract).
 
 | Table | Columns (type; nullable = null) | Notes |
 |---|---|---|
@@ -222,6 +220,8 @@ still not promoted to `main` as of 12b-C — see its own module docstring.
 | `master_key_fingerprint` (0005) | `id` smallint PK, `CHECK (id = 1)` · `fingerprint` · `algorithm` · `created_at` | HMAC-SHA256 of `DATA_MASTER_KEY`; the API refuses to start on a mismatch, and writes the first row only when every stored user key unwraps (R5-5) |
 | `documents` | `id` · `slug` unique · `source`, `title` null · `version` · `effective_date` null · `category_rank` null · `created_at` | corpus, shared |
 | `chunks` | `id` · `document_id` → `documents` (cascade) · `chunk_uid` unique · `heading` · `ordinal` · `text` · `embedding` vector(1024) · `version` · `effective_date` null | corpus, shared |
+| `admin_actions` (0008, T13.1.6) | `id` uuid PK · `admin_user_id` uuid → `users` (**`ON DELETE SET NULL`**, indexed) · `action` varchar · `target` varchar null (an OPAQUE id only — an erasure request id, never an email or any other raw client-submitted value, T13.1.7) · `result` varchar · `created_at`, indexed | audit trail for every mutating `/admin/*` call, written in the SAME request; survives the acting admin's own later erasure — `rag_app.erasure.PURGE_STEPS` nulls `admin_user_id` leaf-first (pseudonymisation), the row itself is kept; no `PURGE_STEPS` deletion entry |
+| `defence_runs` (0008, T13.3.4) | `id` uuid PK · `probe_id` varchar, indexed (a [`THREAT_MODEL.md`](security/THREAT_MODEL.md) catalogue id) · `git_sha` varchar · `expected_outcome`, `observed_outcome` varchar · `passed` bool · `evidence` text null (operator-written, PII-free by construction — the lab only ever targets its own dedicated, disposable test accounts) · `run_at` | one row per defence-lab probe result (13-D, local only — DEC-028); history per phase; no personal data, no `PURGE_STEPS` entry |
 
 **Roles and grants.** The application and the migrations run as the database **owner**
 (a restricted app role is planned for a later phase). `db/roles.sql` (idempotent, run as
@@ -230,14 +230,17 @@ outside Alembic by `scripts/db/apply_roles.sh` (it sends only a client-side SCRA
 
 | Role | Grants | Used by |
 |---|---|---|
-| `secrag_backup` | `CONNECT`, `USAGE` on `public`; `SELECT` on every table and sequence, and **default privileges** so every future table is readable too (0005/0006/0007 also grant their new tables explicitly) | `scripts/db/backup.sh` (`pg_dump` → `age`), the backup Job |
-| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`, `sessions` (0006), **`user_mfa`, `mfa_recovery_codes`, `login_lockouts`, `password_reset_tokens`** (0007): `SELECT, DELETE, UPDATE (id/user_id/email_hmac)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` | `rag_app.purger` (purge Job, compose `purger`) |
+| `secrag_backup` | `CONNECT`, `USAGE` on `public`; `SELECT` on every table and sequence, and **default privileges** so every future table is readable too (0005/0006/0007/0008 also grant their new tables explicitly) | `scripts/db/backup.sh` (`pg_dump` → `age`), the backup Job |
+| `secrag_purger` | `CONNECT`, `USAGE`; `messages`, `conversations`, `email_verification_tokens`, `sessions` (0006), **`user_mfa`, `mfa_recovery_codes`, `login_lockouts`, `password_reset_tokens`** (0007): `SELECT, DELETE, UPDATE (id/user_id/email_hmac)` (row locks with `FOR UPDATE SKIP LOCKED`, never a content change) · `users`: `SELECT, UPDATE, DELETE` · `deletion_requests`: `SELECT, UPDATE` · `user_keys`: `SELECT` · `purger_runs`: `SELECT, INSERT, UPDATE` · **`admin_actions`** (0008): `SELECT, UPDATE (admin_user_id)` (the pseudonymisation write and the same row-lock purpose, never `DELETE` — this step never removes an `admin_actions` row) | `rag_app.purger` (purge Job, compose `purger`) |
 
-0005/0006/0007 check that both roles exist (a missing role fails the upgrade with a clear
-message). 0005's downgrade revokes the purger's grants and **refuses** while any user has
-`email`/`password_hash` NULL or `deleted_at` set; 0006's downgrade **refuses** while any user
-has a non-default `role`; 0007's downgrade **refuses** while any MFA enrolment, recovery
-code, login-lockout or password-reset-token row exists (leaf-first: reset tokens, "part 3",
-then lockout rows, "part 2", then MFA, "part 1"). None of them is a rollback path once that data exists (roll images back
-instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback); 0006/0007 stay in
-place after the 12a rollback).
+0005/0006/0007/0008 check that both roles exist (a missing role fails the upgrade with a
+clear message). 0005's downgrade revokes the purger's grants and **refuses** while any user
+has `email`/`password_hash` NULL or `deleted_at` set; 0006's downgrade **refuses** while any
+user has a non-default `role`; 0007's downgrade **refuses** while any MFA enrolment,
+recovery code, login-lockout or password-reset-token row exists (leaf-first: reset tokens,
+"part 3", then lockout rows, "part 2", then MFA, "part 1"); 0008's downgrade **refuses**
+while any `admin_actions` or `defence_runs` row exists (losing the admin audit trail or the
+defence-lab history silently would be a real regression, not an inconvenience). None of
+them is a rollback path once that data exists (roll images back
+instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback); 0006/0007/0008
+stay in place after a rollback).
