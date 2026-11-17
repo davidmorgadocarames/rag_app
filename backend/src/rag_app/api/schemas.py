@@ -266,6 +266,21 @@ class ErasureActionResponse(BaseModel):
     request_id: str
 
 
+class AdminAlertOut(BaseModel):
+    """T13.5.2: one banner condition, pre-computed server-side (never a client-side
+    threshold) so the same business logic covers both live-update modes (SSE snapshot/
+    heartbeat, local; the REST route below, Azure polling). ``severity`` is a small, fixed
+    vocabulary -- never free text that could carry PII."""
+
+    code: str
+    severity: str  # "amber" | "red"
+    message: str
+
+
+class AdminAlertsResponse(BaseModel):
+    alerts: list[AdminAlertOut]
+
+
 class AdminEraseUserRequest(StrictModel):
     email: str = Field(min_length=3, max_length=320)
     # T13.1.8: a fixed typed phrase, not a re-typed email -- the email is already the one

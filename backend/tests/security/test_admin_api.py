@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Sequence
 
 import pytest
 from cryptography.fernet import Fernet
@@ -226,6 +227,210 @@ def test_admin_erasure_lists_an_open_request_with_rows_remaining(api_env: Engine
     assert mine[0]["id"]  # opaque id present
     assert mine[0]["attempts"] == 0
     assert mine[0]["overdue"] is False
+
+
+# --- GET /admin/alerts (T13.5.2, R6-1, P13-D4): banner alerts, matrix=True ----------------
+
+
+def _age_request(engine: Engine, request_id: uuid.UUID, hours: float) -> None:
+    """Same pattern as ``test_erasure.py``'s own ``_age``: push a request's ``requested_at``
+    back in time without waiting for real time to pass."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE deletion_requests SET requested_at = now() - make_interval(hours => :h)"
+                " WHERE id = :i"
+            ),
+            {"h": hours, "i": request_id},
+        )
+
+
+def _open_erasure_request_id(engine: Engine, email: str) -> uuid.UUID:
+    user_id = _make_live_user(engine, email)
+    with Session(engine) as session:
+        from rag_app.erasure import request_erasure
+
+        assert request_erasure(session, user_id) is True
+        found = session.execute(
+            text("SELECT id FROM deletion_requests WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+        return uuid.UUID(str(found))
+
+
+def _close_every_open_erasure_request(engine: Engine) -> None:
+    """``db_engine`` is shared across every ``db``-marked test in this session (T11.0.14) --
+    an open (possibly aged-back) erasure request another test left behind would otherwise
+    leak into THIS test's "oldest open request" aggregate. Defensive baseline, not a
+    behaviour under test."""
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE deletion_requests SET status = 'done' WHERE status != 'done'"))
+
+
+def test_admin_alerts_is_empty_with_a_clean_stack(api_env: Engine) -> None:
+    """Done-when (T13.5.2): nothing wrong -> no banner at all. ``start_metrics_server`` is
+    idempotent (``rag_app.metrics`` docstring) -- the real app's own lifespan calls it too;
+    this ``TestClient`` never runs a lifespan, so the ``stack-prometheus`` probe would
+    otherwise always read "down" here for a reason that has nothing to do with this test."""
+    from rag_app import metrics as real_metrics
+
+    real_metrics.start_metrics_server(0, addr="127.0.0.1")
+    _close_every_open_erasure_request(api_env)
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/alerts", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["alerts"] == []
+
+
+def test_admin_alerts_fires_red_past_the_24h_erasure_deadline(api_env: Engine) -> None:
+    _close_every_open_erasure_request(api_env)
+    request_id = _open_erasure_request_id(api_env, f"alert-red-{uuid.uuid4().hex[:8]}@example.test")
+    _age_request(api_env, request_id, 25)
+
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/alerts", headers=headers)
+    alerts = {a["code"]: a for a in response.json()["alerts"]}
+    assert alerts["erasure_overdue"]["severity"] == "red"
+
+
+def test_admin_alerts_fires_amber_past_the_20h_erasure_warning(api_env: Engine) -> None:
+    _close_every_open_erasure_request(api_env)
+    request_id = _open_erasure_request_id(
+        api_env, f"alert-amber-{uuid.uuid4().hex[:8]}@example.test"
+    )
+    _age_request(api_env, request_id, 21)
+
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/alerts", headers=headers)
+    alerts = {a["code"]: a for a in response.json()["alerts"]}
+    assert alerts["erasure_approaching"]["severity"] == "amber"
+    assert "erasure_overdue" not in alerts
+
+
+def test_admin_alerts_fires_red_when_the_daily_answer_cap_is_reached(
+    api_env: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rag_app.usage_cap import reserve_answer
+
+    monkeypatch.setenv("DAILY_ANSWER_CAP", "2")
+    with Session(api_env) as session:
+        assert reserve_answer(session, 2) is True
+        assert reserve_answer(session, 2) is True  # at the cap now
+
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/alerts", headers=headers)
+    alerts = {a["code"]: a for a in response.json()["alerts"]}
+    assert alerts["daily_cap_reached"]["severity"] == "red"
+    assert "2/2" in alerts["daily_cap_reached"]["message"]
+
+
+def test_admin_alerts_stays_empty_below_the_daily_answer_cap(
+    api_env: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rag_app import metrics as real_metrics
+    from rag_app.usage_cap import reserve_answer
+
+    real_metrics.start_metrics_server(0, addr="127.0.0.1")
+    _close_every_open_erasure_request(api_env)
+    monkeypatch.setenv("DAILY_ANSWER_CAP", "5")
+    with Session(api_env) as session:
+        assert reserve_answer(session, 5) is True
+
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/alerts", headers=headers)
+    assert response.json()["alerts"] == []
+
+
+def test_banner_alerts_lockout_spike_threshold(api_env: Engine) -> None:
+    """Unit-level, through a fake MetricsBackend (never the real shared counter -- avoids
+    depending on how many OTHER tests in this session happened to hit the real lockout
+    metric first)."""
+    from rag_app.api.admin import LOCKOUT_SPIKE_THRESHOLD, _banner_alerts
+
+    class _FakeMetricsBackend:
+        def __init__(self, values: dict[str, float | None]) -> None:
+            self._values = values
+
+        def current_value(self, metric_name: str) -> float | None:
+            return self._values.get(metric_name)
+
+        def current_values(self, metric_names: Sequence[str]) -> dict[str, float | None]:
+            return {name: self.current_value(name) for name in metric_names}
+
+    with Session(api_env) as session:
+        below = _banner_alerts(
+            session,
+            _FakeMetricsBackend({"secrag_lockout_hits_total": LOCKOUT_SPIKE_THRESHOLD - 1}),
+            [],
+        )
+        at = _banner_alerts(
+            session,
+            _FakeMetricsBackend({"secrag_lockout_hits_total": LOCKOUT_SPIKE_THRESHOLD}),
+            [],
+        )
+    assert not any(a.code == "lockout_spike" for a in below)
+    assert any(a.code == "lockout_spike" and a.severity == "amber" for a in at)
+
+
+def test_banner_alerts_email_failures_any_nonzero(api_env: Engine) -> None:
+    from rag_app.api.admin import _banner_alerts
+
+    class _FakeMetricsBackend:
+        def __init__(self, value: float) -> None:
+            self._value = value
+
+        def current_value(self, metric_name: str) -> float | None:
+            return self._value if metric_name == "secrag_email_failed_total" else None
+
+        def current_values(self, metric_names: Sequence[str]) -> dict[str, float | None]:
+            return {name: self.current_value(name) for name in metric_names}
+
+    with Session(api_env) as session:
+        clean = _banner_alerts(session, _FakeMetricsBackend(0.0), [])
+        failing = _banner_alerts(session, _FakeMetricsBackend(3.0), [])
+    assert not any(a.code == "email_failures" for a in clean)
+    assert any(a.code == "email_failures" and a.severity == "amber" for a in failing)
+
+
+def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: Engine) -> None:
+    """DEBT-017/T13.3.1 precedent: a dev_only/azure_only feature reporting ``down`` locally
+    (lab off, or an Azure-only check run off-Azure) is EXPECTED, never a real failure."""
+    from rag_app.api.admin import _banner_alerts
+    from rag_app.api.schemas import FeatureHealthOut
+
+    class _NoMetrics:
+        def current_value(self, metric_name: str) -> float | None:
+            return None
+
+        def current_values(self, metric_names: Sequence[str]) -> dict[str, float | None]:
+            return {}
+
+    def _feature(id_: str, *, dev_only: bool = False, azure_only: bool = False) -> FeatureHealthOut:
+        return FeatureHealthOut(
+            id=id_,
+            name=id_,
+            phase="13",
+            status="enabled",
+            probe_status="down",
+            probe_detail="test",
+            metrics={},
+            dev_only=dev_only,
+            azure_only=azure_only,
+        )
+
+    with Session(api_env) as session:
+        excused = _banner_alerts(
+            session,
+            _NoMetrics(),
+            [_feature("lab", dev_only=True), _feature("azure-thing", azure_only=True)],
+        )
+        real = _banner_alerts(session, _NoMetrics(), [_feature("stack-postgres")])
+    assert not any(a.code == "probe_failures" for a in excused)
+    assert any(a.code == "probe_failures" and a.severity == "red" for a in real)
 
 
 # --- POST /admin/erasure/{id}/purge-now and /retry (matrix=False, explicit 403s) -----------

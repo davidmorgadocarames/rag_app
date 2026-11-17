@@ -118,3 +118,17 @@ def add_tokens(session: Session, tokens: int, *, now: dt.datetime | None = None)
     except Exception as exc:  # noqa: BLE001 - accounting must not fail the answer
         session.rollback()
         logger.warning("usage_daily: tokens not added (%s)", type(exc).__name__)
+
+
+_TODAY_ANSWERS_SQL = text("SELECT answers FROM usage_daily WHERE day = :day")
+
+
+def today_answers(session: Session, *, now: dt.datetime | None = None) -> int:
+    """T13.5.2 (R6-1 banner): today's (UTC) answer count, or 0 when no row exists yet (the
+    cap has never been approached). This is the line the module docstring above promises
+    the Phase 13 banner reads directly from ``usage_daily`` -- never a Prometheus metric
+    (the counter is per-UTC-day, not per-process, so an in-process-only Azure replica would
+    otherwise show a wrong, reset-on-restart value)."""
+    day = (now or utc_now()).astimezone(dt.UTC).date()
+    row = session.execute(_TODAY_ANSWERS_SQL, {"day": day}).first()
+    return int(row[0]) if row is not None else 0

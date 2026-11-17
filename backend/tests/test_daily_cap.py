@@ -427,6 +427,23 @@ def test_the_counter_starts_again_every_utc_day(db_engine: Engine) -> None:
 
 
 @pytest.mark.db
+def test_today_answers_reads_the_row_for_the_given_day(db_engine: Engine) -> None:
+    """T13.5.2 (R6-1 banner): the exact line the module docstring promises the Phase 13
+    banner reads from -- 0 with no row yet, the real count once there is one, and the
+    PREVIOUS day's row is never conflated with today's (same per-UTC-day isolation as
+    ``reserve_answer`` itself)."""
+    from rag_app.usage_cap import reserve_answer, today_answers
+
+    day = dt.datetime(2032, 3, 3, 12, 0, tzinfo=dt.UTC)
+    with Session(db_engine) as session:
+        assert today_answers(session, now=day) == 0
+        assert reserve_answer(session, 5, now=day) is True
+        assert reserve_answer(session, 5, now=day) is True
+        assert today_answers(session, now=day) == 2
+        assert today_answers(session, now=day + dt.timedelta(days=1)) == 0
+
+
+@pytest.mark.db
 def test_the_cap_reached_log_line_has_no_personal_data(
     client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: Any
 ) -> None:

@@ -55,6 +55,8 @@ from rag_app.api.deps import (
     rate_limit_account,
 )
 from rag_app.api.schemas import (
+    AdminAlertOut,
+    AdminAlertsResponse,
     AdminEraseUserRequest,
     AdminEraseUserResponse,
     AdminErasureResponse,
@@ -97,6 +99,7 @@ from rag_app.metrics_backend import MetricsBackend
 from rag_app.mfa import hash_recovery_code
 from rag_app.purger import run_one_in_background
 from rag_app.ratelimit import RateLimiter
+from rag_app.usage_cap import today_answers
 
 # The eval gate's own metric keys/regression epsilon (rag_app.eval.gate): kept as a local
 # constant rather than importing the module-private ``_METRIC_KEYS``/``_REGRESSION_EPSILON``
@@ -454,6 +457,127 @@ def admin_erasure(session: SessionDep) -> AdminErasureResponse:
     return _erasure_payload(session)
 
 
+# --- T13.5.2: banner alerts (R6-1, P13-D4) --------------------------------------------------
+#
+# Every condition is pre-computed SERVER-SIDE (never a client-side threshold), so the exact
+# same business logic covers both live-update modes: the SSE snapshot/heartbeat (local) and
+# the `/admin/alerts` REST route below (Azure polling, T13.4.2). Every value read here is
+# already available through `MetricsBackend` (in-process on Azure, R6-4), a direct cheap
+# query, or the already-computed `features` payload (never a second probe sweep per tick).
+
+ERASURE_ALERT_RED_HOURS = PURGE_DEADLINE_HOURS  # 24h: the purge promise itself (D-ER)
+ERASURE_ALERT_AMBER_HOURS = 20  # T13.5.2: an early warning before the 24h promise is missed
+# A developer-chosen, documented floor (no history/rate available on Azure, R6-4, so this is
+# an absolute count since the replica started, never a rate): more than a handful of
+# lockouts in one replica's lifetime is worth an admin's attention.
+LOCKOUT_SPIKE_THRESHOLD = 5
+
+
+def _banner_alerts(
+    session: Session, metrics_backend: MetricsBackend, features: list[FeatureHealthOut]
+) -> list[AdminAlertOut]:
+    alerts: list[AdminAlertOut] = []
+
+    oldest_open_at = session.scalars(
+        select(DeletionRequest.requested_at)
+        .where(DeletionRequest.status.in_(OPEN_STATUSES))
+        .order_by(DeletionRequest.requested_at.asc())
+        .limit(1)
+    ).first()
+    if oldest_open_at is not None:
+        age_hours = (dt.datetime.now(dt.UTC) - oldest_open_at).total_seconds() / 3600
+        if age_hours > ERASURE_ALERT_RED_HOURS:
+            alerts.append(
+                AdminAlertOut(
+                    code="erasure_overdue",
+                    severity="red",
+                    message=(
+                        f"An erasure request has been open for over"
+                        f" {ERASURE_ALERT_RED_HOURS}h (the purge deadline)."
+                    ),
+                )
+            )
+        elif age_hours > ERASURE_ALERT_AMBER_HOURS:
+            alerts.append(
+                AdminAlertOut(
+                    code="erasure_approaching",
+                    severity="amber",
+                    message=(
+                        f"An erasure request has been open for over"
+                        f" {ERASURE_ALERT_AMBER_HOURS}h (deadline: {ERASURE_ALERT_RED_HOURS}h)."
+                    ),
+                )
+            )
+
+    lockout_hits = metrics_backend.current_value("secrag_lockout_hits_total")
+    if lockout_hits is not None and lockout_hits >= LOCKOUT_SPIKE_THRESHOLD:
+        alerts.append(
+            AdminAlertOut(
+                code="lockout_spike",
+                severity="amber",
+                message=f"Login lockouts: {int(lockout_hits)} since this replica started.",
+            )
+        )
+
+    # dev_only/azure_only entries report "down" BY DESIGN when the feature is off here (e.g.
+    # the defence lab, T13.3.1, or an Azure-only check run locally) -- never a real failure.
+    failing_probes = [
+        f.name for f in features if f.probe_status == "down" and not f.dev_only and not f.azure_only
+    ]
+    if failing_probes:
+        alerts.append(
+            AdminAlertOut(
+                code="probe_failures",
+                severity="red",
+                message=f"{len(failing_probes)} health probe(s) down: {', '.join(failing_probes)}.",
+            )
+        )
+
+    email_failed = metrics_backend.current_value("secrag_email_failed_total")
+    if email_failed is not None and email_failed > 0:
+        alerts.append(
+            AdminAlertOut(
+                code="email_failures",
+                severity="amber",
+                message=(
+                    f"Email delivery failures: {int(email_failed)} since this replica started."
+                ),
+            )
+        )
+
+    cap = get_settings().daily_answer_cap
+    if cap > 0:
+        answers = today_answers(session)
+        if answers >= cap:
+            alerts.append(
+                AdminAlertOut(
+                    code="daily_cap_reached",
+                    severity="red",
+                    message=f"Daily answer cap reached today ({answers}/{cap}).",
+                )
+            )
+    return alerts
+
+
+@router.get(
+    "/admin/alerts",
+    response_model=AdminAlertsResponse,
+    tags=["admin"],
+    dependencies=[
+        Depends(require_permission_and_mfa("admin:read", route=("GET", "/admin/alerts"))),
+        Depends(rate_limit_account("admin_alerts")),
+    ],
+)
+def admin_alerts(session: SessionDep, metrics_backend: MetricsBackendDep) -> AdminAlertsResponse:
+    """T13.5.2 (R6-1, P13-D4): erasure > 24h (amber > 20h), lockout spikes, probe failures,
+    email send failures, daily answer cap reached -- the same ``_banner_alerts`` the SSE
+    stream's snapshot/heartbeat also calls (below), so local (SSE) and Azure (polling,
+    T13.4.2) show identical alerts for identical underlying state."""
+    _refresh_erasure_gauges(session)
+    features = _features_payload(metrics_backend)
+    return AdminAlertsResponse(alerts=_banner_alerts(session, metrics_backend, features))
+
+
 @router.post(
     "/admin/erasure/{request_id}/purge-now",
     response_model=ErasureActionResponse,
@@ -555,9 +679,15 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
 
 def _stream_snapshot(session: Session, metrics_backend: MetricsBackend) -> dict[str, Any]:
     _refresh_erasure_gauges(session)  # DEBT-046, same as every REST route above
+    features = _features_payload(metrics_backend)
     return {
-        "features": [f.model_dump(mode="json") for f in _features_payload(metrics_backend)],
+        "features": [f.model_dump(mode="json") for f in features],
         "erasure": _erasure_payload(session).model_dump(mode="json"),
+        # T13.5.2: computed from the SAME `features` sweep above -- never a second probe run
+        # per tick.
+        "alerts": [
+            a.model_dump(mode="json") for a in _banner_alerts(session, metrics_backend, features)
+        ],
     }
 
 

@@ -115,6 +115,23 @@ are a human/agent checklist.
   `backend/tests/security/test_exposed_files.py` against a throwaway HTTP server, and the
   backend's own lack of static file serving is checked unconditionally in the same file.
   Enforced by the `security-suite` gate step.
+- **Phase 13+ (feature registry DoD rule, T13.5.1)** — a feature added from 13-E onward
+  must have: a registry entry (`rag_app.features.REGISTRY`); a probe (a `health_probe`
+  answering `≤ 2 s` with or without a live stack, or a `quality_probes` entry when only a
+  live DB/Ollama can meaningfully exercise it); at least one Prometheus metric
+  (`entry.metrics`, cross-checked to really exist against the live registry); and, if the
+  feature is actually catalogued in [`THREAT_MODEL.md`](security/THREAT_MODEL.md), a
+  matching `defence_probes` id. The probe + metric half is structural and enforced by
+  `rag_app.features.check_dod_compliance` (`registry` gate step); every entry that predates
+  the rule is an explicit, reviewed exception in `_DOD_GRANDFATHERED_IDS`, never a silent
+  gap. The "defence probe if catalogued" half is a review judgment call (no reliable,
+  generic way to tell "should be catalogued but isn't" apart from "genuinely has no
+  security-relevant behaviour"). Every metric label name is also checked against a
+  reviewed allow-list (`rag_app.metrics.SAFE_METRIC_LABELS`,
+  `rag_app.metrics.check_no_pii_labels`) so a new metric with a PII-shaped label (a user id,
+  e-mail, IP or free text) fails automatically, not only when someone remembers to add a
+  dedicated per-metric test. Enforced by the `registry` gate step + `pytest`
+  (`test_features.py`, `test_metrics.py`).
 - **Phase 11+ (migrations: expand/contract, T11.2.7)** — every migration is **expand-only**:
   it adds tables, columns, indexes, grants or relaxes a constraint (`DROP NOT NULL`), so the
   image that is still running (and the previous image in a rollback) keeps working on the
