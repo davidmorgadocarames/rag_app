@@ -277,7 +277,9 @@ def test_reenrolling_an_enabled_account_without_proof_is_rejected_and_nothing_ch
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
     confirm = client.post(
-        "/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register)
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
     )
     assert confirm.status_code == 200
 
@@ -310,7 +312,11 @@ def test_reenrolling_an_enabled_account_with_a_wrong_totp_code_is_rejected(api_e
     register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
-    client.post("/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register))
+    client.post(
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
 
     reenroll = client.post(
         "/account/mfa/enroll", json={"code": "000000"}, headers=_csrf_header(register)
@@ -324,7 +330,9 @@ def test_reenrolling_an_enabled_account_with_a_valid_totp_code_succeeds(api_env:
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     old_secret = enroll.json()["secret"]
     client.post(
-        "/account/mfa/confirm", json={"code": pyotp.TOTP(old_secret).now()}, headers=_csrf_header(register)
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(old_secret).now()},
+        headers=_csrf_header(register),
     )
 
     reenroll = client.post(
@@ -336,13 +344,17 @@ def test_reenrolling_an_enabled_account_with_a_valid_totp_code_succeeds(api_env:
     assert reenroll.json()["secret"] != old_secret
 
 
-def test_reenrolling_an_enabled_account_with_a_valid_recovery_code_succeeds(api_env: Engine) -> None:
+def test_reenrolling_an_enabled_account_with_a_valid_recovery_code_succeeds(
+    api_env: Engine,
+) -> None:
     client = _client()
     register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
     confirm = client.post(
-        "/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register)
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
     )
     recovery_code = confirm.json()["recovery_codes"][0]
 
@@ -362,7 +374,9 @@ def test_reenrolling_with_an_already_used_recovery_code_is_rejected(api_env: Eng
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
     confirm = client.post(
-        "/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register)
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
     )
     recovery_code = confirm.json()["recovery_codes"][0]
 
@@ -393,7 +407,11 @@ def test_reenroll_failure_increments_the_mfa_reenroll_metric(api_env: Engine) ->
     register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
-    client.post("/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register))
+    client.post(
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
 
     before = metrics.MFA_REENROLL_TOTAL.labels(result="failure")._value.get()
     reenroll = client.post(
@@ -409,7 +427,11 @@ def test_reenroll_success_increments_the_mfa_reenroll_metric(api_env: Engine) ->
     register = _register_and_login(client)
     enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
     secret = enroll.json()["secret"]
-    client.post("/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register))
+    client.post(
+        "/account/mfa/confirm",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
 
     before = metrics.MFA_REENROLL_TOTAL.labels(result="success")._value.get()
     reenroll = client.post(

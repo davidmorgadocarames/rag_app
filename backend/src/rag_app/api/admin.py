@@ -915,10 +915,10 @@ def mfa_enroll(
     record = session.get(UserMfa, user.id)
     if record is not None and record.enabled:
         code = request.code if request is not None else None
-        verified = bool(code) and mfa_service.verify_totp_code(
+        verified = code is not None and mfa_service.verify_totp_code(
             unwrap_key(record.secret_encrypted).decode(), code
         )
-        if not verified and code:
+        if not verified and code is not None:
             # X10 (no TOCTOU, docs/security/THREAT_MODEL.md "X10"/REC-10): claim_recovery_code
             # is ONE atomic UPDATE -- two concurrent attempts with the same code can never
             # both succeed, and an already-used code can never succeed again.
