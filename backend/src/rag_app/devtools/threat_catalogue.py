@@ -17,7 +17,10 @@ this is the regression test for a catalogue that drifts from the code it claims 
 risk (an entry marked done when the test backing it was renamed or deleted). A data row whose
 cell count doesn't match its table's header (too few cells, or extra ones from an unescaped
 ``|`` inside a cell) is a failure too, never a silent skip (DA-12aA-1) — a catalogue that quietly
-shrinks must fail the gate, not just report fewer entries than it should.
+shrinks must fail the gate, not just report fewer entries than it should. Every entry ID must
+be unique across the whole catalogue (DA-13-F1-1) — two different rows sharing an ID (e.g. a
+copy-pasted row renumbered wrong) used to pass silently and left any cross-reference pointing
+at that ID ambiguous.
 
     python -m rag_app.devtools.threat_catalogue [--root REPO] [FILE]
 
@@ -139,6 +142,7 @@ def _test_exists(root: Path, test_id: str) -> bool:
 
 def check(root: Path, rows: list[CatalogueRow]) -> list[CatalogueProblem]:
     problems: list[CatalogueProblem] = []
+    seen_ids: dict[str, CatalogueRow] = {}  # DA-13-F1-1: two different rows, same ID
     for row in rows:
         if row.status == _MALFORMED:
             problems.append(
@@ -149,6 +153,19 @@ def check(root: Path, rows: list[CatalogueRow]) -> list[CatalogueProblem]:
                 )
             )
             continue
+        # DA-13-F1-1: two different rows both claiming the same ID (e.g. a copy-pasted
+        # header row renumbered wrong) passed silently before this check existed — only
+        # phase/test-ID presence and a mitigated row's test were checked, never ID
+        # uniqueness. The duplicate's cross-references (ADR/TRD/code comments pointing at
+        # "THREAT_MODEL REC-n") become ambiguous the moment this happens.
+        if row.entry_id in seen_ids:
+            problems.append(
+                CatalogueProblem(
+                    row, f"duplicate entry id — already used at {seen_ids[row.entry_id]}"
+                )
+            )
+        else:
+            seen_ids[row.entry_id] = row
         if not row.phase:
             problems.append(CatalogueProblem(row, "missing phase"))
         if not row.test_id:

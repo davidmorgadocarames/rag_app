@@ -226,6 +226,33 @@ def test_an_unknown_status_fails(tmp_path: Path) -> None:
     assert any("not one of" in str(p) for p in problems)
 
 
+def test_a_duplicate_entry_id_fails(tmp_path: Path) -> None:
+    """DA-13-F1-1: two different rows both claiming the same ID used to pass silently —
+    only phase/test-ID presence and a mitigated row's test were ever checked, never ID
+    uniqueness. Reproduces the exact mistake found in THREAT_MODEL.md (a new row copy-
+    pasted and renumbered wrong, landing on an ID an existing row already used)."""
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example one | planned | low | low | 15.1 | T15.1.1 | note |\n"
+        "| X-1 | Example two, unrelated | planned | low | low | 15.2 | T15.2.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert len(rows) == 2
+    problems = threat_catalogue.check(tmp_path, rows)
+    assert any("duplicate entry id" in str(p) for p in problems)
+    assert threat_catalogue.main([str(doc)]) == 1
+
+
+def test_two_distinct_entry_ids_never_report_a_duplicate(tmp_path: Path) -> None:
+    doc = _catalogue_doc(
+        tmp_path,
+        "| X-1 | Example one | planned | low | low | 15.1 | T15.1.1 | note |\n"
+        "| X-2 | Example two | planned | low | low | 15.2 | T15.2.1 | note |\n",
+    )
+    rows = threat_catalogue.extract_rows(doc.read_text(encoding="utf-8"), doc)
+    assert threat_catalogue.check(tmp_path, rows) == []
+
+
 def test_a_planned_entry_with_a_future_task_id_passes(tmp_path: Path) -> None:
     doc = _catalogue_doc(
         tmp_path,

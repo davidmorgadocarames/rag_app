@@ -299,7 +299,7 @@ catalogue analysis; this is the implementation summary.
   session cookie + CSRF token alone can no longer replace an admin's second factor; proven
   by `backend/tests/security/test_mfa.py::
   test_reenrolling_an_enabled_account_without_proof_is_rejected_and_nothing_changes`
-  (THREAT_MODEL REC-10). First-time enrolment is unchanged.
+  (THREAT_MODEL REC-13). First-time enrolment is unchanged.
 - **Security headers + CSP** (T12.2.1/T12.2.2/T12.2.3, `frontend/middleware.ts` +
   `lib/csp.ts`/`lib/securityHeaders.mjs`; backend `rag_app.api.app._add_security_headers`):
   HSTS (no `preload` — shared `*.azurecontainerapps.io` domain, E7), `X-Content-Type-Options:

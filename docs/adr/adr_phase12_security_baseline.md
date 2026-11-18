@@ -315,7 +315,7 @@ race (REC-04) and the step-up session rotation both needed their own concurrency
 tests (`backend/tests/security/test_mfa.py`) because a check-then-use shape here would be a
 silent authentication bypass, not just a cosmetic bug.
 
-**13-F follow-up (DEBT-051/DEC-041, THREAT_MODEL REC-10):** the 13-P smoke found that
+**13-F follow-up (DEBT-051/DEC-041, THREAT_MODEL REC-13):** the 13-P smoke found that
 `/account/mfa/enroll` on an ALREADY-ENABLED record needed only a session cookie + CSRF
 token — no proof of the current factor — so a stolen admin session could replace the
 account's secret and recovery codes outright. `mfa_enroll` now requires a valid current

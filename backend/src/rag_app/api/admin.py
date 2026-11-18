@@ -919,9 +919,9 @@ def mfa_enroll(
             unwrap_key(record.secret_encrypted).decode(), code
         )
         if not verified and code is not None:
-            # X10 (no TOCTOU, docs/security/THREAT_MODEL.md "X10"/REC-10): claim_recovery_code
-            # is ONE atomic UPDATE -- two concurrent attempts with the same code can never
-            # both succeed, and an already-used code can never succeed again.
+            # X10 (no TOCTOU): claim_recovery_code is ONE atomic UPDATE -- two concurrent
+            # attempts with the same code can never both succeed, and an already-used code
+            # can never succeed again.
             verified = claim_recovery_code(session, user.id, code)
         if not verified:
             session.commit()  # persist the (non-)claim attempt either way, same as step-up
