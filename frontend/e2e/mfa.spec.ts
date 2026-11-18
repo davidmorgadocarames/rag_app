@@ -6,6 +6,7 @@
 import { expect, test } from "@playwright/test";
 
 import { registerAndReachChat, uniqueEmail } from "./helpers.ts";
+import { totpCode } from "./totp.ts";
 
 test("starting MFA enrolment renders a QR code built from the real provisioning URI", async ({
   page,
@@ -30,4 +31,32 @@ test("starting MFA enrolment renders a QR code built from the real provisioning 
   // The secret/URI manual-entry fallback is still shown alongside the QR code.
   await expect(page.getByText(/^Secret: /)).toBeVisible();
   await expect(page.getByText(/^URI: otpauth:\/\//)).toBeVisible();
+});
+
+test("the enrol-confirm and step-up forms both submit on Enter, not only a button click", async ({
+  page,
+}) => {
+  const email = uniqueEmail("mfa-enter");
+  const password = "correct-horse-battery-staple";
+  await registerAndReachChat(page, email, password);
+  await expect(page).toHaveURL(/\/chat$/);
+
+  await page.goto("/account/security");
+  await page.getByRole("button", { name: "Start enrolment" }).click();
+
+  const secretText = await page.getByText(/^Secret: /).textContent();
+  const secret = secretText?.replace("Secret: ", "").trim();
+  if (!secret) throw new Error("MFA secret was not rendered");
+
+  // T13.7.4: the code input sits inside a real <form onSubmit> -- pressing Enter submits
+  // it, no "CONFIRM" button click needed.
+  const confirmInput = page.getByLabel(/6-digit code your app shows/);
+  await confirmInput.fill(totpCode(secret));
+  await confirmInput.press("Enter");
+  await expect(page.getByText("Two-factor authentication is enabled.")).toBeVisible();
+
+  const stepUpInput = page.getByLabel(/Step up this session now/);
+  await stepUpInput.fill(totpCode(secret));
+  await stepUpInput.press("Enter");
+  await expect(page.getByText("MFA verified.")).toBeVisible();
 });

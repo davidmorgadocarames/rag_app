@@ -9,24 +9,37 @@
 // provisioning URI as an inline SVG, client-side only, no network call -- the secret never
 // leaves the browser (not logged, not placed in any URL/query). The raw secret and URI are
 // kept visible underneath as a manual-entry fallback for any TOTP app that cannot scan.
-
+//
+// T13.7.4/DEBT-051 (DEC-041): a returning account that already has MFA enabled used to see
+// the SAME "Start enrolment" button every new session -- re-enrolling wiped the old secret
+// and recovery codes with nothing but a session cookie + CSRF token (fixed on the backend
+// in 13-F1; this block is the frontend half). Now the page asks `/auth/me` for its OWN
+// `mfa_enabled` flag (never a role) and shows ONLY the step-up form for a returning,
+// already-enabled account; (re-)enrolling sits behind a separate, explicitly warned
+// action whose form sends the current TOTP/recovery code as the backend's new proof.
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 
 import QrCode from "@/components/QrCode";
-import { ApiError, mfaConfirm, mfaEnroll, mfaStepUp } from "@/lib/api";
+import { ApiError, adminPing, me, mfaConfirm, mfaEnroll, mfaStepUp } from "@/lib/api";
 
-type Stage = "idle" | "enrolled" | "confirmed";
+type Stage = "loading" | "firstEnroll" | "returning" | "enrolling" | "confirmed";
 
 export default function AccountSecurityPage() {
   const router = useRouter();
-  const [stage, setStage] = useState<Stage>("idle");
+  const [stage, setStage] = useState<Stage>("loading");
   const [secret, setSecret] = useState<string | null>(null);
   const [provisioningUri, setProvisioningUri] = useState<string | null>(null);
   const [confirmCode, setConfirmCode] = useState("");
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
   const [stepUpCode, setStepUpCode] = useState("");
   const [stepUpMessage, setStepUpMessage] = useState<string | null>(null);
+  const [reenrollOpen, setReenrollOpen] = useState(false);
+  const [reenrollCode, setReenrollCode] = useState("");
+  // T13.7.4 (user request 2026-11-17): shown only once this session has actually proven
+  // itself against an admin-permissioned route (reuses the existing `/admin/ping`
+  // step-up+role gate's pass/fail -- never a new "what is my role" read anywhere).
+  const [isAdmin, setIsAdmin] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   function handleError(err: unknown) {
@@ -37,19 +50,60 @@ export default function AccountSecurityPage() {
     setError(err instanceof Error ? err.message : "Something went wrong");
   }
 
-  async function onEnroll() {
+  useEffect(() => {
+    // Same "CSR re-check" pattern as /account (T12.1.9): the middleware already redirected
+    // a visitor with no session cookie at all before this ever renders.
+    me()
+      .then((info) => setStage(info.mfa_enabled ? "returning" : "firstEnroll"))
+      .catch(() => {
+        router.replace("/login");
+      });
+  }, [router]);
+
+  async function probeAdmin() {
+    try {
+      await adminPing();
+      setIsAdmin(true);
+    } catch {
+      setIsAdmin(false);
+    }
+  }
+
+  async function onStartFirstEnroll() {
     setError(null);
     try {
       const res = await mfaEnroll();
       setSecret(res.secret);
       setProvisioningUri(res.provisioning_uri);
-      setStage("enrolled");
+      setStage("enrolling");
     } catch (err) {
       handleError(err);
     }
   }
 
-  async function onConfirm() {
+  async function onReenroll(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setError(null);
+    try {
+      const res = await mfaEnroll(reenrollCode.trim() || undefined);
+      setSecret(res.secret);
+      setProvisioningUri(res.provisioning_uri);
+      setReenrollOpen(false);
+      setReenrollCode("");
+      setStage("enrolling");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        // The backend's own message ("invalid code") is already generic/safe to show --
+        // nothing here distinguishes "wrong TOTP" from "reused recovery code" either.
+        setError("That code didn't match. Nothing was changed.");
+      } else {
+        handleError(err);
+      }
+    }
+  }
+
+  async function onConfirm(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
     setError(null);
     try {
       const res = await mfaConfirm(confirmCode);
@@ -60,16 +114,47 @@ export default function AccountSecurityPage() {
     }
   }
 
-  async function onStepUp() {
+  async function onStepUp(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
     setError(null);
     setStepUpMessage(null);
     try {
       const res = await mfaStepUp(stepUpCode);
       setStepUpMessage(res.detail);
+      await probeAdmin();
     } catch (err) {
       handleError(err);
     }
   }
+
+  const stepUpForm = (
+    <form onSubmit={onStepUp} className="flex flex-col gap-3 border border-vault-steel-dark p-4">
+      <label className="text-sm text-vault-steel-light">
+        Step up this session now (code or a recovery code):
+        <input
+          value={stepUpCode}
+          onChange={(e) => setStepUpCode(e.target.value)}
+          className="mt-1 w-full border border-vault-steel-dark bg-transparent px-3 py-2 text-vault-steel-light"
+        />
+      </label>
+      <button
+        type="submit"
+        className="w-fit cursor-pointer border border-vault-steel-dark px-4 py-2 text-sm tracking-[0.1em] text-vault-steel transition-colors hover:border-vault-steel hover:text-vault-steel-light"
+      >
+        Step up
+      </button>
+      {stepUpMessage && <p className="text-sm text-vault-steel">{stepUpMessage}</p>}
+    </form>
+  );
+
+  const adminPanelLink = isAdmin && (
+    <a
+      href="/admin"
+      className="w-fit cursor-pointer border border-vault-amber px-4 py-2 text-xs tracking-[0.18em] text-vault-amber transition-colors hover:text-vault-amber-bright"
+    >
+      Admin panel
+    </a>
+  );
 
   return (
     <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-6 px-6">
@@ -83,18 +168,76 @@ export default function AccountSecurityPage() {
 
       {error && <p className="text-sm text-vault-danger">{error}</p>}
 
-      {stage === "idle" && (
+      {stage === "loading" && <p className="text-sm text-vault-steel">Loading…</p>}
+
+      {stage === "firstEnroll" && (
         <button
           type="button"
-          onClick={onEnroll}
+          onClick={onStartFirstEnroll}
           className="w-fit cursor-pointer border border-vault-steel-dark px-4 py-2 text-sm tracking-[0.1em] text-vault-steel transition-colors hover:border-vault-steel hover:text-vault-steel-light"
         >
           Start enrolment
         </button>
       )}
 
-      {stage === "enrolled" && secret && provisioningUri && (
-        <div className="flex flex-col gap-3 border border-vault-steel-dark p-4">
+      {stage === "returning" && (
+        <>
+          {stepUpForm}
+          {adminPanelLink}
+
+          <div className="border border-vault-danger p-4">
+            <p className="text-sm text-vault-danger">
+              Only replace two-factor authentication if you have lost access to your
+              authenticator app or recovery codes. This invalidates your current secret and
+              every existing recovery code.
+            </p>
+            {!reenrollOpen ? (
+              <button
+                type="button"
+                onClick={() => setReenrollOpen(true)}
+                className="mt-3 w-fit cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+              >
+                Replace my two-factor authentication
+              </button>
+            ) : (
+              <form onSubmit={onReenroll} className="mt-3 flex flex-col gap-3">
+                <label className="text-sm text-vault-steel-light">
+                  Current 6-digit code or a recovery code:
+                  <input
+                    value={reenrollCode}
+                    onChange={(e) => setReenrollCode(e.target.value)}
+                    className="mt-1 w-full border border-vault-steel-dark bg-transparent px-3 py-2 text-vault-steel-light"
+                  />
+                </label>
+                <div className="flex gap-2">
+                  <button
+                    type="submit"
+                    className="cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+                  >
+                    Confirm and replace
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReenrollOpen(false);
+                      setReenrollCode("");
+                    }}
+                    className="cursor-pointer border border-vault-steel-dark px-4 py-2 text-sm text-vault-steel transition-colors hover:text-vault-steel-light"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </>
+      )}
+
+      {stage === "enrolling" && secret && provisioningUri && (
+        <form
+          onSubmit={onConfirm}
+          className="flex flex-col gap-3 border border-vault-steel-dark p-4"
+        >
           <p className="text-sm text-vault-steel-light">
             Scan this QR code with your authenticator app, or enter the secret manually below
             if your app cannot scan.
@@ -114,13 +257,12 @@ export default function AccountSecurityPage() {
             />
           </label>
           <button
-            type="button"
-            onClick={onConfirm}
+            type="submit"
             className="w-fit cursor-pointer border border-vault-amber px-4 py-2 text-xs tracking-[0.18em] text-vault-amber transition-colors hover:text-vault-amber-bright"
           >
             CONFIRM
           </button>
-        </div>
+        </form>
       )}
 
       {stage === "confirmed" && recoveryCodes && (
@@ -137,22 +279,24 @@ export default function AccountSecurityPage() {
             ))}
           </ul>
 
-          <label className="mt-2 text-sm text-vault-steel-light">
-            Step up this session now (code or a recovery code):
-            <input
-              value={stepUpCode}
-              onChange={(e) => setStepUpCode(e.target.value)}
-              className="mt-1 w-full border border-vault-steel-dark bg-transparent px-3 py-2 text-vault-steel-light"
-            />
-          </label>
-          <button
-            type="button"
-            onClick={onStepUp}
-            className="w-fit cursor-pointer border border-vault-steel-dark px-4 py-2 text-sm tracking-[0.1em] text-vault-steel transition-colors hover:border-vault-steel hover:text-vault-steel-light"
-          >
-            Step up
-          </button>
-          {stepUpMessage && <p className="text-sm text-vault-steel">{stepUpMessage}</p>}
+          <form onSubmit={onStepUp} className="mt-2 flex flex-col gap-3">
+            <label className="text-sm text-vault-steel-light">
+              Step up this session now (code or a recovery code):
+              <input
+                value={stepUpCode}
+                onChange={(e) => setStepUpCode(e.target.value)}
+                className="mt-1 w-full border border-vault-steel-dark bg-transparent px-3 py-2 text-vault-steel-light"
+              />
+            </label>
+            <button
+              type="submit"
+              className="w-fit cursor-pointer border border-vault-steel-dark px-4 py-2 text-sm tracking-[0.1em] text-vault-steel transition-colors hover:border-vault-steel hover:text-vault-steel-light"
+            >
+              Step up
+            </button>
+            {stepUpMessage && <p className="text-sm text-vault-steel">{stepUpMessage}</p>}
+          </form>
+          {adminPanelLink}
         </div>
       )}
     </main>

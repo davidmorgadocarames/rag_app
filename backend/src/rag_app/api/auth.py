@@ -35,7 +35,7 @@ from rag_app.api.schemas import (
 from rag_app.config import get_settings
 from rag_app.crypto import generate_user_key, wrap_key
 from rag_app.csrf import CSRF_COOKIE_NAME, csrf_token, require_csrf, require_origin
-from rag_app.db.models import EmailVerificationToken, PasswordResetToken, User, UserKey
+from rag_app.db.models import EmailVerificationToken, PasswordResetToken, User, UserKey, UserMfa
 from rag_app.emailer import (
     send_already_registered_email,
     send_password_reset_email,
@@ -534,8 +534,15 @@ def logout(http: Request, session: SessionDep, response: Response) -> MessageRes
     tags=["identity"],
     dependencies=[Depends(rate_limit_account("auth_me"))],
 )
-def me(user: CurrentUserDep) -> UserOut:
-    return UserOut(id=str(user.id), email=user.email, email_verified=user.email_verified)
+def me(user: CurrentUserDep, session: SessionDep) -> UserOut:
+    # T13.7.4: self-only MFA status (never a role) -- see UserOut.mfa_enabled's docstring.
+    record = session.get(UserMfa, user.id)
+    return UserOut(
+        id=str(user.id),
+        email=user.email,
+        email_verified=user.email_verified,
+        mfa_enabled=record is not None and record.enabled,
+    )
 
 
 @router.delete(

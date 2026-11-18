@@ -65,8 +65,10 @@ export async function loginAndReachChat(
 
 /** T13.2.10: enrol + confirm + step up MFA for real through the UI (a real TOTP code
  * from the real backend-issued secret, `e2e/totp.ts`). Shared by admin-dashboard.spec.ts
- * and security-headers.spec.ts's `/admin` walk (DEC-036). */
-export async function enrolAndStepUpMfa(page: Page): Promise<void> {
+ * and security-headers.spec.ts's `/admin` walk (DEC-036). Returns the raw TOTP secret
+ * (T13.7.5/DEBT-051) so a caller can later prove a step-up-only session with
+ * `stepUpOnlyMfa` below, without ever re-enrolling. */
+export async function enrolAndStepUpMfa(page: Page): Promise<string> {
   await page.goto("/account/security");
   await page.getByRole("button", { name: "Start enrolment" }).click();
 
@@ -80,5 +82,22 @@ export async function enrolAndStepUpMfa(page: Page): Promise<void> {
 
   await page.getByLabel(/Step up this session now/).fill(totpCode(secret));
   await page.getByRole("button", { name: "Step up" }).click();
+  await expect(page.getByText("MFA verified.")).toBeVisible();
+  return secret;
+}
+
+/** T13.7.5/DEBT-051: steps up a session for an account that ALREADY has MFA enabled
+ * (`secret` from an earlier `enrolAndStepUpMfa` call, possibly in a different session/
+ * browser context) -- never touches enrolment. Proves `/account/security` shows only the
+ * step-up form for a returning account (no "Start enrolment"/QR code) and that pressing
+ * Enter in the code field submits it (no button click). */
+export async function stepUpOnlyMfa(page: Page, secret: string): Promise<void> {
+  await page.goto("/account/security");
+  await expect(page.getByRole("button", { name: "Start enrolment" })).toHaveCount(0);
+  await expect(page.getByTestId("mfa-qr-code")).toHaveCount(0);
+
+  const codeInput = page.getByLabel(/Step up this session now/);
+  await codeInput.fill(totpCode(secret));
+  await codeInput.press("Enter");
   await expect(page.getByText("MFA verified.")).toBeVisible();
 }

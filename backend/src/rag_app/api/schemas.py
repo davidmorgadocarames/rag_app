@@ -105,6 +105,13 @@ class UserOut(BaseModel):
     id: str
     email: str | None  # None once erasure scrubbed it (0005)
     email_verified: bool
+    # T13.7.4: the account's OWN MFA status, nothing else -- no role (the frontend never
+    # learns "is this account an admin" from this endpoint; it reuses an existing
+    # admin-permissioned route's pass/fail for that, see
+    # frontend/app/account/security/page.tsx). Lets /account/security show the step-up form
+    # by default for a returning account that already enabled MFA, instead of forcing every
+    # new session through the enrolment flow again (DEBT-051/DEC-041, 13-F2).
+    mfa_enabled: bool
 
 
 class MessageResponse(BaseModel):

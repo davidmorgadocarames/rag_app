@@ -46,6 +46,9 @@ export interface UserInfo {
   id: string;
   email: string;
   email_verified: boolean;
+  // T13.7.4: the account's OWN MFA status (never a role -- see mfaEnroll's own comment on
+  // why "is this account an admin" is deliberately never read from here).
+  mfa_enabled: boolean;
 }
 
 export interface Usage {
@@ -192,8 +195,15 @@ export interface MfaConfirmResponse {
   recovery_codes: string[];
 }
 
-export function mfaEnroll(): Promise<MfaEnrollResponse> {
-  return request("/account/mfa/enroll", { method: "POST" });
+// T13.7.4/DEBT-051: `code` is required only to re-enrol an ALREADY-ENABLED record (the
+// backend's `MfaEnrollRequest.code`, DEC-041) -- omitted entirely (no body at all, never an
+// empty string: the backend's `code: str | None` would reject a blank string on length
+// alone) for first-time enrolment, where there is nothing yet to prove.
+export function mfaEnroll(code?: string): Promise<MfaEnrollResponse> {
+  return request("/account/mfa/enroll", {
+    method: "POST",
+    body: code ? JSON.stringify({ code }) : undefined,
+  });
 }
 
 export function mfaConfirm(code: string): Promise<MfaConfirmResponse> {

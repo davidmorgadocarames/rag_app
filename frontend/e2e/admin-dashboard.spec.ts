@@ -6,7 +6,19 @@
 // works against a real backend.
 import { expect, test } from "@playwright/test";
 
-import { enrolAndStepUpMfa, loginAndReachChat } from "./helpers.ts";
+import {
+  enrolAndStepUpMfa,
+  loginAndReachChat,
+  registerAndReachChat,
+  stepUpOnlyMfa,
+  uniqueEmail,
+} from "./helpers.ts";
+
+// T13.7.5/DEBT-051: set by the first test below (it enrols ADMIN_EMAIL for real) so the
+// step-up-only test further down can prove a NEW session for the SAME, already-enrolled
+// account without ever re-enrolling. Tests in this file run sequentially (no
+// `fullyParallel`, playwright.config.ts) -- the assignment always happens before the read.
+let adminSecret: string | undefined;
 
 const ADMIN_EMAIL = process.env.E2E_ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD;
@@ -30,7 +42,7 @@ test("an admin can enrol MFA, step up, and see the full dashboard", async ({ pag
   await loginAndReachChat(page, ADMIN_EMAIL as string, ADMIN_PASSWORD as string);
   await expect(page).toHaveURL(/\/chat$/);
 
-  await enrolAndStepUpMfa(page);
+  adminSecret = await enrolAndStepUpMfa(page);
 
   await page.goto("/admin");
   await expect(page.getByText("Admin dashboard")).toBeVisible();
@@ -72,4 +84,50 @@ test("the admin can erase another account's data through the erasure panel", asy
 
   // The erasure panel's table now lists at least one open request.
   await expect(page.getByTestId("admin-erasure-panel").locator("tbody tr").first()).toBeVisible();
+});
+
+// T13.7.5/DEBT-051: the real step-up-only e2e path the backend fix (13-F1) was missing --
+// an already-enrolled admin logging into a BRAND NEW session (its own browser context, so
+// no cookie survives from the first test's session) must see only the step-up form, step up
+// by pressing Enter (no button click), and reach the Admin panel link -- never touching
+// enrolment again. The same page also proves a plain user never sees that link, and that
+// re-enrolling without a code is rejected in the UI with a readable message.
+test("an already-enrolled admin steps up in a brand-new session without re-enrolling", async ({
+  page,
+  browser,
+}) => {
+  const context = await browser.newContext();
+  const freshPage = await context.newPage();
+  try {
+    await loginAndReachChat(freshPage, ADMIN_EMAIL as string, ADMIN_PASSWORD as string);
+    await expect(freshPage).toHaveURL(/\/chat$/);
+
+    await stepUpOnlyMfa(freshPage, adminSecret as string);
+    // Still the same page as stepUpOnlyMfa left it (no reload): the Admin panel link
+    // appears right after a successful step-up, same render, no extra navigation.
+    await expect(freshPage.getByRole("link", { name: "Admin panel" })).toBeVisible();
+
+    // Re-enrolling without a code is rejected in the UI (403 shown nicely, no QR code
+    // appears, the account stays untouched) -- the separate, warned action, not the
+    // default view. Submitted by pressing Enter in the (empty) code field, not a button
+    // click, proving the re-enrol form is a real <form onSubmit> too.
+    await freshPage
+      .getByRole("button", { name: "Replace my two-factor authentication" })
+      .click();
+    await freshPage.getByLabel(/Current 6-digit code or a recovery code/).press("Enter");
+    await expect(freshPage.getByText(/didn't match/)).toBeVisible();
+    await expect(freshPage.getByTestId("mfa-qr-code")).toHaveCount(0);
+  } finally {
+    await context.close();
+  }
+
+  // A plain (non-admin) user, freshly registered and self-enrolled -- never sees the link.
+  const plainEmail = uniqueEmail("mfa-plain");
+  await registerAndReachChat(page, plainEmail, "correct-horse-battery-staple");
+  await expect(page).toHaveURL(/\/chat$/);
+  await enrolAndStepUpMfa(page);
+  // Same page `enrolAndStepUpMfa` left it on (no reload): a real step-up just completed,
+  // so this genuinely proves the probe returned 403 for a non-admin, not merely "nobody
+  // checked yet".
+  await expect(page.getByRole("link", { name: "Admin panel" })).toHaveCount(0);
 });
