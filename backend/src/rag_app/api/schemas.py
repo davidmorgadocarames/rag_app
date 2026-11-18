@@ -159,6 +159,15 @@ class RenameRequest(StrictModel):
 # --- Admin MFA (T12.3.4/T12.3.5) ----------------------------------------------------------
 
 
+class MfaEnrollRequest(StrictModel):
+    # DEBT-051/DEC-041: proof of the CURRENT factor, required only when re-enrolling an
+    # ALREADY-ENABLED record (a session cookie + CSRF token alone must never be enough to
+    # replace an enabled admin's secret and wipe their recovery codes). ``None`` for
+    # first-time enrolment, where there is no existing factor to prove. Same bound as
+    # ``MfaStepUpRequest.code`` (a 6-digit TOTP code OR an "XXXX-XXXX-XXXX" recovery code).
+    code: str | None = Field(default=None, min_length=6, max_length=64)
+
+
 class MfaEnrollResponse(BaseModel):
     # The PLAINTEXT base32 secret, shown once so the account page can render a manual-entry
     # fallback next to the QR -- never stored in the clear (user_mfa.secret_encrypted is).

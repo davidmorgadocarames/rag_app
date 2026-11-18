@@ -75,7 +75,7 @@ EMAIL_FAILED_TOTAL = Counter(
 # CLIENT_IP_SIGNATURE_TOTAL's ``result`` label):
 #   route_group  chat / login / email / csp_report / account / mfa (RATE_LIMIT_HITS_TOTAL)
 #   reason       disposable_email / signup_velocity (SIGNUP_BLOCKED_TOTAL)
-#   result       success / failure (MFA_STEP_UP_TOTAL)
+#   result       success / failure (MFA_STEP_UP_TOTAL, MFA_REENROLL_TOTAL)
 RATE_LIMIT_HITS_TOTAL = Counter(
     "secrag_rate_limit_hits_total",
     "Requests rejected (429) by a token-bucket rate limiter, by route group.",
@@ -105,6 +105,17 @@ CSP_REPORTS_TOTAL = Counter(
 MFA_STEP_UP_TOTAL = Counter(
     "secrag_mfa_step_up_total",
     "MFA step-up attempts (/account/mfa/step-up), by result.",
+    ["result"],
+    registry=REGISTRY,
+)
+
+# DEBT-051/DEC-041: the proof check that guards re-enrolling an ALREADY-ENABLED record
+# (/account/mfa/enroll) -- only incremented on that guarded path, never on a plain
+# first-time enrolment (which has no proof to check). Same "audit trail" role for this
+# route as MFA_STEP_UP_TOTAL already plays for step-up.
+MFA_REENROLL_TOTAL = Counter(
+    "secrag_mfa_reenroll_total",
+    "Re-enrolment attempts on an already-enabled MFA record (/account/mfa/enroll), by result.",
     ["result"],
     registry=REGISTRY,
 )

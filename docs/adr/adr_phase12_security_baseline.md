@@ -315,6 +315,15 @@ race (REC-04) and the step-up session rotation both needed their own concurrency
 tests (`backend/tests/security/test_mfa.py`) because a check-then-use shape here would be a
 silent authentication bypass, not just a cosmetic bug.
 
+**13-F follow-up (DEBT-051/DEC-041, THREAT_MODEL REC-10):** the 13-P smoke found that
+`/account/mfa/enroll` on an ALREADY-ENABLED record needed only a session cookie + CSRF
+token — no proof of the current factor — so a stolen admin session could replace the
+account's secret and recovery codes outright. `mfa_enroll` now requires a valid current
+TOTP code or an unused recovery code (via `claim_recovery_code`, the same X10 atomic claim
+step-up already uses) before touching an enabled record; first-time enrolment is
+unchanged. The account-security page still forces re-enrolment on every new session
+instead of offering a step-up-only path — that frontend half is block 13-F2.
+
 #### P12-D7 — Authentication hardening: no account-enumeration via timing or response shape (T12.4.1, T12.4.3, T12.4.4, DA-12bB-1)
 
 **Decision:** Login is constant-time regardless of whether the account exists

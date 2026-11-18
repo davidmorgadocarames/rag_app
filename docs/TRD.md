@@ -293,7 +293,13 @@ catalogue analysis; this is the implementation summary.
   cookie tampering (the cookie is always opaque — the role is re-read from the database on
   every request, never decoded from the cookie), direct backend calls bypassing the
   frontend, and a missing MFA step-up all deny — proven in
-  `backend/tests/security/test_client_tampering.py`.
+  `backend/tests/security/test_client_tampering.py`. **13-F (DEBT-051/DEC-041):**
+  `POST /account/mfa/enroll` on an already-ENABLED record additionally requires a valid
+  current TOTP code or an unused recovery code (403, generic message, otherwise) — a
+  session cookie + CSRF token alone can no longer replace an admin's second factor; proven
+  by `backend/tests/security/test_mfa.py::
+  test_reenrolling_an_enabled_account_without_proof_is_rejected_and_nothing_changes`
+  (THREAT_MODEL REC-10). First-time enrolment is unchanged.
 - **Security headers + CSP** (T12.2.1/T12.2.2/T12.2.3, `frontend/middleware.ts` +
   `lib/csp.ts`/`lib/securityHeaders.mjs`; backend `rag_app.api.app._add_security_headers`):
   HSTS (no `preload` — shared `*.azurecontainerapps.io` domain, E7), `X-Content-Type-Options:

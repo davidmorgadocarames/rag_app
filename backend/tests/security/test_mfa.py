@@ -23,7 +23,7 @@ from rag_app.api.admin import claim_recovery_code
 from rag_app.api.app import create_app
 from rag_app.api.deps import get_email_abuse_limiter, get_signup_tracker
 from rag_app.csrf import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
-from rag_app.db.models import MfaRecoveryCode, User
+from rag_app.db.models import MfaRecoveryCode, User, UserMfa
 from rag_app.email_abuse import EmailAbuseLimiter
 from rag_app.mfa import hash_recovery_code
 from rag_app.risk import SignupTracker
@@ -75,6 +75,18 @@ def _register_and_login(client: TestClient):  # noqa: ANN201
     login = client.post("/auth/login", json=creds)
     assert login.status_code == 200, login.text
     return login
+
+
+def _register_and_login_with_email(client: TestClient) -> tuple[str, object]:
+    """Same as ``_register_and_login`` but also returns the account's email -- the DEBT-051
+    re-enrolment tests below need it to look the account's ``UserMfa``/recovery-code rows up
+    directly in the database."""
+    creds = _credentials()
+    register = client.post("/auth/register", json=creds)
+    assert register.status_code == 202, register.text
+    login = client.post("/auth/login", json=creds)
+    assert login.status_code == 200, login.text
+    return creds["email"], login
 
 
 def _login_as_admin(db_engine: Engine, client: TestClient) -> tuple[str, dict[str, str]]:
@@ -248,6 +260,166 @@ def test_a_recovery_code_steps_up_and_is_then_single_use(api_env: Engine) -> Non
         "/account/mfa/step-up", json={"code": recovery_code}, headers=_csrf_header(first)
     )
     assert second.status_code == 403
+
+
+# --- DEBT-051/DEC-041: re-enrolling an ALREADY-ENABLED record needs proof of the current
+# factor (a session cookie + CSRF token alone is not enough) ------------------------------
+
+
+def test_reenrolling_an_enabled_account_without_proof_is_rejected_and_nothing_changes(
+    api_env: Engine, db_engine: Engine
+) -> None:
+    """Negative control (DEC-041): the exact gap a stolen session could abuse. A session
+    cookie + CSRF token alone -- no TOTP code, no recovery code -- must NOT be enough to
+    replace an already-enabled account's secret or wipe its recovery codes."""
+    client = _client()
+    email, register = _register_and_login_with_email(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    confirm = client.post(
+        "/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register)
+    )
+    assert confirm.status_code == 200
+
+    with Session(db_engine) as session:
+        user_id = session.query(User).filter(User.email == email).one().id
+        before = session.get(UserMfa, user_id)
+        before_secret = before.secret_encrypted
+        before_codes = sorted(
+            row.code_hash
+            for row in session.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == user_id)
+        )
+        assert before_codes  # sanity: confirm really did create 10 codes
+
+    reenroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    assert reenroll.status_code == 403
+
+    with Session(db_engine) as session:
+        after = session.get(UserMfa, user_id)
+        after_codes = sorted(
+            row.code_hash
+            for row in session.query(MfaRecoveryCode).filter(MfaRecoveryCode.user_id == user_id)
+        )
+    assert after.enabled is True
+    assert after.secret_encrypted == before_secret
+    assert after_codes == before_codes
+
+
+def test_reenrolling_an_enabled_account_with_a_wrong_totp_code_is_rejected(api_env: Engine) -> None:
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    client.post("/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register))
+
+    reenroll = client.post(
+        "/account/mfa/enroll", json={"code": "000000"}, headers=_csrf_header(register)
+    )
+    assert reenroll.status_code == 403
+
+
+def test_reenrolling_an_enabled_account_with_a_valid_totp_code_succeeds(api_env: Engine) -> None:
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    old_secret = enroll.json()["secret"]
+    client.post(
+        "/account/mfa/confirm", json={"code": pyotp.TOTP(old_secret).now()}, headers=_csrf_header(register)
+    )
+
+    reenroll = client.post(
+        "/account/mfa/enroll",
+        json={"code": pyotp.TOTP(old_secret).now()},
+        headers=_csrf_header(register),
+    )
+    assert reenroll.status_code == 200
+    assert reenroll.json()["secret"] != old_secret
+
+
+def test_reenrolling_an_enabled_account_with_a_valid_recovery_code_succeeds(api_env: Engine) -> None:
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    confirm = client.post(
+        "/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register)
+    )
+    recovery_code = confirm.json()["recovery_codes"][0]
+
+    reenroll = client.post(
+        "/account/mfa/enroll", json={"code": recovery_code}, headers=_csrf_header(register)
+    )
+    assert reenroll.status_code == 200
+    assert reenroll.json()["secret"] != secret
+
+
+def test_reenrolling_with_an_already_used_recovery_code_is_rejected(api_env: Engine) -> None:
+    """The code was already claimed (by a step-up elsewhere) -- it must not ALSO work as
+    proof for a re-enrolment: ``claim_recovery_code``'s atomic ``UPDATE ... WHERE used_at IS
+    NULL`` (X10) never matches an already-used row."""
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    confirm = client.post(
+        "/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register)
+    )
+    recovery_code = confirm.json()["recovery_codes"][0]
+
+    step_up = client.post(
+        "/account/mfa/step-up", json={"code": recovery_code}, headers=_csrf_header(register)
+    )
+    assert step_up.status_code == 200  # consumes the code; session/CSRF rotated
+
+    reenroll = client.post(
+        "/account/mfa/enroll", json={"code": recovery_code}, headers=_csrf_header(step_up)
+    )
+    assert reenroll.status_code == 403
+
+
+def test_first_time_enrolment_still_works_without_any_code(api_env: Engine) -> None:
+    """DEC-041: the proof requirement only applies to an already-ENABLED record -- a brand
+    new account (no record at all) still enrols with nothing but an authenticated session,
+    exactly as before this fix."""
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    assert enroll.status_code == 200
+    assert len(enroll.json()["secret"]) >= 16
+
+
+def test_reenroll_failure_increments_the_mfa_reenroll_metric(api_env: Engine) -> None:
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    client.post("/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register))
+
+    before = metrics.MFA_REENROLL_TOTAL.labels(result="failure")._value.get()
+    reenroll = client.post(
+        "/account/mfa/enroll", json={"code": "000000"}, headers=_csrf_header(register)
+    )
+    assert reenroll.status_code == 403
+    after = metrics.MFA_REENROLL_TOTAL.labels(result="failure")._value.get()
+    assert after == before + 1
+
+
+def test_reenroll_success_increments_the_mfa_reenroll_metric(api_env: Engine) -> None:
+    client = _client()
+    register = _register_and_login(client)
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    client.post("/account/mfa/confirm", json={"code": pyotp.TOTP(secret).now()}, headers=_csrf_header(register))
+
+    before = metrics.MFA_REENROLL_TOTAL.labels(result="success")._value.get()
+    reenroll = client.post(
+        "/account/mfa/enroll",
+        json={"code": pyotp.TOTP(secret).now()},
+        headers=_csrf_header(register),
+    )
+    assert reenroll.status_code == 200
+    after = metrics.MFA_REENROLL_TOTAL.labels(result="success")._value.get()
+    assert after == before + 1
 
 
 def test_concurrent_claims_of_the_same_recovery_code_let_exactly_one_through(

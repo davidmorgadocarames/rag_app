@@ -72,6 +72,7 @@ from rag_app.api.schemas import (
     MessageResponse,
     MfaConfirmRequest,
     MfaConfirmResponse,
+    MfaEnrollRequest,
     MfaEnrollResponse,
     MfaStepUpRequest,
     StageLatencyOut,
@@ -888,15 +889,47 @@ def admin_erase_user(
             require_permission("user:base", route=("POST", "/account/mfa/enroll"), matrix=False)
         ),
         Depends(rate_limit_account("mfa_enroll")),
+        # DEBT-051/DEC-041: this route now also checks a TOTP/recovery code (see below), so
+        # it shares the same per-account guessing budget as /account/mfa/confirm and
+        # /account/mfa/step-up -- not just the general per-route limiter above.
+        Depends(_rate_limit_mfa),
     ],
 )
-def mfa_enroll(user: CurrentUserDep, session: SessionDep) -> MfaEnrollResponse:
+def mfa_enroll(
+    user: CurrentUserDep, session: SessionDep, request: MfaEnrollRequest | None = None
+) -> MfaEnrollResponse:
     """(Re-)start enrolment: a fresh, PENDING secret -- MFA is OFF (or off again, if it was
     already on) until ``/account/mfa/confirm`` proves the user can generate a valid code.
     Any earlier recovery codes are invalidated at the same time (they belonged to the old
-    secret)."""
-    secret = mfa_service.generate_totp_secret()
+    secret).
+
+    DEBT-051/DEC-041: first-time enrolment (no record, or a record that was started but
+    never confirmed) is UNCHANGED -- a plain authenticated session is enough, exactly like
+    before. Re-enrolling an ALREADY-ENABLED record is different: a session cookie + CSRF
+    token alone would let a stolen admin session swap the account's second factor for the
+    attacker's and sail straight through step-up next -- found in the 13-P smoke (DEC-041).
+    So that path additionally requires a valid CURRENT TOTP code or an unused recovery code
+    in the request body, the same proof ``/account/mfa/step-up`` already demands
+    (``claim_recovery_code``'s single atomic UPDATE, X10, applies here too -- never a
+    SELECT-then-UPDATE)."""
     record = session.get(UserMfa, user.id)
+    if record is not None and record.enabled:
+        code = request.code if request is not None else None
+        verified = bool(code) and mfa_service.verify_totp_code(
+            unwrap_key(record.secret_encrypted).decode(), code
+        )
+        if not verified and code:
+            # X10 (no TOCTOU, docs/security/THREAT_MODEL.md "X10"/REC-10): claim_recovery_code
+            # is ONE atomic UPDATE -- two concurrent attempts with the same code can never
+            # both succeed, and an already-used code can never succeed again.
+            verified = claim_recovery_code(session, user.id, code)
+        if not verified:
+            session.commit()  # persist the (non-)claim attempt either way, same as step-up
+            metrics.MFA_REENROLL_TOTAL.labels(result="failure").inc()
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid code")
+        metrics.MFA_REENROLL_TOTAL.labels(result="success").inc()
+
+    secret = mfa_service.generate_totp_secret()
     if record is None:
         session.add(UserMfa(user_id=user.id, secret_encrypted=wrap_key(secret.encode())))
     else:

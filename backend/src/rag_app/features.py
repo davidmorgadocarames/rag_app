@@ -623,7 +623,7 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         phase="12b",
         status="enabled",
         health_probe=route_probe("POST", "/account/mfa/step-up"),
-        metrics=("secrag_mfa_step_up_total",),
+        metrics=("secrag_mfa_step_up_total", "secrag_mfa_reenroll_total"),
         docs="docs/adr/adr_phase12_security_baseline.md",
     ),
     FeatureEntry(

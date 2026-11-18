@@ -538,6 +538,14 @@ E2E_CLIENT_IP_KEY=""   # set by e2e_start_backend; e2e_start_frontend must reuse
 # signup-velocity budget that auth/admin/mfa.spec.ts's own throwaway registrations already
 # leave little headroom in (found for real: a 6th registration in one run tripped it).
 E2E_ADMIN_EMAIL="e2e-admin@example.test"
+# DEBT-051/DEC-041 (13-F1): admin-dashboard.spec.ts's SECOND test reuses the admin account
+# but `enrolAndStepUpMfa` always (re-)enrols from scratch -- since `/account/mfa/enroll` on
+# an already-ENABLED record now needs proof of the current factor (this block's whole
+# point), a second from-scratch enrolment through the UI, which never supplies one, would
+# 403. Giving that test its OWN seeded admin, never touched by the first test, is simpler
+# than threading a TOTP secret across two otherwise-independent Playwright tests -- the
+# full step-up-only (no re-enrol) UI path is 13-F2's own e2e addition.
+E2E_ADMIN2_EMAIL="e2e-admin2@example.test"
 E2E_ERASE_TARGET_EMAIL="e2e-erase-target@example.test"
 # DEC-036 (DA-13-C-6): step_security-headers's own admin for its /admin walk -- separate from
 # step_e2e's so the two steps' real MFA enrolments never collide in one gate DB lifetime.
@@ -671,6 +679,8 @@ e2e_seed_admin() {
   (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ADMIN_EMAIL" --role admin) \
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ADMIN2_EMAIL" --role admin) \
+    && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ERASE_TARGET_EMAIL" --role user)
 }
 
@@ -703,6 +713,7 @@ step_e2e() {
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
     MAILPIT_API_URL="http://127.0.0.1:$GATE_MAILPIT_API_PORT" \
     E2E_ADMIN_EMAIL="$E2E_ADMIN_EMAIL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    E2E_ADMIN2_EMAIL="$E2E_ADMIN2_EMAIL" \
     E2E_ERASE_TARGET_EMAIL="$E2E_ERASE_TARGET_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
       e2e/mfa.spec.ts)

@@ -10,15 +10,20 @@ import { enrolAndStepUpMfa, loginAndReachChat } from "./helpers.ts";
 
 const ADMIN_EMAIL = process.env.E2E_ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD;
+// DEBT-051/DEC-041 (13-F1): the erasure test below gets its OWN seeded admin -- see this
+// file's `e2e_seed_admin`/`E2E_ADMIN2_EMAIL` comment in scripts/gate.sh for why (reusing
+// ADMIN_EMAIL's account would hit the re-enrolment proof check this block adds, since
+// `enrolAndStepUpMfa` always (re-)enrols from scratch through the UI).
+const ADMIN2_EMAIL = process.env.E2E_ADMIN2_EMAIL;
 // DA-13-C-1: seeded directly (scripts/gate.sh's e2e_seed_admin --role user), never
 // registered through the UI -- see that function's own comment for why (signup-velocity
 // budget).
 const ERASE_TARGET_EMAIL = process.env.E2E_ERASE_TARGET_EMAIL;
 
 test.skip(
-  !ADMIN_EMAIL || !ADMIN_PASSWORD || !ERASE_TARGET_EMAIL,
-  "E2E_ADMIN_EMAIL/E2E_ADMIN_PASSWORD/E2E_ERASE_TARGET_EMAIL not set -- only" +
-    " scripts/gate.sh's step_e2e sets these",
+  !ADMIN_EMAIL || !ADMIN2_EMAIL || !ADMIN_PASSWORD || !ERASE_TARGET_EMAIL,
+  "E2E_ADMIN_EMAIL/E2E_ADMIN2_EMAIL/E2E_ADMIN_PASSWORD/E2E_ERASE_TARGET_EMAIL not set --" +
+    " only scripts/gate.sh's step_e2e sets these",
 );
 
 test("an admin can enrol MFA, step up, and see the full dashboard", async ({ page }) => {
@@ -50,7 +55,7 @@ test("an admin can enrol MFA, step up, and see the full dashboard", async ({ pag
 });
 
 test("the admin can erase another account's data through the erasure panel", async ({ page }) => {
-  await loginAndReachChat(page, ADMIN_EMAIL as string, ADMIN_PASSWORD as string);
+  await loginAndReachChat(page, ADMIN2_EMAIL as string, ADMIN_PASSWORD as string);
   await expect(page).toHaveURL(/\/chat$/);
   await enrolAndStepUpMfa(page);
 
