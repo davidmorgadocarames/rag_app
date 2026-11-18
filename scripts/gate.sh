@@ -547,6 +547,13 @@ E2E_ADMIN_EMAIL="e2e-admin@example.test"
 # full step-up-only (no re-enrol) UI path is 13-F2's own e2e addition.
 E2E_ADMIN2_EMAIL="e2e-admin2@example.test"
 E2E_ERASE_TARGET_EMAIL="e2e-erase-target@example.test"
+# T13.7.5/DEBT-051: seeded directly (never `registerAndReachChat`, same DA-13-C-1 reasoning
+# as ERASE_TARGET_EMAIL above) so the "a plain user never sees Admin panel" e2e check never
+# adds to the real `/auth/register` signup-velocity budget (`rag_app.risk`, 5 signups/hour/IP
+# -- this step's own backend process is the velocity tracker's single in-memory instance for
+# every test below, so one extra registration here used to intermittently 403-block the
+# UNRELATED Mailpit verify test's registration, found running this block for real).
+E2E_PLAIN_USER_EMAIL="e2e-plain-user@example.test"
 # DEC-036 (DA-13-C-6): step_security-headers's own admin for its /admin walk -- separate from
 # step_e2e's so the two steps' real MFA enrolments never collide in one gate DB lifetime.
 E2E_SECHDR_ADMIN_EMAIL="e2e-sechdr-admin@example.test"
@@ -681,7 +688,9 @@ e2e_seed_admin() {
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ADMIN2_EMAIL" --role admin) \
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
-    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ERASE_TARGET_EMAIL" --role user)
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ERASE_TARGET_EMAIL" --role user) \
+    && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_PLAIN_USER_EMAIL" --role user)
 }
 
 step_e2e() {
@@ -715,6 +724,7 @@ step_e2e() {
     E2E_ADMIN_EMAIL="$E2E_ADMIN_EMAIL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
     E2E_ADMIN2_EMAIL="$E2E_ADMIN2_EMAIL" \
     E2E_ERASE_TARGET_EMAIL="$E2E_ERASE_TARGET_EMAIL" \
+    E2E_PLAIN_USER_EMAIL="$E2E_PLAIN_USER_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
       e2e/mfa.spec.ts)
 }
