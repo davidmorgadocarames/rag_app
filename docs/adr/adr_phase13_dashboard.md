@@ -248,10 +248,13 @@ heartbeat's own `alerts` field share ONE implementation (`rag_app.api.admin.
 _banner_alerts`) over the SAME five conditions regardless of live mode: an open erasure
 request past 24 h (amber past 20 h, D-ER's own promise); a lockout-hit count past a fixed,
 documented floor (an absolute count, never a rate — no history on Azure to compute a rate
-from, same R6-4 reasoning); any non-`dev_only`/non-`azure_only` registry entry's health
-probe reporting `down` (a `dev_only`/`azure_only` entry reporting `down` is the EXPECTED
-signal of a feature switched off here by design, e.g. the defence lab locally off or an
-Azure-only check run off-Azure — excluded, never a false alarm); any email send failure;
+from, same R6-4 reasoning); any registry entry's health probe reporting `down` whose
+feature is `expected_here` (T13.8.9, DEBT-053 — a Settings-derived bool, e.g.
+`admin-defence-lab`'s `lab_enabled and env != "prod"`; a `dev_only`/`azure_only` entry
+that is NOT `expected_here` reporting `down` is the EXPECTED signal of a feature switched
+off here by design, e.g. the defence lab locally off or an Azure-only check run
+off-Azure — excluded, never a false alarm, while the SAME entry turned ON here and still
+`down` now alerts); any email send failure;
 and the daily answer cap (R6-1) reached, read directly from `usage_daily` (never a
 Prometheus metric — the counter is per-UTC-day, not per-process, so an in-process-only
 Azure replica would otherwise show a wrong, reset-on-restart value for THIS one condition).
@@ -332,10 +335,12 @@ the lab.
 triage states — OK, Warning, Critical, or "Off here" — reusing the vault palette's existing
 semantic tokens (steel-light/amber/danger/steel-dark; there is no separate "success green"
 token) with an icon *and* text on every badge, never colour alone. A `down` probe on a
-`dev_only`/`azure_only` feature is "Off here" with a truthful one-line "why" (e.g. the
-defence lab being off on Azure by design) rather than counted as a failure — the same
-exclusion `_banner_alerts`' `probe_failures` condition already applies server-side
-(T13.3.1 precedent), now visible in the UI instead of silently absent. Features sort worst
+`dev_only`/`azure_only` feature that is also NOT `expected_here` (T13.8.9, DEBT-053 — e.g.
+`admin-defence-lab`'s `lab_enabled and env != "prod"`) is "Off here" with a truthful
+one-line "why" (e.g. the defence lab being off on Azure by design) rather than counted as
+a failure — the same `expected_here`-gated exclusion `_banner_alerts`' `probe_failures`
+condition already applies server-side (T13.3.1 precedent, refined in 13-G3), now visible
+in the UI instead of silently absent. Features sort worst
 first (Critical, Warning, Off here, then OK); the triage list's status filters (All/
 Critical/Warning/Off here/OK) and the per-feature side drawer (probe detail, its own
 `metrics` map, related alerts via `AdminAlertOut.feature_ids` — T13.8.3a — and a `docs`

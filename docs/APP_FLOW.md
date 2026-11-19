@@ -210,8 +210,9 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
    replica's current state only", never a time series (R6-4).
 4. **Banner alerts** (T13.5.2, R6-1) sit above every panel, worst-first (red before amber):
    an open erasure request past 24 h (amber past 20 h), a lockout-hit spike, any health
-   probe down (excluding a feature switched off here by design — the defence lab locally,
-   or an Azure-only check run off-Azure), an email send failure, or the daily answer cap
+   probe down on a feature that is `expected_here` (DEBT-053; excluding a feature switched
+   off here by design — the defence lab locally, or an Azure-only check run off-Azure — but
+   NOT one switched on here that is still down), an email send failure, or the daily answer cap
    reached. Empty when nothing is wrong — no banner at all.
 5. **Feature cards** list every registry entry (id, phase, status, probe result if any).
    **Latency** shows per-stage p50/p95 from this replica's own histogram. **Security**

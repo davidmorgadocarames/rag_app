@@ -437,8 +437,10 @@ catalogue analysis; this is the implementation summary.
   implementation behind `GET /admin/features`' `alerts` field (what the dashboard polls on
   Azure — one probe sweep per tick, DA-13-E-2), the stand-alone `GET /admin/alerts` and the SSE snapshot/
   heartbeat's `alerts` field (local) — an open erasure request past 24 h (amber past 20 h),
-  a lockout-hit count past a fixed floor, any non-`dev_only`/non-`azure_only` probe
-  reporting `down`, any email send failure, and the daily answer cap (R6-1) reached (read
+  a lockout-hit count past a fixed floor, any probe reporting `down` whose feature is
+  `expected_here` (T13.8.9, DEBT-053 — a `dev_only`/`azure_only` feature switched OFF on
+  this stack never alerts, but one switched ON here that is still `down` now does), any
+  email send failure, and the daily answer cap (R6-1) reached (read
   from `usage_daily` directly, never a Prometheus metric). The frontend
   (`components/admin/AdminDashboard.tsx`) sorts red before amber and renders nothing when
   the list is empty.
