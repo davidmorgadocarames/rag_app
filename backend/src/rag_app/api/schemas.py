@@ -213,6 +213,13 @@ class FeatureHealthOut(BaseModel):
     metrics: dict[str, float | None]
     dev_only: bool
     azure_only: bool
+    # T13.8.9 (DEBT-053): whether THIS stack is expected to be running this feature right
+    # now, computed from the live settings (`rag_app.features.feature_expected_here`) --
+    # DIFFERENT from `dev_only`/`azure_only` above, which only say the feature is EVER
+    # conditional. A `down` probe with `expected_here=False` is "Off here, by design"; a
+    # `down` probe with `expected_here=True` on a dev_only/azure_only feature is a REAL
+    # failure the admin explicitly turned the feature on for.
+    expected_here: bool
     # T13.8.6 (13-G2): the registry's own docs/ADR reference, straight through -- lets the
     # dashboard's feature drawer show a docs link without a second, possibly-drifting lookup.
     docs: str

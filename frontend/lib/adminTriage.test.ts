@@ -19,6 +19,9 @@ function feature(partial: Partial<TriageFeature> & { id: string }): TriageFeatur
     probe_detail: null,
     dev_only: false,
     azure_only: false,
+    // Default false: the dev_only/azure_only fixtures below model the common "correctly off
+    // by design" case unless a test explicitly says otherwise (DEBT-053's negative control).
+    expected_here: false,
     ...partial,
   };
 }
@@ -62,6 +65,26 @@ test("featureStatus: down + azure_only -> Off here with a different, still truth
   const info = featureStatus(feature({ id: "az", probe_status: "down", azure_only: true }));
   assert.equal(info.key, "off");
   assert.match(info.why as string, /Azure/);
+});
+
+// T13.8.9 (DEBT-053, DA-13-G2-2): negative control -- a dev_only feature the admin
+// explicitly turned ON here (expected_here: true, e.g. LAB_ENABLED=true locally) that is
+// STILL down must be Critical, never masked as "Off here by design" just because it is
+// conditional in general. Before this fix, the static dev_only check alone always won here.
+test("featureStatus: down + dev_only BUT expected_here -> Critical, not Off here (negative control)", () => {
+  const info = featureStatus(
+    feature({ id: "lab", probe_status: "down", dev_only: true, expected_here: true }),
+  );
+  assert.equal(info.key, "crit");
+  assert.equal(info.label, "Critical");
+  assert.equal(info.why, null);
+});
+
+test("featureStatus: down + azure_only BUT expected_here -> Critical too", () => {
+  const info = featureStatus(
+    feature({ id: "az", probe_status: "down", azure_only: true, expected_here: true }),
+  );
+  assert.equal(info.key, "crit");
 });
 
 test("sortFeaturesWorstFirst: Critical, then Warning, then Off here, then OK", () => {

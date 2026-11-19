@@ -15,6 +15,7 @@ function feature(partial: Partial<TriageFeature> & { id: string }): TriageFeatur
     probe_detail: null,
     dev_only: false,
     azure_only: false,
+    expected_here: false,
     ...partial,
   };
 }

@@ -502,7 +502,13 @@ def test_banner_alerts_email_failures_any_nonzero(api_env: Engine) -> None:
 
 def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: Engine) -> None:
     """DEBT-017/T13.3.1 precedent: a dev_only/azure_only feature reporting ``down`` locally
-    (lab off, or an Azure-only check run off-Azure) is EXPECTED, never a real failure."""
+    (lab off, or an Azure-only check run off-Azure) is EXPECTED, never a real failure.
+
+    T13.8.9 (DEBT-053, DA-13-G2-2): ALSO a negative control -- a dev_only/azure_only feature
+    the admin explicitly turned ON here (``expected_here=True``) that is STILL ``down`` IS a
+    real failure and must alert, never excused just because the feature is conditional in
+    general. Before this fix, the exclusion was keyed on the static ``dev_only``/
+    ``azure_only`` flags alone and could not tell the two cases apart."""
     from rag_app.api.admin import _banner_alerts
     from rag_app.api.schemas import FeatureHealthOut
 
@@ -513,7 +519,13 @@ def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: E
         def current_values(self, metric_names: Sequence[str]) -> dict[str, float | None]:
             return {}
 
-    def _feature(id_: str, *, dev_only: bool = False, azure_only: bool = False) -> FeatureHealthOut:
+    def _feature(
+        id_: str,
+        *,
+        dev_only: bool = False,
+        azure_only: bool = False,
+        expected_here: bool = True,
+    ) -> FeatureHealthOut:
         return FeatureHealthOut(
             id=id_,
             name=id_,
@@ -524,6 +536,7 @@ def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: E
             metrics={},
             dev_only=dev_only,
             azure_only=azure_only,
+            expected_here=expected_here,
             docs="docs/TRD.md",
         )
 
@@ -531,11 +544,19 @@ def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: E
         excused = _banner_alerts(
             session,
             _NoMetrics(),
-            [_feature("lab", dev_only=True), _feature("azure-thing", azure_only=True)],
+            [
+                _feature("lab", dev_only=True, expected_here=False),
+                _feature("azure-thing", azure_only=True, expected_here=False),
+            ],
         )
         real = _banner_alerts(session, _NoMetrics(), [_feature("stack-postgres")])
         multiple = _banner_alerts(
             session, _NoMetrics(), [_feature("stack-postgres"), _feature("stack-migrations")]
+        )
+        # Negative control (DEBT-053): expected_here=True + down must alert even though the
+        # feature is dev_only -- the admin turned it on here and it is genuinely broken.
+        turned_on_but_broken = _banner_alerts(
+            session, _NoMetrics(), [_feature("lab", dev_only=True, expected_here=True)]
         )
     assert not any(a.code == "probe_failures" for a in excused)
     assert any(a.code == "probe_failures" and a.severity == "red" for a in real)
@@ -545,6 +566,9 @@ def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: E
         "stack-postgres",
         "stack-migrations",
     }
+    assert any(
+        a.code == "probe_failures" and a.feature_ids == ["lab"] for a in turned_on_but_broken
+    )
 
 
 # --- POST /admin/erasure/{id}/purge-now and /retry (matrix=False, explicit 403s) -----------

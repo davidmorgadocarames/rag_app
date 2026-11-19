@@ -230,6 +230,10 @@ export interface FeatureHealthOut {
   metrics: Record<string, number | null>;
   dev_only: boolean;
   azure_only: boolean;
+  // T13.8.9 (DEBT-053): whether THIS stack is expected to be running this feature right now
+  // (computed server-side from the live settings) -- see adminTriage.ts::featureStatus for
+  // how this replaces the static dev_only/azure_only check for the Off-here/Critical split.
+  expected_here: boolean;
   // T13.8.6 (13-G2): the registry's own docs/ADR reference, for the feature drawer's docs link.
   docs: string;
 }

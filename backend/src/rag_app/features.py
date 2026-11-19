@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
     from prometheus_client import CollectorRegistry
 
+    from rag_app.config import Settings
+
 FeatureStatus = Literal["enabled", "disabled", "retained-not-adopted", "expected-fail"]
 ProbeStatus = Literal["ok", "degraded", "down"]
 QualityOutcome = Literal["passed", "failed", "skipped"]
@@ -97,6 +99,15 @@ class FeatureEntry:
     modules: tuple[str, ...] = ()
     dev_only: bool = False
     azure_only: bool = False
+    # T13.8.9 (DEBT-053, DA-13-G2-2): whether this feature is expected to be RUNNING on the
+    # CURRENT stack, computed from the live settings -- a DIFFERENT, more specific fact than
+    # the static `dev_only`/`azure_only` flags above, which only say the feature is EVER
+    # conditional, not whether this particular process should have it on right now. `None`
+    # means "always expected" (every ordinary, unconditional entry). A `dev_only`/`azure_only`
+    # entry that leaves this `None` is a deliberate choice (e.g. `azure-internal-ingress` has
+    # no health probe at all, so the distinction never matters for it in practice) -- not an
+    # oversight, since the DoD rule only requires a probe/metric, not this field.
+    expected_here: Callable[[Settings], bool] | None = None
 
 
 # --- generic probe factories (most entries below just plug one of these in) ----------------
@@ -802,6 +813,11 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         ),  # fmt: skip
         router_tags=("admin-lab",),
         dev_only=True,
+        # T13.8.9 (DEBT-053): a running process can only ever have LAB_ENABLED=True with
+        # ENV != "prod" (check_dev_only_flags refuses the combination at startup) -- the
+        # explicit `env != "prod"` check is defensive, not load-bearing, in case that
+        # invariant is ever relaxed.
+        expected_here=lambda s: s.lab_enabled and s.env != "prod",
         docs="docs/adr/adr_phase13_dashboard.md",
     ),
 )
@@ -877,6 +893,16 @@ def check_dod_compliance(entries: tuple[FeatureEntry, ...] = REGISTRY) -> list[s
 
 def entries_by_status(status: FeatureStatus) -> tuple[FeatureEntry, ...]:
     return tuple(entry for entry in REGISTRY if entry.status == status)
+
+
+def feature_expected_here(entry: FeatureEntry, settings: Settings) -> bool:
+    """T13.8.9 (DEBT-053): whether ``entry`` is expected to be running on THIS stack right
+    now. ``entry.expected_here`` is ``None`` for every ordinary (unconditional) entry, which
+    is always expected -- only a `dev_only`/`azure_only` entry that actually DEFINES this
+    callable gets a real, settings-derived answer."""
+    if entry.expected_here is None:
+        return True
+    return entry.expected_here(settings)
 
 
 def _known_metric_names(prometheus_registry: CollectorRegistry) -> set[str]:

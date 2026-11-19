@@ -97,7 +97,7 @@ from rag_app.erasure import (
     request_erasure,
 )
 from rag_app.eval.gate import BASELINE_PATH, RESULTS_PATH, THRESHOLDS_PATH
-from rag_app.features import REGISTRY, run_health_probe
+from rag_app.features import REGISTRY, feature_expected_here, run_health_probe
 from rag_app.metrics_backend import MetricsBackend
 from rag_app.mfa import hash_recovery_code
 from rag_app.purger import run_one_in_background
@@ -221,6 +221,7 @@ def _refresh_erasure_gauges(session: Session) -> None:
 def _features_payload(metrics_backend: MetricsBackend) -> list[FeatureHealthOut]:
     """Shared by the REST route below and the T13.4.1 SSE stream's snapshot/heartbeat (so
     the two never drift into two different shapes of "what a feature card shows")."""
+    settings = get_settings()
     out = []
     for entry in REGISTRY:
         probe = run_health_probe(entry.health_probe) if entry.health_probe is not None else None
@@ -236,6 +237,7 @@ def _features_payload(metrics_backend: MetricsBackend) -> list[FeatureHealthOut]
                 metrics=values,
                 dev_only=entry.dev_only,
                 azure_only=entry.azure_only,
+                expected_here=feature_expected_here(entry, settings),
                 docs=entry.docs,
             )
         )
@@ -564,11 +566,13 @@ def _banner_alerts(
             )
         )
 
-    # dev_only/azure_only entries report "down" BY DESIGN when the feature is off here (e.g.
-    # the defence lab, T13.3.1, or an Azure-only check run locally) -- never a real failure.
-    failing_probes = [
-        f for f in features if f.probe_status == "down" and not f.dev_only and not f.azure_only
-    ]
+    # T13.8.9 (DEBT-053): a feature NOT expected to run here reports "down" BY DESIGN (e.g.
+    # the defence lab with LAB_ENABLED off, T13.3.1) -- never a real failure. Gated on
+    # `expected_here` (computed from the LIVE settings), not the static `dev_only`/
+    # `azure_only` flags alone -- a dev_only feature the admin explicitly turned ON here
+    # (e.g. LAB_ENABLED=true locally) that is still "down" IS a real failure and must alert
+    # (DA-13-G2-2: the old static check hid exactly this case).
+    failing_probes = [f for f in features if f.probe_status == "down" and f.expected_here]
     if failing_probes:
         names = ", ".join(f.name for f in failing_probes)
         alerts.append(

@@ -10,6 +10,9 @@ export interface TriageFeature {
   probe_detail: string | null;
   dev_only: boolean;
   azure_only: boolean;
+  // T13.8.9 (DEBT-053, DA-13-G2-2): whether THIS stack is expected to be running the
+  // feature right now (server-computed from the live settings) -- see featureStatus below.
+  expected_here: boolean;
 }
 
 export type FeatureStatusKey = "crit" | "warn" | "off" | "ok";
@@ -49,8 +52,15 @@ function offHereWhy(feature: TriageFeature): string {
 /** Maps a feature's raw probe outcome to the triage vocabulary (T13.8.5): `ok`/`degraded` ->
  * OK/Warning; no probe at all -> OK with a truthful "config check only" detail (never silently
  * "ok" as if a real probe ran); `down` -> Critical, EXCEPT a `dev_only`/`azure_only` feature
- * that is down BY DESIGN on this stack -> "Off here" with an explanation (replaces the old,
- * unexplained "N probe(s) not ok"). */
+ * that is down AND NOT `expected_here` -> "Off here" with an explanation (replaces the old,
+ * unexplained "N probe(s) not ok").
+ *
+ * T13.8.9 (DEBT-053, DA-13-G2-2): the "Off here" branch now also requires
+ * `!feature.expected_here` -- a `dev_only`/`azure_only` feature the admin explicitly turned
+ * ON here (e.g. `LAB_ENABLED=true` locally) that is STILL down is a REAL failure (Critical),
+ * never masked as "off by design" just because the feature happens to be conditional in
+ * general. The static `dev_only`/`azure_only` flags alone used to decide this and could not
+ * tell the two cases apart. */
 export function featureStatus(feature: TriageFeature): FeatureStatusInfo {
   const { probe_status, probe_detail } = feature;
   if (probe_status === null) {
@@ -73,7 +83,7 @@ export function featureStatus(feature: TriageFeature): FeatureStatusInfo {
     };
   }
   // "down" (or any other value the backend might one day add -- treated as down, never as ok).
-  if (feature.dev_only || feature.azure_only) {
+  if ((feature.dev_only || feature.azure_only) && !feature.expected_here) {
     return {
       key: "off",
       label: STATUS_LABEL.off,
