@@ -252,6 +252,10 @@ class CrossEncoderReranker:
         model = self._ensure_model()
         pairs = [(query, candidate.text) for candidate in candidates]
         semaphore = _get_predict_semaphore()
+        # DA-13-G1-1(b): `order_by_scores` now runs INSIDE the `rerank_inference` stage span
+        # (it used to run just after it closed) so `wait_slot + cross_encoder +
+        # order_by_scores` sums to exactly the stage total instead of exceeding it; the
+        # stage total itself grows by `order_by_scores`'s (tiny) sort cost.
         with timing.stage("rerank_inference"):
             with timing.step("reranking", "wait_slot"):
                 semaphore.acquire()
@@ -260,8 +264,8 @@ class CrossEncoderReranker:
                     scores = model.predict(pairs)
             finally:
                 semaphore.release()
-        with timing.step("reranking", "order_by_scores"):
-            return order_by_scores(candidates, [float(score) for score in scores], top_n)
+            with timing.step("reranking", "order_by_scores"):
+                return order_by_scores(candidates, [float(score) for score in scores], top_n)
 
     def warm_up(self) -> None:
         """Load the model and run one dummy ``predict`` (T11.4.1), so no real request ever

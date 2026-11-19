@@ -12,7 +12,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from rag_app import generation, reranking
+from rag_app import generation, reranking, timing
 from rag_app.generation import (
     INSUFFICIENT,
     StreamResult,
@@ -132,6 +132,33 @@ def test_stream_emits_real_answer_tokens() -> None:
     tokens = "".join(i.text for i in items if isinstance(i, StreamToken))
     assert tokens == "Use parameterized queries [1]"
     assert items[-1] == "Use parameterized queries [1]"
+
+
+def test_token_stream_step_is_recorded_even_on_a_mid_stream_disconnect() -> None:
+    """DA-13-G1-3: closing the generator mid-stream (a client disconnect throws
+    ``GeneratorExit`` at whatever ``yield`` is currently suspended) must still record a
+    PARTIAL ``token_stream`` duration -- the metric stays honest instead of silently
+    dropping it, a third case beyond the two already-documented "nothing streamed" ones."""
+    # First delta alone is >= len(INSUFFICIENT): it yields immediately and sets
+    # ``emitting``, so every later delta also yields immediately (one `next()` per delta) --
+    # needed so we can close the generator after the first delta but before the stream (and
+    # the normal end-of-loop recording) is exhausted.
+    chat = _FakeChat(["X" * 25, "second chunk", "third chunk"])
+    usage = Usage()
+    recorded: list[tuple[str, str, float]] = []
+
+    def on_step(stage: str, step: str, elapsed_s: float) -> None:
+        recorded.append((stage, step, elapsed_s))
+
+    with timing.recorder(streaming=True, on_step=on_step):
+        gen = _stream_answer_tokens(chat, "q", [_chunk()], usage)  # type: ignore[arg-type]
+        next(gen)  # consumes "X"*25 -> llm_first_token recorded, first StreamToken yielded
+        next(gen)  # consumes "second chunk" -> yields again (emitting == True)
+        gen.close()  # simulate a client disconnect before "third chunk" is ever consumed
+
+    token_stream = [r for r in recorded if r[0] == "generating" and r[1] == "token_stream"]
+    assert len(token_stream) == 1  # recorded exactly once (never dropped, never double-counted)
+    assert token_stream[0][2] >= 0.0
 
 
 # --- per-stage timing (T11.3.1): one JSON record per answer, no PII ----------------------

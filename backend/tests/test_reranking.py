@@ -469,6 +469,54 @@ def test_concurrency_cap_is_configurable_and_actually_enforced(
     ), "RERANK_CONCURRENCY=1 did not fully serialize predict()"
 
 
+def _step_counts() -> dict[tuple[str, str], float]:
+    """Mirrors ``test_generation.py::_step_counts()`` -- current observation counts per
+    (stage, step), read from the REAL process-wide ``metrics.REGISTRY``."""
+    from rag_app import metrics as real_metrics
+
+    out: dict[tuple[str, str], float] = {}
+    for metric in real_metrics.REGISTRY.collect():
+        if metric.name != "secrag_chat_step_seconds":
+            continue
+        for sample in metric.samples:
+            if sample.name.endswith("_count"):
+                out[(sample.labels["stage"], sample.labels["step"])] = sample.value
+    return out
+
+
+def test_rerank_emits_exactly_its_allow_listed_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DA-13-G1-2: unlike ``test_generation.py``'s atomic-step tests (which monkeypatch
+    ``CrossEncoderReranker.rerank`` away entirely), this calls the REAL ``rerank()`` -- only
+    the model load/predict is faked -- so a typo in one of its 3 literal (stage, step) pairs
+    (``metrics.observe_step`` raises on an unlisted pair) would fail THIS test directly,
+    instead of only the slow, Ollama+DB-backed e2e chat turn."""
+    import rag_app.reranking as reranking
+    from rag_app import metrics as real_metrics
+    from rag_app import timing
+
+    class _FakePredict:
+        def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+            return [0.5 for _ in pairs]
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _FakePredict())
+    reranker = reranking.CrossEncoderReranker(
+        model_name="BAAI/bge-reranker-v2-m3", revision=PINNED, quantize=False
+    )
+
+    before = _step_counts()
+    with timing.recorder(streaming=False, on_step=real_metrics.observe_step):
+        ranked = reranker.rerank("q", [_chunk("a"), _chunk("b")], top_n=2)
+    after = _step_counts()
+
+    assert len(ranked) == 2
+    for pair in (
+        ("reranking", "wait_slot"),
+        ("reranking", "cross_encoder"),
+        ("reranking", "order_by_scores"),
+    ):
+        assert after.get(pair, 0.0) > before.get(pair, 0.0), pair
+
+
 def test_concurrency_cap_does_not_corrupt_per_caller_timing_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

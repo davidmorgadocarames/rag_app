@@ -319,3 +319,84 @@ def test_step_sums_approximately_match_stage_time_on_a_fake_pipeline_run() -> No
     assert stage_total is not None
     assert step_sum <= stage_total + 0.02  # a little scheduling slack, never a huge gap
     assert step_sum >= stage_total - 0.02
+
+
+def test_step_sums_cover_exactly_the_stage_time_for_the_three_fixed_stages() -> None:
+    """DA-13-G1-1: the test above only exercises "hybrid_search" minus `load_chunks`/the
+    ranked-list build, and never "rerank_inference"/"generate" at all -- it could not have
+    caught the real gaps DA-13-G1 found: (a) retrieval.py's ranked-list build ran untracked
+    inside `stage("hybrid_search")` but outside any step; (b) reranking.py's
+    `order_by_scores` ran OUTSIDE `stage("rerank_inference")`; (c) generation.py's
+    `parse_answer` ran OUTSIDE `stage("generate")` (both answer paths). This fake pipeline
+    mirrors the FIXED nesting for all three -- would fail (by far more than the tolerance
+    below) if any of the three steps that moved were back outside its stage's ``with``
+    block, which is exactly the bug this test exists to catch."""
+    from rag_app import timing
+
+    stage_registry, stage_histogram = _fresh_stage_histogram()
+    step_registry, step_histogram = _fresh_step_histogram()
+
+    def on_stage(name: str, elapsed_s: float) -> None:
+        stage_histogram.labels(stage=name).observe(elapsed_s)
+
+    def on_step(stage_name: str, step_name: str, elapsed_s: float) -> None:
+        step_histogram.labels(stage=stage_name, step=step_name).observe(elapsed_s)
+
+    with timing.recorder(streaming=True, on_stage=on_stage, on_step=on_step):
+        # (a) retrieval.hybrid_search: `load_chunks` now also covers the ranked-list build.
+        with timing.stage("hybrid_search"):
+            with timing.step("retrieving", "vector_search"):
+                time.sleep(0.01)
+            with timing.step("retrieving", "bm25_search"):
+                time.sleep(0.01)
+            with timing.step("retrieving", "rrf_fusion"):
+                time.sleep(0.005)
+            with timing.step("retrieving", "load_chunks"):
+                time.sleep(0.005)  # the _load_chunks query itself
+                time.sleep(0.02)  # the ranked-list build loop, now inside the same step
+
+        # (b) reranking.rerank: `order_by_scores` now runs inside `rerank_inference`.
+        with timing.stage("rerank_inference"):
+            with timing.step("reranking", "wait_slot"):
+                time.sleep(0.002)
+            with timing.step("reranking", "cross_encoder"):
+                time.sleep(0.02)
+            with timing.step("reranking", "order_by_scores"):
+                time.sleep(0.02)
+
+        # (c) generation.answer_from_chunks: `parse_answer` now runs inside `generate`.
+        with timing.stage("generate"):
+            with timing.step("generating", "build_prompt"):
+                time.sleep(0.002)
+            with timing.step("generating", "llm_first_token"):
+                time.sleep(0.02)
+            with timing.step("generating", "parse_answer"):
+                time.sleep(0.02)
+
+    stage_summary = metrics.stage_latency_summary(stage_registry, "secrag_chat_stage_seconds")
+    step_summary = metrics.step_latency_summary(step_registry, "secrag_chat_step_seconds")
+
+    cases: tuple[tuple[str, list[tuple[str, str]]], ...] = (
+        (
+            "hybrid_search",
+            [
+                ("retrieving", step)
+                for step in ("vector_search", "bm25_search", "rrf_fusion", "load_chunks")
+            ],
+        ),
+        (
+            "rerank_inference",
+            [("reranking", step) for step in ("wait_slot", "cross_encoder", "order_by_scores")],
+        ),
+        (
+            "generate",
+            [("generating", step) for step in ("build_prompt", "llm_first_token", "parse_answer")],
+        ),
+    )
+    tolerance = 0.01  # tight on purpose: the moved steps are each worth 0.02s
+    for stage_name, step_pairs in cases:
+        stage_total = stage_summary[stage_name]["avg_seconds"]
+        step_sum = sum(step_summary[pair]["avg_seconds"] for pair in step_pairs)
+        assert stage_total is not None, stage_name
+        assert step_sum <= stage_total + tolerance, (stage_name, step_sum, stage_total)
+        assert step_sum >= stage_total - tolerance, (stage_name, step_sum, stage_total)

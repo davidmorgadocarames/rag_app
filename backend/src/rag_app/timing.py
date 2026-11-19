@@ -154,7 +154,19 @@ def record(name: str, elapsed_s: float) -> None:
 def step(stage_name: str, step_name: str) -> Iterator[None]:
     """Time one ATOMIC STEP within ``stage_name`` (T13.8.1); a no-op outside an active
     recorder, exactly like :func:`stage`. Always safe to nest inside a :func:`stage` block
-    (or several, like ``reranking``'s wait_slot/cross_encoder)."""
+    (or several, like ``reranking``'s wait_slot/cross_encoder).
+
+    DA-13-G1-4: if the wrapped block raises AND ``add_step`` (whose ``on_step`` is wired to
+    ``metrics.observe_step``, which raises on an unlisted (stage, step) pair) ALSO raises
+    while recording the step, Python would otherwise replace the block's own exception with
+    that secondary one (a ``raise`` inside ``finally`` while another exception is already
+    propagating discards it, keeping it only as ``__context__``) -- a metrics bug would
+    momentarily hide a real pipeline error. Caught and logged ONLY on that path, so the
+    original exception always propagates untouched; on the NORMAL (no exception) path,
+    ``add_step`` still raises as before -- an unlisted pair at a real call site must keep
+    crashing loudly (the "dev-time bug signal" ``metrics.STEP_ALLOWLIST``'s own docstring
+    promises), never be silently swallowed just because nothing else went wrong.
+    """
     rec = _current.get()
     if rec is None:
         yield
@@ -162,7 +174,15 @@ def step(stage_name: str, step_name: str) -> Iterator[None]:
     start = time.perf_counter()
     try:
         yield
-    finally:
+    except BaseException:
+        try:
+            rec.add_step(stage_name, step_name, time.perf_counter() - start)
+        except Exception:
+            logger.exception(
+                "rag_app.timing.step: failed to record step (%r, %r)", stage_name, step_name
+            )
+        raise
+    else:
         rec.add_step(stage_name, step_name, time.perf_counter() - start)
 
 

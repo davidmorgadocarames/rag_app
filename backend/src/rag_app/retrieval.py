@@ -122,15 +122,19 @@ def hybrid_search(
 
         with timing.step("retrieving", "rrf_fusion"):
             fused = reciprocal_rank_fusion([vector_uids, bm25_uids])[:top_k]
+        # DA-13-G1-1(a): the ranked-list build below is attach-score-and-collect bookkeeping
+        # over the SAME chunks `_load_chunks` just materialized -- the nearest truthful
+        # boundary is to keep it inside the "load_chunks" step rather than leaving it
+        # untracked (still inside `stage("hybrid_search")`, so the stage total itself is
+        # unaffected; only the step/stage split changes).
         with timing.step("retrieving", "load_chunks"):
             chunks = _load_chunks(session, [uid for uid, _ in fused])
-
-        ranked: list[RetrievedChunk] = []
-        for uid, score in fused:
-            chunk = chunks.get(uid)
-            if chunk is not None:
-                chunk.score = score
-                ranked.append(chunk)
+            ranked: list[RetrievedChunk] = []
+            for uid, score in fused:
+                chunk = chunks.get(uid)
+                if chunk is not None:
+                    chunk.score = score
+                    ranked.append(chunk)
     return ranked
 
 

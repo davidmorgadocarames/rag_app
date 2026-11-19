@@ -177,3 +177,39 @@ def test_emit_runs_even_on_exception(caplog: pytest.LogCaptureFixture) -> None:
                 raise RuntimeError("boom")
     records = [r for r in caplog.records if r.name == "rag_app.timing"]
     assert len(records) == 1
+
+
+# --- DA-13-G1-4: an ``on_step`` error must never mask the wrapped block's own exception ----
+
+
+def test_step_does_not_mask_the_original_exception_when_on_step_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the wrapped block raises AND ``on_step`` (``metrics.observe_step`` in production,
+    which raises on an unlisted (stage, step) pair) ALSO raises while recording the step in
+    ``step()``'s ``finally``, the ORIGINAL exception must still be what propagates -- a
+    secondary metrics bug must never replace/hide a real pipeline error."""
+    caplog.set_level(logging.ERROR, logger="rag_app.timing")
+
+    def exploding_on_step(*_a: object) -> None:
+        raise ValueError("observe_step exploded")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with timing.recorder(streaming=False, on_step=exploding_on_step):
+            with timing.step("retrieving", "embed_query"):
+                raise RuntimeError("boom")
+    # the secondary failure is logged, not silently swallowed either.
+    errors = [
+        r for r in caplog.records if r.name == "rag_app.timing" and r.levelno >= logging.ERROR
+    ]
+    assert any("failed to record step" in r.getMessage() for r in errors)
+
+
+def test_step_still_records_normally_when_on_step_does_not_raise() -> None:
+    """Sanity check alongside the test above: the try/except added for DA-13-G1-4 must not
+    change the normal (no secondary exception) recording behaviour."""
+    seen: list[tuple[str, str, float]] = []
+    with timing.recorder(streaming=False, on_step=lambda *a: seen.append(a)):
+        with timing.step("retrieving", "embed_query"):
+            pass
+    assert seen and seen[0][:2] == ("retrieving", "embed_query")

@@ -415,7 +415,18 @@ catalogue analysis; this is the implementation summary.
   pair outside it. `rag_app.timing.step()`/`record_step()` wire `retrieval.py`,
   `reranking.py` and `generation.py` (both answer paths) into it; the non-streaming path has
   no incremental token stream, so `llm_first_token` alone covers its one blocking LLM call
-  and `token_stream` is simply never emitted there.
+  and `token_stream` is simply never emitted there. On a mid-stream client disconnect
+  (`GeneratorExit` inside `_stream_answer_tokens`), `token_stream` records whatever PARTIAL
+  duration had elapsed so far (a `finally`) instead of being silently dropped — a third,
+  now-documented case alongside the non-streaming one above (DA-13-G1-3). Each stage's own
+  step-sum is the single source of truth for that stage's time in the `pipeline` field
+  (T13.8.2) — never reconciled against `stages`' value for the same stage: `retrieving`'s
+  `load_chunks` step also covers the ranked-list build, and `reranking`'s
+  `order_by_scores`/`generating`'s `parse_answer` steps now run INSIDE their own stage's
+  `with timing.stage(...)` span (DA-13-G1-1 fix block 13-G1-fix) so each stage's step-sum
+  lands within a small tolerance of that stage's own `secrag_chat_stage_seconds` total; this
+  slightly grew the `rerank_inference`/`generate` stage totals themselves (they now also
+  cover `order_by_scores`/`parse_answer`'s own, small, cost) — intended, not a regression.
 - **Live updates** (T13.4.1/T13.4.2) and **metrics backends** (T13.4.3, R6-4: why no
   managed Prometheus on Azure) are a dedicated ADR decision — see [ADR phase 13, "Live
   updates + metrics backends"](adr/adr_phase13_dashboard.md#live-updates--metrics-backends-13-c-t1341t1343-r6-4).

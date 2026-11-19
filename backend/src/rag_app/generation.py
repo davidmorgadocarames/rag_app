@@ -170,6 +170,10 @@ def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk
     # call -- the full answer only becomes available at the same moment a streaming caller's
     # first delta would -- and "token_stream" is simply never emitted here (there is nothing
     # to stream after it).
+    # DA-13-G1-1(c): `parse_answer` now runs INSIDE the `generate` stage span (it used to run
+    # just after it closed), so `build_prompt + llm_first_token + parse_answer` sums to
+    # exactly the stage total instead of exceeding it; the stage total itself grows by
+    # `parse_answer`'s (tiny) regex-parse cost.
     with timing.stage("generate"):
         with timing.step("generating", "build_prompt"):
             messages = build_messages(query, chunks)
@@ -181,10 +185,11 @@ def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk
                 num_ctx=settings.num_ctx_answer,
                 call_type="answer",
             )
-    # Non-streaming: the full response arrives at once, so "first token" == "generate done".
-    timing.mark_first_token()
-    with timing.step("generating", "parse_answer"):
-        answer = parse_answer(raw, chunks)
+        # Non-streaming: the full response arrives at once, so "first token" == "generate
+        # done" -- still true now that "generate" also covers parse_answer below.
+        timing.mark_first_token()
+        with timing.step("generating", "parse_answer"):
+            answer = parse_answer(raw, chunks)
     if answer.abstained:
         return answer
 
@@ -406,6 +411,12 @@ def _stream_answer_tokens(
     call), ``llm_first_token`` (request start to the first delta) and ``token_stream`` (first
     delta to the last one) -- a separate channel from the unchanged "generate" stage total
     the caller times around this whole generator.
+
+    DA-13-G1-3: a client disconnecting mid-stream throws ``GeneratorExit`` into whichever
+    ``yield`` is currently suspended, unwinding past the normal ``token_stream`` recording
+    below (it never runs) -- the ``finally`` records the PARTIAL ``token_stream`` duration
+    instead, so the metric stays honest (a real, if incomplete, measurement) rather than
+    silently reporting nothing for a stream that did run for a while.
     """
     buffer = ""
     emitting = False
@@ -425,29 +436,35 @@ def _stream_answer_tokens(
     first_delta = True
     first_token_start = time.perf_counter()
     stream_start: float | None = None
-    for delta in stream:
-        if first_delta:
-            timing.record_step(
-                "generating", "llm_first_token", time.perf_counter() - first_token_start
-            )
-            stream_start = time.perf_counter()
-            first_delta = False
-        full += delta
-        if emitting:
-            yield StreamToken(text=delta)
-            continue
-        buffer += delta
-        if INSUFFICIENT[:6] in buffer.upper():
-            continue  # likely abstaining — do not stream the sentinel
-        if len(buffer) >= len(INSUFFICIENT):
+    token_stream_recorded = False
+    try:
+        for delta in stream:
+            if first_delta:
+                timing.record_step(
+                    "generating", "llm_first_token", time.perf_counter() - first_token_start
+                )
+                stream_start = time.perf_counter()
+                first_delta = False
+            full += delta
+            if emitting:
+                yield StreamToken(text=delta)
+                continue
+            buffer += delta
+            if INSUFFICIENT[:6] in buffer.upper():
+                continue  # likely abstaining — do not stream the sentinel
+            if len(buffer) >= len(INSUFFICIENT):
+                yield StreamToken(text=buffer)
+                buffer = ""
+                emitting = True
+        if stream_start is not None:
+            timing.record_step("generating", "token_stream", time.perf_counter() - stream_start)
+            token_stream_recorded = True
+        if not emitting and buffer and INSUFFICIENT[:6] not in buffer.upper():
             yield StreamToken(text=buffer)
-            buffer = ""
-            emitting = True
-    if stream_start is not None:
-        timing.record_step("generating", "token_stream", time.perf_counter() - stream_start)
-    if not emitting and buffer and INSUFFICIENT[:6] not in buffer.upper():
-        yield StreamToken(text=buffer)
-    yield full
+        yield full
+    finally:
+        if stream_start is not None and not token_stream_recorded:
+            timing.record_step("generating", "token_stream", time.perf_counter() - stream_start)
 
 
 def answer_question_stream(
@@ -522,10 +539,15 @@ def answer_question_stream(
                 yield item
             else:
                 raw = item
-        timing.record("generate", time.perf_counter() - generate_start)
 
+        # DA-13-G1-1(c): `parse_answer` is recorded INSIDE the "generate" stage span -- moved
+        # the manual `timing.record("generate", ...)` call to AFTER it (it used to run just
+        # before), so `build_prompt + llm_first_token + token_stream + parse_answer` sums to
+        # exactly the stage total instead of exceeding it; the stage total itself grows by
+        # `parse_answer`'s (tiny) regex-parse cost.
         with timing.step("generating", "parse_answer"):
             answer = parse_answer(raw, chunks)
+        timing.record("generate", time.perf_counter() - generate_start)
         if answer.abstained:
             yield StreamResult(answer=answer, usage=usage)
             return
