@@ -359,3 +359,61 @@ section menu (Triage · Pipeline · Quality · Erasure · Defence lab, the last 
 `admin-defence-lab`'s own probe is `ok` — same gating `DefenceLabPanel` already used).
 Pipeline/Quality/Erasure/Defence lab keep their existing panels verbatim inside the new
 shell for this block; their own redesign is 13-G3.
+
+## Atomic-step metrics + the Pipeline waterfall (13-G1, T13.8.1–T13.8.2; 13-G3, T13.8.7)
+
+**Decision: a SECOND histogram, with its own fail-closed allow-list, not a labelled
+extension of the existing stage histogram.** `secrag_chat_step_seconds` (new, T13.8.1)
+records atomic steps WITHIN a UI pipeline stage — e.g. `(retrieving, embed_query)`,
+`(generating, token_stream)` — as a separate `Histogram` from the pre-existing
+`secrag_chat_stage_seconds`. The alternative (adding an optional `step` label to the
+existing stage histogram) was rejected: it would let a future call site observe a stage
+with an arbitrary step name (or none), leaving the no-high-cardinality-label discipline
+resting entirely on code review. Instead, `metrics.STEP_ALLOWLIST` is a fixed, literal
+`tuple[tuple[str, tuple[str, ...]], ...]` naming every legal `(stage, step)` pair in
+pipeline order, and `observe_step` **raises** `UnknownPipelineStepError` for anything
+outside it — a dev-time bug signal (every real call site passes a hard-coded literal pair,
+so this can only fire from a typo or a new step someone forgot to add to the allow-list),
+never a silently-dropped or silently-renamed observation. `timing.step()`'s own `finally`
+re-raises the wrapped block's original exception even if `observe_step` ALSO raises while
+recording (DA-13-G1-4) — a metrics bug must never mask a real pipeline error.
+
+**Decision: a stage's waterfall total is the SUM of its own steps, never reconciled
+against the separate `stages` field.** `/admin/latency`'s `pipeline` field groups every
+`(stage, step)` pair by its UI pipeline stage (`metrics.STEP_ALLOWLIST`'s own grouping —
+a DIFFERENT, higher-level grouping than `StageLatencyOut.stage`; e.g. "retrieving" covers
+both the old "embed" and "hybrid_search" stage names). The DA-13-G1-1 review found three of
+the six UI stages did NOT sum exactly to their `secrag_chat_stage_seconds` counterpart
+(code that ran inside the stage span but outside any step's own `with` block — the
+"untracked gap"); the 13-G1-fix (`012581d..0cfaddc`) closed the three known gaps by moving
+`retrieval.py`'s ranked-list loop, `reranking.py`'s `order_by_scores` and
+`generation.py`'s `parse_answer` (both answer paths) inside their stage's own `with
+timing.stage(...)` span. Even so, the frontend's `adminPipeline.ts::buildPipelineWaterfall`
+(13-G3) computes each stage's own total as `sum(step.avg_seconds for step in
+stage.steps)` and NEVER reads `AdminLatencyResponse.stages` for that same stage name — a
+future untracked gap (or a regression of this fix) must never make the waterfall's parent
+bar and its own children visibly disagree; the two numbers are allowed to drift apart
+without it being a UI bug, because they are deliberately two different (and both
+legitimate) ways of totalling the same work.
+
+**Waterfall semantics (13-G3).** One row per UI pipeline stage, in `STEP_ALLOWLIST`'s own
+order, each expandable to its atomic steps; every step's bar starts where the previous
+step's ends (`waterfallBarPercent`), so the stage row's own bar visually spans exactly its
+children's combined width. The single globally slowest OBSERVED step (across every stage,
+ties broken by pipeline order) is the only step highlighted — never a per-stage "slowest",
+which would highlight something in every stage regardless of how fast the whole pipeline
+actually is. The chit-chat fast path's own stage (`responding` → `stream_canned_reply`) is
+a SEPARATE pipeline from the RAG path (classifying → retrieving → reranking → generating →
+checking): its bar is drawn starting at 0, not continuing the RAG path's cumulative offset,
+and it is excluded from the RAG path's own total average — summing durations from two
+different code paths into one number would not mean anything. An unobserved `(stage,
+step)` pair (nothing has exercised it yet this process) still appears, with `count=0`,
+`avg_seconds=None` and a visible "n/a" — the waterfall's rows never shuffle or disappear as
+traffic arrives, same no-history/R6-4 caveat as every other metric on this dashboard.
+Non-streaming answers never record a `token_stream` step (there is nothing to stream); a
+third, less obvious case is a mid-stream client disconnect for a STREAMING answer, where
+`GeneratorExit` can unwind past the `token_stream` step's own recording — the 13-G1-fix
+closed that one too (the duration is now recorded in a `finally`, so the partial time is
+still captured rather than silently dropped). Per-request latency TRACES (as opposed to
+this replica-wide average) are out of scope here — that is 16-F's own future work; the
+Pipeline section carries a small caption saying so rather than implying it already exists.
