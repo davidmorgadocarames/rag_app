@@ -489,7 +489,15 @@ def test_rerank_emits_exactly_its_allow_listed_steps(monkeypatch: pytest.MonkeyP
     ``CrossEncoderReranker.rerank`` away entirely), this calls the REAL ``rerank()`` -- only
     the model load/predict is faked -- so a typo in one of its 3 literal (stage, step) pairs
     (``metrics.observe_step`` raises on an unlisted pair) would fail THIS test directly,
-    instead of only the slow, Ollama+DB-backed e2e chat turn."""
+    instead of only the slow, Ollama+DB-backed e2e chat turn.
+
+    T13.8.9 (DA-13-G1-fix-1): ALSO wraps the real call's own ``timing.stage("rerank_inference")``
+    via ``on_stage`` and asserts the real step-sum is within a tight tolerance of the real
+    stage total -- catches a regression of the 13-G1-fix (``order_by_scores`` moved back
+    OUTSIDE ``with timing.stage("rerank_inference")``) that the synthetic
+    ``test_metrics.py`` sum test cannot, since it never calls this real code."""
+    import time
+
     import rag_app.reranking as reranking
     from rag_app import metrics as real_metrics
     from rag_app import timing
@@ -503,18 +511,52 @@ def test_rerank_emits_exactly_its_allow_listed_steps(monkeypatch: pytest.MonkeyP
         model_name="BAAI/bge-reranker-v2-m3", revision=PINNED, quantize=False
     )
 
+    # A deliberate, measurable delay on the REAL order_by_scores (module-level name,
+    # monkeypatched so the unqualified call inside rerank() picks it up) -- with trivial fake
+    # data every step is otherwise sub-millisecond, so a genuine "this step fell outside the
+    # stage span" regression would be invisible against timer noise without this.
+    real_order_by_scores = reranking.order_by_scores
+
+    def _slow_order_by_scores(*args: object, **kwargs: object) -> object:
+        time.sleep(0.05)
+        return real_order_by_scores(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(reranking, "order_by_scores", _slow_order_by_scores)
+
+    step_durations: dict[tuple[str, str], float] = {}
+
+    def _capturing_on_step(stage: str, step: str, elapsed_s: float) -> None:
+        step_durations[(stage, step)] = step_durations.get((stage, step), 0.0) + elapsed_s
+        real_metrics.observe_step(stage, step, elapsed_s)
+
+    stage_totals: dict[str, float] = {}
+
+    def _capturing_on_stage(stage: str, elapsed_s: float) -> None:
+        stage_totals[stage] = stage_totals.get(stage, 0.0) + elapsed_s
+
     before = _step_counts()
-    with timing.recorder(streaming=False, on_step=real_metrics.observe_step):
+    with timing.recorder(streaming=False, on_step=_capturing_on_step, on_stage=_capturing_on_stage):
         ranked = reranker.rerank("q", [_chunk("a"), _chunk("b")], top_n=2)
     after = _step_counts()
 
     assert len(ranked) == 2
-    for pair in (
+    reranking_pairs = (
         ("reranking", "wait_slot"),
         ("reranking", "cross_encoder"),
         ("reranking", "order_by_scores"),
-    ):
+    )
+    for pair in reranking_pairs:
         assert after.get(pair, 0.0) > before.get(pair, 0.0), pair
+
+    # DA-13-G1-1/13-G1-fix: "reranking"'s own step-sum must equal rerank_inference's real
+    # stage total (NOT rerank_load, the separate one-time model-load stage). The injected
+    # 0.05s delay on order_by_scores makes this assertion actually discriminate: if that step
+    # ever moves back outside `with timing.stage("rerank_inference")`, real_stage_total stays
+    # ~0.05s smaller than real_step_sum and this fails well outside the 0.02s tolerance.
+    real_step_sum = sum(step_durations.get(pair, 0.0) for pair in reranking_pairs)
+    real_stage_total = stage_totals.get("rerank_inference", 0.0)
+    assert step_durations.get(("reranking", "order_by_scores"), 0.0) >= 0.04  # the delay landed
+    assert real_step_sum == pytest.approx(real_stage_total, abs=0.02)
 
 
 def test_concurrency_cap_does_not_corrupt_per_caller_timing_records(

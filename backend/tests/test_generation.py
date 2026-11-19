@@ -216,15 +216,78 @@ def _step_counts() -> dict[tuple[str, str], float]:
     return out
 
 
+def _stage_sum(stage_name: str) -> float:
+    """T13.8.9 (DA-13-G1-fix-1): the REAL cumulative duration (``_sum``, not ``_count``)
+    Prometheus has recorded for one ``secrag_chat_stage_seconds`` stage label, across the
+    whole pytest session -- ``answer_question`` wires its own internal recorder straight to
+    ``metrics.observe_stage``/``observe_step`` (see ``generation.py``), so a before/after
+    DELTA of this value is the real stage total for one call, no custom capture needed."""
+    from rag_app import metrics as real_metrics
+
+    for metric in real_metrics.REGISTRY.collect():
+        if metric.name != "secrag_chat_stage_seconds":
+            continue
+        for sample in metric.samples:
+            if sample.name.endswith("_sum") and sample.labels.get("stage") == stage_name:
+                return sample.value
+    return 0.0
+
+
+def _step_sum(stage_name: str, step_name: str) -> float:
+    """Same idea as :func:`_stage_sum`, for one ``secrag_chat_step_seconds`` (stage, step)."""
+    from rag_app import metrics as real_metrics
+
+    for metric in real_metrics.REGISTRY.collect():
+        if metric.name != "secrag_chat_step_seconds":
+            continue
+        for sample in metric.samples:
+            if (
+                sample.name.endswith("_sum")
+                and sample.labels.get("stage") == stage_name
+                and sample.labels.get("step") == step_name
+            ):
+                return sample.value
+    return 0.0
+
+
 def test_answer_question_emits_the_expected_atomic_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-streaming path: build_prompt/llm_first_token/parse_answer (generating) and
     build_check_prompt/llm_verdict/parse_verdict (checking) -- but never token_stream (no
-    incremental stream in this path, T13.8.1's documented mapping choice)."""
+    incremental stream in this path, T13.8.1's documented mapping choice).
+
+    T13.8.9 (DA-13-G1-fix-1): also asserts the real "generating" step-sum (build_prompt +
+    llm_first_token + parse_answer, the generation equivalent of the retrieval/reranking
+    real-sum tests) is within a tight tolerance of the real "generate" stage total --
+    ``answer_question`` is called for real here (only ``hybrid_search``/the LLM are faked),
+    so a regression of the 13-G1-fix (``parse_answer`` moved back OUTSIDE
+    ``with timing.stage("generate")``) would fail THIS test, unlike the synthetic
+    ``test_metrics.py`` sum test."""
+    import time
+
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+
+    # A deliberate, measurable delay on the REAL parse_answer (module-level name, so the
+    # unqualified call inside answer_from_chunks picks it up) -- with trivial fake data every
+    # step is otherwise sub-millisecond, so a genuine "this step fell outside the stage span"
+    # regression (DA-13-G1-1(c)'s own parse_answer case) would be invisible against timer
+    # noise without it.
+    real_parse_answer = generation.parse_answer
+
+    def _slow_parse_answer(*args: object, **kwargs: object) -> object:
+        time.sleep(0.05)
+        return real_parse_answer(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation, "parse_answer", _slow_parse_answer)
+
     chat = _FakeChatSync("Use prepared statements [1].")
     before = _step_counts()
+    stage_before = _stage_sum("generate")
+    parse_answer_before = _step_sum("generating", "parse_answer")
+    steps_before = sum(
+        _step_sum("generating", s) for s in ("build_prompt", "llm_first_token", "parse_answer")
+    )
 
     generation.answer_question(None, "q", chat=chat, use_rerank=False)  # type: ignore[arg-type]
 
@@ -240,6 +303,17 @@ def test_answer_question_emits_the_expected_atomic_steps(
         assert after.get(pair, 0.0) > before.get(pair, 0.0), pair
     token_stream = ("generating", "token_stream")
     assert after.get(token_stream, 0.0) == before.get(token_stream, 0.0)
+
+    stage_delta = _stage_sum("generate") - stage_before
+    steps_delta = (
+        sum(_step_sum("generating", s) for s in ("build_prompt", "llm_first_token", "parse_answer"))
+        - steps_before
+    )
+    parse_answer_delta = _step_sum("generating", "parse_answer") - parse_answer_before
+    # The injected 0.05s delay makes the stage/step comparison below actually discriminate --
+    # with trivial fake data every step would otherwise be sub-millisecond either way.
+    assert parse_answer_delta >= 0.04, "the injected 0.05s delay on parse_answer did not land"
+    assert steps_delta == pytest.approx(stage_delta, abs=0.02)
 
 
 def test_answer_question_stream_emits_the_expected_atomic_steps(
