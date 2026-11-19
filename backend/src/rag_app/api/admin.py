@@ -602,7 +602,19 @@ def _banner_alerts(
                     code="daily_cap_reached",
                     severity="red",
                     message=f"Daily answer cap reached today ({answers}/{cap}).",
-                    feature_ids=["rag-generation-groundedness"],
+                    # T13.8.9 (DA-13-G1-5): "abuse-rate-limiting" is the closest EXISTING
+                    # registry entry, not a dedicated one invented for this alert --
+                    # usage_cap.py's own docstring frames the daily cap as bounding "what one
+                    # day of abuse can cost", the same abuse-mitigation role rate limiting
+                    # already plays, just at a global/daily granularity instead of per-route.
+                    # "rag-generation-groundedness" (the original mapping) is about
+                    # hallucination checking, unrelated to cost control -- confusing for an
+                    # admin following this alert's drawer link. No entry is an exact match
+                    # (no registry id exists for usage_cap.py itself, and this block does not
+                    # add a probe for one, per the brief) -- a dedicated "cost control/daily
+                    # cap" entry remains a fair follow-up for 15.2 if this mapping still reads
+                    # as confusing in practice.
+                    feature_ids=["abuse-rate-limiting"],
                 )
             )
     return alerts

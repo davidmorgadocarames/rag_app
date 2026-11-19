@@ -421,7 +421,9 @@ def test_admin_alerts_fires_red_when_the_daily_answer_cap_is_reached(
     alerts = {a["code"]: a for a in response.json()["alerts"]}
     assert alerts["daily_cap_reached"]["severity"] == "red"
     assert "2/2" in alerts["daily_cap_reached"]["message"]
-    assert alerts["daily_cap_reached"]["feature_ids"] == ["rag-generation-groundedness"]
+    # T13.8.9 (DA-13-G1-5): the closest EXISTING abuse/cost-control registry entry, not the
+    # generation/groundedness feature (unrelated to cost) the original mapping used.
+    assert alerts["daily_cap_reached"]["feature_ids"] == ["abuse-rate-limiting"]
 
 
 def test_admin_alerts_stays_empty_below_the_daily_answer_cap(
