@@ -47,7 +47,7 @@ export default function ForgotPasswordPanel() {
         className="border-0 border-b border-vault-steel-dark bg-transparent px-0.5 py-2 text-vault-steel-light outline-none placeholder:text-vault-steel-dark focus:border-vault-amber"
       />
       {message && (
-        <p className="text-sm text-vault-danger" role="alert">
+        <p className="text-sm text-vault-danger-text" role="alert">
           {message}
         </p>
       )}

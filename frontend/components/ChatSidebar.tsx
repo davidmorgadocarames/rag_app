@@ -98,7 +98,7 @@ export default function ChatSidebar({
                 type="button"
                 onClick={() => setPendingDelete(c)}
                 aria-label="Delete"
-                className="cursor-pointer px-1 text-vault-steel-dark opacity-0 transition-opacity hover:text-vault-danger group-hover:opacity-100"
+                className="cursor-pointer px-1 text-vault-steel-dark opacity-0 transition-opacity hover:text-vault-danger-text group-hover:opacity-100"
               >
                 ✕
               </button>
@@ -136,7 +136,7 @@ export default function ChatSidebar({
                   onDelete(pendingDelete.id);
                   setPendingDelete(null);
                 }}
-                className="cursor-pointer border border-vault-danger px-4 py-2 text-xs tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+                className="cursor-pointer border border-vault-danger px-4 py-2 text-xs tracking-[0.1em] text-vault-danger-text transition-colors hover:bg-vault-danger hover:text-vault-bg"
               >
                 DELETE
               </button>

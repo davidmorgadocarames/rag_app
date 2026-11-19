@@ -116,7 +116,7 @@ export default function AccountPage() {
       </button>
 
       <div className="mt-4 border border-vault-danger p-4">
-        <p className="font-medium tracking-[0.06em] text-vault-danger">Delete my data</p>
+        <p className="font-medium tracking-[0.06em] text-vault-danger-text">Delete my data</p>
         <p className="mt-1 text-sm text-vault-steel">
           Erases your account and all associated data. This is irreversible. Your data in the
           live service becomes unreadable immediately and you are signed out; the remaining
@@ -126,13 +126,13 @@ export default function AccountPage() {
           or content) is kept so that a restore cannot bring the account back; its exported
           copies are kept for 30 days.
         </p>
-        {error && <p className="mt-2 text-sm text-vault-danger">{error}</p>}
+        {error && <p className="mt-2 text-sm text-vault-danger-text">{error}</p>}
         {confirming ? (
           <div className="mt-3 flex gap-2">
             <button
               type="button"
               onClick={onDelete}
-              className="cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+              className="cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger-text transition-colors hover:bg-vault-danger hover:text-vault-bg"
             >
               Confirm deletion
             </button>
@@ -148,7 +148,7 @@ export default function AccountPage() {
           <button
             type="button"
             onClick={() => setConfirming(true)}
-            className="mt-3 cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+            className="mt-3 cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger-text transition-colors hover:bg-vault-danger hover:text-vault-bg"
           >
             Delete my data
           </button>

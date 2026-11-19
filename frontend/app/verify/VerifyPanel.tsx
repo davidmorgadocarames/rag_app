@@ -29,7 +29,7 @@ export default function VerifyPanel({ token }: { token: string }) {
   return (
     <div className="flex flex-col gap-4">
       {!token ? (
-        <p className="text-sm text-vault-danger" role="alert">
+        <p className="text-sm text-vault-danger-text" role="alert">
           This link is missing its verification token.
         </p>
       ) : (

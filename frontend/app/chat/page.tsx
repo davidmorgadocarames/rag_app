@@ -285,7 +285,7 @@ export default function ChatPage() {
                 </div>
               ) : m.error ? (
                 <div key={i} role="alert" className="border border-vault-danger bg-vault-plate/40 p-4">
-                  <p className="text-xs uppercase tracking-[0.18em] text-vault-danger">Error</p>
+                  <p className="text-xs uppercase tracking-[0.18em] text-vault-danger-text">Error</p>
                   <p className="mt-1 text-sm text-vault-steel-light">{m.content}</p>
                 </div>
               ) : m.abstained ? (
@@ -309,7 +309,7 @@ export default function ChatPage() {
             {busy && stage && (
               <p className="text-xs tracking-[0.1em] text-vault-amber">{STAGE_LABELS[stage] ?? stage}</p>
             )}
-            {error && <p className="text-sm text-vault-danger">{error}</p>}
+            {error && <p className="text-sm text-vault-danger-text">{error}</p>}
           </div>
         </div>
 

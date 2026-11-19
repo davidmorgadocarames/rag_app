@@ -98,7 +98,7 @@ export default function LoginPanel() {
             className="border-0 border-b border-vault-steel-dark bg-transparent px-0.5 py-2 text-vault-steel-light outline-none placeholder:text-vault-steel-dark focus:border-vault-amber"
           />
           {message && <p className="text-xs text-vault-steel">{message}</p>}
-          {error && <p className="text-xs text-vault-danger">{error}</p>}
+          {error && <p className="text-xs text-vault-danger-text">{error}</p>}
           {showResend && (
             <button
               type="button"

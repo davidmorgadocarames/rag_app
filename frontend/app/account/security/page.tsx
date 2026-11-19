@@ -166,7 +166,7 @@ export default function AccountSecurityPage() {
         manager&apos;s built-in authenticator) below.
       </p>
 
-      {error && <p className="text-sm text-vault-danger">{error}</p>}
+      {error && <p className="text-sm text-vault-danger-text">{error}</p>}
 
       {stage === "loading" && <p className="text-sm text-vault-steel">Loading…</p>}
 
@@ -186,7 +186,7 @@ export default function AccountSecurityPage() {
           {adminPanelLink}
 
           <div className="border border-vault-danger p-4">
-            <p className="text-sm text-vault-danger">
+            <p className="text-sm text-vault-danger-text">
               Only replace two-factor authentication if you have lost access to your
               authenticator app or recovery codes. This invalidates your current secret and
               every existing recovery code.
@@ -195,7 +195,7 @@ export default function AccountSecurityPage() {
               <button
                 type="button"
                 onClick={() => setReenrollOpen(true)}
-                className="mt-3 w-fit cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+                className="mt-3 w-fit cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger-text transition-colors hover:bg-vault-danger hover:text-vault-bg"
               >
                 Replace my two-factor authentication
               </button>
@@ -212,7 +212,7 @@ export default function AccountSecurityPage() {
                 <div className="flex gap-2">
                   <button
                     type="submit"
-                    className="cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger transition-colors hover:bg-vault-danger hover:text-vault-bg"
+                    className="cursor-pointer border border-vault-danger bg-transparent px-4 py-2 text-sm tracking-[0.1em] text-vault-danger-text transition-colors hover:bg-vault-danger hover:text-vault-bg"
                   >
                     Confirm and replace
                   </button>
