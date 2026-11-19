@@ -36,7 +36,7 @@ import {
   featuresHealthySummary,
 } from "@/lib/adminKpi";
 import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "@/lib/adminStream";
-import { alertJumpFeatureId, sortFeaturesWorstFirst, type TriageFilterKey } from "@/lib/adminTriage";
+import { resolveAlertJump, sortFeaturesWorstFirst, type TriageFilterKey } from "@/lib/adminTriage";
 
 import DefenceLabPanel from "./DefenceLabPanel";
 import ErasurePanel from "./ErasurePanel";
@@ -64,9 +64,10 @@ const SECTION_DEFS: { key: Section; label: string }[] = [
   { key: "lab", label: "Defence lab" },
 ];
 
-// T13.8.4: a severity badge (icon + text, never colour alone) plus a jump action to the
-// related feature (AdminAlertOut.feature_ids, T13.8.3a) -- or, when none resolves, to the
-// Erasure section for the two erasure-shaped alert codes.
+// T13.8.4/T13.8.7: a severity badge (icon + text, never colour alone) plus a jump action to
+// the related feature (AdminAlertOut.feature_ids, T13.8.3a) -- or, for the two erasure-shaped
+// alert codes (DEC-043/DA-13-G2-1), always to the Erasure section regardless of feature_ids
+// (see adminTriage.ts::resolveAlertJump for why `feature_ids` alone is not enough here).
 function AlertBanner({
   alerts,
   features,
@@ -87,7 +88,7 @@ function AlertBanner({
     >
       {sortAlertsBySeverity(alerts).map((alert) => {
         const tone = alert.severity === "red" ? "crit" : "warn";
-        const featureId = alertJumpFeatureId(alert, features);
+        const target = resolveAlertJump(alert, features);
         return (
           <div
             key={alert.code}
@@ -98,20 +99,20 @@ function AlertBanner({
           >
             <StatusBadge tone={tone} label={alert.severity === "red" ? "Critical" : "Warning"} />
             <span className="flex-1 text-vault-steel-light">{alert.message}</span>
-            {featureId ? (
+            {target.featureId ? (
               <button
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
-                onClick={() => onJumpToFeature(featureId)}
+                onClick={() => onJumpToFeature(target.featureId as string)}
                 className="cursor-pointer border border-vault-steel-dark px-2.5 py-1 text-vault-amber hover:border-vault-steel"
               >
                 Open feature
               </button>
-            ) : alert.code.startsWith("erasure") ? (
+            ) : target.section ? (
               <button
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
-                onClick={() => onJumpToSection("erasure")}
+                onClick={() => onJumpToSection(target.section as Section)}
                 className="cursor-pointer border border-vault-steel-dark px-2.5 py-1 text-vault-amber hover:border-vault-steel"
               >
                 Open erasure

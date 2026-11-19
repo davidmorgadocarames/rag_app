@@ -7,6 +7,7 @@ import {
   featureGroup,
   featureStatus,
   filterFeaturesByStatus,
+  resolveAlertJump,
   sortFeaturesWorstFirst,
   TRIAGE_FILTERS,
   type TriageFeature,
@@ -139,4 +140,41 @@ test("alertJumpFeatureId returns null when no feature_ids match, never a guess",
   const features = [{ id: "rag-rerank" }];
   assert.equal(alertJumpFeatureId({ feature_ids: ["unknown-id"] }, features), null);
   assert.equal(alertJumpFeatureId({}, features), null);
+});
+
+// T13.8.7 (DEC-043 = A, DA-13-G2-1): regression tests using the REAL `feature_ids` shape
+// `_banner_alerts` (admin.py) actually sends for these two codes -- both carry the real
+// registry id "privacy-asynchronous-erasure", which is exactly why the naive
+// `alertJumpFeatureId`-first order used to always win and never fall back to "Open erasure".
+const REAL_ERASURE_FEATURES = [{ id: "privacy-asynchronous-erasure" }, { id: "rag-rerank" }];
+
+test("resolveAlertJump: erasure_overdue always targets the Erasure section, never the feature it also names", () => {
+  const target = resolveAlertJump(
+    { code: "erasure_overdue", feature_ids: ["privacy-asynchronous-erasure"] },
+    REAL_ERASURE_FEATURES,
+  );
+  assert.deepEqual(target, { featureId: null, section: "erasure" });
+});
+
+test("resolveAlertJump: erasure_approaching always targets the Erasure section too", () => {
+  const target = resolveAlertJump(
+    { code: "erasure_approaching", feature_ids: ["privacy-asynchronous-erasure"] },
+    REAL_ERASURE_FEATURES,
+  );
+  assert.deepEqual(target, { featureId: null, section: "erasure" });
+});
+
+test("resolveAlertJump: a non-erasure code still resolves its own feature_ids as before", () => {
+  const target = resolveAlertJump(
+    { code: "daily_cap_reached", feature_ids: ["unknown-id", "rag-rerank"] },
+    REAL_ERASURE_FEATURES,
+  );
+  assert.deepEqual(target, { featureId: "rag-rerank", section: null });
+});
+
+test("resolveAlertJump: a non-erasure code with no matching feature_ids resolves neither", () => {
+  const target = resolveAlertJump({ code: "lockout_spike", feature_ids: ["unknown-id"] }, [
+    { id: "rag-rerank" },
+  ]);
+  assert.deepEqual(target, { featureId: null, section: null });
 });

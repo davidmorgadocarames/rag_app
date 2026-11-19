@@ -146,3 +146,28 @@ export function alertJumpFeatureId(
   }
   return null;
 }
+
+export interface AlertJumpTarget {
+  featureId: string | null;
+  section: "erasure" | null;
+}
+
+/** T13.8.7 (DEC-043 = A, DA-13-G2-1, high): the alert banner's own jump action for
+ * `erasure_overdue`/`erasure_approaching` -- BOTH carry a real registry id
+ * (`feature_ids: ["privacy-asynchronous-erasure"]`, set in `_banner_alerts`, 13-G1), so
+ * `alertJumpFeatureId` alone would always resolve a feature first and never fall back to the
+ * Erasure section the Done-when and the approved mockup actually want for these two codes.
+ * This resolver checks the erasure-shaped code FIRST: it always sends those two codes to the
+ * Erasure section, regardless of `feature_ids` -- `feature_ids` itself is untouched and still
+ * used by the feature drawer's own "related alerts" list (`FeatureDrawer`'s `relatedAlerts`
+ * filter reads the alert's `feature_ids` directly, not this resolver). Any other alert code
+ * keeps the original feature-first behaviour. */
+export function resolveAlertJump(
+  alert: JumpableAlert & { code: string },
+  features: { id: string }[],
+): AlertJumpTarget {
+  if (alert.code.startsWith("erasure")) {
+    return { featureId: null, section: "erasure" };
+  }
+  return { featureId: alertJumpFeatureId(alert, features), section: null };
+}
