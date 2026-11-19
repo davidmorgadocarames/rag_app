@@ -219,11 +219,16 @@ class AdminAlertOut(BaseModel):
     """T13.5.2: one banner condition, pre-computed server-side (never a client-side
     threshold) so the same business logic covers both live-update modes (SSE snapshot/
     heartbeat, local; the REST route below, Azure polling). ``severity`` is a small, fixed
-    vocabulary -- never free text that could carry PII."""
+    vocabulary -- never free text that could carry PII.
+
+    T13.8.3: ``feature_ids`` names the registry feature(s) (``rag_app.features.REGISTRY``
+    ids) this alert relates to, so the dashboard's side drawer for a feature can list its
+    related alerts without a second lookup table."""
 
     code: str
     severity: str  # "amber" | "red"
     message: str
+    feature_ids: list[str] = []
 
 
 class AdminFeaturesResponse(BaseModel):
@@ -248,8 +253,34 @@ class StageLatencyOut(BaseModel):
     p95_seconds: float | None
 
 
+class StepLatencyOut(BaseModel):
+    """T13.8.2: one atomic step's latency (``secrag_chat_step_seconds``), nested under its
+    UI-facing pipeline stage below -- see ``rag_app.metrics.STEP_ALLOWLIST``."""
+
+    stage: str
+    step: str
+    count: float
+    avg_seconds: float | None
+    p50_seconds: float | None
+    p95_seconds: float | None
+
+
+class PipelineStageLatencyOut(BaseModel):
+    """One UI pipeline stage (classifying/retrieving/reranking/generating/checking/
+    responding, in ``STEP_ALLOWLIST`` order) with its atomic steps, also in pipeline order --
+    the data behind the Pipeline waterfall's expandable rows (13-G mockup). A DIFFERENT,
+    higher-level grouping than ``StageLatencyOut.stage`` above (e.g. "retrieving" covers both
+    the old "embed" and "hybrid_search" stage names)."""
+
+    stage: str
+    steps: list[StepLatencyOut]
+
+
 class AdminLatencyResponse(BaseModel):
     stages: list[StageLatencyOut]
+    # T13.8.2: additive -- `stages` (the pre-existing secrag_chat_stage_seconds view) is
+    # unchanged; `pipeline` is the new per-atomic-step waterfall view.
+    pipeline: list[PipelineStageLatencyOut] = []
 
 
 class EvalMetricOut(BaseModel):
@@ -277,6 +308,10 @@ class ErasureRequestOut(BaseModel):
     attempts: int
     last_error_class: str | None
     overdue: bool
+    # T13.8.3: when the row is already `done`, its completion timestamp
+    # (``DeletionRequest.completed_at``, written by ``rag_app.purger``/``rag_app.erasure``
+    # when a request finishes) -- ``None`` while open (never set yet).
+    completed_at: dt.datetime | None = None
 
 
 class LastPurgerRunOut(BaseModel):

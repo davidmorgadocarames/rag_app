@@ -75,7 +75,9 @@ from rag_app.api.schemas import (
     MfaEnrollRequest,
     MfaEnrollResponse,
     MfaStepUpRequest,
+    PipelineStageLatencyOut,
     StageLatencyOut,
+    StepLatencyOut,
 )
 from rag_app.authz import ROLE_PERMISSIONS, require_permission, require_permission_and_mfa
 from rag_app.config import get_settings
@@ -317,7 +319,13 @@ def admin_latency() -> AdminLatencyResponse:
     """``rag_app.metrics.stage_latency_summary`` reads THIS process's own
     ``secrag_chat_stage_seconds`` histogram directly -- never through ``MetricsBackend``
     (percentiles are not an unlabelled counter/gauge value); the same computation local and
-    on Azure, "this replica since it last started", no history (R6-4)."""
+    on Azure, "this replica since it last started", no history (R6-4).
+
+    T13.8.2: ``pipeline`` is the SAME in-process approach applied to the new
+    ``secrag_chat_step_seconds`` histogram (``metrics.step_latency_summary``), grouped by UI
+    pipeline stage in ``metrics.STEP_ALLOWLIST``'s fixed order -- an unobserved (stage, step)
+    pair (nothing has exercised it yet this process) still appears, with ``count=0`` and
+    ``None`` averages, so the waterfall's rows never shuffle as traffic arrives."""
     summary = metrics.stage_latency_summary()
     stages = [
         StageLatencyOut(
@@ -329,7 +337,27 @@ def admin_latency() -> AdminLatencyResponse:
         )
         for stage, values in sorted(summary.items())
     ]
-    return AdminLatencyResponse(stages=stages)
+    step_summary = metrics.step_latency_summary()
+
+    def _step_latency(pipeline_stage: str, step: str) -> StepLatencyOut:
+        values = step_summary.get((pipeline_stage, step))
+        return StepLatencyOut(
+            stage=pipeline_stage,
+            step=step,
+            count=(values["count"] or 0.0) if values else 0.0,
+            avg_seconds=values["avg_seconds"] if values else None,
+            p50_seconds=values["p50_seconds"] if values else None,
+            p95_seconds=values["p95_seconds"] if values else None,
+        )
+
+    pipeline = [
+        PipelineStageLatencyOut(
+            stage=pipeline_stage,
+            steps=[_step_latency(pipeline_stage, step) for step in steps],
+        )
+        for pipeline_stage, steps in metrics.STEP_ALLOWLIST
+    ]
+    return AdminLatencyResponse(stages=stages, pipeline=pipeline)
 
 
 # --- T13.1.4: last eval run vs baseline and floors -----------------------------------------
@@ -431,6 +459,7 @@ def _erasure_payload(session: Session) -> AdminErasureResponse:
                 attempts=row.attempts,
                 last_error_class=row.last_error,
                 overdue=seconds_left < 0 and row.status != "done",
+                completed_at=row.completed_at,
             )
         )
     last_run = session.scalars(
@@ -484,6 +513,10 @@ LOCKOUT_SPIKE_THRESHOLD = 5
 def _banner_alerts(
     session: Session, metrics_backend: MetricsBackend, features: list[FeatureHealthOut]
 ) -> list[AdminAlertOut]:
+    """T13.8.3(a): every alert below now carries ``feature_ids`` -- the registry feature(s)
+    (``rag_app.features.REGISTRY`` ids) a drawer for that feature should list it under. A
+    fixed, reviewed mapping per alert code, except ``probe_failures`` (dynamic: the actual
+    failing features' own ids, never a single static guess)."""
     alerts: list[AdminAlertOut] = []
 
     oldest_open_at = session.scalars(
@@ -503,6 +536,7 @@ def _banner_alerts(
                         f"An erasure request has been open for over"
                         f" {ERASURE_ALERT_RED_HOURS}h (the purge deadline)."
                     ),
+                    feature_ids=["privacy-asynchronous-erasure"],
                 )
             )
         elif age_hours > ERASURE_ALERT_AMBER_HOURS:
@@ -514,6 +548,7 @@ def _banner_alerts(
                         f"An erasure request has been open for over"
                         f" {ERASURE_ALERT_AMBER_HOURS}h (deadline: {ERASURE_ALERT_RED_HOURS}h)."
                     ),
+                    feature_ids=["privacy-asynchronous-erasure"],
                 )
             )
 
@@ -524,20 +559,23 @@ def _banner_alerts(
                 code="lockout_spike",
                 severity="amber",
                 message=f"Login lockouts: {int(lockout_hits)} since this replica started.",
+                feature_ids=["identity-lockout"],
             )
         )
 
     # dev_only/azure_only entries report "down" BY DESIGN when the feature is off here (e.g.
     # the defence lab, T13.3.1, or an Azure-only check run locally) -- never a real failure.
     failing_probes = [
-        f.name for f in features if f.probe_status == "down" and not f.dev_only and not f.azure_only
+        f for f in features if f.probe_status == "down" and not f.dev_only and not f.azure_only
     ]
     if failing_probes:
+        names = ", ".join(f.name for f in failing_probes)
         alerts.append(
             AdminAlertOut(
                 code="probe_failures",
                 severity="red",
-                message=f"{len(failing_probes)} health probe(s) down: {', '.join(failing_probes)}.",
+                message=f"{len(failing_probes)} health probe(s) down: {names}.",
+                feature_ids=[f.id for f in failing_probes],
             )
         )
 
@@ -550,6 +588,7 @@ def _banner_alerts(
                 message=(
                     f"Email delivery failures: {int(email_failed)} since this replica started."
                 ),
+                feature_ids=["identity-email-verification-reset"],
             )
         )
 
@@ -562,6 +601,7 @@ def _banner_alerts(
                     code="daily_cap_reached",
                     severity="red",
                     message=f"Daily answer cap reached today ({answers}/{cap}).",
+                    feature_ids=["rag-generation-groundedness"],
                 )
             )
     return alerts

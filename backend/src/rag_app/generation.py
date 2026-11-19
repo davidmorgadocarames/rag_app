@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from rag_app import timing
 from rag_app.config import get_settings
 from rag_app.llm import ChatClient, Message, Usage, make_chat_client
-from rag_app.metrics import observe_stage
+from rag_app.metrics import observe_stage, observe_step
 from rag_app.retrieval import RetrievedChunk, hybrid_search
 
 if TYPE_CHECKING:
@@ -127,24 +127,29 @@ def parse_groundedness(raw: str) -> bool:
 
 
 def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[RetrievedChunk]) -> bool:
-    context = build_context(chunks)
-    user = (
-        f"CONTEXT:\n{context}\n\nANSWER:\n{answer_text}\n\n"
-        "Is the ANSWER fully supported by the CONTEXT? GROUNDED or NOT_GROUNDED?"
-    )
-    messages: list[Message] = [
-        {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
-        {"role": "user", "content": user},
-    ]
-    return parse_groundedness(
-        chat.chat(
+    """T13.8.1: three atomic steps (pipeline stage "checking") -- build_check_prompt,
+    llm_verdict, parse_verdict -- a separate channel from the unchanged ``groundedness``
+    stage total (``answer_from_chunks``'s own ``timing.stage("groundedness")``)."""
+    with timing.step("checking", "build_check_prompt"):
+        context = build_context(chunks)
+        user = (
+            f"CONTEXT:\n{context}\n\nANSWER:\n{answer_text}\n\n"
+            "Is the ANSWER fully supported by the CONTEXT? GROUNDED or NOT_GROUNDED?"
+        )
+        messages: list[Message] = [
+            {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
+            {"role": "user", "content": user},
+        ]
+    with timing.step("checking", "llm_verdict"):
+        raw = chat.chat(
             messages,
             temperature=0.0,
             max_tokens=GROUNDEDNESS_MAX_TOKENS,
             num_ctx=get_settings().num_ctx_groundedness,
             call_type="groundedness",
         )
-    )
+    with timing.step("checking", "parse_verdict"):
+        return parse_groundedness(raw)
 
 
 def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk]) -> Answer:
@@ -159,17 +164,27 @@ def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk
 
     settings = get_settings()
     max_tokens = settings.max_tokens
+    # T13.8.1: build_prompt/llm_first_token/parse_answer (pipeline stage "generating") -- a
+    # separate channel from the unchanged "generate" stage total. The non-streaming path has
+    # no incremental token stream (one blocking call): "llm_first_token" covers the WHOLE
+    # call -- the full answer only becomes available at the same moment a streaming caller's
+    # first delta would -- and "token_stream" is simply never emitted here (there is nothing
+    # to stream after it).
     with timing.stage("generate"):
-        raw = chat.chat(
-            build_messages(query, chunks),
-            temperature=0.0,
-            max_tokens=max_tokens,
-            num_ctx=settings.num_ctx_answer,
-            call_type="answer",
-        )
+        with timing.step("generating", "build_prompt"):
+            messages = build_messages(query, chunks)
+        with timing.step("generating", "llm_first_token"):
+            raw = chat.chat(
+                messages,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                num_ctx=settings.num_ctx_answer,
+                call_type="answer",
+            )
     # Non-streaming: the full response arrives at once, so "first token" == "generate done".
     timing.mark_first_token()
-    answer = parse_answer(raw, chunks)
+    with timing.step("generating", "parse_answer"):
+        answer = parse_answer(raw, chunks)
     if answer.abstained:
         return answer
 
@@ -205,7 +220,7 @@ def answer_question(
     top_n = top_n or settings.rerank_top_n
     chat = chat or make_chat_client()
 
-    with timing.recorder(streaming=False, on_stage=observe_stage):
+    with timing.recorder(streaming=False, on_stage=observe_stage, on_step=observe_step):
         if use_rerank:
             from rag_app.reranking import get_shared_reranker, retrieve
 
@@ -386,20 +401,37 @@ def _stream_answer_tokens(
 
     Deltas are emitted as ``StreamToken`` for preview; the accumulated raw string is
     yielded as the final item so the caller can parse it authoritatively.
+
+    T13.8.1: three atomic steps (pipeline stage "generating") -- ``build_prompt`` (before the
+    call), ``llm_first_token`` (request start to the first delta) and ``token_stream`` (first
+    delta to the last one) -- a separate channel from the unchanged "generate" stage total
+    the caller times around this whole generator.
     """
     buffer = ""
     emitting = False
     full = ""
     settings = get_settings()
     max_tokens = settings.max_tokens
-    for delta in chat.chat_stream(
-        build_messages(query, chunks),
+    with timing.step("generating", "build_prompt"):
+        messages = build_messages(query, chunks)
+    stream = chat.chat_stream(
+        messages,
         temperature=0.0,
         max_tokens=max_tokens,
         usage=usage,
         num_ctx=settings.num_ctx_answer,
         call_type="answer",
-    ):
+    )
+    first_delta = True
+    first_token_start = time.perf_counter()
+    stream_start: float | None = None
+    for delta in stream:
+        if first_delta:
+            timing.record_step(
+                "generating", "llm_first_token", time.perf_counter() - first_token_start
+            )
+            stream_start = time.perf_counter()
+            first_delta = False
         full += delta
         if emitting:
             yield StreamToken(text=delta)
@@ -411,6 +443,8 @@ def _stream_answer_tokens(
             yield StreamToken(text=buffer)
             buffer = ""
             emitting = True
+    if stream_start is not None:
+        timing.record_step("generating", "token_stream", time.perf_counter() - stream_start)
     if not emitting and buffer and INSUFFICIENT[:6] not in buffer.upper():
         yield StreamToken(text=buffer)
     yield full
@@ -445,14 +479,15 @@ def answer_question_stream(
     chat = chat or make_chat_client()
     usage = Usage()
 
-    with timing.recorder(streaming=True, on_stage=observe_stage):
+    with timing.recorder(streaming=True, on_stage=observe_stage, on_step=observe_step):
         yield StreamStage(stage="classifying")
-        with timing.stage("classify"):
+        with timing.stage("classify"), timing.step("classifying", "classify_intent"):
             intent = classify_intent(query)
         if intent == "chitchat":
             yield StreamStage(stage="responding")
-            for word in _CHITCHAT_REPLY.split(" "):
-                yield StreamToken(text=word + " ")
+            with timing.step("responding", "stream_canned_reply"):
+                for word in _CHITCHAT_REPLY.split(" "):
+                    yield StreamToken(text=word + " ")
             yield StreamResult(
                 answer=Answer(text=_CHITCHAT_REPLY, abstained=False, grounded=True), usage=usage
             )
@@ -489,7 +524,8 @@ def answer_question_stream(
                 raw = item
         timing.record("generate", time.perf_counter() - generate_start)
 
-        answer = parse_answer(raw, chunks)
+        with timing.step("generating", "parse_answer"):
+            answer = parse_answer(raw, chunks)
         if answer.abstained:
             yield StreamResult(answer=answer, usage=usage)
             return
@@ -505,27 +541,36 @@ def answer_question_stream(
 def _check_groundedness_counted(
     chat: ChatClient, answer_text: str, chunks: list[RetrievedChunk], usage: Usage
 ) -> bool:
-    """Groundedness check that also accounts the tokens it spends (via streaming)."""
-    context = build_context(chunks)
-    user = (
-        f"CONTEXT:\n{context}\n\nANSWER:\n{answer_text}\n\n"
-        "Is the ANSWER fully supported by the CONTEXT? GROUNDED or NOT_GROUNDED?"
-    )
-    messages: list[Message] = [
-        {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
-        {"role": "user", "content": user},
-    ]
-    verdict = "".join(
-        chat.chat_stream(
-            messages,
-            temperature=0.0,
-            max_tokens=GROUNDEDNESS_MAX_TOKENS,
-            usage=usage,
-            num_ctx=get_settings().num_ctx_groundedness,
-            call_type="groundedness",
+    """Groundedness check that also accounts the tokens it spends (via streaming).
+
+    T13.8.1: build_check_prompt/llm_verdict/parse_verdict (pipeline stage "checking") -- same
+    three steps as ``check_groundedness``'s non-streaming twin. The stream is consumed in
+    full here (``"".join(...)``, never shown to the user), so "llm_verdict" times the whole
+    call, same nearest-real-boundary choice as the non-streaming answer path.
+    """
+    with timing.step("checking", "build_check_prompt"):
+        context = build_context(chunks)
+        user = (
+            f"CONTEXT:\n{context}\n\nANSWER:\n{answer_text}\n\n"
+            "Is the ANSWER fully supported by the CONTEXT? GROUNDED or NOT_GROUNDED?"
         )
-    )
-    return parse_groundedness(verdict)
+        messages: list[Message] = [
+            {"role": "system", "content": _GROUNDEDNESS_SYSTEM},
+            {"role": "user", "content": user},
+        ]
+    with timing.step("checking", "llm_verdict"):
+        verdict = "".join(
+            chat.chat_stream(
+                messages,
+                temperature=0.0,
+                max_tokens=GROUNDEDNESS_MAX_TOKENS,
+                usage=usage,
+                num_ctx=get_settings().num_ctx_groundedness,
+                call_type="groundedness",
+            )
+        )
+    with timing.step("checking", "parse_verdict"):
+        return parse_groundedness(verdict)
 
 
 def main(argv: list[str] | None = None) -> int:

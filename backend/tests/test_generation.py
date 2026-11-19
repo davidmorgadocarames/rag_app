@@ -169,6 +169,100 @@ def _timing_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]
     return [r for r in caplog.records if r.name == "rag_app.timing"]
 
 
+# --- T13.8.1: atomic-step metrics (secrag_chat_step_seconds), both generation paths -------
+
+
+def _step_counts() -> dict[tuple[str, str], float]:
+    """Current observation counts per (stage, step), read from the REAL process-wide
+    ``metrics.REGISTRY`` -- tests below only ever assert a before/after DELTA (a histogram's
+    ``_count`` is monotonic), so sharing the registry with the rest of the pytest session is
+    harmless, same precedent as ``test_metrics_server_serves_observed_stages_on_its_own_port``."""
+    from rag_app import metrics as real_metrics
+
+    out: dict[tuple[str, str], float] = {}
+    for metric in real_metrics.REGISTRY.collect():
+        if metric.name != "secrag_chat_step_seconds":
+            continue
+        for sample in metric.samples:
+            if sample.name.endswith("_count"):
+                out[(sample.labels["stage"], sample.labels["step"])] = sample.value
+    return out
+
+
+def test_answer_question_emits_the_expected_atomic_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-streaming path: build_prompt/llm_first_token/parse_answer (generating) and
+    build_check_prompt/llm_verdict/parse_verdict (checking) -- but never token_stream (no
+    incremental stream in this path, T13.8.1's documented mapping choice)."""
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    chat = _FakeChatSync("Use prepared statements [1].")
+    before = _step_counts()
+
+    generation.answer_question(None, "q", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    after = _step_counts()
+    for pair in (
+        ("generating", "build_prompt"),
+        ("generating", "llm_first_token"),
+        ("generating", "parse_answer"),
+        ("checking", "build_check_prompt"),
+        ("checking", "llm_verdict"),
+        ("checking", "parse_verdict"),
+    ):
+        assert after.get(pair, 0.0) > before.get(pair, 0.0), pair
+    token_stream = ("generating", "token_stream")
+    assert after.get(token_stream, 0.0) == before.get(token_stream, 0.0)
+
+
+def test_answer_question_stream_emits_the_expected_atomic_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    monkeypatch.setattr(
+        reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
+    )
+    chat = _FakeChatStreamSeq([["Use prepared statements ", "[1]."], ["GROUNDED"]])
+    before = _step_counts()
+
+    list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "How do I prevent SQL injection?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    after = _step_counts()
+    for pair in (
+        ("classifying", "classify_intent"),
+        ("generating", "build_prompt"),
+        ("generating", "llm_first_token"),
+        ("generating", "token_stream"),
+        ("generating", "parse_answer"),
+        ("checking", "build_check_prompt"),
+        ("checking", "llm_verdict"),
+        ("checking", "parse_verdict"),
+    ):
+        assert after.get(pair, 0.0) > before.get(pair, 0.0), pair
+
+
+def test_answer_question_stream_chitchat_emits_classify_and_canned_reply_steps() -> None:
+    """The chit-chat fast path never calls the LLM -- only classify_intent and
+    stream_canned_reply are observed, nothing from retrieving/reranking/generating/checking."""
+    before = _step_counts()
+
+    list(generation.answer_question_stream(None, "hi", chat=_FakeChatSync("")))  # type: ignore[arg-type]
+
+    after = _step_counts()
+    classify = ("classifying", "classify_intent")
+    canned = ("responding", "stream_canned_reply")
+    assert after.get(classify, 0.0) > before.get(classify, 0.0)
+    assert after.get(canned, 0.0) > before.get(canned, 0.0)
+    build_prompt = ("generating", "build_prompt")
+    assert after.get(build_prompt, 0.0) == before.get(build_prompt, 0.0)
+
+
 def test_answer_question_emits_one_timing_record_with_no_pii(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

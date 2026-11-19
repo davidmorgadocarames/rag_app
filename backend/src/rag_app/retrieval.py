@@ -108,15 +108,22 @@ def hybrid_search(
     candidate_k = candidate_k or settings.top_k
     embedder = embedder or OllamaEmbedder()
 
-    with timing.stage("embed"):
+    # T13.8.1: the atomic-step wraps below are a SEPARATE channel (``secrag_chat_step_seconds``,
+    # pipeline stage "retrieving") -- the outer ``timing.stage(...)`` calls and their meaning
+    # (the existing ``secrag_chat_stage_seconds`` histogram) are unchanged.
+    with timing.stage("embed"), timing.step("retrieving", "embed_query"):
         query_vector = embedder.embed_one(query)
 
     with timing.stage("hybrid_search"):
-        vector_uids = _vector_uids(session, query_vector, candidate_k, version)
-        bm25_uids = _bm25_uids(session, query, candidate_k, version)
+        with timing.step("retrieving", "vector_search"):
+            vector_uids = _vector_uids(session, query_vector, candidate_k, version)
+        with timing.step("retrieving", "bm25_search"):
+            bm25_uids = _bm25_uids(session, query, candidate_k, version)
 
-        fused = reciprocal_rank_fusion([vector_uids, bm25_uids])[:top_k]
-        chunks = _load_chunks(session, [uid for uid, _ in fused])
+        with timing.step("retrieving", "rrf_fusion"):
+            fused = reciprocal_rank_fusion([vector_uids, bm25_uids])[:top_k]
+        with timing.step("retrieving", "load_chunks"):
+            chunks = _load_chunks(session, [uid for uid, _ in fused])
 
         ranked: list[RetrievedChunk] = []
         for uid, score in fused:

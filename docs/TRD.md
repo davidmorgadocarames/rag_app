@@ -396,12 +396,26 @@ catalogue analysis; this is the implementation summary.
   and a per-account rate limit. `GET /admin/features` (registry + live health + metrics
   summary), `GET /admin/metrics` (every declared metric's current value through
   `MetricsBackend`), `GET /admin/latency` (per-stage p50/p95 from the chat-pipeline
-  histogram), `GET /admin/eval` (last eval run vs baseline/floors, aggregate metrics only —
+  histogram, `stages`; plus `pipeline`, T13.8.2: the SAME computation over the atomic-step
+  histogram below, grouped by UI pipeline stage in `STEP_ALLOWLIST` order — the Pipeline
+  waterfall's expandable rows, aggregate/this-replica-only, never per-request), `GET
+  /admin/eval` (last eval run vs baseline/floors, aggregate metrics only —
   never a per-question golden-set text, T13.1.7), `GET /admin/erasure` (open erasure
-  requests, rows remaining, last purger run) + `POST .../purge-now` / `.../retry`, `POST
+  requests, rows remaining, last purger run, `completed_at` once `done` — T13.8.3) + `POST
+  .../purge-now` / `.../retry`, `POST
   /admin/users/erase` (DEBT-002, last-admin guard, DEC-033/DEC-035), and `GET
-  /admin/alerts` (T13.5.2, below). Every mutating call is audited in `admin_actions`
+  /admin/alerts` (T13.5.2, below; `feature_ids` per alert — T13.8.3). Every mutating call is audited in `admin_actions`
   (migration 0008, [BACKEND_SCHEMA §5](BACKEND_SCHEMA.md#5-as-implemented-migrations-0001-0008)).
+- **Atomic-step metrics** (T13.8.1): `secrag_chat_step_seconds{stage,step}`, a SECOND
+  histogram alongside `secrag_chat_stage_seconds` (unchanged), labelled by the UI-facing
+  pipeline stage (`generation.StreamStage`'s own vocabulary: classifying/retrieving/
+  reranking/generating/checking/responding — a different, higher-level grouping than the
+  stage histogram's own `stage` label) and a FIXED, reviewed allow-list of steps within it
+  (`rag_app.metrics.STEP_ALLOWLIST`); `rag_app.metrics.observe_step` rejects (raises) any
+  pair outside it. `rag_app.timing.step()`/`record_step()` wire `retrieval.py`,
+  `reranking.py` and `generation.py` (both answer paths) into it; the non-streaming path has
+  no incremental token stream, so `llm_first_token` alone covers its one blocking LLM call
+  and `token_stream` is simply never emitted there.
 - **Live updates** (T13.4.1/T13.4.2) and **metrics backends** (T13.4.3, R6-4: why no
   managed Prometheus on Azure) are a dedicated ADR decision — see [ADR phase 13, "Live
   updates + metrics backends"](adr/adr_phase13_dashboard.md#live-updates--metrics-backends-13-c-t1341t1343-r6-4).

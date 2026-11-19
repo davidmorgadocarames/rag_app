@@ -9,6 +9,11 @@ Histograms carry only the ``stage`` label (a small, fixed vocabulary: classify, 
 hybrid_search, rerank_load, rerank_inference, generate, groundedness, total, ttft) — never
 a user id, IP, question text or answer text (see PHASE_PLANNING appendix "Prometheus in
 one page"). The in-flight gauge has no labels at all.
+
+T13.8.1 adds a SECOND histogram, ``secrag_chat_step_seconds``, labelled ``stage``+``step``
+with its OWN fixed, reviewed allow-list (``STEP_ALLOWLIST``) of atomic steps within the
+UI-facing pipeline stages (classifying/retrieving/reranking/generating/checking/
+responding) -- same no-PII discipline, enforced at write time by :func:`observe_step`.
 """
 
 from __future__ import annotations
@@ -142,13 +147,51 @@ ERASURE_FAILURES_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+# T13.8.1: the atomic steps WITHIN each UI-facing pipeline stage (``generation.StreamStage``'s
+# own vocabulary: classifying/retrieving/reranking/generating/checking/responding -- a
+# DIFFERENT, higher-level grouping than STAGE_SECONDS's own ``stage`` label, e.g. "retrieving"
+# covers "embed"+"hybrid_search"). A FIXED, reviewed allow-list, in PIPELINE order (the order
+# this tuple declares is also the order the admin latency panel lists steps in, T13.8.2) -- a
+# (stage, step) pair outside it is REJECTED (``observe_step`` raises), never silently emitted,
+# so this histogram can never grow a query-text/user-id/high-cardinality label by a future
+# careless call site. Every call site in retrieval.py/reranking.py/generation.py uses only a
+# literal pair from here, so the raise is a dev-time bug signal, never a real-traffic outcome.
+STEP_ALLOWLIST: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("classifying", ("classify_intent",)),
+    ("retrieving", ("embed_query", "vector_search", "bm25_search", "rrf_fusion", "load_chunks")),
+    ("reranking", ("wait_slot", "cross_encoder", "order_by_scores")),
+    ("generating", ("build_prompt", "llm_first_token", "token_stream", "parse_answer")),
+    ("checking", ("build_check_prompt", "llm_verdict", "parse_verdict")),
+    ("responding", ("stream_canned_reply",)),
+)
+
+_STEP_ALLOWLIST_LOOKUP: dict[str, frozenset[str]] = {
+    stage_name: frozenset(steps) for stage_name, steps in STEP_ALLOWLIST
+}
+
+
+class UnknownPipelineStepError(ValueError):
+    """Raised by :func:`observe_step` for a (stage, step) pair outside ``STEP_ALLOWLIST``."""
+
+
+STEP_SECONDS = Histogram(
+    "secrag_chat_step_seconds",
+    "Duration of one atomic step within a chat-pipeline stage (seconds), labelled by the"
+    " fixed stage/step vocabulary in STEP_ALLOWLIST (T13.8.1).",
+    ["stage", "step"],
+    registry=REGISTRY,
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120),
+)
+
 # T13.5.1: the reviewed, explicit allow-list of label NAMES any metric in this module may
 # ever declare -- every per-metric no-PII-label test above/below (and in
 # ``backend/tests/test_metrics.py``) only catches a label on a metric someone remembered to
 # write a test for; this allow-list + ``check_no_pii_labels`` instead catches metric N+1
 # automatically, the moment a new ``Counter``/``Gauge``/``Histogram`` module-level object
 # declares a label name that was never reviewed, without anyone having to add a new test.
-SAFE_METRIC_LABELS: frozenset[str] = frozenset({"stage", "result", "kind", "route_group", "reason"})
+SAFE_METRIC_LABELS: frozenset[str] = frozenset(
+    {"stage", "step", "result", "kind", "route_group", "reason"}
+)
 
 
 def check_no_pii_labels(namespace: dict[str, object] | None = None) -> list[str]:
@@ -183,6 +226,19 @@ _server_port: int | None = None
 def observe_stage(stage: str, elapsed_s: float) -> None:
     """Record one stage duration (``rag_app.timing``'s ``on_stage`` callback)."""
     STAGE_SECONDS.labels(stage=stage).observe(elapsed_s)
+
+
+def observe_step(stage: str, step: str, elapsed_s: float) -> None:
+    """Record one atomic-step duration (``rag_app.timing``'s ``on_step`` callback, T13.8.1).
+
+    Raises :class:`UnknownPipelineStepError` for any ``(stage, step)`` pair outside
+    ``STEP_ALLOWLIST`` -- rejected, never emitted (see that constant's docstring)."""
+    allowed = _STEP_ALLOWLIST_LOOKUP.get(stage)
+    if allowed is None or step not in allowed:
+        raise UnknownPipelineStepError(
+            f"({stage!r}, {step!r}) is not in metrics.STEP_ALLOWLIST -- refusing to emit it"
+        )
+    STEP_SECONDS.labels(stage=stage, step=step).observe(elapsed_s)
 
 
 @contextmanager
@@ -263,6 +319,45 @@ def stage_latency_summary(
             "avg_seconds": (total / count) if count > 0 else None,
             "p50_seconds": _quantile_from_buckets(stage_buckets, count, 0.5),
             "p95_seconds": _quantile_from_buckets(stage_buckets, count, 0.95),
+        }
+    return out
+
+
+def step_latency_summary(
+    registry: CollectorRegistry = REGISTRY, histogram_name: str = "secrag_chat_step_seconds"
+) -> dict[tuple[str, str], dict[str, float | None]]:
+    """T13.8.2 (pipeline waterfall panel): the :func:`stage_latency_summary` computation,
+    keyed by ``(stage, step)`` instead of a single ``stage`` label -- same bucket/count/sum
+    read, same one-process-only caveat, same test-injected-registry convention."""
+    buckets: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    sums: dict[tuple[str, str], float] = {}
+    counts: dict[tuple[str, str], float] = {}
+    for metric in registry.collect():
+        if metric.name != histogram_name:
+            continue
+        for sample in metric.samples:
+            stage = sample.labels.get("stage")
+            step = sample.labels.get("step")
+            if stage is None or step is None:
+                continue
+            key = (stage, step)
+            if sample.name.endswith("_bucket"):
+                le = float(sample.labels["le"])
+                buckets.setdefault(key, []).append((le, sample.value))
+            elif sample.name.endswith("_sum"):
+                sums[key] = sample.value
+            elif sample.name.endswith("_count"):
+                counts[key] = sample.value
+    out: dict[tuple[str, str], dict[str, float | None]] = {}
+    for key, key_buckets in buckets.items():
+        key_buckets.sort(key=lambda item: item[0])
+        count = counts.get(key, 0.0)
+        total = sums.get(key, 0.0)
+        out[key] = {
+            "count": count,
+            "avg_seconds": (total / count) if count > 0 else None,
+            "p50_seconds": _quantile_from_buckets(key_buckets, count, 0.5),
+            "p95_seconds": _quantile_from_buckets(key_buckets, count, 0.95),
         }
     return out
 

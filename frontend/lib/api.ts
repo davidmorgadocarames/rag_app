@@ -255,8 +255,29 @@ export interface StageLatencyOut {
   p95_seconds: number | null;
 }
 
+// T13.8.2: one atomic step's latency, nested under its UI pipeline stage below -- a
+// DIFFERENT, higher-level "stage" grouping than StageLatencyOut's own (e.g. "retrieving"
+// covers both the old "embed" and "hybrid_search" stage names).
+export interface StepLatencyOut {
+  stage: string;
+  step: string;
+  count: number;
+  avg_seconds: number | null;
+  p50_seconds: number | null;
+  p95_seconds: number | null;
+}
+
+export interface PipelineStageLatencyOut {
+  stage: string;
+  steps: StepLatencyOut[];
+}
+
 export interface AdminLatencyResponse {
   stages: StageLatencyOut[];
+  // Additive (13-G1 backend): the atomic-step waterfall behind the Pipeline view's
+  // expandable rows (13-G2/13-G3 frontend, this replica only). Optional so a response
+  // observed before this field existed still type-checks.
+  pipeline?: PipelineStageLatencyOut[];
 }
 
 export interface EvalMetricOut {
@@ -284,6 +305,8 @@ export interface ErasureRequestOut {
   attempts: number;
   last_error_class: string | null;
   overdue: boolean;
+  // T13.8.3(b): set once status is "done" (null while open).
+  completed_at?: string | null;
 }
 
 export interface LastPurgerRunOut {
@@ -307,6 +330,9 @@ export interface AdminAlertOut {
   code: string;
   severity: AdminAlertSeverity;
   message: string;
+  // T13.8.3(a): registry feature id(s) this alert relates to -- lets the drawer for a
+  // feature list its related alerts without a second lookup table.
+  feature_ids?: string[];
 }
 
 export interface AdminAlertsResponse {

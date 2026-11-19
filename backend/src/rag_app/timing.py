@@ -13,6 +13,13 @@ stage names (a small, fixed vocabulary) and durations.
 An optional ``on_stage`` callback (wired to ``rag_app.metrics.observe_stage`` by the
 caller, T11.3.2) is invoked for every stage duration AND for ``"total"``/``"ttft"`` at
 ``emit()`` time, so the Prometheus histograms get exactly the same numbers as the log.
+
+T13.8.1 adds a SECOND, independent callback: ``on_step`` (wired to
+``rag_app.metrics.observe_step``), fed by :func:`step`/:func:`record_step` -- atomic steps
+WITHIN a stage (e.g. ``retrieving``/``embed_query``). Unlike ``add()``/``on_stage``, step
+durations are forwarded straight to ``on_step`` and never added to ``durations_s``, so they
+never appear in the per-answer JSON log line -- that line keeps EXACTLY the stage vocabulary
+it already had (see ``test_no_pii_in_the_timing_record``'s allow-list).
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("rag_app.timing")
 
 OnStage = Callable[[str, float], None]
+OnStep = Callable[[str, str, float], None]
 
 _log_installed = False
 
@@ -63,6 +71,7 @@ class TimingRecorder:
 
     streaming: bool
     on_stage: OnStage | None = None
+    on_step: OnStep | None = None
     durations_s: dict[str, float] = field(default_factory=dict)
     ttft_s: float | None = None
     _start: float = field(default_factory=time.perf_counter)
@@ -71,6 +80,12 @@ class TimingRecorder:
         self.durations_s[stage] = self.durations_s.get(stage, 0.0) + elapsed_s
         if self.on_stage is not None:
             self.on_stage(stage, elapsed_s)
+
+    def add_step(self, stage: str, step: str, elapsed_s: float) -> None:
+        """Record one atomic step duration (T13.8.1) -- forwarded to ``on_step`` only, never
+        into ``durations_s``/the JSON log (see the module docstring)."""
+        if self.on_step is not None:
+            self.on_step(stage, step, elapsed_s)
 
     def mark_first_token(self) -> None:
         """Record time-to-first-token once (a later call is a no-op)."""
@@ -100,10 +115,12 @@ _current: contextvars.ContextVar[TimingRecorder | None] = contextvars.ContextVar
 
 
 @contextmanager
-def recorder(*, streaming: bool, on_stage: OnStage | None = None) -> Iterator[TimingRecorder]:
+def recorder(
+    *, streaming: bool, on_stage: OnStage | None = None, on_step: OnStep | None = None
+) -> Iterator[TimingRecorder]:
     """Open one timing recorder for the current answer and emit it on exit (always —
     partial data from a failed/interrupted answer is still useful and still carries no PII)."""
-    rec = TimingRecorder(streaming=streaming, on_stage=on_stage)
+    rec = TimingRecorder(streaming=streaming, on_stage=on_stage, on_step=on_step)
     token = _current.set(rec)
     try:
         yield rec
@@ -131,6 +148,30 @@ def record(name: str, elapsed_s: float) -> None:
     rec = _current.get()
     if rec is not None:
         rec.add(name, elapsed_s)
+
+
+@contextmanager
+def step(stage_name: str, step_name: str) -> Iterator[None]:
+    """Time one ATOMIC STEP within ``stage_name`` (T13.8.1); a no-op outside an active
+    recorder, exactly like :func:`stage`. Always safe to nest inside a :func:`stage` block
+    (or several, like ``reranking``'s wait_slot/cross_encoder)."""
+    rec = _current.get()
+    if rec is None:
+        yield
+        return
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        rec.add_step(stage_name, step_name, time.perf_counter() - start)
+
+
+def record_step(stage_name: str, step_name: str, elapsed_s: float) -> None:
+    """Record one atomic-step duration measured by the caller (e.g. an incremental stream's
+    own first-delta/rest-of-stream split, T13.8.1) -- the :func:`record` analogue for steps."""
+    rec = _current.get()
+    if rec is not None:
+        rec.add_step(stage_name, step_name, elapsed_s)
 
 
 def mark_first_token() -> None:

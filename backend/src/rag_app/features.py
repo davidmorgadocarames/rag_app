@@ -574,6 +574,10 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         status="enabled",
         health_probe=module_probe("rag_app.eval.latency", "run_latency_benchmark"),
         quality_probes=("latency-p95",),
+        # T13.8.2: the admin latency panel's atomic-step waterfall (`/admin/latency`'s
+        # `pipeline` field) -- closes this entry's DoD rule for real (removed from
+        # `_DOD_GRANDFATHERED_IDS` in the same change).
+        metrics=("secrag_chat_step_seconds",),
         docs="docs/adr/adr_phase11_stability.md",
     ),
     FeatureEntry(
@@ -835,7 +839,6 @@ _DOD_GRANDFATHERED_IDS: frozenset[str] = frozenset(
         "rag-agentic-router",
         "quality-eval-vs-baseline",
         "quality-judge-kappa",
-        "quality-per-stage-latency",
         "quality-misspelling-probe",
         "identity-registration-verification",
         "identity-login-sessions",

@@ -194,6 +194,34 @@ def test_admin_latency_reports_per_stage_percentiles(api_env: Engine) -> None:
     assert stages["embed"]["p95_seconds"] is not None
 
 
+def test_admin_latency_pipeline_lists_every_allowlisted_step_in_order(api_env: Engine) -> None:
+    """T13.8.2: ``pipeline`` has one entry per ``STEP_ALLOWLIST`` stage, in order, each with
+    every one of its allow-listed steps (observed or not -- the waterfall's rows never
+    shuffle); a step actually observed in this process shows a real count/avg/p50/p95."""
+    from rag_app import metrics as real_metrics
+
+    real_metrics.observe_step("retrieving", "embed_query", 0.03)
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/latency", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [stage["stage"] for stage in body["pipeline"]] == [
+        name for name, _steps in real_metrics.STEP_ALLOWLIST
+    ]
+    retrieving = next(s for s in body["pipeline"] if s["stage"] == "retrieving")
+    steps_by_name = {s["step"]: s for s in retrieving["steps"]}
+    assert list(steps_by_name) == list(
+        next(steps for name, steps in real_metrics.STEP_ALLOWLIST if name == "retrieving")
+    )
+    assert steps_by_name["embed_query"]["count"] >= 1
+    assert steps_by_name["embed_query"]["avg_seconds"] is not None
+    # An allow-listed step never observed yet still appears, with a zero/None placeholder.
+    never_observed = steps_by_name["load_chunks"]
+    if never_observed["count"] == 0:
+        assert never_observed["avg_seconds"] is None
+
+
 def test_admin_eval_reports_aggregate_metrics_only(api_env: Engine) -> None:
     client = _client()
     headers = _admin_headers(api_env, stepped_up=True)
@@ -227,6 +255,38 @@ def test_admin_erasure_lists_an_open_request_with_rows_remaining(api_env: Engine
     assert mine[0]["id"]  # opaque id present
     assert mine[0]["attempts"] == 0
     assert mine[0]["overdue"] is False
+    assert mine[0]["completed_at"] is None  # T13.8.3(b): never set while still open
+
+
+def test_admin_erasure_exposes_completed_at_for_done_rows(api_env: Engine) -> None:
+    """T13.8.3(b): once a request is ``done``, its completion timestamp is exposed too --
+    the column already existed (written by the purger), no migration needed."""
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    user_id = _make_live_user(api_env, f"erase-done-{uuid.uuid4().hex[:8]}@example.test")
+    with Session(api_env) as session:
+        from rag_app.erasure import request_erasure
+
+        assert request_erasure(session, user_id) is True
+        request_id = session.execute(
+            text("SELECT id FROM deletion_requests WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+
+    with api_env.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE deletion_requests SET status = 'done', completed_at = now()"
+                " WHERE id = :i"
+            ),
+            {"i": request_id},
+        )
+
+    response = client.get("/admin/erasure", headers=headers)
+    assert response.status_code == 200, response.text
+    rows = {r["id"]: r for r in response.json()["requests"]}
+    row = rows[str(request_id)]
+    assert row["status"] == "done"
+    assert row["completed_at"] is not None
 
 
 def test_admin_features_carries_the_alerts_from_a_single_probe_sweep(
@@ -325,6 +385,8 @@ def test_admin_alerts_fires_red_past_the_24h_erasure_deadline(api_env: Engine) -
     response = client.get("/admin/alerts", headers=headers)
     alerts = {a["code"]: a for a in response.json()["alerts"]}
     assert alerts["erasure_overdue"]["severity"] == "red"
+    # T13.8.3(a): the drawer for the erasure feature needs to find this alert.
+    assert alerts["erasure_overdue"]["feature_ids"] == ["privacy-asynchronous-erasure"]
 
 
 def test_admin_alerts_fires_amber_past_the_20h_erasure_warning(api_env: Engine) -> None:
@@ -339,6 +401,7 @@ def test_admin_alerts_fires_amber_past_the_20h_erasure_warning(api_env: Engine) 
     response = client.get("/admin/alerts", headers=headers)
     alerts = {a["code"]: a for a in response.json()["alerts"]}
     assert alerts["erasure_approaching"]["severity"] == "amber"
+    assert alerts["erasure_approaching"]["feature_ids"] == ["privacy-asynchronous-erasure"]
     assert "erasure_overdue" not in alerts
 
 
@@ -358,6 +421,7 @@ def test_admin_alerts_fires_red_when_the_daily_answer_cap_is_reached(
     alerts = {a["code"]: a for a in response.json()["alerts"]}
     assert alerts["daily_cap_reached"]["severity"] == "red"
     assert "2/2" in alerts["daily_cap_reached"]["message"]
+    assert alerts["daily_cap_reached"]["feature_ids"] == ["rag-generation-groundedness"]
 
 
 def test_admin_alerts_stays_empty_below_the_daily_answer_cap(
@@ -407,6 +471,7 @@ def test_banner_alerts_lockout_spike_threshold(api_env: Engine) -> None:
         )
     assert not any(a.code == "lockout_spike" for a in below)
     assert any(a.code == "lockout_spike" and a.severity == "amber" for a in at)
+    assert any(a.code == "lockout_spike" and a.feature_ids == ["identity-lockout"] for a in at)
 
 
 def test_banner_alerts_email_failures_any_nonzero(api_env: Engine) -> None:
@@ -427,6 +492,10 @@ def test_banner_alerts_email_failures_any_nonzero(api_env: Engine) -> None:
         failing = _banner_alerts(session, _FakeMetricsBackend(3.0), [])
     assert not any(a.code == "email_failures" for a in clean)
     assert any(a.code == "email_failures" and a.severity == "amber" for a in failing)
+    assert any(
+        a.code == "email_failures" and a.feature_ids == ["identity-email-verification-reset"]
+        for a in failing
+    )
 
 
 def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: Engine) -> None:
@@ -462,8 +531,17 @@ def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: E
             [_feature("lab", dev_only=True), _feature("azure-thing", azure_only=True)],
         )
         real = _banner_alerts(session, _NoMetrics(), [_feature("stack-postgres")])
+        multiple = _banner_alerts(
+            session, _NoMetrics(), [_feature("stack-postgres"), _feature("stack-migrations")]
+        )
     assert not any(a.code == "probe_failures" for a in excused)
     assert any(a.code == "probe_failures" and a.severity == "red" for a in real)
+    # T13.8.3(a): probe_failures lists the ACTUAL failing feature ids, never a static guess.
+    assert next(a for a in real if a.code == "probe_failures").feature_ids == ["stack-postgres"]
+    assert set(next(a for a in multiple if a.code == "probe_failures").feature_ids) == {
+        "stack-postgres",
+        "stack-migrations",
+    }
 
 
 # --- POST /admin/erasure/{id}/purge-now and /retry (matrix=False, explicit 403s) -----------

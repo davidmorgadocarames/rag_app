@@ -241,14 +241,27 @@ class CrossEncoderReranker:
         under load, exactly what a real ``/chat`` request experiences; the in-flight
         chat-requests gauge (TF4) is unaffected, since a queued request is still genuinely
         in flight for the whole wait.
+
+        T13.8.1: the SAME wait+predict span is now also split into two atomic steps
+        (``secrag_chat_step_seconds``, pipeline stage "reranking") -- ``wait_slot`` (the
+        semaphore wait above) and ``cross_encoder`` (the actual ``predict()`` call) -- a
+        SEPARATE channel from the unchanged ``rerank_inference`` stage total below.
         """
         if not candidates:
             return []
         model = self._ensure_model()
         pairs = [(query, candidate.text) for candidate in candidates]
-        with timing.stage("rerank_inference"), _get_predict_semaphore():
-            scores = model.predict(pairs)
-        return order_by_scores(candidates, [float(score) for score in scores], top_n)
+        semaphore = _get_predict_semaphore()
+        with timing.stage("rerank_inference"):
+            with timing.step("reranking", "wait_slot"):
+                semaphore.acquire()
+            try:
+                with timing.step("reranking", "cross_encoder"):
+                    scores = model.predict(pairs)
+            finally:
+                semaphore.release()
+        with timing.step("reranking", "order_by_scores"):
+            return order_by_scores(candidates, [float(score) for score in scores], top_n)
 
     def warm_up(self) -> None:
         """Load the model and run one dummy ``predict`` (T11.4.1), so no real request ever

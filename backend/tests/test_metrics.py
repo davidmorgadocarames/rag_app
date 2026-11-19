@@ -4,6 +4,8 @@ in-flight gauge, no PII.
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 
@@ -200,3 +202,120 @@ def test_stage_latency_summary_computes_p50_p95_count_avg_per_stage() -> None:
 def test_stage_latency_summary_is_empty_with_no_observations() -> None:
     registry, _histogram = _fresh_stage_histogram()
     assert metrics.stage_latency_summary(registry, "secrag_chat_stage_seconds") == {}
+
+
+# --- T13.8.1: secrag_chat_step_seconds (stage, step), a FIXED reviewed allow-list ----------
+
+
+def test_step_histogram_has_exactly_the_stage_and_step_labels() -> None:
+    assert metrics.STEP_SECONDS._labelnames == ("stage", "step")
+
+
+def test_step_allowlist_matches_the_approved_pipeline() -> None:
+    """Pins the exact (stage, step) vocabulary agreed in the 13-G mockup/HANDOFF -- any
+    future change to it is a deliberate, reviewed edit of this test too."""
+    assert metrics.STEP_ALLOWLIST == (
+        ("classifying", ("classify_intent",)),
+        (
+            "retrieving",
+            ("embed_query", "vector_search", "bm25_search", "rrf_fusion", "load_chunks"),
+        ),
+        ("reranking", ("wait_slot", "cross_encoder", "order_by_scores")),
+        ("generating", ("build_prompt", "llm_first_token", "token_stream", "parse_answer")),
+        ("checking", ("build_check_prompt", "llm_verdict", "parse_verdict")),
+        ("responding", ("stream_canned_reply",)),
+    )
+
+
+def test_observe_step_records_an_allowed_pair() -> None:
+    port = metrics.start_metrics_server(0, addr="127.0.0.1")
+    metrics.observe_step("retrieving", "embed_query", 0.042)
+    body = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=5).text
+    expected = 'secrag_chat_step_seconds_bucket{le="0.05",stage="retrieving",step="embed_query"}'
+    assert expected in body
+    assert "@" not in body
+    assert "question" not in body.lower()
+
+
+def test_observe_step_rejects_a_pair_outside_the_allowlist() -> None:
+    """Done-when (T13.8.1): an unlisted (stage, step) is REJECTED -- it never reaches the
+    histogram at all (``STEP_SECONDS`` label values stay exactly the reviewed set)."""
+    with pytest.raises(metrics.UnknownPipelineStepError):
+        metrics.observe_step("retrieving", "not_a_real_step", 0.01)
+    with pytest.raises(metrics.UnknownPipelineStepError):
+        metrics.observe_step("not_a_real_stage", "embed_query", 0.01)
+    with pytest.raises(metrics.UnknownPipelineStepError):
+        # A step that exists, but under a DIFFERENT stage, is still rejected.
+        metrics.observe_step("checking", "embed_query", 0.01)
+
+
+def _fresh_step_histogram() -> tuple[object, object]:
+    from prometheus_client import CollectorRegistry, Histogram
+
+    registry = CollectorRegistry()
+    histogram = Histogram(
+        "secrag_chat_step_seconds",
+        "test",
+        ["stage", "step"],
+        registry=registry,
+        buckets=metrics.STEP_SECONDS._upper_bounds[:-1],
+    )
+    return registry, histogram
+
+
+def test_step_latency_summary_computes_p50_p95_count_avg_per_pair() -> None:
+    registry, histogram = _fresh_step_histogram()
+    for value in (0.01, 0.02, 0.03):
+        histogram.labels(stage="retrieving", step="embed_query").observe(value)
+    histogram.labels(stage="retrieving", step="vector_search").observe(0.5)
+
+    summary = metrics.step_latency_summary(registry, "secrag_chat_step_seconds")
+
+    key = ("retrieving", "embed_query")
+    assert summary[key]["count"] == 3.0
+    assert summary[key]["avg_seconds"] == pytest.approx((0.01 + 0.02 + 0.03) / 3)
+    assert summary[key]["p50_seconds"] is not None
+    assert summary[("retrieving", "vector_search")]["count"] == 1.0
+
+
+def test_step_latency_summary_is_empty_with_no_observations() -> None:
+    registry, _histogram = _fresh_step_histogram()
+    assert metrics.step_latency_summary(registry, "secrag_chat_step_seconds") == {}
+
+
+def test_step_sums_approximately_match_stage_time_on_a_fake_pipeline_run() -> None:
+    """T13.8.2 done-when: run a fake pipeline through ``rag_app.timing`` with BOTH callbacks
+    wired to throwaway registries, and check that the sum of a stage's own step durations is
+    close to (never exceeds, barely under) the stage's own total -- the atomic steps really
+    do partition the stage's time, they do not double-count or drop most of it."""
+    from rag_app import timing
+
+    stage_registry, stage_histogram = _fresh_stage_histogram()
+    step_registry, step_histogram = _fresh_step_histogram()
+
+    def on_stage(name: str, elapsed_s: float) -> None:
+        stage_histogram.labels(stage=name).observe(elapsed_s)
+
+    def on_step(stage_name: str, step_name: str, elapsed_s: float) -> None:
+        step_histogram.labels(stage=stage_name, step=step_name).observe(elapsed_s)
+
+    with timing.recorder(streaming=True, on_stage=on_stage, on_step=on_step):
+        with timing.stage("hybrid_search"):
+            with timing.step("retrieving", "vector_search"):
+                time.sleep(0.01)
+            with timing.step("retrieving", "bm25_search"):
+                time.sleep(0.01)
+            with timing.step("retrieving", "rrf_fusion"):
+                time.sleep(0.005)
+
+    stage_summary = metrics.stage_latency_summary(stage_registry, "secrag_chat_stage_seconds")
+    step_summary = metrics.step_latency_summary(step_registry, "secrag_chat_step_seconds")
+
+    stage_total = stage_summary["hybrid_search"]["avg_seconds"]
+    step_sum = sum(
+        step_summary[("retrieving", step)]["avg_seconds"]
+        for step in ("vector_search", "bm25_search", "rrf_fusion")
+    )
+    assert stage_total is not None
+    assert step_sum <= stage_total + 0.02  # a little scheduling slack, never a huge gap
+    assert step_sum >= stage_total - 0.02

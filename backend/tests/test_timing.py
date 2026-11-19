@@ -111,6 +111,55 @@ def test_no_pii_in_the_timing_record(caplog: pytest.LogCaptureFixture) -> None:
     assert set(payload) <= allowed_keys
 
 
+def test_step_is_a_no_op_without_an_active_recorder() -> None:
+    """T13.8.1: mirrors ``test_stage_is_a_no_op_without_an_active_recorder`` for steps."""
+    ran = False
+    with timing.step("retrieving", "embed_query"):
+        ran = True
+    assert ran
+    timing.record_step("retrieving", "embed_query", 0.1)  # must not raise
+
+
+def test_step_is_a_no_op_with_a_recorder_but_no_on_step_callback() -> None:
+    """A recorder opened with only ``on_stage`` (every pre-13-G1 caller) never crashes on a
+    ``step()``/``record_step()`` call -- it is simply never forwarded anywhere."""
+    with timing.recorder(streaming=False, on_stage=lambda *_a: None):
+        with timing.step("retrieving", "embed_query"):
+            pass
+        timing.record_step("retrieving", "embed_query", 0.1)
+
+
+def test_on_step_callback_sees_stage_step_and_elapsed_seconds() -> None:
+    seen: list[tuple[str, str, float]] = []
+
+    def on_step(stage_name: str, step_name: str, secs: float) -> None:
+        seen.append((stage_name, step_name, secs))
+
+    with timing.recorder(streaming=False, on_step=on_step):
+        with timing.step("retrieving", "embed_query"):
+            pass
+        timing.record_step("retrieving", "vector_search", 0.05)
+    assert seen[0][:2] == ("retrieving", "embed_query")
+    assert seen[1] == ("retrieving", "vector_search", 0.05)
+
+
+def test_step_durations_never_reach_durations_s_or_the_json_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T13.8.1: steps are a SEPARATE channel from stages -- they must never pollute
+    ``durations_s`` (and therefore never appear in the per-answer JSON log), even with an
+    ``on_step`` callback wired up."""
+    caplog.set_level(logging.INFO, logger="rag_app.timing")
+    with timing.recorder(streaming=False, on_step=lambda *_a: None) as rec:
+        with timing.step("retrieving", "embed_query"):
+            pass
+        timing.record_step("retrieving", "vector_search", 0.05)
+    assert rec.durations_s == {}
+    payload = json.loads(next(r for r in caplog.records if r.name == "rag_app.timing").getMessage())
+    assert "embed_query" not in json.dumps(payload)
+    assert "vector_search" not in json.dumps(payload)
+
+
 def test_install_timing_log_is_idempotent_and_sets_info_level() -> None:
     timing.install_timing_log()
     handlers_after_first = list(timing.logger.handlers)

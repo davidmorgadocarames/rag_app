@@ -111,6 +111,37 @@ def test_enroll_returns_a_secret_and_a_provisioning_uri(api_env: Engine) -> None
     assert body["provisioning_uri"].startswith("otpauth://totp/")
 
 
+def test_auth_me_returns_the_accounts_own_mfa_enabled_flag(api_env: Engine) -> None:
+    """DA-13-F2-1: a direct, targeted unit test for ``/auth/me``'s own ``mfa_enabled`` --
+    ``false`` for a brand-new account, ``true`` after enrol+confirm, through the REAL route
+    (never a direct ``UserMfa`` read) -- and never another account's value, proven through a
+    second, fully independent client/session (no shared cookie jar)."""
+    client = _client()
+    register = _register_and_login(client)
+
+    before = client.get("/auth/me")
+    assert before.status_code == 200
+    assert before.json()["mfa_enabled"] is False
+
+    enroll = client.post("/account/mfa/enroll", headers=_csrf_header(register))
+    secret = enroll.json()["secret"]
+    code = pyotp.TOTP(secret).now()
+    confirm = client.post(
+        "/account/mfa/confirm", json={"code": code}, headers=_csrf_header(register)
+    )
+    assert confirm.status_code == 200
+
+    after = client.get("/auth/me")
+    assert after.status_code == 200
+    assert after.json()["mfa_enabled"] is True
+
+    other_client = _client()
+    _register_and_login(other_client)
+    other_me = other_client.get("/auth/me")
+    assert other_me.status_code == 200
+    assert other_me.json()["mfa_enabled"] is False  # never the first account's own true
+
+
 def test_confirm_with_a_wrong_code_fails_and_mfa_stays_disabled(api_env: Engine) -> None:
     client = _client()
     register = _register_and_login(client)

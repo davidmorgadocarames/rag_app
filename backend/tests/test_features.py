@@ -275,7 +275,7 @@ def test_check_dod_compliance_has_no_problems_against_the_real_registry() -> Non
 # could quietly add a new, non-compliant entry's id to it and every DoD test above would stay
 # green. Closing a grandfathered entry -> remove its id AND lower this number in the same
 # change; raising it is never allowed (a new entry must follow the DoD rule instead).
-DOD_GRANDFATHERED_COUNT = 29
+DOD_GRANDFATHERED_COUNT = 28  # T13.8.2 closed "quality-per-stage-latency" for real
 
 
 def test_the_dod_grandfather_list_is_frozen_and_only_lists_real_entries() -> None:
