@@ -72,13 +72,34 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
   await page.getByTestId("triage-row-admin-api").click();
   await expect(page.getByTestId("admin-feature-drawer")).toBeVisible();
   await expect(page.getByTestId("admin-feature-drawer-id")).toHaveText("admin-api");
+  // T13.8.8/DA-13-G2-3: the drawer also shows the registry's own lifecycle status (a
+  // DIFFERENT field from the probe status badge above it) -- admin-api is "enabled".
+  await expect(page.getByTestId("admin-feature-drawer-lifecycle-status")).toContainText(
+    "enabled",
+  );
 
-  // The other sections' existing panels still render inside the new shell (13-G3 redesigns
-  // them; unchanged for now).
+  // T13.8.7: the redesigned Pipeline section (waterfall from the `pipeline` field, 13-G3).
+  // Whether THIS backend process has already answered a real chat turn by the time this test
+  // runs depends on test-file scheduling (shared in-process histograms, T13.5.2-style
+  // caveat) -- assert the one thing that is always true either way: exactly one of the empty
+  // state or the "Expand all" control renders, never neither.
   await page.getByTestId("admin-nav-pipeline").click();
   await expect(page.getByTestId("admin-latency-panel")).toBeVisible();
+  await expect(
+    page.getByTestId("pipeline-empty-state").or(page.getByTestId("pipeline-expand-all")),
+  ).toBeVisible();
+
+  // T13.8.8: the redesigned Quality section -- same reasoning: whichever state it is in
+  // (nothing run yet on this checkout vs. a real `eval` gate run earlier in this `--full`),
+  // exactly one of the empty state or the metrics table renders.
   await page.getByTestId("admin-nav-quality").click();
   await expect(page.getByTestId("admin-quality-panel")).toBeVisible();
+  await expect(
+    page
+      .getByTestId("quality-empty-state")
+      .or(page.getByTestId("quality-metric-retrieval_recall")),
+  ).toBeVisible();
+
   await page.getByTestId("admin-nav-erasure").click();
   await expect(page.getByTestId("admin-erasure-panel")).toBeVisible();
 });
@@ -100,8 +121,11 @@ test("the admin can erase another account's data through the erasure panel", asy
   await expect(form.getByText(/request /)).toBeVisible();
   await expect(page.getByText(ERASE_TARGET_EMAIL as string)).toHaveCount(0);
 
-  // The erasure panel's table now lists at least one open request.
-  await expect(page.getByTestId("admin-erasure-panel").locator("tbody tr").first()).toBeVisible();
+  // The erasure panel's table now lists at least one open request, with its status shown as
+  // a real icon+text StatusBadge (T13.8.8), not plain text.
+  const firstRow = page.getByTestId("admin-erasure-panel").locator("tbody tr").first();
+  await expect(firstRow).toBeVisible();
+  await expect(firstRow.getByText(/Pending|Running/)).toBeVisible();
 });
 
 // T13.7.5/DEBT-051: the real step-up-only e2e path the backend fix (13-F1) was missing --
