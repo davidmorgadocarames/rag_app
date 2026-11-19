@@ -230,6 +230,8 @@ export interface FeatureHealthOut {
   metrics: Record<string, number | null>;
   dev_only: boolean;
   azure_only: boolean;
+  // T13.8.6 (13-G2): the registry's own docs/ADR reference, for the feature drawer's docs link.
+  docs: string;
 }
 
 // TF14: the server-side decision the dashboard reads to pick SSE vs. polling -- never a

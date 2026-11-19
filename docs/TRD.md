@@ -406,6 +406,9 @@ catalogue analysis; this is the implementation summary.
   /admin/users/erase` (DEBT-002, last-admin guard, DEC-033/DEC-035), and `GET
   /admin/alerts` (T13.5.2, below; `feature_ids` per alert — T13.8.3). Every mutating call is audited in `admin_actions`
   (migration 0008, [BACKEND_SCHEMA §5](BACKEND_SCHEMA.md#5-as-implemented-migrations-0001-0008)).
+  `FeatureHealthOut.docs` (T13.8.6, 13-G2) passes the registry's own `docs` reference straight
+  through, so the dashboard's feature drawer shows a docs/ADR pointer without a second,
+  possibly-drifting lookup table.
 - **Atomic-step metrics** (T13.8.1): `secrag_chat_step_seconds{stage,step}`, a SECOND
   histogram alongside `secrag_chat_stage_seconds` (unchanged), labelled by the UI-facing
   pipeline stage (`generation.StreamStage`'s own vocabulary: classifying/retrieving/

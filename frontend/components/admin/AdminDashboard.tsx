@@ -1,10 +1,19 @@
 "use client";
 
-// T13.2.1-T13.2.8: the admin dashboard's CSR half. The SSR shell (app/admin/page.tsx)
-// already proved role+MFA server-side and did the first `/admin/features` load (T13.2.1);
-// everything from here on is client-rendered and kept live either by SSE (T13.4.1, local)
-// or low-frequency polling + a manual refresh (T13.4.2, Azure) -- the MODE itself comes
-// from the backend's own `live_mode` field (TF14), never a frontend build-time variable.
+// T13.2.1-T13.2.8/T13.8.4-T13.8.6: the admin dashboard's CSR half. The SSR shell
+// (app/admin/page.tsx) already proved role+MFA server-side and did the first
+// `/admin/features` load (T13.2.1); everything from here on is client-rendered and kept
+// live either by SSE (T13.4.1, local) or low-frequency polling + a manual refresh (T13.4.2,
+// Azure) -- the MODE itself comes from the backend's own `live_mode` field (TF14), never a
+// frontend build-time variable.
+//
+// 13-G2 redesign: a header + alert banner + up to four KPI tiles + a left-hand section menu
+// (Triage/Pipeline/Quality/Erasure/Defence lab) replace the old always-on card stack. Triage
+// (T13.8.5/T13.8.6) is the only section redesigned this block; Pipeline/Quality/Erasure/
+// Defence lab render their EXISTING panels unchanged inside the new shell (13-G3 redesigns
+// those). Deliberately no "MFA verified" badge here (reviewed, approved mockup change): every
+// `/admin/*` request already re-proves the step-up server-side, so a client-side badge would
+// just echo a point-in-time fact the UI cannot itself keep guaranteeing mid-session.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -20,13 +29,22 @@ import {
   type AdminLatencyResponse,
   type FeatureHealthOut,
 } from "@/lib/api";
+import {
+  alertSeverityCounts,
+  chatLatencySummary,
+  erasureQueueSummary,
+  featuresHealthySummary,
+} from "@/lib/adminKpi";
 import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "@/lib/adminStream";
+import { alertJumpFeatureId, sortFeaturesWorstFirst, type TriageFilterKey } from "@/lib/adminTriage";
 
 import DefenceLabPanel from "./DefenceLabPanel";
 import ErasurePanel from "./ErasurePanel";
+import FeatureDrawer from "./FeatureDrawer";
 import LatencyPanel from "./LatencyPanel";
 import QualityPanel from "./QualityPanel";
-import SecurityPanel from "./SecurityPanel";
+import StatusBadge from "./StatusBadge";
+import TriagePanel from "./TriagePanel";
 
 // Azure (T13.4.2): low frequency + a manual "Refresh now" button, never a tight loop --
 // Container Apps scale-to-zero + internal ingress make this the server-side-decided mode.
@@ -36,101 +54,132 @@ interface AdminDashboardProps {
   initial: AdminFeaturesResponse;
 }
 
-const STATUS_COLOR: Record<string, string> = {
-  enabled: "text-vault-steel-light",
-  disabled: "text-vault-steel-dark",
-  "retained-not-adopted": "text-vault-steel-dark",
-  "expected-fail": "text-vault-amber",
-};
+type Section = "triage" | "pipeline" | "quality" | "erasure" | "lab";
 
-function OverviewPanel({ features, liveMode }: { features: FeatureHealthOut[]; liveMode: string }) {
-  const byStatus = features.reduce<Record<string, number>>((acc, f) => {
-    acc[f.status] = (acc[f.status] ?? 0) + 1;
-    return acc;
-  }, {});
-  const unhealthy = features.filter(
-    (f) => f.probe_status !== null && f.probe_status !== "ok",
-  ).length;
+const SECTION_DEFS: { key: Section; label: string }[] = [
+  { key: "triage", label: "Triage" },
+  { key: "pipeline", label: "Pipeline" },
+  { key: "quality", label: "Quality" },
+  { key: "erasure", label: "Erasure" },
+  { key: "lab", label: "Defence lab" },
+];
 
-  return (
-    <section
-      data-testid="admin-overview-panel"
-      className="flex flex-col gap-2 border border-vault-steel-dark p-4"
-    >
-      <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">OVERVIEW</h2>
-      <p className="text-xs text-vault-steel">
-        {features.length} registry entries -- {unhealthy} probe(s) not ok -- live updates:{" "}
-        <span className="text-vault-amber">{liveMode}</span>
-      </p>
-      {/* T13.4.3/R6-4 (DA-13-C-2): no managed Prometheus on Azure -- every metric value on
-          this dashboard is "now" only, never a time series. Shown whenever the backend's own
-          live_mode says "polling" (the Azure indicator, TF14) -- never a frontend build-time
-          check. */}
-      {liveMode === "polling" && (
-        <p data-testid="admin-history-note" className="text-xs text-vault-steel-dark">
-          History: <span className="text-vault-steel-light">Azure: n/a</span> -- every value
-          above is this replica&apos;s current state only, never a cross-replica time series.
-        </p>
-      )}
-      <ul className="flex flex-wrap gap-3 text-xs text-vault-steel-dark">
-        {Object.entries(byStatus).map(([status, count]) => (
-          <li key={status}>
-            {status}: <span className="text-vault-steel-light">{count}</span>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function FeatureCards({ features }: { features: FeatureHealthOut[] }) {
-  return (
-    <section
-      data-testid="admin-feature-cards"
-      className="grid grid-cols-1 gap-2 border border-vault-steel-dark p-4 sm:grid-cols-2 lg:grid-cols-3"
-    >
-      {features.map((f) => (
-        <article
-          key={f.id}
-          data-testid={`feature-card-${f.id}`}
-          className="flex flex-col gap-1 border border-vault-steel-dark/60 p-2 text-xs"
-        >
-          <h3 className="text-vault-steel-light">{f.name}</h3>
-          <p className={STATUS_COLOR[f.status] ?? "text-vault-steel"}>{f.status}</p>
-          {f.probe_status && (
-            <p className="text-vault-steel-dark">
-              probe: {f.probe_status} -- {f.probe_detail}
-            </p>
-          )}
-        </article>
-      ))}
-    </section>
-  );
-}
-
-const ALERT_SEVERITY_CLASS: Record<string, string> = {
-  red: "border-vault-danger text-vault-danger",
-  amber: "border-vault-amber text-vault-amber",
-};
-
-// T13.5.2 (R6-1, P13-D4): the alerts array is already pre-computed server-side (one shared
-// implementation for SSE local and polling Azure) -- this component only sorts for display
-// (red before amber, sortAlertsBySeverity) and renders. Empty -> renders nothing, same as
-// the SSE-closed-reason banner above it.
-function AlertBanner({ alerts }: { alerts: AdminAlertOut[] }) {
+// T13.8.4: a severity badge (icon + text, never colour alone) plus a jump action to the
+// related feature (AdminAlertOut.feature_ids, T13.8.3a) -- or, when none resolves, to the
+// Erasure section for the two erasure-shaped alert codes.
+function AlertBanner({
+  alerts,
+  features,
+  onJumpToFeature,
+  onJumpToSection,
+}: {
+  alerts: AdminAlertOut[];
+  features: FeatureHealthOut[];
+  onJumpToFeature: (id: string) => void;
+  onJumpToSection: (section: Section) => void;
+}) {
   if (alerts.length === 0) return null;
   return (
-    <div data-testid="admin-alert-banner" className="flex flex-col gap-1">
-      {sortAlertsBySeverity(alerts).map((alert) => (
-        <p
-          key={alert.code}
-          data-testid={`admin-alert-${alert.code}`}
-          className={`border p-2 text-xs ${ALERT_SEVERITY_CLASS[alert.severity] ?? "border-vault-steel-dark text-vault-steel"}`}
-        >
-          {alert.message}
-        </p>
-      ))}
+    <section
+      aria-label="Active alerts"
+      data-testid="admin-alert-banner"
+      className="flex flex-col gap-2"
+    >
+      {sortAlertsBySeverity(alerts).map((alert) => {
+        const tone = alert.severity === "red" ? "crit" : "warn";
+        const featureId = alertJumpFeatureId(alert, features);
+        return (
+          <div
+            key={alert.code}
+            data-testid={`admin-alert-${alert.code}`}
+            className={`flex flex-wrap items-center gap-3 border p-2.5 text-xs ${
+              tone === "crit" ? "border-vault-danger" : "border-vault-amber"
+            }`}
+          >
+            <StatusBadge tone={tone} label={alert.severity === "red" ? "Critical" : "Warning"} />
+            <span className="flex-1 text-vault-steel-light">{alert.message}</span>
+            {featureId ? (
+              <button
+                type="button"
+                data-testid={`admin-alert-${alert.code}-open`}
+                onClick={() => onJumpToFeature(featureId)}
+                className="cursor-pointer border border-vault-steel-dark px-2.5 py-1 text-vault-amber hover:border-vault-steel"
+              >
+                Open feature
+              </button>
+            ) : alert.code.startsWith("erasure") ? (
+              <button
+                type="button"
+                data-testid={`admin-alert-${alert.code}-open`}
+                onClick={() => onJumpToSection("erasure")}
+                className="cursor-pointer border border-vault-steel-dark px-2.5 py-1 text-vault-amber hover:border-vault-steel"
+              >
+                Open erasure
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+function KpiTile({ label, value, sub }: { label: string; value: string; sub: string }) {
+  return (
+    <div className="flex flex-col gap-1 border border-vault-steel-dark p-3">
+      <span className="text-xs uppercase tracking-[0.08em] text-vault-steel-dark">{label}</span>
+      <span className="font-mono text-2xl font-semibold text-vault-steel-light">{value}</span>
+      <span className="text-xs text-vault-steel">{sub}</span>
     </div>
+  );
+}
+
+// T13.8.4: at most four KPI tiles, every number a direct read of real `/admin/*` data (never
+// a client-side threshold of its own) -- same "aggregate, this replica only" caveat as the
+// rest of the dashboard.
+function KpiTiles({
+  features,
+  alerts,
+  latency,
+  erasure,
+}: {
+  features: FeatureHealthOut[];
+  alerts: AdminAlertOut[];
+  latency: AdminLatencyResponse | null;
+  erasure: AdminErasureResponse | null;
+}) {
+  const health = featuresHealthySummary(features);
+  const severity = alertSeverityCounts(alerts);
+  const chat = chatLatencySummary(latency?.stages ?? []);
+  const queue = erasureQueueSummary(erasure?.requests ?? []);
+
+  return (
+    <section
+      aria-label="Key indicators"
+      data-testid="admin-kpi-tiles"
+      className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4"
+    >
+      <KpiTile
+        label="Features healthy"
+        value={`${health.healthy} / ${health.countedTotal}`}
+        sub={`${health.critical} critical · ${health.warning} warning · ${health.offByDesign} off by design`}
+      />
+      <KpiTile
+        label="Active alerts"
+        value={String(alerts.length)}
+        sub={`${severity.red} red · ${severity.amber} amber`}
+      />
+      <KpiTile
+        label="Chat latency (avg)"
+        value={chat.avgSeconds !== null ? `${chat.avgSeconds.toFixed(2)}s` : "n/a"}
+        sub={chat.slowestStage ? `slowest stage: ${chat.slowestStage}` : "no data yet"}
+      />
+      <KpiTile
+        label="Erasure queue"
+        value={String(queue.pending)}
+        sub={`${queue.overdue} overdue`}
+      />
+    </section>
   );
 }
 
@@ -143,6 +192,21 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   const [alerts, setAlerts] = useState<AdminAlertOut[]>(initial.alerts ?? []);
   const [banner, setBanner] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+
+  const [section, setSection] = useState<Section>("triage");
+  const [triageFilter, setTriageFilter] = useState<TriageFilterKey>("all");
+  const [selectedFeatureId, setSelectedFeatureId] = useState<string | null>(
+    () => sortFeaturesWorstFirst(initial.features)[0]?.id ?? null,
+  );
+  // T13.8.4: "refreshed Ns ago" -- a plain wall-clock tick, display-only, never influences
+  // when data is actually re-fetched (that stays SSE/poll-interval driven below).
+  const [lastSync, setLastSync] = useState<number>(() => Date.now());
+  const [now, setNow] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const refreshAll = useCallback(async () => {
     // DA-13-E-2: alerts come with /admin/features (same probe sweep) -- no separate poll.
@@ -157,17 +221,34 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
     setLatency(l);
     setEvalResult(ev);
     setAlerts(f.alerts ?? []);
+    setLastSync(Date.now());
   }, []);
 
   const refreshErasure = useCallback(async () => {
     setErasure(await adminErasure());
+    setLastSync(Date.now());
   }, []);
 
   // First client-side load (SSR only fetched /admin/features) -- regardless of live mode.
   useEffect(() => {
-    adminErasure().then(setErasure).catch(() => undefined);
-    adminLatency().then(setLatency).catch(() => undefined);
-    adminEval().then(setEvalResult).catch(() => undefined);
+    adminErasure()
+      .then((e) => {
+        setErasure(e);
+        setLastSync(Date.now());
+      })
+      .catch(() => undefined);
+    adminLatency()
+      .then((l) => {
+        setLatency(l);
+        setLastSync(Date.now());
+      })
+      .catch(() => undefined);
+    adminEval()
+      .then((ev) => {
+        setEvalResult(ev);
+        setLastSync(Date.now());
+      })
+      .catch(() => undefined);
   }, []);
 
   // T13.4.1: SSE, local only.
@@ -187,6 +268,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
         setErasure(parsedErasure as AdminErasureResponse);
       }
       if (Array.isArray(parsedAlerts)) setAlerts(parsedAlerts as AdminAlertOut[]);
+      setLastSync(Date.now());
     }
 
     source.addEventListener("snapshot", applySnapshot);
@@ -213,37 +295,156 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
     return () => clearInterval(id);
   }, [liveMode, refreshAll]);
 
+  const jumpToFeature = useCallback((featureId: string) => {
+    setSection("triage");
+    setTriageFilter("all");
+    setSelectedFeatureId(featureId);
+  }, []);
+  const jumpToSection = useCallback((target: Section) => setSection(target), []);
+
+  const sortedFeatures = sortFeaturesWorstFirst(features);
+  const selectedFeature =
+    features.find((f) => f.id === selectedFeatureId) ?? sortedFeatures[0] ?? null;
+
+  const labFeature = features.find((f) => f.id === "admin-defence-lab");
+  // T13.3.1 precedent: same gate DefenceLabPanel itself already uses -- the lab tab only
+  // exists when the lab's own routes are actually mounted here (local), never on Azure.
+  const labAvailable = labFeature?.probe_status === "ok";
+
+  const health = featuresHealthySummary(features);
+  const queueSummary = erasureQueueSummary(erasure?.requests ?? []);
+  const navTag: Record<Section, string> = {
+    triage: `${health.critical + health.warning} to look at`,
+    pipeline: `${latency?.stages.length ?? 0} stages`,
+    quality: evalResult ? (evalResult.passed ? "passed" : "regressed") : "no data",
+    erasure: `${queueSummary.pending} pending`,
+    lab: "local",
+  };
+
+  const elapsedSeconds = Math.max(0, Math.round((now - lastSync) / 1000));
+  const refreshText =
+    liveMode === "polling"
+      ? `refreshed ${elapsedSeconds}s ago · polling every ${POLL_INTERVAL_MS / 1000}s`
+      : `refreshed ${elapsedSeconds}s ago · live stream`;
+
   return (
-    <main className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-8">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-[0.12em] text-vault-steel-light">
-          Admin dashboard
-        </h1>
-        {liveMode === "polling" && (
-          <button
-            type="button"
-            onClick={() => refreshAll()}
-            className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel hover:border-vault-steel"
+    <main className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-6 sm:px-6 sm:py-8">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-vault-steel-dark pb-4">
+        <div>
+          <h1
+            data-testid="admin-header-title"
+            className="font-mono text-xl font-semibold tracking-[0.12em] text-vault-steel-light"
           >
-            Refresh now
-          </button>
-        )}
-      </div>
+            SECRAG &middot; ADMIN
+          </h1>
+          <p className="text-xs text-vault-steel-dark">Operations dashboard</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3 text-xs text-vault-steel-dark">
+          <span className="rounded-full border border-vault-steel-dark px-2.5 py-1 font-mono">
+            live mode: <span className="text-vault-steel-light">{liveMode}</span>
+          </span>
+          <span data-testid="admin-refresh-text" className="font-mono">
+            {refreshText}
+          </span>
+          {liveMode === "polling" && (
+            <button
+              type="button"
+              onClick={() => refreshAll()}
+              className="cursor-pointer border border-vault-steel-dark px-3 py-1 tracking-[0.1em] text-vault-steel hover:border-vault-steel"
+            >
+              Refresh now
+            </button>
+          )}
+        </div>
+      </header>
+
+      {/* T13.4.3/R6-4 (DA-13-C-2): no managed Prometheus on Azure -- every metric value on
+          this dashboard is "now" only, never a time series. Shown whenever the backend's own
+          live_mode says "polling" (the Azure indicator, TF14) -- never a frontend build-time
+          check. Relocated here from the old standalone OverviewPanel, 13-G2. */}
+      {liveMode === "polling" && (
+        <p data-testid="admin-history-note" className="text-xs text-vault-steel-dark">
+          History: <span className="text-vault-steel-light">Azure: n/a</span> -- every metric
+          value below is this replica&apos;s current state only, never a cross-replica time
+          series.
+        </p>
+      )}
 
       {banner && (
-        <p data-testid="admin-stream-banner" className="border border-vault-danger p-2 text-xs text-vault-danger">
+        <p
+          data-testid="admin-stream-banner"
+          className="border border-vault-danger p-2 text-xs text-vault-danger"
+        >
           {banner}
         </p>
       )}
-      <AlertBanner alerts={alerts} />
 
-      <OverviewPanel features={features} liveMode={liveMode} />
-      <FeatureCards features={features} />
-      <LatencyPanel latency={latency} />
-      <SecurityPanel features={features} />
-      <QualityPanel evalResult={evalResult} features={features} />
-      <ErasurePanel erasure={erasure} onChanged={refreshErasure} />
-      <DefenceLabPanel features={features} />
+      <AlertBanner
+        alerts={alerts}
+        features={features}
+        onJumpToFeature={jumpToFeature}
+        onJumpToSection={jumpToSection}
+      />
+
+      <KpiTiles features={features} alerts={alerts} latency={latency} erasure={erasure} />
+
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
+        <nav
+          aria-label="Dashboard sections"
+          className="flex w-full flex-col gap-1 border border-vault-steel-dark p-2 lg:w-56 lg:flex-shrink-0"
+        >
+          {SECTION_DEFS.filter((s) => s.key !== "lab" || labAvailable).map((s) => (
+            <button
+              key={s.key}
+              type="button"
+              data-testid={`admin-nav-${s.key}`}
+              aria-current={section === s.key ? "page" : undefined}
+              onClick={() => setSection(s.key)}
+              className={`flex items-center justify-between gap-2 rounded px-3 py-2 text-left text-sm ${
+                section === s.key
+                  ? "bg-vault-amber/10 font-semibold text-vault-amber-bright"
+                  : "text-vault-steel hover:text-vault-steel-light"
+              }`}
+            >
+              <span>{s.label}</span>
+              <span className="font-mono text-xs text-vault-steel-dark">{navTag[s.key]}</span>
+            </button>
+          ))}
+          {!labAvailable && (
+            <p className="px-3 py-2 text-xs text-vault-steel-dark">
+              Defence lab appears only on a local stack; it is hidden on Azure.
+            </p>
+          )}
+        </nav>
+
+        <div className="flex min-w-0 flex-1 flex-col gap-4">
+          {section === "triage" && (
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
+              <TriagePanel
+                features={features}
+                filter={triageFilter}
+                onFilterChange={setTriageFilter}
+                selectedId={selectedFeature?.id ?? null}
+                onSelect={setSelectedFeatureId}
+              />
+              {selectedFeature && (
+                <FeatureDrawer
+                  feature={selectedFeature}
+                  relatedAlerts={alerts.filter((a) =>
+                    (a.feature_ids ?? []).includes(selectedFeature.id),
+                  )}
+                />
+              )}
+            </div>
+          )}
+          {section === "pipeline" && <LatencyPanel latency={latency} />}
+          {section === "quality" && <QualityPanel evalResult={evalResult} features={features} />}
+          {section === "erasure" && (
+            <ErasurePanel erasure={erasure} onChanged={refreshErasure} />
+          )}
+          {section === "lab" && <DefenceLabPanel features={features} />}
+        </div>
+      </div>
     </main>
   );
 }

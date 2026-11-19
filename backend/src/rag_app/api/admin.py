@@ -236,6 +236,7 @@ def _features_payload(metrics_backend: MetricsBackend) -> list[FeatureHealthOut]
                 metrics=values,
                 dev_only=entry.dev_only,
                 azure_only=entry.azure_only,
+                docs=entry.docs,
             )
         )
     return out

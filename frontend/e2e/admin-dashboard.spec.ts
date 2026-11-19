@@ -38,32 +38,49 @@ test.skip(
     "E2E_PLAIN_USER_EMAIL not set -- only scripts/gate.sh's step_e2e sets these",
 );
 
-test("an admin can enrol MFA, step up, and see the full dashboard", async ({ page }) => {
+// T13.8.4-T13.8.6/13-G2: the redesigned shell -- header, KPI tiles, the Triage section (the
+// default one) with its status filters and feature drawer, plus every other section's
+// existing panel still reachable through the new left-hand menu.
+test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", async ({
+  page,
+}) => {
   await loginAndReachChat(page, ADMIN_EMAIL as string, ADMIN_PASSWORD as string);
   await expect(page).toHaveURL(/\/chat$/);
 
   adminSecret = await enrolAndStepUpMfa(page);
 
   await page.goto("/admin");
-  await expect(page.getByText("Admin dashboard")).toBeVisible();
+  await expect(page.getByTestId("admin-header-title")).toBeVisible();
+  await expect(page.getByText("Operations dashboard")).toBeVisible();
 
   // T13.5.2: a freshly seeded e2e stack has nothing to alert on -- no banner at all.
   await expect(page.getByTestId("admin-alert-banner")).toHaveCount(0);
 
-  // Every card (T13.2.10's own "every card" requirement).
-  for (const testId of [
-    "admin-overview-panel",
-    "admin-feature-cards",
-    "admin-latency-panel",
-    "admin-security-panel",
-    "admin-quality-panel",
-    "admin-erasure-panel",
-  ]) {
-    await expect(page.getByTestId(testId)).toBeVisible();
-  }
+  await expect(page.getByTestId("admin-kpi-tiles")).toBeVisible();
 
-  // At least the admin-api feature itself is rendered as a card (the registry is real).
-  await expect(page.getByTestId("feature-card-admin-api")).toBeVisible();
+  // Triage is the default section: every registry feature, including admin-api itself.
+  await expect(page.getByTestId("admin-triage-panel")).toBeVisible();
+  await expect(page.getByTestId("triage-row-admin-api")).toBeVisible();
+
+  // A filter narrows the list (T13.8.5): a freshly seeded stack has no Critical feature.
+  await page.getByTestId("triage-filter-crit").click();
+  await expect(page.getByTestId("triage-row-admin-api")).toHaveCount(0);
+  await expect(page.getByText("Nothing in this state right now.")).toBeVisible();
+  await page.getByTestId("triage-filter-all").click();
+
+  // Selecting a row opens the drawer with that feature (T13.8.6).
+  await page.getByTestId("triage-row-admin-api").click();
+  await expect(page.getByTestId("admin-feature-drawer")).toBeVisible();
+  await expect(page.getByTestId("admin-feature-drawer-id")).toHaveText("admin-api");
+
+  // The other sections' existing panels still render inside the new shell (13-G3 redesigns
+  // them; unchanged for now).
+  await page.getByTestId("admin-nav-pipeline").click();
+  await expect(page.getByTestId("admin-latency-panel")).toBeVisible();
+  await page.getByTestId("admin-nav-quality").click();
+  await expect(page.getByTestId("admin-quality-panel")).toBeVisible();
+  await page.getByTestId("admin-nav-erasure").click();
+  await expect(page.getByTestId("admin-erasure-panel")).toBeVisible();
 });
 
 test("the admin can erase another account's data through the erasure panel", async ({ page }) => {
@@ -72,6 +89,7 @@ test("the admin can erase another account's data through the erasure panel", asy
   await enrolAndStepUpMfa(page);
 
   await page.goto("/admin");
+  await page.getByTestId("admin-nav-erasure").click();
   const form = page.getByTestId("erase-account-form");
   await expect(form).toBeVisible();
   await form.getByLabel("Account email").fill(ERASE_TARGET_EMAIL as string);

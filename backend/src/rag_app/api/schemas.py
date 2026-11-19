@@ -213,6 +213,9 @@ class FeatureHealthOut(BaseModel):
     metrics: dict[str, float | None]
     dev_only: bool
     azure_only: bool
+    # T13.8.6 (13-G2): the registry's own docs/ADR reference, straight through -- lets the
+    # dashboard's feature drawer show a docs link without a second, possibly-drifting lookup.
+    docs: str
 
 
 class AdminAlertOut(BaseModel):

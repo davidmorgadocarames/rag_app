@@ -129,10 +129,12 @@ test("the admin dashboard serves the required headers with zero CSP violations",
   await enrolAndStepUpMfa(page);
 
   await visit(page, "/admin");
-  await expect(page.getByText("Admin dashboard")).toBeVisible();
-  // The chart must actually have rendered (inline styles applied), not just the shell.
+  await expect(page.getByTestId("admin-header-title")).toBeVisible();
+  await expect(page.getByTestId("admin-triage-panel")).toBeVisible();
+  // The chart must actually have rendered (inline styles applied), not just the shell --
+  // Pipeline is no longer the default section (Triage is, 13-G2), so select it first.
+  await page.getByTestId("admin-nav-pipeline").click();
   await expect(page.getByTestId("admin-latency-panel")).toBeVisible();
-  await expect(page.getByTestId("admin-feature-cards")).toBeVisible();
 
   expect(violations, `CSP violations:\n${violations.join("\n")}`).toHaveLength(0);
 });

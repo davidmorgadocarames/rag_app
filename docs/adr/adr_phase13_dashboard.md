@@ -229,7 +229,9 @@ test_both_backends_return_the_same_shape_for_the_same_names`):
   replica's own `prometheus_client` registry — the exact numbers its internal `/metrics`
   port would otherwise expose, with no network call and no sidecar. **History is never
   available this way** (only ever "now"; a scale-to-zero restart resets every counter to
-  0) — the dashboard shows "Azure: n/a" for it (`OverviewPanel`, frontend concern only).
+  0) — the dashboard shows "Azure: n/a" for it (frontend concern only; the redesigned shell,
+  13-G2, moved this note from a standalone panel into the header's own live-mode line,
+  `admin-history-note`, shown only when `live_mode` is `"polling"`).
 
 **Consequence.** Every Azure metric value on the dashboard — including the T13.5.2 banner
 alerts below, which read the SAME `MetricsBackend` — is "this replica, since it last
@@ -322,3 +324,38 @@ proves the pre-fix formula really did flag a declared-but-unmounted route and th
 not. The same pattern will recur for Phase 16/19/20's own dev-only features (fake LLM
 provider, data explorer, code-fix) — the fix is in the shared walker test, not specific to
 the lab.
+
+## Dashboard shell redesign (13-G2, T13.8.4–T13.8.6)
+
+**Decision: an explicit, EXPLAINED status vocabulary, not a bare "N probe(s) not ok".**
+`frontend/lib/adminTriage.ts` maps each feature's raw `probe_status` to one of four
+triage states — OK, Warning, Critical, or "Off here" — reusing the vault palette's existing
+semantic tokens (steel-light/amber/danger/steel-dark; there is no separate "success green"
+token) with an icon *and* text on every badge, never colour alone. A `down` probe on a
+`dev_only`/`azure_only` feature is "Off here" with a truthful one-line "why" (e.g. the
+defence lab being off on Azure by design) rather than counted as a failure — the same
+exclusion `_banner_alerts`' `probe_failures` condition already applies server-side
+(T13.3.1 precedent), now visible in the UI instead of silently absent. Features sort worst
+first (Critical, Warning, Off here, then OK); the triage list's status filters (All/
+Critical/Warning/Off here/OK) and the per-feature side drawer (probe detail, its own
+`metrics` map, related alerts via `AdminAlertOut.feature_ids` — T13.8.3a — and a `docs`
+link, T13.8.6) replace the old `OverviewPanel`/`FeatureCards`/`SecurityPanel` trio: a
+feature's security-relevant metrics (rate limiting, lockouts, CSP reports, …) now live in
+that feature's own drawer rather than a second, separately-aggregated panel.
+
+**Decision: no "MFA verified" badge in the header (reviewed, approved mockup change).**
+Every `/admin/*` route already re-proves the session's MFA step-up server-side on every
+request (`require_permission_and_mfa`); a header badge claiming "MFA verified" would be a
+point-in-time client-side echo of that fact, not a new guarantee, and risks reading as a
+promise the UI itself cannot keep if the step-up later expires mid-session (DA-13-C-5: no
+step-up TTL is enforced client-side either). Reviewed and dropped from the approved mockup.
+
+**Shell layout.** Header (title, live mode, last-refresh/polling text — the former
+`admin-history-note`'s "Azure: n/a" caveat now lives here) + alert banner (severity badge,
+jump action to the related feature via `feature_ids`, or to the Erasure section when none
+resolves) + up to four KPI tiles (features healthy, active alerts, chat latency average
+from `/admin/latency`'s existing `stages` "total" entry, erasure queue) + a left-hand
+section menu (Triage · Pipeline · Quality · Erasure · Defence lab, the last one only when
+`admin-defence-lab`'s own probe is `ok` — same gating `DefenceLabPanel` already used).
+Pipeline/Quality/Erasure/Defence lab keep their existing panels verbatim inside the new
+shell for this block; their own redesign is 13-G3.

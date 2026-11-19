@@ -522,6 +522,7 @@ def test_banner_alerts_probe_failures_exclude_dev_only_and_azure_only(api_env: E
             metrics={},
             dev_only=dev_only,
             azure_only=azure_only,
+            docs="docs/TRD.md",
         )
 
     with Session(api_env) as session:
