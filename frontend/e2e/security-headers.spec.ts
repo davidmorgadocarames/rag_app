@@ -103,9 +103,10 @@ test("a fresh login panel still gets the same headers (second vault-door open)",
   await expect(page.getByPlaceholder("email")).toBeVisible();
 });
 
-// DEC-036 = A (DA-13-C-6): the admin dashboard is the one page whose components (Recharts'
-// ResponsiveContainer, LatencyPanel) add inline styles -- walk it for real, as a stepped-up
-// admin, under the same header + zero-violation checks. Its own seeded admin
+// DEC-036 = A (DA-13-C-6): the admin dashboard is the one page whose components add inline
+// styles (originally Recharts' ResponsiveContainer; since 13-G3, LatencyPanel's own waterfall
+// bars compute their left/width inline, no Recharts any more) -- walk it for real, as a
+// stepped-up admin, under the same header + zero-violation checks. Its own seeded admin
 // (scripts/gate.sh's step_security-headers), separate from step_e2e's, so the two steps'
 // MFA enrolments never collide.
 const SECHDR_ADMIN_EMAIL = process.env.E2E_SECHDR_ADMIN_EMAIL;

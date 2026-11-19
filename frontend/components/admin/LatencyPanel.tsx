@@ -1,60 +1,219 @@
 "use client";
 
-// T13.2.5: per-stage p50/p95 (P13-D1, Recharts) -- this replica's own in-process histogram
-// since it last started, no cross-replica history (same R6-4 caveat as every Azure metric).
+// T13.2.5/T13.8.7 (13-G3): the Pipeline section's average waterfall -- one row per UI pipeline
+// stage (classifying/retrieving/reranking/generating/checking/responding, in the backend's
+// own STEP_ALLOWLIST order), expandable to its own atomic steps, each bar starting where the
+// previous one ends (DA-13-G1-1: a stage's total is ALWAYS the sum of its own steps, read from
+// `pipeline`, NEVER reconciled against the separate `stages` field for the same name -- see
+// adminPipeline.ts's own docstring and the ADR "Pipeline waterfall semantics" section). No
+// Recharts here any more: every bar below is a plain absolutely-positioned `<span>` with an
+// inline `style` (same CSP-exercising "real inline style" the security-headers e2e spec walks
+// this section for, DEC-036).
 
-import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { useState } from "react";
 
 import type { AdminLatencyResponse } from "@/lib/api";
+import { buildPipelineWaterfall, waterfallBarPercent, type WaterfallStage } from "@/lib/adminPipeline";
 
 interface LatencyPanelProps {
   latency: AdminLatencyResponse | null;
 }
 
+// Presentational-only copy (not logic, not unit-tested): a short, human description of what
+// each atomic step actually measures, in the same pipeline order the backend returns them.
+// Step ids are unique across every stage (metrics.STEP_ALLOWLIST), so one flat lookup suffices.
+const STEP_WHAT: Record<string, string> = {
+  classify_intent: "intent classifier (RAG / chit-chat / abstain)",
+  embed_query: "query embedding model",
+  vector_search: "pgvector nearest neighbours",
+  bm25_search: "full-text (BM25) search",
+  rrf_fusion: "reciprocal rank fusion",
+  load_chunks: "fetch chunk text + metadata",
+  wait_slot: "queue for a rerank slot (concurrency cap)",
+  cross_encoder: "tokenise + cross-encoder inference",
+  order_by_scores: "sort + keep top_n",
+  build_prompt: "context + citations prompt",
+  llm_first_token: "LLM time to first token",
+  token_stream: "stream the remaining tokens (non-streaming answers never record this step)",
+  parse_answer: "citations + abstention parse",
+  build_check_prompt: "answer + context prompt",
+  llm_verdict: "groundedness LLM call",
+  parse_verdict: "GROUNDED / NOT_GROUNDED parse",
+  stream_canned_reply: "chit-chat path only -- no retrieval/rerank/generation call",
+};
+
+function fmt(seconds: number | null): string {
+  return seconds === null ? "n/a" : `${seconds.toFixed(2)}s`;
+}
+
+function StageRow({
+  stage,
+  totalSeconds,
+  expanded,
+  onToggle,
+}: {
+  stage: WaterfallStage;
+  totalSeconds: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const bar = waterfallBarPercent(stage.startSeconds, stage.totalAvgSeconds, totalSeconds);
+  return (
+    <div
+      data-testid={`pipeline-stage-${stage.stage}`}
+      className="flex flex-col gap-1 border-b border-vault-steel-dark/40 py-1.5"
+    >
+      <button
+        type="button"
+        data-testid={`pipeline-toggle-${stage.stage}`}
+        aria-expanded={expanded}
+        onClick={onToggle}
+        className="flex w-full flex-wrap items-center gap-2 text-left"
+      >
+        <span className="flex w-40 flex-shrink-0 items-center gap-1.5 font-mono text-xs font-semibold text-vault-steel-light">
+          <span
+            aria-hidden="true"
+            className={`inline-block w-3 text-vault-amber transition-transform ${expanded ? "rotate-90" : ""}`}
+          >
+            &rsaquo;
+          </span>
+          {stage.stage}
+          {stage.drawnFromZero && (
+            <span className="font-sans text-[10px] font-normal text-vault-steel-dark">(chit-chat)</span>
+          )}
+        </span>
+        <span className="relative h-5 min-w-[7rem] flex-1 rounded border border-vault-steel-dark/60 bg-vault-bg">
+          <span
+            className="absolute inset-y-0 rounded bg-vault-steel"
+            style={{ left: `${bar.leftPercent}%`, width: `${bar.widthPercent}%` }}
+          />
+        </span>
+        <span className="w-32 flex-shrink-0 text-right font-mono text-xs text-vault-steel-light">
+          {fmt(stage.totalAvgSeconds)}{" "}
+          <span className="text-vault-steel-dark">&middot; p95 {fmt(stage.totalP95Seconds)}</span>
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="flex flex-col gap-1 pl-5">
+          {stage.steps.map((step) => {
+            const stepBar = waterfallBarPercent(step.startSeconds, step.avgSeconds, totalSeconds);
+            return (
+              <div
+                key={step.step}
+                data-testid={`pipeline-step-${stage.stage}-${step.step}`}
+                className="flex flex-wrap items-center gap-2"
+              >
+                <span className="flex w-40 flex-shrink-0 flex-col">
+                  <span className="font-mono text-xs text-vault-steel">{step.step}</span>
+                  <span className="text-[11px] text-vault-steel-dark">
+                    {STEP_WHAT[step.step] ?? ""}
+                  </span>
+                </span>
+                <span className="relative h-2 min-w-[7rem] flex-1">
+                  <span
+                    className={`absolute inset-y-0 rounded ${step.isSlowest ? "bg-vault-amber" : "bg-vault-steel-dark"}`}
+                    style={{ left: `${stepBar.leftPercent}%`, width: `${stepBar.widthPercent}%` }}
+                  />
+                </span>
+                <span className="w-32 flex-shrink-0 text-right font-mono text-xs text-vault-steel">
+                  {step.observed ? fmt(step.avgSeconds) : "n/a"}{" "}
+                  <span className="text-vault-steel-dark">
+                    &middot; p95 {step.observed ? fmt(step.p95Seconds) : "n/a"}
+                  </span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function LatencyPanel({ latency }: LatencyPanelProps) {
-  const stages = latency?.stages ?? [];
-  const data = stages.map((s) => ({
-    stage: s.stage,
-    p50: s.p50_seconds ?? 0,
-    p95: s.p95_seconds ?? 0,
-  }));
+  const pipeline = latency?.pipeline ?? [];
+  const waterfall = buildPipelineWaterfall(pipeline);
+  const [openMap, setOpenMap] = useState<Record<string, boolean>>({});
+  const isOpen = (stageName: string) => openMap[stageName] ?? true; // default: expanded
+  const setAll = (value: boolean) => {
+    const next: Record<string, boolean> = {};
+    for (const s of waterfall.stages) next[s.stage] = value;
+    setOpenMap(next);
+  };
+
+  // "total" (timing.py's recorder.emit()) counts every chat turn, RAG or chit-chat alike --
+  // the one authoritative chat count, never derived from the pipeline sum (DA-13-G1-1).
+  const chatCount = latency?.stages.find((s) => s.stage === "total")?.count ?? null;
 
   return (
     <section
       data-testid="admin-latency-panel"
+      aria-label="Chat pipeline latency"
       className="flex flex-col gap-3 border border-vault-steel-dark p-4"
     >
-      <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">LATENCY (p50 / p95)</h2>
-      {data.length === 0 ? (
-        <p className="text-xs text-vault-steel-dark">No stage timings observed yet.</p>
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">
+          CHAT PIPELINE &middot; AVERAGE PER STAGE
+        </h2>
+        <span className="text-xs text-vault-steel-dark">
+          This replica since start &middot;{" "}
+          <span className="font-mono text-vault-steel">{chatCount ?? "n/a"}</span> chats &middot;
+          not per-request (per-request traces: 16-F)
+        </span>
+      </div>
+
+      {!waterfall.hasAnyData || pipeline.length === 0 ? (
+        <p data-testid="pipeline-empty-state" className="text-xs text-vault-steel-dark">
+          No chat turns observed yet on this replica -- the waterfall fills in as real chats
+          happen.
+        </p>
       ) : (
-        <div style={{ width: "100%", height: 240 }}>
-          <ResponsiveContainer>
-            <BarChart data={data}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--steel-dark)" />
-              <XAxis dataKey="stage" tick={{ fill: "var(--steel)", fontSize: 11 }} />
-              <YAxis
-                tick={{ fill: "var(--steel)", fontSize: 11 }}
-                label={{ value: "seconds", angle: -90, position: "insideLeft", fill: "var(--steel)" }}
+        <>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="pipeline-expand-all"
+              onClick={() => setAll(true)}
+              className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber hover:border-vault-steel"
+            >
+              Expand all
+            </button>
+            <button
+              type="button"
+              data-testid="pipeline-stages-only"
+              onClick={() => setAll(false)}
+              className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel hover:border-vault-steel"
+            >
+              Stages only
+            </button>
+          </div>
+
+          <div className="flex flex-col">
+            {waterfall.stages.map((stage) => (
+              <StageRow
+                key={stage.stage}
+                stage={stage}
+                totalSeconds={waterfall.totalAvgSeconds}
+                expanded={isOpen(stage.stage)}
+                onToggle={() => setOpenMap((prev) => ({ ...prev, [stage.stage]: !isOpen(stage.stage) }))}
               />
-              <Tooltip
-                contentStyle={{ background: "var(--plate)", border: "1px solid var(--steel-dark)" }}
-              />
-              <Legend />
-              <Bar dataKey="p50" name="p50" fill="var(--steel-light)" />
-              <Bar dataKey="p95" name="p95" fill="var(--amber)" />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
+            ))}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-vault-steel-dark pt-2 text-xs text-vault-steel-dark">
+            <span>
+              Average waterfall: each bar starts where the previous step ends. Amber = the
+              single slowest observed step. &quot;responding&quot; is the chit-chat path only, so
+              it starts at 0 and is not part of the RAG total. Non-streaming answers never
+              record a <code className="font-mono">token_stream</code> step.
+            </span>
+            <span className="font-mono text-vault-steel-light">
+              RAG path total avg {fmt(waterfall.totalAvgSeconds)}
+            </span>
+          </div>
+        </>
       )}
-      <ul className="grid grid-cols-2 gap-1 text-xs text-vault-steel sm:grid-cols-4">
-        {stages.map((s) => (
-          <li key={s.stage} data-testid={`latency-stage-${s.stage}`}>
-            {s.stage}: p50 {s.p50_seconds?.toFixed(3) ?? "n/a"}s / p95{" "}
-            {s.p95_seconds?.toFixed(3) ?? "n/a"}s ({s.count} samples)
-          </li>
-        ))}
-      </ul>
     </section>
   );
 }
