@@ -18,6 +18,8 @@ const config: Config = {
           "amber-bright": "var(--amber-bright)",
           plate: "var(--plate)",
           danger: "var(--danger)",
+          // T13.8.8 (DA-13-G2-4): lighter red for TEXT only -- see globals.css's own comment.
+          "danger-text": "var(--danger-text)",
         },
       },
       fontFamily: {

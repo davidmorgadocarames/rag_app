@@ -19,6 +19,14 @@
   --amber-bright: #f0b968;
   --plate: #2b2f35;
   --danger: #c0563f;
+  /* T13.8.8 (DA-13-G2-4): --danger as TEXT on this page's #0a0a0c background measures
+     ~4.37:1, just under WCAG AA's 4.5:1 for normal text (every other palette token passes:
+     steel-light 12.2:1, amber 8.1:1, amber-bright 11.2:1, steel 5.4:1). --danger-text is the
+     same hue scaled lighter (~6.4:1, computed) for every status/error TEXT use (StatusBadge's
+     "Critical" tone, the alert banner, Quality/Erasure/FeatureDrawer status text); --danger
+     itself is kept unchanged for BORDERS/fills (a border/fill is not subject to WCAG text
+     contrast, and several destructive buttons already rely on its exact shade). */
+  --danger-text: #e2725a;
 }
 
 body {

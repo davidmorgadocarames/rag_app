@@ -374,7 +374,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       {banner && (
         <p
           data-testid="admin-stream-banner"
-          className="border border-vault-danger p-2 text-xs text-vault-danger"
+          className="border border-vault-danger p-2 text-xs text-vault-danger-text"
         >
           {banner}
         </p>

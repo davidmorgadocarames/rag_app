@@ -1,9 +1,10 @@
 "use client";
 
-// T13.8.6: the side drawer for the feature selected in Triage -- name/id/phase, its status
-// badge, the probe detail (+ the "why" when it is Off here by design), its own metrics map,
-// related alerts (via AdminAlertOut.feature_ids, T13.8.3a) and the registry's docs link
-// (T13.8.6/backend docs field).
+// T13.8.6/T13.8.8: the side drawer for the feature selected in Triage -- name/id/phase, its
+// probe status badge, the registry's own lifecycle status (DA-13-G2-3), the probe detail (+
+// the "why" when it is Off here by design), its own metrics map, related alerts (via
+// AdminAlertOut.feature_ids, T13.8.3a) and the registry's docs link (T13.8.6/backend docs
+// field).
 
 import type { AdminAlertOut, FeatureHealthOut } from "@/lib/api";
 import { featureGroup, featureStatus } from "@/lib/adminTriage";
@@ -40,6 +41,13 @@ export default function FeatureDrawer({ feature, relatedAlerts }: FeatureDrawerP
         </div>
         <StatusBadge tone={info.key} label={info.label} testId="admin-feature-drawer-status" />
       </div>
+
+      <p
+        data-testid="admin-feature-drawer-lifecycle-status"
+        className="font-mono text-xs text-vault-steel-dark"
+      >
+        Registry status: <span className="text-vault-steel">{feature.status}</span>
+      </p>
 
       <div className="flex flex-col gap-1.5">
         <h4 className="text-xs uppercase tracking-[0.08em] text-vault-steel-dark">Health probe</h4>
@@ -86,7 +94,7 @@ export default function FeatureDrawer({ feature, relatedAlerts }: FeatureDrawerP
             {relatedAlerts.map((alert) => (
               <li
                 key={alert.code}
-                className={`text-xs ${alert.severity === "red" ? "text-vault-danger" : "text-vault-amber"}`}
+                className={`text-xs ${alert.severity === "red" ? "text-vault-danger-text" : "text-vault-amber"}`}
               >
                 {alert.message}
               </li>

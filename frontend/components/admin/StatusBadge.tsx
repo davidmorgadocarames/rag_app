@@ -6,10 +6,13 @@
 
 import type { FeatureStatusKey } from "@/lib/adminTriage";
 
+// T13.8.8 (DA-13-G2-4): "crit" uses --danger-text for the TEXT/icon colour (>= 4.5:1 on the
+// dark background, computed ~6.4:1) and keeps --danger only for the border -- see
+// globals.css's own comment for why the two tokens differ.
 const TONE_CLASS: Record<FeatureStatusKey, string> = {
   ok: "border-vault-steel-light text-vault-steel-light",
   warn: "border-vault-amber text-vault-amber",
-  crit: "border-vault-danger text-vault-danger",
+  crit: "border-vault-danger text-vault-danger-text",
   off: "border-vault-steel-dark text-vault-steel",
 };
 

@@ -1,11 +1,14 @@
 "use client";
 
-// T13.2.8: the erasure panel (opaque request ids, countdown to the 24h deadline, "Purge
-// now"/"Retry" with an explicit two-click confirmation, the TF16 "continuing in the
-// scheduled job" text straight from the backend's own action response) plus the
+// T13.2.8/T13.8.8 (13-G3): the erasure panel (opaque request ids, countdown to the 24h
+// deadline, "Purge now"/"Retry" with an explicit two-click confirmation, the TF16 "continuing
+// in the scheduled job" text straight from the backend's own action response) plus the
 // "Erase an account" form (T13.1.8, DEBT-002) with its typed "ERASE" confirmation and the
 // 409 (last remaining admin)/404 (no such account)/503 (busy, retry) responses each shown
 // with their own distinct message -- never a submitted email echoed back anywhere.
+//
+// T13.8.8: a "done" row now shows "Completed <completed_at>" -- a fact about the past -- never
+// a countdown (which only ever makes sense for an OPEN request still racing the deadline).
 
 import { useState } from "react";
 
@@ -18,6 +21,8 @@ import {
   type ErasureRequestOut,
 } from "@/lib/api";
 
+import StatusBadge from "./StatusBadge";
+
 const AMBER_THRESHOLD_SECONDS = 4 * 3600; // age > 20h of a 24h deadline
 
 interface ErasurePanelProps {
@@ -27,7 +32,7 @@ interface ErasurePanelProps {
 
 function countdownClass(row: ErasureRequestOut): string {
   if (row.status === "done") return "text-vault-steel";
-  if (row.overdue) return "text-vault-danger";
+  if (row.overdue) return "text-vault-danger-text";
   if (row.seconds_left < AMBER_THRESHOLD_SECONDS) return "text-vault-amber";
   return "text-vault-steel-light";
 }
@@ -35,6 +40,28 @@ function countdownClass(row: ErasureRequestOut): string {
 function formatHours(seconds: number): string {
   const hours = seconds / 3600;
   return `${hours >= 0 ? "" : "-"}${Math.abs(hours).toFixed(1)}h`;
+}
+
+/** T13.8.8: a done row's own time column -- its completion fact, never a countdown (which
+ * stops meaning anything once the request is no longer open). `completed_at` is optional on
+ * the wire (older backends before T13.8.3(b)) -- falls back to a plain "Completed" rather than
+ * fabricating a timestamp. */
+function timeCellText(row: ErasureRequestOut): string {
+  if (row.status === "done") {
+    return row.completed_at ? `Completed ${row.completed_at}` : "Completed";
+  }
+  return formatHours(row.seconds_left);
+}
+
+function statusTone(status: string): "ok" | "warn" | "crit" | "off" {
+  if (status === "done") return "off";
+  if (status === "failed") return "crit";
+  if (status === "running") return "warn";
+  return "ok"; // "pending"
+}
+
+function statusLabel(status: string): string {
+  return status.length === 0 ? status : status[0].toUpperCase() + status.slice(1);
 }
 
 type Action = "purge-now" | "retry";
@@ -65,7 +92,7 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
       <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">ERASURE</h2>
 
       {actionMessage && <p className="text-xs text-vault-amber">{actionMessage}</p>}
-      {actionError && <p className="text-xs text-vault-danger">{actionError}</p>}
+      {actionError && <p className="text-xs text-vault-danger-text">{actionError}</p>}
 
       <table className="w-full text-left text-xs text-vault-steel">
         <thead>
@@ -86,8 +113,10 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
               className="border-t border-vault-steel-dark/40"
             >
               <td className="py-1 font-mono">{row.id.slice(0, 8)}</td>
-              <td>{row.status}</td>
-              <td className={countdownClass(row)}>{formatHours(row.seconds_left)}</td>
+              <td>
+                <StatusBadge tone={statusTone(row.status)} label={statusLabel(row.status)} />
+              </td>
+              <td className={`font-mono ${countdownClass(row)}`}>{timeCellText(row)}</td>
               <td>{row.attempts}</td>
               <td>{row.last_error_class ?? "-"}</td>
               <td>
@@ -146,7 +175,7 @@ function ErasureActionButton({
         <button
           type="button"
           onClick={() => runAction(row.id, action)}
-          className="cursor-pointer border border-vault-danger px-2 py-1 text-vault-danger"
+          className="cursor-pointer border border-vault-danger px-2 py-1 text-vault-danger-text"
         >
           Confirm {label.toLowerCase()}?
         </button>
@@ -234,12 +263,12 @@ function EraseAccountForm({ onDone }: { onDone: () => void }) {
       <button
         type="submit"
         disabled={submitting}
-        className="w-fit cursor-pointer border border-vault-danger px-3 py-1 text-xs tracking-[0.1em] text-vault-danger disabled:opacity-50"
+        className="w-fit cursor-pointer border border-vault-danger px-3 py-1 text-xs tracking-[0.1em] text-vault-danger-text disabled:opacity-50"
       >
         Erase account
       </button>
       {result && <p className="text-xs text-vault-amber">{result}</p>}
-      {error && <p className="text-xs text-vault-danger">{error}</p>}
+      {error && <p className="text-xs text-vault-danger-text">{error}</p>}
     </form>
   );
 }
