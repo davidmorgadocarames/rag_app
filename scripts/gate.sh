@@ -742,6 +742,8 @@ step_e2e() {
   # DEC-024 (the QR code actually renders from the real backend-issued provisioning URI).
   # wakeup.spec.ts (T13.9.2/DEBT-056): the wake-up UX against a `page.route()`-injected
   # slow/503 "backend" (chat + login), incl. the negative control -- no extra env needed.
+  # not-found.spec.ts (T13.10.3/DEBT-057): the custom 404 page -- real HTTP 404 status, single
+  # "Back to login" link, no path echo, /api/... negative control, phone width, no extra env.
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
   # verification email through the gate's own Mailpit (e2e_ensure_mailpit, above).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
@@ -752,7 +754,7 @@ step_e2e() {
     E2E_PLAIN_USER_EMAIL="$E2E_PLAIN_USER_EMAIL" \
     E2E_WAKEUP_EMAIL="$E2E_WAKEUP_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
-      e2e/mfa.spec.ts e2e/wakeup.spec.ts)
+      e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/not-found.spec.ts)
 }
 
 # T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for

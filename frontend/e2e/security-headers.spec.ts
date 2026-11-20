@@ -63,6 +63,11 @@ test("every page (logged out and in) serves the required headers with zero CSP v
   // --- logged out ---
   await visit(page, "/");
   await visit(page, "/login");
+  // T13.10.2 (DEBT-057): the custom 404 page (app/not-found.tsx) gets the exact same
+  // middleware-set CSP/headers as every other page -- `visit()` below also asserts the
+  // response status implicitly matches nothing special, but the 404-specific status check
+  // itself lives in e2e/not-found.spec.ts; this is only the headers/CSP-violation proof.
+  await visit(page, "/this-page-does-not-exist-secrag-404");
 
   // --- register -> logged in ---
   const email = uniqueEmail("sechdr");
