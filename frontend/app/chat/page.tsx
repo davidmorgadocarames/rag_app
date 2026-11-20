@@ -313,7 +313,7 @@ export default function ChatPage() {
           </div>
         </header>
 
-        <div ref={threadRef} className="flex-1 overflow-y-auto px-4 py-6">
+        <div ref={threadRef} data-testid="chat-thread" className="flex-1 overflow-y-auto px-4 py-6">
           <div className="mx-auto flex max-w-2xl flex-col gap-5">
             {messages.length === 0 && (
               <p className="mt-10 text-center text-sm text-vault-steel-dark">

@@ -554,6 +554,13 @@ E2E_ERASE_TARGET_EMAIL="e2e-erase-target@example.test"
 # every test below, so one extra registration here used to intermittently 403-block the
 # UNRELATED Mailpit verify test's registration, found running this block for real).
 E2E_PLAIN_USER_EMAIL="e2e-plain-user@example.test"
+# T13.9.2 (DEBT-056): wakeup.spec.ts's own plain user, seeded directly for the SAME
+# signup-velocity reason as E2E_PLAIN_USER_EMAIL above -- its 4 scenarios need a real,
+# already-logged-in-capable chat account, not a fresh `/auth/register` each time, and never
+# share E2E_PLAIN_USER_EMAIL itself so a parallel admin-dashboard.spec.ts run (which
+# enrols/step-ups MFA on that exact account) can never interleave with wakeup.spec.ts's own
+# chat/login traffic on the one account.
+E2E_WAKEUP_EMAIL="e2e-wakeup@example.test"
 # DEC-036 (DA-13-C-6): step_security-headers's own admin for its /admin walk -- separate from
 # step_e2e's so the two steps' real MFA enrolments never collide in one gate DB lifetime.
 E2E_SECHDR_ADMIN_EMAIL="e2e-sechdr-admin@example.test"
@@ -682,15 +689,31 @@ e2e_start_stack() {
 # `( ... )` subshell, which ensure_e2e_env's write block is, but e2e_start_backend's `set -a`
 # source is not). Seeds BOTH the admin and the plain-user erasure target (DA-13-C-1) --
 # the same password for both, fine for a throwaway pair scoped to one gate run.
+# T13.9.2 (DEBT-056): DATA_MASTER_KEY="$E2E_MASTER_KEY" -- a pre-existing gap, found running
+# wakeup.spec.ts for real: without it, `create_verified_user`'s own `wrap_key` (which reads
+# DATA_MASTER_KEY from the environment AT CALL TIME, rag_app.crypto) wraps the new user's
+# data key with whatever DATA_MASTER_KEY this script's OWN shell happens to have (usually
+# none), not the native backend's `$E2E_MASTER_KEY` (e2e_start_backend) -- so the FIRST
+# real decrypt (e.g. this seeded account's first chat message) always 409s as "cannot be
+# decrypted right now". Every account seeded here had simply never sent a chat message
+# before (enrol/MFA/admin-panel/erasure-target checks don't decrypt anything) -- nothing
+# wakeup.spec.ts's OWN BFF/wake-up code could have caused.
 e2e_seed_admin() {
   (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    DATA_MASTER_KEY="$E2E_MASTER_KEY" \
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ADMIN_EMAIL" --role admin) \
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    DATA_MASTER_KEY="$E2E_MASTER_KEY" \
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ADMIN2_EMAIL" --role admin) \
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    DATA_MASTER_KEY="$E2E_MASTER_KEY" \
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_ERASE_TARGET_EMAIL" --role user) \
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
-    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_PLAIN_USER_EMAIL" --role user)
+    DATA_MASTER_KEY="$E2E_MASTER_KEY" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_PLAIN_USER_EMAIL" --role user) \
+    && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    DATA_MASTER_KEY="$E2E_MASTER_KEY" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_WAKEUP_EMAIL" --role user)
 }
 
 step_e2e() {
@@ -717,6 +740,8 @@ step_e2e() {
   # (client-state tampering buys an ordinary user nothing on /admin) + T13.2.10 (the real
   # admin dashboard, MFA via e2e/totp.ts + e2e_seed_admin above). mfa.spec.ts: T12.3.5/
   # DEC-024 (the QR code actually renders from the real backend-issued provisioning URI).
+  # wakeup.spec.ts (T13.9.2/DEBT-056): the wake-up UX against a `page.route()`-injected
+  # slow/503 "backend" (chat + login), incl. the negative control -- no extra env needed.
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
   # verification email through the gate's own Mailpit (e2e_ensure_mailpit, above).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
@@ -725,8 +750,9 @@ step_e2e() {
     E2E_ADMIN2_EMAIL="$E2E_ADMIN2_EMAIL" \
     E2E_ERASE_TARGET_EMAIL="$E2E_ERASE_TARGET_EMAIL" \
     E2E_PLAIN_USER_EMAIL="$E2E_PLAIN_USER_EMAIL" \
+    E2E_WAKEUP_EMAIL="$E2E_WAKEUP_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
-      e2e/mfa.spec.ts)
+      e2e/mfa.spec.ts e2e/wakeup.spec.ts)
 }
 
 # T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for

@@ -254,26 +254,39 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   }, []);
 
   // First client-side load (SSR only fetched /admin/features) -- regardless of live mode.
+  // T13.9.1: wired to the same wake hooks as refreshAll, so a cold-start-shaped failure
+  // right on this very first render (e.g. the first admin visit after a long idle period)
+  // shows the banner too, in both SSE and polling mode -- these three GETs are not gated by
+  // `liveMode` at all.
   useEffect(() => {
-    adminErasure()
+    adminErasure({ onWaking, onRecovered })
       .then((e) => {
         setErasure(e);
         setLastSync(Date.now());
+        resetWake();
       })
-      .catch(() => undefined);
-    adminLatency()
+      .catch((err) => {
+        if (err instanceof WakeUpError) onFailed();
+      });
+    adminLatency({ onWaking, onRecovered })
       .then((l) => {
         setLatency(l);
         setLastSync(Date.now());
+        resetWake();
       })
-      .catch(() => undefined);
-    adminEval()
+      .catch((err) => {
+        if (err instanceof WakeUpError) onFailed();
+      });
+    adminEval({ onWaking, onRecovered })
       .then((ev) => {
         setEvalResult(ev);
         setLastSync(Date.now());
+        resetWake();
       })
-      .catch(() => undefined);
-  }, []);
+      .catch((err) => {
+        if (err instanceof WakeUpError) onFailed();
+      });
+  }, [onWaking, onRecovered, onFailed, resetWake]);
 
   // T13.4.1: SSE, local only.
   useEffect(() => {
