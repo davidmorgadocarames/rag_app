@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import ChatSidebar from "@/components/ChatSidebar";
+import WakeBanner from "@/components/WakeBanner";
 import {
   type Citation,
   type ConversationSummary,
@@ -16,6 +17,7 @@ import {
   streamChat,
 } from "@/lib/api";
 import { conversationLoadError } from "@/lib/chatStream";
+import { useWakeState } from "@/lib/useWakeState";
 
 interface UiMessage {
   role: "user" | "assistant";
@@ -67,6 +69,16 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const threadRef = useRef<HTMLDivElement>(null);
+  // T13.9.1 (DEBT-056): the shared wake-up state. A cold-start-shaped failure retries
+  // automatically (wake.state "waking") WITHOUT resubmitting the question a second time --
+  // only the single in-flight attempt is retried, never a duplicate. If that gives up
+  // (wake.state "failed"), the question is never auto-resent (it may already have reached
+  // the LLM): the Retry button below re-sends the SAME, still-visible question exactly once,
+  // on the user's own explicit click.
+  const wake = useWakeState();
+  const lastQuestionRef = useRef<{ question: string; conversationId: string | null } | null>(
+    null,
+  );
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -165,23 +177,14 @@ export default function ChatPage() {
     });
   }
 
-  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const question = input.trim();
-    if (!question || busy) return;
-
-    setInput("");
-    setError(null);
+  async function sendQuestion(question: string, conversationId: string | null) {
+    lastQuestionRef.current = { question, conversationId };
     setBusy(true);
     setStage("classifying");
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: question },
-      { role: "assistant", content: "", streaming: true },
-    ]);
+    wake.reset();
 
     await streamChat(
-      { question, conversation_id: activeId ?? undefined },
+      { question, conversation_id: conversationId ?? undefined },
       {
         // The id arrives first (T11.2.16): keep it even if the turn then fails, so the next
         // message continues this conversation instead of starting a new one.
@@ -200,6 +203,7 @@ export default function ChatPage() {
           setConvTotal(d.conversation_total_tokens);
           setActiveId(d.conversation_id);
           void refreshConversations();
+          wake.reset();
           setBusy(false);
           setStage(null);
         },
@@ -210,11 +214,49 @@ export default function ChatPage() {
           if (dropConversation) setActiveId(null);
           else if (conversationId) setActiveId(conversationId);
           void refreshConversations();
+          wake.reset();
+          setBusy(false);
+          setStage(null);
+        },
+        // T13.9.1: onWaking/onRecovered bracket an automatic retry of the SAME attempt (a
+        // connect-level failure that never reached the backend) -- the assistant bubble
+        // stays in its normal "streaming" placeholder the whole time, the banner below adds
+        // the explanation. onWakeFailed means the retry budget ran out, or the failure was
+        // ambiguous (may have reached the backend): the question is NOT auto-resent --
+        // instead the empty assistant placeholder is dropped and the Retry button (bound to
+        // the SAME question + conversation, via lastQuestionRef) takes its place.
+        onWaking: wake.onWaking,
+        onRecovered: wake.onRecovered,
+        onWakeFailed: () => {
+          setMessages((prev) => prev.slice(0, -1)); // drop the empty "streaming" placeholder
+          wake.onFailed();
           setBusy(false);
           setStage(null);
         },
       },
     );
+  }
+
+  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const question = input.trim();
+    if (!question || busy) return;
+
+    setInput("");
+    setError(null);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: question },
+      { role: "assistant", content: "", streaming: true },
+    ]);
+    await sendQuestion(question, activeId);
+  }
+
+  async function onRetryWake() {
+    const last = lastQuestionRef.current;
+    if (!last) return;
+    setMessages((prev) => [...prev, { role: "assistant", content: "", streaming: true }]);
+    await sendQuestion(last.question, last.conversationId);
   }
 
   function appendToken(t: string) {
@@ -306,9 +348,10 @@ export default function ChatPage() {
                 </div>
               ),
             )}
-            {busy && stage && (
+            {busy && stage && wake.state === "idle" && (
               <p className="text-xs tracking-[0.1em] text-vault-amber">{STAGE_LABELS[stage] ?? stage}</p>
             )}
+            <WakeBanner state={wake.state} onRetry={() => void onRetryWake()} />
             {error && <p className="text-sm text-vault-danger-text">{error}</p>}
           </div>
         </div>

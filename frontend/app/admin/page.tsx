@@ -11,11 +11,20 @@ import { headers } from "next/headers";
 import type { AdminFeaturesResponse } from "@/lib/api";
 import { bffConfig } from "@/lib/bffConfig";
 import { proxyToBackend } from "@/lib/bffProxy";
+import { classifyWakeSignal } from "@/lib/wakeUp";
 import AdminDashboard from "@/components/admin/AdminDashboard";
+import WakeBanner from "@/components/WakeBanner";
 
 export const dynamic = "force-dynamic"; // never statically generated (D12.2) -- a fresh check every time
 
-async function loadFeatures(): Promise<AdminFeaturesResponse | null> {
+type LoadResult =
+  | { ok: true; data: AdminFeaturesResponse }
+  // T13.9.1 (DEBT-056): distinguishes "really not an admin" (a real 4xx: show today's
+  // message) from a cold-start-shaped failure (never show it as "you do not have access" --
+  // that would be a 4xx-shaped lie about a user who may well be an admin).
+  | { ok: false; waking: boolean };
+
+async function loadFeatures(): Promise<LoadResult> {
   // next/headers' ReadonlyHeaders only differs from DOM Headers in being read-only --
   // proxyToBackend only ever calls .get() on it, so this cast is structurally safe.
   const incoming = (await headers()) as unknown as Headers;
@@ -30,17 +39,41 @@ async function loadFeatures(): Promise<AdminFeaturesResponse | null> {
       },
       bffConfig(),
     );
-    if (!response.ok) return null; // not an admin, no MFA step-up, or the backend is down
-    return (await response.json()) as AdminFeaturesResponse;
+    if (response.ok) return { ok: true, data: (await response.json()) as AdminFeaturesResponse };
+    let detail: string | null = null;
+    try {
+      const body = await response.json();
+      if (typeof body?.detail === "string") detail = body.detail;
+    } catch {
+      // keep detail null
+    }
+    return { ok: false, waking: classifyWakeSignal(response.status, detail) !== "none" };
   } catch {
-    return null; // backend unreachable: fail closed, never render admin content
+    // The BFF's own fetch to the backend never got a response at all -- the same signature
+    // as a cold start with no replica listening yet.
+    return { ok: false, waking: true };
   }
 }
 
 export default async function AdminPage() {
-  const initial = await loadFeatures();
+  const result = await loadFeatures();
 
-  if (initial === null) {
+  if (!result.ok && result.waking) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 px-6">
+        <h1 className="text-2xl font-bold tracking-[0.12em] text-vault-steel-light">Admin</h1>
+        <WakeBanner state="waking" />
+        <p className="text-sm text-vault-steel">
+          <a href="/admin" className="underline">
+            Reload this page
+          </a>{" "}
+          in a little while.
+        </p>
+      </main>
+    );
+  }
+
+  if (!result.ok) {
     return (
       <main className="mx-auto flex min-h-screen max-w-md flex-col justify-center gap-4 px-6">
         <h1 className="text-2xl font-bold tracking-[0.12em] text-vault-steel-light">Admin</h1>
@@ -56,5 +89,5 @@ export default async function AdminPage() {
     );
   }
 
-  return <AdminDashboard initial={initial} />;
+  return <AdminDashboard initial={result.data} />;
 }

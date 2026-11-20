@@ -37,7 +37,10 @@ import {
 } from "@/lib/adminKpi";
 import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "@/lib/adminStream";
 import { resolveAlertJump, sortFeaturesWorstFirst, type TriageFilterKey } from "@/lib/adminTriage";
+import { useWakeState } from "@/lib/useWakeState";
+import { WakeUpError } from "@/lib/wakeUp";
 
+import WakeBanner from "../WakeBanner";
 import DefenceLabPanel from "./DefenceLabPanel";
 import ErasurePanel from "./ErasurePanel";
 import FeatureDrawer from "./FeatureDrawer";
@@ -203,27 +206,47 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   // when data is actually re-fetched (that stays SSE/poll-interval driven below).
   const [lastSync, setLastSync] = useState<number>(() => Date.now());
   const [now, setNow] = useState<number>(() => Date.now());
+  // T13.9.1 (DEBT-056): every /admin/* call here is a GET -- idempotent by construction, so
+  // lib/wakeUp.ts always retries a cold-start-shaped failure automatically, whatever its
+  // "safe"/"unsafe" classification; this hook only drives the shared banner around that
+  // already-safe retry loop. If the retry budget is exhausted, "Refresh now" below retries
+  // explicitly on the user's own click (polling will also pick it back up on its own tick).
+  const wake = useWakeState();
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
+  // wake's onWaking/onRecovered/onFailed/reset are stable (useCallback, no deps) -- used
+  // directly rather than the `wake` object itself so this callback's own identity does not
+  // change every time the waking banner toggles (which would otherwise restart the poll
+  // interval below on every wake/recover).
+  const { onWaking, onRecovered, onFailed, reset: resetWake } = wake;
   const refreshAll = useCallback(async () => {
-    // DA-13-E-2: alerts come with /admin/features (same probe sweep) -- no separate poll.
-    const [f, e, l, ev] = await Promise.all([
-      adminFeatures(),
-      adminErasure(),
-      adminLatency(),
-      adminEval(),
-    ]);
-    setFeatures(f.features);
-    setErasure(e);
-    setLatency(l);
-    setEvalResult(ev);
-    setAlerts(f.alerts ?? []);
-    setLastSync(Date.now());
-  }, []);
+    try {
+      // DA-13-E-2: alerts come with /admin/features (same probe sweep) -- no separate poll.
+      const [f, e, l, ev] = await Promise.all([
+        adminFeatures({ onWaking, onRecovered }),
+        adminErasure({ onWaking, onRecovered }),
+        adminLatency({ onWaking, onRecovered }),
+        adminEval({ onWaking, onRecovered }),
+      ]);
+      setFeatures(f.features);
+      setErasure(e);
+      setLatency(l);
+      setEvalResult(ev);
+      setAlerts(f.alerts ?? []);
+      setLastSync(Date.now());
+      resetWake();
+    } catch (err) {
+      if (err instanceof WakeUpError) {
+        onFailed();
+        return;
+      }
+      throw err;
+    }
+  }, [onWaking, onRecovered, onFailed, resetWake]);
 
   const refreshErasure = useCallback(async () => {
     setErasure(await adminErasure());
@@ -358,6 +381,8 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
           )}
         </div>
       </header>
+
+      <WakeBanner state={wake.state} onRetry={() => void refreshAll()} />
 
       {/* T13.4.3/R6-4 (DA-13-C-2): no managed Prometheus on Azure -- every metric value on
           this dashboard is "now" only, never a time series. Shown whenever the backend's own

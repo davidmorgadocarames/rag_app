@@ -4,7 +4,10 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import VaultDoor from "@/components/VaultDoor";
+import WakeBanner from "@/components/WakeBanner";
 import { login, register, resendVerification } from "@/lib/api";
+import { useWakeState } from "@/lib/useWakeState";
+import { WakeUpError } from "@/lib/wakeUp";
 
 export default function LoginPanel() {
   const router = useRouter();
@@ -22,16 +25,21 @@ export default function LoginPanel() {
   // button is unreachable too. Offering it right here, on the exact failed-login error, is
   // the only UI path left to request a fresh email without one.
   const [showResend, setShowResend] = useState(false);
+  // T13.9.1 (DEBT-056): login retries a cold-start-shaped failure automatically (wake.state
+  // "waking"); if that gives up, wake.state becomes "failed" and the user presses Retry
+  // below -- re-running the exact same submit, with email/password still in state (never
+  // cleared on error), so nothing typed is lost.
+  const wake = useWakeState();
 
-  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function submitLogin() {
     setBusy(true);
     setError(null);
     setMessage(null);
     setShowResend(false);
     try {
       if (mode === "login") {
-        await login(email, password);
+        await login(email, password, { onWaking: wake.onWaking, onRecovered: wake.onRecovered });
+        wake.reset();
         // The session is a cookie the BFF/backend just set (T12.1.3/T12.1.7) -- nothing to
         // store client-side; /chat's own guard (middleware + a real API call) takes it from
         // here.
@@ -39,16 +47,26 @@ export default function LoginPanel() {
         return;
       }
       const res = await register(email, password);
+      wake.reset();
       setMessage(res.detail);
       setMode("login");
       setPassword("");
     } catch (err) {
+      if (err instanceof WakeUpError) {
+        wake.onFailed();
+        return;
+      }
       const detail = err instanceof Error ? err.message : "Something went wrong";
       setError(detail);
       if (mode === "login" && detail === "email not verified") setShowResend(true);
     } finally {
       setBusy(false);
     }
+  }
+
+  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await submitLogin();
   }
 
   async function onResend() {
@@ -99,6 +117,7 @@ export default function LoginPanel() {
           />
           {message && <p className="text-xs text-vault-steel">{message}</p>}
           {error && <p className="text-xs text-vault-danger-text">{error}</p>}
+          <WakeBanner state={wake.state} onRetry={() => void submitLogin()} />
           {showResend && (
             <button
               type="button"
