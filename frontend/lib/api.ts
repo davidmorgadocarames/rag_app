@@ -5,6 +5,7 @@
 // `__Host-secrag_csrf` cookie on every state-changing request.
 
 import { consumeChatStream, refusedStream } from "./chatStream.ts";
+import { classifyWakeSignal, WakeUpError, withWakeRetry } from "./wakeUp.ts";
 
 // --- CSRF (P12-D2): pure, DOM-light helpers so they stay directly testable -----------------
 
@@ -107,19 +108,41 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const method = (options.method ?? "GET").toUpperCase();
+// T13.9.1 (DEBT-056, DEC-048): hooks a caller passes through to show (and clear) a shared
+// "Waking the server up…" state around this one call -- see lib/wakeUp.ts for the retry
+// policy itself. `idempotent` overrides the method-based default (every GET is idempotent
+// by default; everything else is not, UNLESS the caller knows better -- see `login` below).
+export interface WakeHooks {
+  idempotent?: boolean;
+  onWaking?: () => void;
+  onRecovered?: () => void;
+  // Test-only override of the retry budget/clock, threaded straight through to
+  // withWakeRetry -- never set in product code.
+  budgetMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+async function doRequest<T>(path: string, options: RequestInit, method: string): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (CSRF_METHODS.has(method)) {
     const csrf = currentCsrfToken();
     if (csrf) headers["X-CSRF-Token"] = csrf;
   }
-  const response = await fetch(`/api${path}`, {
-    ...options,
-    method,
-    headers,
-    credentials: "same-origin", // the BFF is always same-origin: send the session cookie
-  });
+  let response: Response;
+  try {
+    response = await fetch(`/api${path}`, {
+      ...options,
+      method,
+      headers,
+      credentials: "same-origin", // the BFF is always same-origin: send the session cookie
+    });
+  } catch {
+    // The browser's own fetch to our same-origin BFF route never even got a response --
+    // nothing could have reached the backend either. ApiError with status === undefined is
+    // classified "safe" below (classifyWakeSignal(null, ...)).
+    throw new ApiError("The server cannot be reached. Please try again.", undefined);
+  }
   if (!response.ok) {
     let detail = `request failed (${response.status})`;
     try {
@@ -133,22 +156,49 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+  wake: WakeHooks = {},
+): Promise<T> {
+  const method = (options.method ?? "GET").toUpperCase();
+  return withWakeRetry({
+    attempt: () => doRequest<T>(path, options, method),
+    classifyError: (err) =>
+      err instanceof ApiError ? classifyWakeSignal(err.status ?? null, err.message) : "none",
+    idempotent: wake.idempotent ?? method === "GET",
+    onWaking: wake.onWaking,
+    onRecovered: wake.onRecovered,
+    budgetMs: wake.budgetMs,
+    now: wake.now,
+    sleep: wake.sleep,
+  });
+}
+
 // T12.4.4: a generic 202, no session/token any more -- the caller never learns whether the
 // address was new or already registered (only the real owner, by email, does).
 export function register(email: string, password: string): Promise<{ detail: string }> {
   return request("/auth/register", { method: "POST", body: JSON.stringify({ email, password }) });
 }
 
-export function login(email: string, password: string): Promise<void> {
-  return request("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
+// T13.9.1: `idempotent: true` -- unlike a chat question, repeating a login has no harmful
+// side effect (the backend re-checks the password and sets the same session cookie either
+// way), so a cold-start-shaped failure here is always retried automatically with backoff,
+// never just a single soft fail.
+export function login(email: string, password: string, wake: WakeHooks = {}): Promise<void> {
+  return request(
+    "/auth/login",
+    { method: "POST", body: JSON.stringify({ email, password }) },
+    { ...wake, idempotent: true },
+  );
 }
 
 export function logout(): Promise<{ detail: string }> {
   return request("/auth/logout", { method: "POST" });
 }
 
-export function me(): Promise<UserInfo> {
-  return request("/auth/me");
+export function me(wake: WakeHooks = {}): Promise<UserInfo> {
+  return request("/auth/me", {}, wake);
 }
 
 // T12.4.4: reached by email now, not an authenticated session (a freshly registered,
@@ -355,24 +405,24 @@ export interface AdminEraseUserResponse {
   request_id: string;
 }
 
-export function adminFeatures(): Promise<AdminFeaturesResponse> {
-  return request("/admin/features");
+export function adminFeatures(wake: WakeHooks = {}): Promise<AdminFeaturesResponse> {
+  return request("/admin/features", {}, wake);
 }
 
 export function adminMetrics(): Promise<AdminMetricsResponse> {
   return request("/admin/metrics");
 }
 
-export function adminLatency(): Promise<AdminLatencyResponse> {
-  return request("/admin/latency");
+export function adminLatency(wake: WakeHooks = {}): Promise<AdminLatencyResponse> {
+  return request("/admin/latency", {}, wake);
 }
 
-export function adminEval(): Promise<AdminEvalResponse> {
-  return request("/admin/eval");
+export function adminEval(wake: WakeHooks = {}): Promise<AdminEvalResponse> {
+  return request("/admin/eval", {}, wake);
 }
 
-export function adminErasure(): Promise<AdminErasureResponse> {
-  return request("/admin/erasure");
+export function adminErasure(wake: WakeHooks = {}): Promise<AdminErasureResponse> {
+  return request("/admin/erasure", {}, wake);
 }
 
 export function adminAlerts(): Promise<AdminAlertsResponse> {
@@ -464,47 +514,108 @@ export interface StreamCallbacks {
   // Always called when the turn fails, with the conversation id when known;
   // dropConversation: the conversation is gone (404) — the next message starts a new one.
   onError?: (detail: string, conversationId: string | null, dropConversation?: boolean) => void;
+  // T13.9.1 (DEBT-056): the shared wake-up state (lib/wakeUp.ts). onWaking/onRecovered
+  // bracket an automatic retry loop, which only ever happens BEFORE any token has streamed,
+  // for a connect-level failure that provably never reached the backend (classic
+  // scale-from-zero: no replica is listening yet). onWakeFailed fires INSTEAD OF onError
+  // when the retry budget ran out, or a single ambiguous cold-start-shaped failure (a BFF
+  // timeout, or a pass-through 502/503/504 -- the question may already be mid-flight on the
+  // backend) hit: the caller must offer an explicit Retry of the SAME question rather than
+  // show it as an ordinary answer-failed error, and must never resend it automatically.
+  onWaking?: () => void;
+  onRecovered?: () => void;
+  onWakeFailed?: () => void;
+}
+
+/** Carries the BFF's response (or its absence) through withWakeRetry's classifier. */
+class StreamRefusedError extends Error {
+  readonly status: number | null;
+  readonly detail: string | null;
+  constructor(status: number | null, detail: string | null) {
+    super(detail ?? `request failed (${status ?? "no response"})`);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+// Test-only tuning of the retry loop (budget/clock/sleep) -- see lib/wakeUp.ts's own
+// WakeRetryOptions; never set outside lib/chatStream-adjacent tests.
+export interface StreamWakeTuning {
+  budgetMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export async function streamChat(
   body: { question: string; conversation_id?: string; version?: string },
   cb: StreamCallbacks,
+  wakeTuning: StreamWakeTuning = {},
 ): Promise<void> {
   const csrf = currentCsrfToken();
-  let response: Response;
-  try {
-    response = await fetch("/api/chat/stream", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: {
-        "Content-Type": "application/json",
-        ...(csrf ? { "X-CSRF-Token": csrf } : {}),
-      },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    cb.onError?.("The server cannot be reached. Please try again.", body.conversation_id ?? null);
-    return;
-  }
-  if (!response.ok || !response.body) {
-    let detail = `request failed (${response.status})`;
+
+  async function attempt(): Promise<void> {
+    let response: Response;
     try {
-      const err = await response.json();
-      if (typeof err?.detail === "string") detail = err.detail;
+      response = await fetch("/api/chat/stream", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          ...(csrf ? { "X-CSRF-Token": csrf } : {}),
+        },
+        body: JSON.stringify(body),
+      });
     } catch {
-      // keep default
+      throw new StreamRefusedError(null, null);
     }
-    // DA-G2-7: a 404 drops the stale conversation id (the next message starts a new one).
-    const refused = refusedStream(response.status, detail, body.conversation_id ?? null);
-    cb.onError?.(refused.detail, refused.conversationId, refused.dropConversation);
-    return;
+    if (!response.ok || !response.body) {
+      let detail = `request failed (${response.status})`;
+      try {
+        const err = await response.json();
+        if (typeof err?.detail === "string") detail = err.detail;
+      } catch {
+        // keep default
+      }
+      throw new StreamRefusedError(response.status, detail);
+    }
+    await consumeChatStream(response.body, {
+      onConversation: cb.onConversation,
+      onStage: cb.onStage,
+      onToken: cb.onToken,
+      onDone: (event) => cb.onDone?.(event as unknown as ChatDone),
+      onError: cb.onError,
+    });
   }
 
-  await consumeChatStream(response.body, {
-    onConversation: cb.onConversation,
-    onStage: cb.onStage,
-    onToken: cb.onToken,
-    onDone: (event) => cb.onDone?.(event as unknown as ChatDone),
-    onError: cb.onError,
-  });
+  try {
+    await withWakeRetry({
+      attempt,
+      classifyError: (err) =>
+        err instanceof StreamRefusedError ? classifyWakeSignal(err.status, err.detail) : "none",
+      // A chat question is never safely resent automatically once it may have reached the
+      // LLM (double-answer/double-cost risk) -- only a PROVABLY-safe ("safe") failure loops.
+      idempotent: false,
+      onWaking: cb.onWaking,
+      onRecovered: cb.onRecovered,
+      budgetMs: wakeTuning.budgetMs,
+      now: wakeTuning.now,
+      sleep: wakeTuning.sleep,
+    });
+  } catch (err) {
+    if (err instanceof WakeUpError) {
+      cb.onWakeFailed?.();
+      return;
+    }
+    if (err instanceof StreamRefusedError) {
+      // DA-G2-7: a 404 drops the stale conversation id (the next message starts a new one).
+      const refused = refusedStream(
+        err.status ?? 0,
+        err.detail ?? "Something went wrong.",
+        body.conversation_id ?? null,
+      );
+      cb.onError?.(refused.detail, refused.conversationId, refused.dropConversation);
+      return;
+    }
+    throw err; // a genuine programming error -- never swallowed silently
+  }
 }
