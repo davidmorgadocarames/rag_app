@@ -147,6 +147,20 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
    - **Error** → the assistant bubble shows the error message (also for a stream that breaks without a
      final event); nothing partial is presented as authoritative. The client keeps the
      `conversation_id` from the first event, so the next message continues the same conversation.
+   - **Waking up after scale-to-zero** (T13.9.1, DEBT-056, DEC-048): Azure runs every
+     Container App with `minReplicas 0`/`cooldownPeriod 300 s`, so a request after ~5 min
+     idle hits a cold start. The frontend's shared retry policy (`frontend/lib/wakeUp.ts`)
+     classifies a failed BFF/`/api/*` call by what `lib/bffProxy.ts` actually returns: a
+     connect-level failure (502 `"upstream unreachable"` — the request provably never
+     reached the backend) is **always** retried automatically with bounded backoff, showing
+     a "Waking the server up…" banner (`aria-live="polite"`); a BFF timeout (502
+     `"upstream timed out"`) or any other pass-through 502/503/504 is ambiguous — the
+     request may already be mid-flight — so a chat question or login is **never**
+     auto-resubmitted in that case: the banner switches to a Retry button (typed input is
+     never lost; one click resends the exact same request exactly once). A real 4xx
+     (401/403/404/422/429…) is never treated as waking up. The same mechanism covers login,
+     the admin dashboard's data loads, and every other `/api/*` call through
+     `lib/api.ts`'s shared `request()`.
      If the conversation was deleted elsewhere (404 before streaming), the client drops the id and
      says so; the next message starts a new conversation. Opening a conversation that cannot be
      decrypted (409) shows a clear message and an empty thread instead of a blank view.
@@ -235,6 +249,10 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
    idle timer) and shows a banner + prompts a reload if it closes (session expired, role
    lost, MFA lost, idle timeout); on Azure the page polls at a low frequency with a manual
    **Refresh now** button instead (Container Apps internal ingress + scale-to-zero, TF16).
+   T13.9.1/DEBT-056: every `/admin/*` GET behind both the first load and the poll/Refresh
+   tick is idempotent, so a cold-start-shaped failure here is always retried automatically
+   (same banner as §1 above) — the SSR gate (`app/admin/page.tsx`) also no longer shows the
+   misleading "you do not have access" message for a cold start, only for a real 4xx.
 
 ## 3. Route → auth matrix
 

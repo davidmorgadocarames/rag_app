@@ -422,3 +422,49 @@ closed that one too (the duration is now recorded in a `finally`, so the partial
 still captured rather than silently dropped). Per-request latency TRACES (as opposed to
 this replica-wide average) are out of scope here — that is 16-F's own future work; the
 Pipeline section carries a small caption saying so rather than implying it already exists.
+
+## Wake-up UX after scale-to-zero (13-H, T13.9.1–T13.9.2, DEBT-056, DEC-048)
+
+**Why.** Every Container App runs `minReplicas 0`/`cooldownPeriod 300 s` (since 11a): after
+~5 min idle, Azure scales to zero and the next request hits a cold start. The session
+itself is fine (Postgres-backed), but without this block the page just looked dead/broken
+for the length of the cold start.
+
+**P13-D-wakeup — classification, not a timer.** The frontend never guesses "is the backend
+cold" from elapsed time; it classifies exactly what `lib/bffProxy.ts` already returns for a
+failed upstream call: a connect-level failure (502 `"upstream unreachable"`, thrown before
+`fetch` to the backend ever got a response — no replica is listening yet) vs. a BFF timeout
+(502 `"upstream timed out"`, `bffConfig.ts`'s `MIN_TIMEOUT_MS` abort, DEC-006) vs. any other
+pass-through 502/503/504 vs. a real 4xx. This needed **no backend change at all** — the
+whole policy lives in `frontend/lib/wakeUp.ts`, reading signals the BFF already produced for
+other reasons (DEC-006's own timeout, `bffProxy.ts`'s own catch block).
+
+**Idempotency — the "don't answer/charge a chat question twice" requirement.** The first
+class above (connect-level failure) is the classic scale-from-zero signature and is, by
+construction, provably safe: the request never reached the backend, whatever HTTP method it
+was, so it is retried automatically with bounded exponential backoff (60 s total budget).
+The other three failure classes are ambiguous for a non-idempotent call (the backend may
+already be mid-flight) — those are retried automatically only when the caller marks the call
+`idempotent` (every GET, by the HTTP method alone, plus `login` explicitly, since repeating
+a login has no harmful side effect); every other case (a chat question, register, an admin
+mutation) surfaces once as a `WakeUpError` with **no automatic resend** — the UI shows a
+Retry button instead, so at most one further attempt ever happens, and only on the user's
+own explicit click. `frontend/lib/api.ts`'s `request()`/`streamChat()` are the only two call
+sites that implement this; `frontend/lib/useWakeState.ts` + `frontend/components/
+WakeBanner.tsx` (`aria-live="polite"`, reusing the existing `--amber`/`--danger-text`
+tokens) are the one shared UI piece every page (login, chat, the admin dashboard's data
+loads) wires the same three hooks (`onWaking`/`onRecovered`/`onWakeFailed`) into, rather than
+a per-page copy.
+
+**Found running this for real (T13.9.2): `app/admin/page.tsx`'s own SSR gate.** Before this
+block, a cold-start-shaped failure on the dashboard's first (server-side) load was
+indistinguishable from "not an admin" and showed the exact same "you do not have access to
+this page" message — a 4xx-shaped lie about a user who may well be an admin. The same
+`classifyWakeSignal` now runs there too (no retry loop server-side, just the right message +
+a reload link), closing that gap as part of the same fix rather than leaving it half done.
+
+**Scope boundary (DEC-048, orchestrator decision, not this block's).** Whether to also raise
+`cooldownPeriod` on Azure (300 s → 900/1800 s) is a cost trade-off the orchestrator brings to
+the user separately (T13.9.3); this block's own Done-when is the Local UX only — the
+eventual Azure gate (T13.9.4, ≥ 6 min idle → first action shows the wake-up state and then
+succeeds) is a later promotion step.

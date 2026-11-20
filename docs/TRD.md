@@ -193,6 +193,24 @@ catalogue analysis; this is the implementation summary.
   responses is defense in depth only since 12b (T12.5.3): the backend itself stopped
   issuing one at all (F1 closes on this path; the legacy Bearer rollback, TF10, was
   removed entirely the same block — see the 12b bullet below).
+- **Wake-up retry policy** (`frontend/lib/wakeUp.ts`, T13.9.1/DEBT-056/DEC-048): the one
+  place that classifies a failed BFF call so a scale-to-zero cold start never looks like a
+  dead page. A connect-level failure (the BFF's own 502 `"upstream unreachable"`, thrown
+  before `proxyToBackend`'s `fetch` ever got a response — i.e. no replica is listening yet)
+  is classified **"safe"**: provably never reached the backend, so it is retried
+  automatically with bounded exponential backoff (base 1 s, factor 1.8, capped at 8 s/step,
+  total budget 60 s) regardless of HTTP method. A BFF timeout (502 `"upstream timed out"`,
+  the `MIN_TIMEOUT_MS` abort above) or any other pass-through 502/503/504 is classified
+  **"unsafe"**: the request may already have reached the backend, so it is only
+  auto-retried for a call the caller declares `idempotent` (every GET, by the HTTP method
+  alone, plus `login` explicitly — repeating it has no harmful side effect); every other
+  "unsafe" failure (a chat question, register, an admin mutation) is surfaced once as a
+  `WakeUpError`, with **no automatic resend** — the UI shows a Retry button instead, so a
+  duplicate answer/charge requires one real, user-initiated click, never a silent retry. A
+  real 4xx is classified `"none"` and never enters this path at all. `lib/api.ts`'s
+  `request()`/`streamChat()` are the only two call sites; every page wires the same
+  `onWaking`/`onRecovered`/`onWakeFailed` hooks to the shared `<WakeBanner>`
+  (`frontend/components/WakeBanner.tsx`, `aria-live="polite"`).
 - **CSRF** (`rag_app.csrf`, P12-D2): double-submit, `csrf_token = HMAC-SHA256(CSRF_SECRET,
   raw_session_id)`, issued in a **readable** (non-`HttpOnly`) `__Host-secrag_csrf` cookie so
   page script can echo it back as `X-CSRF-Token`. `require_csrf` is attached to every
