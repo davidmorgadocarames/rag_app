@@ -181,10 +181,15 @@ export function register(email: string, password: string): Promise<{ detail: str
   return request("/auth/register", { method: "POST", body: JSON.stringify({ email, password }) });
 }
 
-// T13.9.1: `idempotent: true` -- unlike a chat question, repeating a login has no harmful
-// side effect (the backend re-checks the password and sets the same session cookie either
-// way), so a cold-start-shaped failure here is always retried automatically with backoff,
-// never just a single soft fail.
+// T13.9.1 (reworded, DA-13-H-2): `idempotent: true` -- unlike a chat question, repeating a
+// login has no HARMFUL side effect, so a cold-start-shaped failure here is always retried
+// automatically with backoff, never just a single soft fail. What actually happens on a
+// retry is NOT "the same session cookie either way": backend/src/rag_app/api/auth.py's
+// `login()` calls `session_service.create_session` on every successful call, so a retry
+// after a lost response creates a second, equally valid session -- harmless, just one more
+// row to expire later on its own idle/absolute timeout. It cannot double-count the lockout
+// counter either: a real 401 is classified "none" by `classifyWakeSignal` and is never
+// retried at all, and that check runs BEFORE `create_session` on the backend.
 export function login(email: string, password: string, wake: WakeHooks = {}): Promise<void> {
   return request(
     "/auth/login",

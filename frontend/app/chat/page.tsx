@@ -17,6 +17,7 @@ import {
   streamChat,
 } from "@/lib/api";
 import { conversationLoadError } from "@/lib/chatStream";
+import { createRetryGuard } from "@/lib/retryGuard";
 import { useWakeState } from "@/lib/useWakeState";
 
 interface UiMessage {
@@ -79,6 +80,13 @@ export default function ChatPage() {
   const lastQuestionRef = useRef<{ question: string; conversationId: string | null } | null>(
     null,
   );
+  // DA-13-H-1 fix (13-H-fix): a synchronous in-flight guard for the Retry button specifically
+  // -- `busy` alone is not enough (by the time the Retry banner renders, `busy` is already
+  // false again; two clicks in the same tick would both read that stale value and both
+  // re-send the SAME question). `retrying` (React state) only drives the button's `disabled`
+  // look; `retryGuardRef` (a plain ref) is the actual guard.
+  const retryGuardRef = useRef(createRetryGuard());
+  const [retrying, setRetrying] = useState(false);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -253,10 +261,17 @@ export default function ChatPage() {
   }
 
   async function onRetryWake() {
-    const last = lastQuestionRef.current;
-    if (!last) return;
-    setMessages((prev) => [...prev, { role: "assistant", content: "", streaming: true }]);
-    await sendQuestion(last.question, last.conversationId);
+    await retryGuardRef.current.run(async () => {
+      const last = lastQuestionRef.current;
+      if (!last) return;
+      setRetrying(true);
+      try {
+        setMessages((prev) => [...prev, { role: "assistant", content: "", streaming: true }]);
+        await sendQuestion(last.question, last.conversationId);
+      } finally {
+        setRetrying(false);
+      }
+    });
   }
 
   function appendToken(t: string) {
@@ -351,7 +366,7 @@ export default function ChatPage() {
             {busy && stage && wake.state === "idle" && (
               <p className="text-xs tracking-[0.1em] text-vault-amber">{STAGE_LABELS[stage] ?? stage}</p>
             )}
-            <WakeBanner state={wake.state} onRetry={() => void onRetryWake()} />
+            <WakeBanner state={wake.state} onRetry={() => void onRetryWake()} retrying={retrying} />
             {error && <p className="text-sm text-vault-danger-text">{error}</p>}
           </div>
         </div>

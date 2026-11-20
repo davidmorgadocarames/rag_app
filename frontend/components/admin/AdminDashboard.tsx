@@ -37,6 +37,7 @@ import {
 } from "@/lib/adminKpi";
 import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "@/lib/adminStream";
 import { resolveAlertJump, sortFeaturesWorstFirst, type TriageFilterKey } from "@/lib/adminTriage";
+import { createRetryGuard } from "@/lib/retryGuard";
 import { useWakeState } from "@/lib/useWakeState";
 import { WakeUpError } from "@/lib/wakeUp";
 
@@ -212,6 +213,12 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   // already-safe retry loop. If the retry budget is exhausted, "Refresh now" below retries
   // explicitly on the user's own click (polling will also pick it back up on its own tick).
   const wake = useWakeState();
+  // DA-13-H-1 fix (13-H-fix): same gap as ChatPage/LoginPanel's Retry button -- "Refresh now"
+  // below calls `refreshAll()` with no guard of its own, so a double click could fire two
+  // concurrent fetch rounds. These GETs have no side effect to duplicate, but the overlapping
+  // requests/state updates are still wasted work; guarded the same way for consistency.
+  const retryGuardRef = useRef(createRetryGuard());
+  const [retrying, setRetrying] = useState(false);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
@@ -247,6 +254,17 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       throw err;
     }
   }, [onWaking, onRecovered, onFailed, resetWake]);
+
+  const onRetryRefresh = useCallback(async () => {
+    await retryGuardRef.current.run(async () => {
+      setRetrying(true);
+      try {
+        await refreshAll();
+      } finally {
+        setRetrying(false);
+      }
+    });
+  }, [refreshAll]);
 
   const refreshErasure = useCallback(async () => {
     setErasure(await adminErasure());
@@ -395,7 +413,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
         </div>
       </header>
 
-      <WakeBanner state={wake.state} onRetry={() => void refreshAll()} />
+      <WakeBanner state={wake.state} onRetry={() => void onRetryRefresh()} retrying={retrying} />
 
       {/* T13.4.3/R6-4 (DA-13-C-2): no managed Prometheus on Azure -- every metric value on
           this dashboard is "now" only, never a time series. Shown whenever the backend's own

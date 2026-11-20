@@ -1,11 +1,12 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import VaultDoor from "@/components/VaultDoor";
 import WakeBanner from "@/components/WakeBanner";
 import { login, register, resendVerification } from "@/lib/api";
+import { createRetryGuard } from "@/lib/retryGuard";
 import { useWakeState } from "@/lib/useWakeState";
 import { WakeUpError } from "@/lib/wakeUp";
 
@@ -30,6 +31,13 @@ export default function LoginPanel() {
   // below -- re-running the exact same submit, with email/password still in state (never
   // cleared on error), so nothing typed is lost.
   const wake = useWakeState();
+  // DA-13-H-1 fix (13-H-fix): the Retry button below calls `submitLogin()` directly with no
+  // guard of its own -- `busy` is already false again by the time the Retry banner renders,
+  // so two clicks in the same tick would both pass the (unrelated) submit-button disable and
+  // fire a second `login()` call. `retryGuardRef` blocks that synchronously; `retrying` only
+  // drives the button's `disabled` look.
+  const retryGuardRef = useRef(createRetryGuard());
+  const [retrying, setRetrying] = useState(false);
 
   async function submitLogin() {
     setBusy(true);
@@ -67,6 +75,17 @@ export default function LoginPanel() {
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     await submitLogin();
+  }
+
+  async function onRetryLogin() {
+    await retryGuardRef.current.run(async () => {
+      setRetrying(true);
+      try {
+        await submitLogin();
+      } finally {
+        setRetrying(false);
+      }
+    });
   }
 
   async function onResend() {
@@ -117,7 +136,7 @@ export default function LoginPanel() {
           />
           {message && <p className="text-xs text-vault-steel">{message}</p>}
           {error && <p className="text-xs text-vault-danger-text">{error}</p>}
-          <WakeBanner state={wake.state} onRetry={() => void submitLogin()} />
+          <WakeBanner state={wake.state} onRetry={() => void onRetryLogin()} retrying={retrying} />
           {showResend && (
             <button
               type="button"

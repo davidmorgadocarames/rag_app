@@ -113,6 +113,50 @@ test("chat: an ambiguous cold-start failure is never auto-resubmitted -- Retry s
   await expect(thread.getByText(SECURITY_QUESTION)).toHaveCount(1);
 });
 
+test("chat: double-clicking Retry (same tick) sends the question exactly once (DA-13-H-1)", async ({
+  page,
+}) => {
+  await loginAndReachChat(page, WAKEUP_EMAIL as string, WAKEUP_PASSWORD as string);
+  await expect(page).toHaveURL(/\/chat$/);
+
+  let attempts = 0;
+  await page.route("**/api/chat/stream", async (route) => {
+    attempts += 1;
+    // The first attempt is the user's own click (ambiguous failure -- never auto-resent).
+    // Every attempt after it (the retry, and -- if the bug were still present -- a second,
+    // duplicate retry) is let through to the real backend, with a short delay so a missing
+    // guard would have a real window to let a second request land before the first settles.
+    if (attempts === 1) return route.fulfill(upstreamTimedOut());
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return route.continue();
+  });
+
+  const thread = page.getByTestId("chat-thread");
+  await page.getByPlaceholder("Ask a security question…").fill(SECURITY_QUESTION);
+  await page.getByRole("button", { name: "SEND" }).click();
+
+  const retryButton = page.getByTestId("wake-banner-retry");
+  await expect(retryButton).toBeVisible();
+
+  // Two native `click()` calls in the SAME browser task/tick -- the exact race DA-13-H-1
+  // describes (two activations landing before React has re-rendered away from the "failed"
+  // state). A `Promise.all` of two Playwright `.click()` calls would not reliably reproduce
+  // this (each goes through a separate CDP round trip); calling the DOM method twice inside
+  // one `page.evaluate` does.
+  await page.evaluate(() => {
+    const btn = document.querySelector<HTMLButtonElement>('[data-testid="wake-banner-retry"]');
+    btn?.click();
+    btn?.click();
+  });
+
+  await expect(thread.getByText(/Sources/)).toBeVisible({ timeout: 60_000 });
+  // Exactly one retry reached the real backend -- the second, duplicate click was a no-op.
+  expect(attempts).toBe(2);
+  // Still exactly one user bubble and one assistant answer -- no duplicate turn was created.
+  await expect(thread.getByText(SECURITY_QUESTION)).toHaveCount(1);
+  await expect(thread.getByText(/Sources/)).toHaveCount(1);
+});
+
 test("login: a connect-refused cold start retries automatically and still signs in", async ({
   page,
 }) => {
