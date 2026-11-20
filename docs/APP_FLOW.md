@@ -269,10 +269,31 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
 | `GET /admin/features`, `GET /admin/metrics`, `GET /admin/latency`, `GET /admin/eval`, `GET /admin/erasure`, `GET /admin/alerts`, `GET /admin/stream` (local only) | yes + role=admin + MFA set | `admin:read`; read-only, no PII in any response (T13.1.7) |
 | `POST /admin/erasure/{id}/purge-now`, `POST /admin/erasure/{id}/retry`, `POST /admin/users/erase` | yes + role=admin + MFA set | `admin:users`; audited in `admin_actions` (migration 0008) |
 | `GET /admin/lab/runs`, `POST /admin/lab/run` | yes + role=admin + MFA set, **local only** | Absent (404) with `LAB_ENABLED` off or `ENV=prod` — never a 403 (DEC-028) |
+| any other page route | no | T13.10.1/T13.10.2 (DEBT-057): Next's App Router renders `app/not-found.tsx` with a real HTTP 404 — never a soft-404 200; `/admin` for a non-admin and any real `/api/...` path are unaffected (they are real routes, see below) |
 
 Every path above the backend actually serves is also on the BFF's explicit allow-list
 (`frontend/lib/bffRoutes.ts`) under `/api/...` — a path not listed there is a 404 from the
-frontend itself, before it would ever reach the backend.
+frontend itself, before it would ever reach the backend. This is a JSON 404 from the BFF's
+own catch-all route handler, never the HTML page above.
+
+### 2.8 Unknown route (404)
+
+- Any URL that matches no route (typo, stale link, moved page) renders the custom 404 page
+  (T13.10.1, DEBT-057): the ASCII vault door drawn standing ajar (same geometry formula as the
+  landing page's closed door, `frontend/lib/vaultGeometry.ts`) with a confused stickman who has
+  walked out of it and stopped well clear of the frame, large "404 · room not found", the
+  heading "This room isn't in the vault.", one sentence of body text, and **exactly one**
+  button: "Back to login" (`/login`).
+- Deliberately no echo of the requested path and no other link (e.g. to `/chat`) — an error
+  page is attack surface, and the page never even reads the pathname (no
+  `usePathname()`/`useSearchParams()`/`headers()`) to make that structurally true, not just a
+  UI choice.
+- `prefers-reduced-motion`: the art is drawn once and never animates; the art itself is
+  `aria-hidden` (decorative), the real content is a plain `<h1>` + paragraph + link, and it
+  works down to a ~390px phone width with no horizontal scroll.
+- Security headers (CSP etc., §8.1 of the TRD) are present on this response exactly like every
+  other page — the per-request CSP nonce comes from the same `middleware.ts` every route goes
+  through.
 
 ## 4. Key states to design for
 

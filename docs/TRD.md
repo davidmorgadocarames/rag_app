@@ -211,6 +211,24 @@ catalogue analysis; this is the implementation summary.
   `request()`/`streamChat()` are the only two call sites; every page wires the same
   `onWaking`/`onRecovered`/`onWakeFailed` hooks to the shared `<WakeBanner>`
   (`frontend/components/WakeBanner.tsx`, `aria-live="polite"`).
+- **Custom 404 page** (`frontend/app/not-found.tsx`, T13.10.1/T13.10.2/DEBT-057): Next's App
+  Router renders it automatically, with a real HTTP 404 status, for any request matching no
+  route — never a soft-404 200; `/api/*`'s own catch-all route (`app/api/[...path]/route.ts`)
+  always answers in JSON and is never reached here, and `/admin` for a non-admin stays a real
+  route (its own SSR role check, §12 below). The door-slab/wheel formula is shared, not
+  duplicated, with the closed-door hero on `/` (`frontend/lib/vaultGeometry.ts`,
+  `sampleDoorBody`/`createVaultSampler` — the same math `components/VaultDoor.tsx` uses);
+  the ajar scene's own frame/interior/footprints/stickman composition is
+  `frontend/lib/vaultAjarScene.ts` (pure, `node --test`-able, no DOM). The page's copy model
+  (`frontend/lib/notFoundContent.ts`) exposes exactly one destination (`/login`) and no field
+  for the request path at all — the component never reads the pathname
+  (no `usePathname()`/`useSearchParams()`/`headers()`), so there is nothing it could echo
+  back even by accident (user: an error page's extra links/path echo are attack surface).
+  `prefers-reduced-motion`: drawn once, no interval; the art is `aria-hidden`, the heading is
+  a real `<h1>`, and it holds at a ~390px phone width with no horizontal scroll. Served
+  through the same `middleware.ts` as every other route, so it gets the identical per-request
+  CSP nonce and security headers (proven by `e2e/security-headers.spec.ts`'s walk, which now
+  also visits an unknown path).
 - **CSRF** (`rag_app.csrf`, P12-D2): double-submit, `csrf_token = HMAC-SHA256(CSRF_SECRET,
   raw_session_id)`, issued in a **readable** (non-`HttpOnly`) `__Host-secrag_csrf` cookie so
   page script can echo it back as `X-CSRF-Token`. `require_csrf` is attached to every
