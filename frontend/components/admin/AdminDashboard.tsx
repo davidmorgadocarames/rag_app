@@ -97,18 +97,18 @@ function AlertBanner({
           <div
             key={alert.code}
             data-testid={`admin-alert-${alert.code}`}
-            className={`flex flex-wrap items-center gap-3 border p-2.5 text-xs ${
-              tone === "crit" ? "border-vault-danger" : "border-vault-amber"
+            className={`flex flex-wrap items-center gap-3 rounded-lg border p-2.5 text-xs ${
+              tone === "crit" ? "border-vault-crit-border bg-vault-crit-bg" : "border-vault-warn-border bg-vault-warn-bg"
             }`}
           >
             <StatusBadge tone={tone} label={alert.severity === "red" ? "Critical" : "Warning"} />
-            <span className="flex-1 text-vault-steel-light">{alert.message}</span>
+            <span className="flex-1 text-vault-text-strong">{alert.message}</span>
             {target.featureId ? (
               <button
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
                 onClick={() => onJumpToFeature(target.featureId as string)}
-                className="cursor-pointer border border-vault-steel-dark px-2.5 py-1 text-vault-amber hover:border-vault-steel"
+                className="cursor-pointer rounded border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
               >
                 Open feature
               </button>
@@ -117,7 +117,7 @@ function AlertBanner({
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
                 onClick={() => onJumpToSection(target.section as Section)}
-                className="cursor-pointer border border-vault-steel-dark px-2.5 py-1 text-vault-amber hover:border-vault-steel"
+                className="cursor-pointer rounded border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
               >
                 Open erasure
               </button>
@@ -129,12 +129,25 @@ function AlertBanner({
   );
 }
 
-function KpiTile({ label, value, sub }: { label: string; value: string; sub: string }) {
+// T13.J.1: `subClass` colours the sub-line the same way the mockup's own KPI tiles do (a
+// severity-tinted sub-line, never the tile value/label itself) -- always derived from the real
+// counts already computed by the caller below, never a client-side threshold of its own.
+function KpiTile({
+  label,
+  value,
+  sub,
+  subClass = "text-vault-text-muted",
+}: {
+  label: string;
+  value: string;
+  sub: string;
+  subClass?: string;
+}) {
   return (
-    <div className="flex flex-col gap-1 border border-vault-steel-dark p-3">
-      <span className="text-xs uppercase tracking-[0.08em] text-vault-steel-dark">{label}</span>
-      <span className="font-mono text-2xl font-semibold text-vault-steel-light">{value}</span>
-      <span className="text-xs text-vault-steel">{sub}</span>
+    <div className="flex flex-col gap-1 rounded-lg border border-vault-line bg-vault-surface p-3">
+      <span className="text-xs uppercase tracking-[0.08em] text-vault-text-muted">{label}</span>
+      <span className="font-mono text-2xl font-semibold text-vault-text-strong">{value}</span>
+      <span className={`text-xs ${subClass}`}>{sub}</span>
     </div>
   );
 }
@@ -168,11 +181,13 @@ function KpiTiles({
         label="Features healthy"
         value={`${health.healthy} / ${health.countedTotal}`}
         sub={`${health.critical} critical · ${health.warning} warning · ${health.offByDesign} off by design`}
+        subClass={health.critical > 0 ? "text-vault-crit" : health.warning > 0 ? "text-vault-warn" : undefined}
       />
       <KpiTile
         label="Active alerts"
         value={String(alerts.length)}
         sub={`${severity.red} red · ${severity.amber} amber`}
+        subClass={severity.red > 0 ? "text-vault-crit" : severity.amber > 0 ? "text-vault-warn" : undefined}
       />
       <KpiTile
         label="Chat latency (avg)"
@@ -183,6 +198,7 @@ function KpiTiles({
         label="Erasure queue"
         value={String(queue.pending)}
         sub={`${queue.overdue} overdue`}
+        subClass={queue.overdue > 0 ? "text-vault-crit" : undefined}
       />
     </section>
   );
@@ -384,19 +400,19 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
 
   return (
     <main className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-6 sm:px-6 sm:py-8">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-vault-steel-dark pb-4">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-vault-line pb-4">
         <div>
           <h1
             data-testid="admin-header-title"
-            className="font-mono text-xl font-semibold tracking-[0.12em] text-vault-steel-light"
+            className="font-mono text-xl font-semibold tracking-[0.12em] text-vault-text-strong"
           >
             SECRAG &middot; ADMIN
           </h1>
-          <p className="text-xs text-vault-steel-dark">Operations dashboard</p>
+          <p className="text-xs text-vault-text-muted">Operations dashboard</p>
         </div>
-        <div className="flex flex-wrap items-center gap-3 text-xs text-vault-steel-dark">
+        <div className="flex flex-wrap items-center gap-3 text-xs text-vault-text-muted">
           <span className="rounded-full border border-vault-steel-dark px-2.5 py-1 font-mono">
-            live mode: <span className="text-vault-steel-light">{liveMode}</span>
+            live mode: <span className="text-vault-text-strong">{liveMode}</span>
           </span>
           <span data-testid="admin-refresh-text" className="font-mono">
             {refreshText}
@@ -420,8 +436,8 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
           live_mode says "polling" (the Azure indicator, TF14) -- never a frontend build-time
           check. Relocated here from the old standalone OverviewPanel, 13-G2. */}
       {liveMode === "polling" && (
-        <p data-testid="admin-history-note" className="text-xs text-vault-steel-dark">
-          History: <span className="text-vault-steel-light">Azure: n/a</span> -- every metric
+        <p data-testid="admin-history-note" className="text-xs text-vault-text-muted">
+          History: <span className="text-vault-text-strong">Azure: n/a</span> -- every metric
           value below is this replica&apos;s current state only, never a cross-replica time
           series.
         </p>
@@ -448,7 +464,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <nav
           aria-label="Dashboard sections"
-          className="flex w-full flex-col gap-1 border border-vault-steel-dark p-2 lg:w-56 lg:flex-shrink-0"
+          className="flex w-full flex-col gap-1 rounded-lg border border-vault-line bg-vault-surface p-2 lg:w-56 lg:flex-shrink-0"
         >
           {SECTION_DEFS.filter((s) => s.key !== "lab" || labAvailable).map((s) => (
             <button
@@ -460,15 +476,15 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
               className={`flex items-center justify-between gap-2 rounded px-3 py-2 text-left text-sm ${
                 section === s.key
                   ? "bg-vault-amber/10 font-semibold text-vault-amber-bright"
-                  : "text-vault-steel hover:text-vault-steel-light"
+                  : "text-vault-steel-light hover:text-vault-amber-bright"
               }`}
             >
               <span>{s.label}</span>
-              <span className="font-mono text-xs text-vault-steel-dark">{navTag[s.key]}</span>
+              <span className="font-mono text-xs text-vault-text-muted">{navTag[s.key]}</span>
             </button>
           ))}
           {!labAvailable && (
-            <p className="px-3 py-2 text-xs text-vault-steel-dark">
+            <p className="px-3 py-2 text-xs text-vault-text-muted">
               Defence lab appears only on a local stack; it is hidden on Azure.
             </p>
           )}

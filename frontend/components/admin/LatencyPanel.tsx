@@ -61,7 +61,7 @@ function StageRow({
   return (
     <div
       data-testid={`pipeline-stage-${stage.stage}`}
-      className="flex flex-col gap-1 border-b border-vault-steel-dark/40 py-1.5"
+      className="flex flex-col gap-1 border-b border-vault-line/70 py-1.5"
     >
       <button
         type="button"
@@ -70,7 +70,7 @@ function StageRow({
         onClick={onToggle}
         className="flex w-full flex-wrap items-center gap-2 text-left"
       >
-        <span className="flex w-40 flex-shrink-0 items-center gap-1.5 font-mono text-xs font-semibold text-vault-steel-light">
+        <span className="flex w-40 flex-shrink-0 items-center gap-1.5 font-mono text-xs font-semibold text-vault-text-strong">
           <span
             aria-hidden="true"
             className={`inline-block w-3 text-vault-amber transition-transform ${expanded ? "rotate-90" : ""}`}
@@ -79,18 +79,18 @@ function StageRow({
           </span>
           {stage.stage}
           {stage.drawnFromZero && (
-            <span className="font-sans text-[10px] font-normal text-vault-steel-dark">(chit-chat)</span>
+            <span className="font-sans text-[10px] font-normal text-vault-text-muted">(chit-chat)</span>
           )}
         </span>
-        <span className="relative h-5 min-w-[7rem] flex-1 rounded border border-vault-steel-dark/60 bg-vault-bg">
+        <span className="relative h-5 min-w-[7rem] flex-1 rounded border border-vault-line bg-vault-bg">
           <span
             className="absolute inset-y-0 rounded bg-vault-steel"
             style={{ left: `${bar.leftPercent}%`, width: `${bar.widthPercent}%` }}
           />
         </span>
-        <span className="w-32 flex-shrink-0 text-right font-mono text-xs text-vault-steel-light">
+        <span className="w-32 flex-shrink-0 text-right font-mono text-xs text-vault-text-strong">
           {fmt(stage.totalAvgSeconds)}{" "}
-          <span className="text-vault-steel-dark">&middot; p95 {fmt(stage.totalP95Seconds)}</span>
+          <span className="text-vault-text-muted">&middot; p95 {fmt(stage.totalP95Seconds)}</span>
         </span>
       </button>
 
@@ -105,8 +105,8 @@ function StageRow({
                 className="flex flex-wrap items-center gap-2"
               >
                 <span className="flex w-40 flex-shrink-0 flex-col">
-                  <span className="font-mono text-xs text-vault-steel">{step.step}</span>
-                  <span className="text-[11px] text-vault-steel-dark">
+                  <span className="font-mono text-xs text-vault-steel-light">{step.step}</span>
+                  <span className="text-[11px] text-vault-text-muted">
                     {STEP_WHAT[step.step] ?? ""}
                   </span>
                 </span>
@@ -116,9 +116,9 @@ function StageRow({
                     style={{ left: `${stepBar.leftPercent}%`, width: `${stepBar.widthPercent}%` }}
                   />
                 </span>
-                <span className="w-32 flex-shrink-0 text-right font-mono text-xs text-vault-steel">
+                <span className="w-32 flex-shrink-0 text-right font-mono text-xs text-vault-steel-light">
                   {step.observed ? fmt(step.avgSeconds) : "n/a"}{" "}
-                  <span className="text-vault-steel-dark">
+                  <span className="text-vault-text-muted">
                     &middot; p95 {step.observed ? fmt(step.p95Seconds) : "n/a"}
                   </span>
                 </span>
@@ -150,21 +150,21 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
     <section
       data-testid="admin-latency-panel"
       aria-label="Chat pipeline latency"
-      className="flex flex-col gap-3 border border-vault-steel-dark p-4"
+      className="flex flex-col gap-3 rounded-lg border border-vault-line bg-vault-surface p-4"
     >
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">
+        <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">
           CHAT PIPELINE &middot; AVERAGE PER STAGE
         </h2>
-        <span className="text-xs text-vault-steel-dark">
+        <span className="text-xs text-vault-text-muted">
           This replica since start &middot;{" "}
-          <span className="font-mono text-vault-steel">{chatCount ?? "n/a"}</span> chats &middot;
+          <span className="font-mono text-vault-steel-light">{chatCount ?? "n/a"}</span> chats &middot;
           not per-request (per-request traces: 16-F)
         </span>
       </div>
 
       {!waterfall.hasAnyData || pipeline.length === 0 ? (
-        <p data-testid="pipeline-empty-state" className="text-xs text-vault-steel-dark">
+        <p data-testid="pipeline-empty-state" className="text-xs text-vault-text-muted">
           No chat turns observed yet on this replica -- the waterfall fills in as real chats
           happen.
         </p>
@@ -175,7 +175,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
               type="button"
               data-testid="pipeline-expand-all"
               onClick={() => setAll(true)}
-              className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber hover:border-vault-steel"
+              className="cursor-pointer rounded border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel"
             >
               Expand all
             </button>
@@ -183,7 +183,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
               type="button"
               data-testid="pipeline-stages-only"
               onClick={() => setAll(false)}
-              className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel hover:border-vault-steel"
+              className="cursor-pointer rounded border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
             >
               Stages only
             </button>
@@ -201,14 +201,14 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
             ))}
           </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-vault-steel-dark pt-2 text-xs text-vault-steel-dark">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-vault-line pt-2 text-xs text-vault-text-muted">
             <span>
               Average waterfall: each bar starts where the previous step ends. Amber = the
               single slowest observed step. &quot;responding&quot; is the chit-chat path only, so
               it starts at 0 and is not part of the RAG total. Non-streaming answers never
               record a <code className="font-mono">token_stream</code> step.
             </span>
-            <span className="font-mono text-vault-steel-light">
+            <span className="font-mono text-vault-text-strong">
               RAG path total avg {fmt(waterfall.totalAvgSeconds)}
             </span>
           </div>

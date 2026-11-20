@@ -27,6 +27,36 @@
      itself is kept unchanged for BORDERS/fills (a border/fill is not subject to WCAG text
      contrast, and several destructive buttons already rely on its exact shade). */
   --danger-text: #e2725a;
+
+  /* T13.J.1 (13-J): the admin dashboard's own status/surface tokens, taken verbatim from the
+     approved mockup (Main.dc.html, 2026-11-19) -- 13-G shipped the dashboard reusing the
+     generic vault tokens above (no dedicated success green, no tinted pill backgrounds); this
+     block restores the mockup's palette without introducing a new font (the app keeps its own
+     monospace everywhere). Every value here is scoped to admin components only -- chat/login/
+     404 keep using the vault tokens above, unchanged.
+     Status tones: tinted pill background + border, text/icon colour on top. Verified >= 4.5:1
+     WCAG AA for the TEXT colour against its own tinted background (composited over both
+     --surface and --surface-raised, the two backgrounds a pill can sit on): ok 8.4-9.9:1, warn
+     7.9-9.2:1, crit 6.6-7.6:1, off 7.9-9.2:1 (see lib/adminColours.test.ts). */
+  --ok: #8fd6b0;
+  --ok-bg: rgba(108, 197, 151, 0.12);
+  --ok-border: rgba(108, 197, 151, 0.35);
+  --warn: var(--amber-bright);
+  --warn-bg: rgba(240, 185, 104, 0.12);
+  --warn-border: rgba(240, 185, 104, 0.4);
+  --crit: #f29a85;
+  --crit-bg: rgba(239, 138, 115, 0.14);
+  --crit-border: rgba(239, 138, 115, 0.45);
+  --off: #b4bcc6;
+  --off-bg: rgba(154, 163, 174, 0.1);
+  --off-border: rgba(154, 163, 174, 0.35);
+
+  /* Surfaces + text roles (mockup's cards/panels/drawer + heading/secondary text colours). */
+  --surface: #131418;
+  --surface-raised: #16181d;
+  --line: #2b2f35;
+  --text-strong: #e4e7eb;
+  --text-muted: #9aa3ae;
 }
 
 body {

@@ -30,11 +30,14 @@ interface ErasurePanelProps {
   onChanged: () => void; // re-fetch the erasure list after an action completes
 }
 
+// T13.J.1: countdown colours now mirror the mockup's own `e.timeColor` values exactly
+// (done -> muted, retrying/near-deadline -> warn, overdue -> crit, otherwise -> strong text)
+// instead of the generic danger/steel tokens 13-G shipped with.
 function countdownClass(row: ErasureRequestOut): string {
-  if (row.status === "done") return "text-vault-steel";
-  if (row.overdue) return "text-vault-danger-text";
-  if (row.seconds_left < AMBER_THRESHOLD_SECONDS) return "text-vault-amber";
-  return "text-vault-steel-light";
+  if (row.status === "done") return "text-vault-text-muted";
+  if (row.overdue) return "text-vault-crit";
+  if (row.seconds_left < AMBER_THRESHOLD_SECONDS) return "text-vault-warn";
+  return "text-vault-text-strong";
 }
 
 function formatHours(seconds: number): string {
@@ -87,16 +90,16 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
   return (
     <section
       data-testid="admin-erasure-panel"
-      className="flex flex-col gap-4 border border-vault-steel-dark p-4"
+      className="flex flex-col gap-4 rounded-lg border border-vault-line bg-vault-surface p-4"
     >
-      <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">ERASURE</h2>
+      <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">ERASURE</h2>
 
-      {actionMessage && <p className="text-xs text-vault-amber">{actionMessage}</p>}
+      {actionMessage && <p className="text-xs text-vault-amber-bright">{actionMessage}</p>}
       {actionError && <p className="text-xs text-vault-danger-text">{actionError}</p>}
 
-      <table className="w-full text-left text-xs text-vault-steel">
+      <table className="w-full text-left text-xs text-vault-steel-light">
         <thead>
-          <tr className="text-vault-steel-dark">
+          <tr className="text-vault-text-muted">
             <th className="py-1">Request</th>
             <th>Status</th>
             <th>Time left</th>
@@ -110,9 +113,9 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
             <tr
               key={row.id}
               data-testid={`erasure-row-${row.id}`}
-              className="border-t border-vault-steel-dark/40"
+              className="border-t border-vault-line/60"
             >
-              <td className="py-1 font-mono">{row.id.slice(0, 8)}</td>
+              <td className="py-1 font-mono text-vault-text-strong">{row.id.slice(0, 8)}</td>
               <td>
                 <StatusBadge tone={statusTone(row.status)} label={statusLabel(row.status)} />
               </td>
@@ -133,7 +136,7 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
           ))}
           {(erasure?.requests ?? []).length === 0 && (
             <tr>
-              <td colSpan={6} className="py-2 text-vault-steel-dark">
+              <td colSpan={6} className="py-2 text-vault-text-muted">
                 No erasure requests.
               </td>
             </tr>
@@ -142,7 +145,7 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
       </table>
 
       {erasure?.last_purger_run && (
-        <p className="text-xs text-vault-steel-dark">
+        <p className="text-xs text-vault-text-muted">
           Last purge job run: {erasure.last_purger_run.started_at} --{" "}
           {erasure.last_purger_run.requests_processed} processed,{" "}
           {erasure.last_purger_run.errors} error(s).
@@ -238,10 +241,10 @@ function EraseAccountForm({ onDone }: { onDone: () => void }) {
     <form
       data-testid="erase-account-form"
       onSubmit={onSubmit}
-      className="flex flex-col gap-2 border-t border-vault-steel-dark pt-4"
+      className="flex flex-col gap-2 border-t border-vault-line pt-4"
     >
-      <h3 className="text-xs tracking-[0.14em] text-vault-steel-light">ERASE AN ACCOUNT</h3>
-      <label className="text-xs text-vault-steel">
+      <h3 className="text-xs tracking-[0.14em] text-vault-text-strong">ERASE AN ACCOUNT</h3>
+      <label className="text-xs text-vault-text-muted">
         Account email
         <input
           type="email"
@@ -251,7 +254,7 @@ function EraseAccountForm({ onDone }: { onDone: () => void }) {
           className="mt-1 w-full border border-vault-steel-dark bg-transparent px-2 py-1 text-vault-steel-light"
         />
       </label>
-      <label className="text-xs text-vault-steel">
+      <label className="text-xs text-vault-text-muted">
         Type ERASE to confirm
         <input
           required
@@ -267,7 +270,7 @@ function EraseAccountForm({ onDone }: { onDone: () => void }) {
       >
         Erase account
       </button>
-      {result && <p className="text-xs text-vault-amber">{result}</p>}
+      {result && <p className="text-xs text-vault-amber-bright">{result}</p>}
       {error && <p className="text-xs text-vault-danger-text">{error}</p>}
     </form>
   );

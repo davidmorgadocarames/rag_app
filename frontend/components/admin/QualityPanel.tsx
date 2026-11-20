@@ -10,6 +10,7 @@
 // has been observed (every metric value is None, so nothing trips below_floor/regressed), so
 // the OLD text was not merely unhelpful but actively misleading ("passed" implies a real run).
 
+import { TONE_CLASS } from "@/lib/adminColours";
 import type { AdminEvalResponse, FeatureHealthOut } from "@/lib/api";
 
 interface QualityPanelProps {
@@ -17,12 +18,16 @@ interface QualityPanelProps {
   features: FeatureHealthOut[];
 }
 
+// T13.J.1: same "ok"/"warn" tones the mockup's own qmetrics table uses (Main.dc.html:
+// `q[4]` is "ok" or "warn", never "crit" -- regressed/below-floor on the golden set is a
+// warning, not a critical failure) -- tinted pill, icon-free here (the row's own Metric/
+// Value text already carries the label, so this badge is the colour signal; "Above floor"/
+// "Below baseline" is itself the text, never colour alone).
 function StateBadge({ ok }: { ok: boolean }) {
+  const tone = ok ? "ok" : "warn";
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-semibold ${
-        ok ? "border-vault-steel-light text-vault-steel-light" : "border-vault-danger text-vault-danger-text"
-      }`}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-semibold ${TONE_CLASS[tone]}`}
     >
       {ok ? "Above floor" : "Below baseline"}
     </span>
@@ -36,24 +41,27 @@ export default function QualityPanel({ evalResult, features }: QualityPanelProps
   return (
     <section
       data-testid="admin-quality-panel"
-      className="flex flex-col gap-3 border border-vault-steel-dark p-4"
+      className="flex flex-col gap-3 rounded-lg border border-vault-line bg-vault-surface p-4"
     >
-      <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">
+      <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">
         ANSWER QUALITY &middot; GOLDEN SET
       </h2>
 
       {hasRun && evalResult ? (
         <>
-          <p className="text-xs text-vault-steel-dark">
-            Last run: <span className="font-mono text-vault-steel-light">{evalResult.last_run_at}</span>{" "}
+          <p className="text-xs text-vault-text-muted">
+            Last run: <span className="font-mono text-vault-text-strong">{evalResult.last_run_at}</span>{" "}
             --{" "}
-            <span className={evalResult.passed ? "text-vault-steel-light" : "text-vault-danger-text"}>
+            <span className={evalResult.passed ? "text-vault-ok" : "text-vault-warn"}>
               {evalResult.passed ? "passed" : "regressed / below floor"}
             </span>
           </p>
-          <table className="w-full text-left text-xs text-vault-steel">
+          {/* T13.J.1: row text stays plain (mockup colours only the State pill, never the whole
+              row) -- the per-row red tint this used to carry is gone; StateBadge alone is the
+              colour signal, icon-free but label-full ("Above floor"/"Below baseline"). */}
+          <table className="w-full text-left text-xs text-vault-steel-light">
             <thead>
-              <tr className="text-vault-steel-dark">
+              <tr className="text-vault-text-muted">
                 <th>Metric</th>
                 <th>Value</th>
                 <th>Floor</th>
@@ -65,15 +73,11 @@ export default function QualityPanel({ evalResult, features }: QualityPanelProps
               {evalResult.metrics.map((row) => {
                 const below = row.below_floor || row.regressed;
                 return (
-                  <tr
-                    key={row.key}
-                    data-testid={`quality-metric-${row.key}`}
-                    className={below ? "text-vault-danger-text" : ""}
-                  >
-                    <td className="font-mono">{row.key}</td>
-                    <td className="font-mono">{row.value ?? "n/a"}</td>
-                    <td className="font-mono text-vault-steel-dark">{row.floor ?? "n/a"}</td>
-                    <td className="font-mono text-vault-steel-dark">{row.baseline ?? "n/a"}</td>
+                  <tr key={row.key} data-testid={`quality-metric-${row.key}`}>
+                    <td className="font-mono text-vault-text-strong">{row.key}</td>
+                    <td className="font-mono text-vault-text-strong">{row.value ?? "n/a"}</td>
+                    <td className="font-mono text-vault-text-muted">{row.floor ?? "n/a"}</td>
+                    <td className="font-mono text-vault-text-muted">{row.baseline ?? "n/a"}</td>
                     <td>{row.value !== null && <StateBadge ok={!below} />}</td>
                   </tr>
                 );
@@ -82,14 +86,14 @@ export default function QualityPanel({ evalResult, features }: QualityPanelProps
           </table>
         </>
       ) : (
-        <p data-testid="quality-empty-state" className="flex items-center gap-2 text-xs text-vault-steel-dark">
+        <p data-testid="quality-empty-state" className="flex items-center gap-2 text-xs text-vault-text-muted">
           No evaluation recorded yet -- run the gate&apos;s eval step to get a verdict.
         </p>
       )}
 
       {misspelling && (
-        <p data-testid="quality-misspelling-probe" className="text-xs text-vault-steel-dark">
-          Misspelling tolerance probe: <span className="text-vault-amber">{misspelling.status}</span>{" "}
+        <p data-testid="quality-misspelling-probe" className="text-xs text-vault-text-muted">
+          Misspelling tolerance probe: <span className="text-vault-amber-bright">{misspelling.status}</span>{" "}
           -- {misspelling.probe_detail ?? "no detail"}
         </p>
       )}

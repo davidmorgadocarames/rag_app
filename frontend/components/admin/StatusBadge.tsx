@@ -1,20 +1,11 @@
-// T13.8.5/T13.8.4: a single shared badge for every status/severity shown on the dashboard --
-// icon + text together (never colour alone, accessibility rule from the approved mockup), on
-// the existing vault palette tokens (there is no dedicated "success green" token: OK reuses
-// the neutral steel-light, Warning/Critical reuse the amber/danger tokens already used
-// elsewhere on this dashboard, Off here reuses the muted steel-dark).
+// T13.8.5/T13.8.4/T13.J.1: a single shared badge for every status/severity shown on the
+// dashboard -- icon + text together (never colour alone, accessibility rule from the approved
+// mockup), on the mockup's own dedicated status tokens (13-J restores these: OK now has its
+// own success green, Warning/Critical/Off here each get their own tinted pill background +
+// border instead of reusing generic vault tokens -- see lib/adminColours.ts/globals.css).
 
+import { TONE_CLASS } from "@/lib/adminColours";
 import type { FeatureStatusKey } from "@/lib/adminTriage";
-
-// T13.8.8 (DA-13-G2-4): "crit" uses --danger-text for the TEXT/icon colour (>= 4.5:1 on the
-// dark background, computed ~6.4:1) and keeps --danger only for the border -- see
-// globals.css's own comment for why the two tokens differ.
-const TONE_CLASS: Record<FeatureStatusKey, string> = {
-  ok: "border-vault-steel-light text-vault-steel-light",
-  warn: "border-vault-amber text-vault-amber",
-  crit: "border-vault-danger text-vault-danger-text",
-  off: "border-vault-steel-dark text-vault-steel",
-};
 
 function Icon({ tone }: { tone: FeatureStatusKey }) {
   const common = {

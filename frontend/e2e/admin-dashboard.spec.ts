@@ -68,6 +68,20 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
   await expect(page.getByText("Nothing in this state right now.")).toBeVisible();
   await page.getByTestId("triage-filter-all").click();
 
+  // T13.J.1: the OK tone now paints the mockup's own tinted pill (dedicated green token) --
+  // a freshly seeded e2e stack guarantees at least one OK row (admin-api itself), so this is
+  // the one tone always exercisable live end-to-end without touching backend probe data
+  // (warn/crit/off have no live-data path here without a behaviour change out of this
+  // block's scope -- they are covered at the unit level instead, lib/adminColours.test.ts).
+  // This fails on the pre-13-J code: the old OK badge had no background at all (border
+  // only, reusing the neutral steel-light token).
+  const adminApiBadge = page
+    .getByTestId("triage-row-admin-api")
+    .getByText("OK", { exact: true });
+  await expect(adminApiBadge).toBeVisible();
+  await expect(adminApiBadge).toHaveCSS("background-color", "rgba(108, 197, 151, 0.12)");
+  await expect(adminApiBadge).toHaveCSS("color", "rgb(143, 214, 176)");
+
   // Selecting a row opens the drawer with that feature (T13.8.6).
   await page.getByTestId("triage-row-admin-api").click();
   await expect(page.getByTestId("admin-feature-drawer")).toBeVisible();

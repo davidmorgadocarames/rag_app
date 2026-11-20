@@ -334,7 +334,8 @@ the lab.
 `frontend/lib/adminTriage.ts` maps each feature's raw `probe_status` to one of four
 triage states — OK, Warning, Critical, or "Off here" — reusing the vault palette's existing
 semantic tokens (steel-light/amber/danger/steel-dark; there is no separate "success green"
-token) with an icon *and* text on every badge, never colour alone. A `down` probe on a
+token — **13-J below restores the mockup's dedicated tokens**) with an icon *and* text on
+every badge, never colour alone. A `down` probe on a
 `dev_only`/`azure_only` feature that is also NOT `expected_here` (T13.8.9, DEBT-053 — e.g.
 `admin-defence-lab`'s `lab_enabled and env != "prod"`) is "Off here" with a truthful
 one-line "why" (e.g. the defence lab being off on Azure by design) rather than counted as
@@ -468,3 +469,76 @@ a reload link), closing that gap as part of the same fix rather than leaving it 
 the user separately (T13.9.3); this block's own Done-when is the Local UX only — the
 eventual Azure gate (T13.9.4, ≥ 6 min idle → first action shows the wake-up state and then
 succeeds) is a later promotion step.
+
+## 13-J: mockup palette restored
+
+**Why.** 13-G2/13-G3 shipped the redesigned shell reusing the generic vault tokens
+(`--steel-light`/`--amber`/`--danger`/`--steel-dark`) for status, because at the time there
+was "no dedicated success green token" — the live dashboard read grey/amber only, never the
+approved mockup's (`Main.dc.html`, approved 2026-11-19) green/amber/salmon/blue-grey status
+pills with tinted backgrounds. This block restores that palette **without** adopting the
+mockup's IBM Plex fonts (cohesion with the rest of the app, which stays monospace
+throughout, per the orchestrator's explicit brief).
+
+**Decision: new tokens, not a repaint of the existing ones.** `app/globals.css` gained 16
+new custom properties, scoped to the admin dashboard only — `--ok`/`--ok-bg`/`--ok-border`,
+`--warn`/`--warn-bg`/`--warn-border` (`--warn` aliases `--amber-bright` via
+`var(--amber-bright)` — same value, one source of truth), `--crit`/`--crit-bg`/
+`--crit-border`, `--off`/`--off-bg`/`--off-border`, plus `--surface`/`--surface-raised`/
+`--line`/`--text-strong`/`--text-muted` for the mockup's card/drawer backgrounds and
+heading/secondary text roles — mirrored in `tailwind.config.ts` as `colors.vault.{ok,warn,
+crit,off}{,-bg,-border}` / `surface`/`surface-raised`/`line`/`text-strong`/`text-muted`.
+Chat/login/404 are untouched — they keep the pre-existing vault tokens.
+
+**`lib/adminColours.ts` (C5 pattern, same as `adminTriage.ts`).** `TONE_CLASS`/
+`TONE_TEXT_CLASS` are StatusBadge's and every panel's single source of truth for the four
+tones' Tailwind classes — unit-tested directly (`lib/adminColours.test.ts`), rather than
+inlined per-component, so a future tone change cannot drift between StatusBadge and the
+triage filter chips/alert banner/erasure countdown that all read the SAME map.
+
+**WCAG AA verified, not assumed.** The same module implements the WCAG contrast maths
+(relative luminance → contrast ratio, alpha-compositing a tinted pill's rgba background over
+the two real surfaces a pill can sit on — the plain card `--surface` and the raised feature
+drawer `--surface-raised`) and a test asserts every tone's text clears 4.5:1 against its own
+composited background: ok 8.4–9.9:1, warn 7.9–9.2:1, crit 6.6–7.6:1, off 7.9–9.2:1 (worst
+case first). None of the mockup's four status colours failed AA — nothing had to be
+changed from the mockup's own values.
+
+**Filter chips keep the mockup's own nuance: tone colours the TEXT, amber colours the
+SELECTION.** `Main.dc.html`'s filter-chip `style()` colours each chip's label with its own
+status tone (a Critical chip's label is always salmon) regardless of whether it is the
+active filter; only the border/background switch to amber when a chip IS the active filter.
+`TriagePanel.tsx` now matches this exactly, rather than the previous "active chip turns
+amber, inactive chips are all the same grey" behaviour.
+
+**KPI tile sub-lines stay data-driven.** The mockup's four KPI tiles each have one fixed
+sub-line colour (crit/warn/muted/warn) in the static sample data; `AdminDashboard.tsx`
+instead derives each sub-line's colour from the SAME real counts the sub-line text already
+reads (`health.critical`/`severity.red`/`queue.overdue`, falling back to warn, then muted)
+— the mockup's intent (draw the eye to a bad number) without inventing a colour that
+disagrees with the real number next to it.
+
+**Found while wiring this up: Tailwind's `content` glob never scanned `lib/`.**
+`tailwind.config.ts`'s `content` array only listed `app/**` and `components/**`; with the
+tone classes defined as string literals in `lib/adminColours.ts`, Tailwind's JIT purged
+them as unused, so the built CSS had no rule for e.g. `bg-vault-ok-bg` at all — the OK pill
+rendered with a fully transparent background in a real build (caught by the new e2e smoke
+test asserting the OK badge's computed `background-color`, not by typecheck/lint/unit,
+which cannot see generated CSS). Fixed by adding `./lib/**/*.{js,ts,jsx,tsx,mdx}` to
+`content`.
+
+**Known gap for the DA (e2e tone coverage).** The e2e smoke
+(`e2e/admin-dashboard.spec.ts`) can only exercise the OK tone live — a freshly seeded e2e
+stack has no Critical/Warning feature and no alerts (T13.5.2's own comment), and fabricating
+one would need a backend test hook or behaviour change, out of this block's scope ("do not
+change data/polling/behaviour"). Warn/crit/off are proven correct at the unit level
+(`lib/adminColours.test.ts`) and visually in a manual run against the mockup, not live
+end-to-end. A follow-up phase could add an admin-only "force a probe status" test
+hook if full-tone e2e coverage becomes a priority.
+
+**Minor approximation (reported, not silently changed).** The mockup actually uses THREE
+border/divider shades (`#2b2f35` card border, `#23262b` row-level divider, `#454c56`
+drawer/button border); this block introduces one new token, `--line` (`#2b2f35`), for both
+card borders and row dividers, rather than a fourth near-identical shade for the `#23262b`
+case. The visual difference is negligible (both are dark neutral greys a few % apart) and
+borders are not subject to WCAG text-contrast rules.

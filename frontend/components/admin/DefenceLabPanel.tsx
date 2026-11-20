@@ -95,15 +95,15 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
   return (
     <section
       data-testid="admin-defence-lab-panel"
-      className="flex flex-col gap-3 border border-vault-steel-dark p-4"
+      className="flex flex-col gap-3 rounded-lg border border-vault-line bg-vault-surface p-4"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm tracking-[0.18em] text-vault-steel-light">DEFENCE LAB</h2>
-        <span className="rounded-full border border-vault-amber px-2.5 py-0.5 text-xs text-vault-amber">
+        <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">DEFENCE LAB</h2>
+        <span className="rounded-full border border-vault-warn-border px-2.5 py-0.5 text-xs text-vault-warn">
           Local stack only &middot; dev routes
         </span>
       </div>
-      <p className="text-xs text-vault-steel-dark">
+      <p className="text-xs text-vault-text-muted">
         Each probe attacks this local stack on purpose and expects the defence to hold. Same
         status language as the Triage section: OK = the defence held.
       </p>
@@ -114,7 +114,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
           data-testid="defence-lab-run-button"
           disabled={running}
           onClick={() => runNow()}
-          className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
+          className="cursor-pointer rounded border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
         >
           {running ? "Running…" : "Run defence lab"}
         </button>
@@ -123,7 +123,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
             type="button"
             data-testid="defence-lab-history-button"
             onClick={() => loadRuns()}
-            className="cursor-pointer border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel hover:border-vault-steel"
+            className="cursor-pointer rounded border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
           >
             Show history
           </button>
@@ -133,7 +133,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
       {lastRun && (
         <p
           data-testid="defence-lab-last-run"
-          className={lastRun.all_matched ? "text-xs text-vault-steel-light" : "text-xs text-vault-danger-text"}
+          className={lastRun.all_matched ? "text-xs text-vault-ok" : "text-xs text-vault-crit"}
         >
           Last run @ {lastRun.git_sha.slice(0, 12)}: {lastRun.results.length} probe(s),{" "}
           {lastRun.all_matched ? "all matched" : "mismatch -- see below"}
@@ -141,7 +141,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
       )}
 
       {cards.length === 0 ? (
-        <p data-testid="defence-lab-empty-state" className="text-xs text-vault-steel-dark">
+        <p data-testid="defence-lab-empty-state" className="text-xs text-vault-text-muted">
           No probes run yet on this replica -- press &quot;Run defence lab&quot; or &quot;Show
           history&quot;.
         </p>
@@ -154,15 +154,15 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
             <div
               key={card.probeId}
               data-testid={`defence-lab-card-${card.probeId}`}
-              className="flex flex-col gap-1.5 border border-vault-steel-dark p-3"
+              className="flex flex-col gap-1.5 rounded border border-vault-line bg-vault-surface-raised p-3"
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-xs text-vault-steel-light">{card.probeId}</span>
+                <span className="font-mono text-xs text-vault-text-strong">{card.probeId}</span>
                 <StatusBadge tone={card.passed ? "ok" : "crit"} label={card.passed ? "Held" : "Mismatch"} />
               </div>
-              <span className="text-xs text-vault-steel-dark">{card.observedOutcome}</span>
+              <span className="text-xs text-vault-text-muted">{card.observedOutcome}</span>
               {card.lastAt && (
-                <span className="font-mono text-[11px] text-vault-steel-dark">{card.lastAt}</span>
+                <span className="font-mono text-[11px] text-vault-text-muted">{card.lastAt}</span>
               )}
             </div>
           ))}
