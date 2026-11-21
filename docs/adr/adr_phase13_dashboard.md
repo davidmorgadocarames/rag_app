@@ -598,6 +598,13 @@ dashboard's own polling interval and "Refresh now" button are deliberately NOT w
 timer — out of scope ("admin dashboard **loads**", and the user's own standing "do not touch
 polling" constraint from 13-J).
 
+**Known boundary: the server-rendered first `/admin` load (DA-13-J2-1).** `app/admin/page.tsx`
+is server-rendered, so on a fresh or direct `/admin` navigation during a HELD cold start no
+client-side timer can run before hydration: the user sees only the browser's own native
+loading indicator, never the wake banner. The banner covers every client-side call (login,
+chat send/stream, the dashboard's client-side initial load); a global navigation-loading
+indicator for the SSR case is a possible future admin-UX item (DA-13-J2-2), not built here.
+
 **Tests.** `lib/pendingWake.test.ts` (12 cases): never fires before `clear()` cancels it
 (the negative-control shape), fires exactly once at the threshold, `clear()`/`dispose()`
 after firing (the latter silent, no `onCleared`), re-arming for a second call, the default
