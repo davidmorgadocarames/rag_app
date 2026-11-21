@@ -2,9 +2,15 @@
 
 // T13.8.6/T13.8.8: the side drawer for the feature selected in Triage -- name/id/phase, its
 // probe status badge, the registry's own lifecycle status (DA-13-G2-3), the probe detail (+
-// the "why" when it is Off here by design), its own metrics map, related alerts (via
-// AdminAlertOut.feature_ids, T13.8.3a) and the registry's docs link (T13.8.6/backend docs
-// field).
+// the "why" when it is Off here by design), its own metrics map and related alerts (via
+// AdminAlertOut.feature_ids, T13.8.3a).
+//
+// T13.12-fix (13-J3, user 2026-11-22): the "Docs: …" line (the registry's own `docs` field,
+// e.g. `docs/RUNBOOK_AZURE.md#email`) is REMOVED here by explicit user decision, overriding
+// the mockup (which still shows it) -- "no sirve para nada" (not clickable, not useful in
+// this drawer). `FeatureHealthOut.docs` itself is untouched (still a real backend field,
+// used nowhere else in the frontend) -- this is a presentation-only removal, not an API
+// change.
 
 import { TONE_TEXT_CLASS } from "@/lib/adminColours";
 import type { AdminAlertOut, FeatureHealthOut } from "@/lib/api";
@@ -108,8 +114,6 @@ export default function FeatureDrawer({ feature, relatedAlerts }: FeatureDrawerP
           </ul>
         )}
       </div>
-
-      <p className="font-mono text-xs text-vault-text-muted">Docs: {feature.docs}</p>
     </aside>
   );
 }
