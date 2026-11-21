@@ -66,8 +66,14 @@ export default function TriagePanel({
               data-testid={`triage-filter-${f.key}`}
               aria-pressed={pressed}
               onClick={() => onFilterChange(f.key)}
-              className={`cursor-pointer rounded-full border px-3 py-1 text-xs ${toneTextClass} ${
-                pressed ? "border-vault-amber bg-vault-amber/10" : "border-vault-steel-dark hover:border-vault-steel"
+              // T13.12.1/T13.12.2: `min-h-9` (36px) + `px-3 py-1.5` (12/6px) match the
+              // mockup's own filter-chip style string exactly (Main.dc.html `filters[].style`)
+              // -- `bg-vault-amber-wash-14` replaces the pre-13-J3 `bg-vault-amber with a /10 modifier` (an
+              // opacity modifier on a var() colour, compiled to no rule at all).
+              className={`flex min-h-9 cursor-pointer items-center rounded-full border px-3 py-1.5 text-xs ${toneTextClass} ${
+                pressed
+                  ? "border-vault-amber bg-vault-amber-wash-14"
+                  : "border-vault-steel-dark hover:border-vault-steel"
               }`}
             >
               {f.label} <span className="font-mono">{count}</span>
@@ -87,13 +93,18 @@ export default function TriagePanel({
               data-testid={`triage-row-${feature.id}`}
               aria-pressed={selected}
               onClick={() => onSelect(feature.id)}
-              className={`flex w-full flex-wrap items-center gap-3 border-b border-vault-line/60 px-2 py-2.5 text-left ${
-                selected ? "bg-vault-amber/10 shadow-[inset_3px_0_0_var(--amber)]" : ""
+              // T13.12.1/T13.12.2: `min-h-[52px]` + `px-3 py-2.5` (12/10px) match the mockup's
+              // own row style string -- `border-vault-row-divider` replaces the pre-13-J3
+              // `border-vault-line with a /60 modifier` (same opacity-modifier bug as the amber wash above:
+              // --line is also a var() colour, so the divider never rendered at all) and
+              // `bg-vault-amber-wash-10` replaces `bg-vault-amber with a /10 modifier`.
+              className={`flex min-h-[52px] w-full flex-wrap items-center gap-3 border-b border-vault-row-divider px-3 py-2.5 text-left ${
+                selected ? "bg-vault-amber-wash-10 shadow-[inset_3px_0_0_var(--amber)]" : ""
               }`}
             >
               <StatusBadge tone={info.key} label={info.label} />
               <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <span className="text-vault-text-strong">{feature.name}</span>
+                <span className="font-medium text-vault-text-strong">{feature.name}</span>
                 <span className="text-xs text-vault-text-muted">{info.detail}</span>
               </span>
               <span className="min-w-[4.5rem] text-right font-mono text-xs text-vault-text-muted">

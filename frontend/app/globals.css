@@ -57,6 +57,31 @@
   --line: #2b2f35;
   --text-strong: #e4e7eb;
   --text-muted: #9aa3ae;
+
+  /* T13.12.1 fix (13-J3, DEBT-059 reopened): named, pre-composited amber washes. Tailwind 3
+     cannot apply an opacity modifier (e.g. `bg-vault-amber/10`) to a colour whose Tailwind
+     value is a CSS custom property (`vault.amber: var(--amber)`, tailwind.config.ts) -- there
+     is no literal rgb triplet for it to scale, so it silently emits NO rule at all. That is
+     exactly what made the selected triage row, the active nav item and the pressed filter
+     chip render with no tint (found live by the user, "mucho menos colorido" than the
+     mockup). Rule going forward: no class in any admin component may ever write an opacity
+     modifier on a `vault-*` colour (see adr_phase13_dashboard.md's 13-J3 section and
+     lib/adminTailwindCompile.test.ts, which enforces this). These three are solid rgba()
+     values instead, mirroring Main.dc.html's own `rows[].style`/`sections[].style`/
+     `filters[].style` strings exactly. */
+  --amber-wash-10: rgba(217, 154, 63, 0.1); /* selected triage row background */
+  --amber-wash-12: rgba(217, 154, 63, 0.12); /* active nav item background */
+  --amber-wash-14: rgba(217, 154, 63, 0.14); /* pressed filter chip background */
+
+  /* T13.12.1 fix (13-J3): same root cause as the amber washes above, found by the same grep
+     -- `border-vault-line/60`/`/70` (an opacity modifier on --line, itself a var()) also
+     compiled to no rule at all, so triage/metrics/erasure row dividers and pipeline stage
+     dividers never rendered a border. Named after the mockup's own literal divider colours
+     (Main.dc.html rows[].style/sel.metrics row style/pipeline stage row style) rather than a
+     generic opacity of --line, since the mockup never actually uses a transparent --line for
+     these -- it uses two different, slightly darker solid tones. */
+  --row-divider: #23262b; /* triage rows, feature-drawer metrics, quality/erasure table rows */
+  --stage-divider: #1d2025; /* pipeline stage rows (darker still, mockup line 177) */
 }
 
 body {

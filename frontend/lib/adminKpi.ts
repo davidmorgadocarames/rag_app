@@ -40,16 +40,30 @@ export function alertSeverityCounts(alerts: { severity: string }[]): AlertSeveri
   return { red, amber };
 }
 
+// T13.J.1/ErasurePanel.tsx: an open (non-overdue) request counts as "near deadline" once less
+// than 4h of its 24h SLA remain (age > 20h) -- the SAME threshold ErasurePanel's own
+// `countdownClass` already used (re-exported from here, 13-J3, so the two never drift apart).
+export const AMBER_THRESHOLD_SECONDS = 4 * 3600;
+
 export interface ErasureQueueSummary {
   pending: number;
   overdue: number;
+  // T13.12.2 (13-J3): the mockup's own KPI sub-line always shows BOTH clauses ("0 overdue ·
+  // 1 near deadline", Main.dc.html kpis[3]) -- the pre-13-J3 code only ever showed "N
+  // overdue", dropping the near-deadline count (and so never coloured the sub-line amber for
+  // a queue with nothing overdue yet but something about to be).
+  nearDeadline: number;
 }
 
 export function erasureQueueSummary(
-  requests: { status: string; overdue: boolean }[],
+  requests: { status: string; overdue: boolean; seconds_left: number }[],
 ): ErasureQueueSummary {
   const open = requests.filter((r) => r.status !== "done");
-  return { pending: open.length, overdue: open.filter((r) => r.overdue).length };
+  const overdue = open.filter((r) => r.overdue);
+  const nearDeadline = open.filter(
+    (r) => !r.overdue && r.seconds_left < AMBER_THRESHOLD_SECONDS,
+  );
+  return { pending: open.length, overdue: overdue.length, nearDeadline: nearDeadline.length };
 }
 
 export interface ChatLatencySummary {

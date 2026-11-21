@@ -97,7 +97,9 @@ function AlertBanner({
           <div
             key={alert.code}
             data-testid={`admin-alert-${alert.code}`}
-            className={`flex flex-wrap items-center gap-3 rounded-admin-card border p-2.5 text-xs ${
+            // T13.12.2: `px-3.5 py-2.5` (14/10px) matches the mockup's own alert box padding
+            // exactly (Main.dc.html `al.boxStyle`: `padding: 10px 14px`).
+            className={`flex flex-wrap items-center gap-3 rounded-admin-card border px-3.5 py-2.5 text-xs ${
               tone === "crit" ? "border-vault-crit-border bg-vault-crit-bg" : "border-vault-warn-border bg-vault-warn-bg"
             }`}
           >
@@ -108,7 +110,7 @@ function AlertBanner({
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
                 onClick={() => onJumpToFeature(target.featureId as string)}
-                className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
+                className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-vault-amber-bright hover:border-vault-steel"
               >
                 Open feature
               </button>
@@ -117,7 +119,7 @@ function AlertBanner({
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
                 onClick={() => onJumpToSection(target.section as Section)}
-                className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
+                className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-vault-amber-bright hover:border-vault-steel"
               >
                 Open erasure
               </button>
@@ -144,7 +146,10 @@ function KpiTile({
   subClass?: string;
 }) {
   return (
-    <div className="flex flex-col gap-1 rounded-admin-card border border-vault-line bg-vault-surface p-3">
+    // T13.12.2: `px-[18px] py-4` (18/16px) matches the mockup's own KPI tile padding exactly
+    // (Main.dc.html's kpis section: `padding: 16px 18px`) -- the pre-13-J3 `p-3` (12px all
+    // round) never matched it.
+    <div className="flex flex-col gap-1.5 rounded-admin-card border border-vault-line bg-vault-surface px-[18px] py-4">
       <span className="text-xs uppercase tracking-[0.08em] text-vault-text-muted">{label}</span>
       <span className="font-mono text-2xl font-semibold text-vault-text-strong">{value}</span>
       <span className={`text-xs ${subClass}`}>{sub}</span>
@@ -197,8 +202,18 @@ function KpiTiles({
       <KpiTile
         label="Erasure queue"
         value={String(queue.pending)}
-        sub={`${queue.overdue} overdue`}
-        subClass={queue.overdue > 0 ? "text-vault-crit" : undefined}
+        // T13.12.2: the mockup's own sub-line always shows BOTH clauses ("0 overdue · 1 near
+        // deadline", Main.dc.html kpis[3]) -- the pre-13-J3 text dropped the near-deadline
+        // count entirely, and so never coloured the sub-line amber for a queue with nothing
+        // overdue yet but something about to be.
+        sub={`${queue.overdue} overdue · ${queue.nearDeadline} near deadline`}
+        subClass={
+          queue.overdue > 0
+            ? "text-vault-crit"
+            : queue.nearDeadline > 0
+              ? "text-vault-warn"
+              : undefined
+        }
       />
     </section>
   );
@@ -406,16 +421,37 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       : `refreshed ${elapsedSeconds}s ago · live stream`;
 
   return (
-    <main className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-6 sm:px-6 sm:py-8">
+    // T13.12.2: `max-w-[1440px]` matches the mockup's own page max-width exactly
+    // (Main.dc.html line 21) -- Tailwind's `max-w-6xl` (1152px) never matched it.
+    <main className="mx-auto flex max-w-[1440px] flex-col gap-4 px-4 py-6 sm:px-6 sm:py-8">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-vault-line pb-4">
-        <div>
-          <h1
-            data-testid="admin-header-title"
-            className="font-mono text-xl font-semibold tracking-[0.12em] text-vault-text-strong"
+        <div className="flex items-center gap-3.5">
+          {/* T13.12.2: the mockup's own header target/radar icon (Main.dc.html line 26,
+              28x28, amber stroke, aria-hidden) -- missing entirely pre-13-J3. */}
+          <svg
+            width="28"
+            height="28"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="#d99a3f"
+            strokeWidth={1.6}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
           >
-            SECRAG &middot; ADMIN
-          </h1>
-          <p className="text-xs text-vault-text-muted">Operations dashboard</p>
+            <circle cx="12" cy="12" r="9" />
+            <circle cx="12" cy="12" r="3.5" />
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3" />
+          </svg>
+          <div>
+            <h1
+              data-testid="admin-header-title"
+              className="font-mono text-xl font-semibold tracking-[0.12em] text-vault-text-strong"
+            >
+              SECRAG &middot; ADMIN
+            </h1>
+            <p className="text-xs text-vault-text-muted">Operations dashboard</p>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-xs text-vault-text-muted">
           <span className="rounded-full border border-vault-steel-dark px-2.5 py-1 font-mono">
@@ -425,10 +461,14 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
             {refreshText}
           </span>
           {liveMode === "polling" && (
+            // T13.12.2: styled as the mockup's own secondary button (Main.dc.html's shared
+            // button style: `min-height: 36px; padding: 6px 12px; border-radius: 6px;
+            // color: #f0b968; border: 1px solid #454c56;`) -- the pre-13-J3 version used the
+            // plain (non-tinted) steel colour and had no radius/min-height at all.
             <button
               type="button"
               onClick={() => refreshAll()}
-              className="cursor-pointer border border-vault-steel-dark px-3 py-1 tracking-[0.1em] text-vault-steel hover:border-vault-steel"
+              className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-vault-amber-bright hover:border-vault-steel"
             >
               Refresh now
             </button>
@@ -480,9 +520,15 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
               data-testid={`admin-nav-${s.key}`}
               aria-current={section === s.key ? "page" : undefined}
               onClick={() => setSection(s.key)}
-              className={`flex items-center justify-between gap-2 rounded-admin-btn px-3 py-2 text-left text-sm ${
+              // T13.12.1/T13.12.2: `rounded-admin-nav` (8px, the mockup's own nav-item radius
+              // -- a DIFFERENT value from the generic 6px `admin-btn` 13-J2 used here) +
+              // `min-h-11` (44px, Main.dc.html `sections[].style`) + `bg-vault-amber-wash-12`
+              // (replaces the pre-13-J3 `bg-vault-amber with a /10 modifier`, an opacity modifier on a var()
+              // colour that compiled to no rule at all, AND was the wrong tint: the mockup's
+              // own active-nav tint is 0.12, not 0.10).
+              className={`flex min-h-11 items-center justify-between gap-2 rounded-admin-nav px-3 py-2 text-left text-sm ${
                 section === s.key
-                  ? "bg-vault-amber/10 font-semibold text-vault-amber-bright"
+                  ? "bg-vault-amber-wash-12 font-semibold text-vault-amber-bright"
                   : "text-vault-steel-light hover:text-vault-amber-bright"
               }`}
             >

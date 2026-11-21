@@ -114,7 +114,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
           data-testid="defence-lab-run-button"
           disabled={running}
           onClick={() => runNow()}
-          className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
+          className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
         >
           {running ? "Running…" : "Run defence lab"}
         </button>
@@ -123,7 +123,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
             type="button"
             data-testid="defence-lab-history-button"
             onClick={() => loadRuns()}
-            className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
+            className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
           >
             Show history
           </button>
@@ -154,7 +154,9 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
             <div
               key={card.probeId}
               data-testid={`defence-lab-card-${card.probeId}`}
-              className="flex flex-col gap-1.5 rounded-admin-card-inner border border-vault-line bg-vault-surface-raised p-3"
+              // T13.12.2: `p-3.5` (14px) matches the mockup's own probe card padding exactly
+              // (Main.dc.html lab card: `padding: 14px`).
+              className="flex flex-col gap-1.5 rounded-admin-card-inner border border-vault-line bg-vault-surface-raised p-3.5"
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-xs text-vault-text-strong">{card.probeId}</span>

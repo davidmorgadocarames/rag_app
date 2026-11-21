@@ -61,7 +61,10 @@ function StageRow({
   return (
     <div
       data-testid={`pipeline-stage-${stage.stage}`}
-      className="flex flex-col gap-1 border-b border-vault-line/70 py-1.5"
+      // T13.12.1: `border-vault-stage-divider` replaces `border-vault-line with a /70 modifier` (an opacity
+      // modifier on a var() colour -- compiled to no rule at all, same bug as the triage row
+      // divider; the mockup's own pipeline stage divider is a different, darker solid tone).
+      className="flex flex-col gap-1 border-b border-vault-stage-divider py-1.5"
     >
       <button
         type="button"
@@ -175,7 +178,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
               type="button"
               data-testid="pipeline-expand-all"
               onClick={() => setAll(true)}
-              className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel"
+              className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel"
             >
               Expand all
             </button>
@@ -183,7 +186,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
               type="button"
               data-testid="pipeline-stages-only"
               onClick={() => setAll(false)}
-              className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
+              className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
             >
               Stages only
             </button>

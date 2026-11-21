@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   alertSeverityCounts,
+  AMBER_THRESHOLD_SECONDS,
   chatLatencySummary,
   erasureQueueSummary,
   featuresHealthySummary,
@@ -42,11 +43,30 @@ test("alertSeverityCounts on an empty list is all zero", () => {
 
 test("erasureQueueSummary counts open (non-done) requests and how many are overdue", () => {
   const summary = erasureQueueSummary([
-    { status: "pending", overdue: false },
-    { status: "failed", overdue: true },
-    { status: "done", overdue: false },
+    { status: "pending", overdue: false, seconds_left: 18 * 3600 },
+    { status: "failed", overdue: true, seconds_left: -1800 },
+    { status: "done", overdue: false, seconds_left: 0 },
   ]);
-  assert.deepEqual(summary, { pending: 2, overdue: 1 });
+  assert.deepEqual(summary, { pending: 2, overdue: 1, nearDeadline: 0 });
+});
+
+// T13.12.2: the mockup's KPI sub-line always shows both "overdue" and "near deadline" (a
+// non-overdue open request with less than AMBER_THRESHOLD_SECONDS left) -- fails on the
+// pre-13-J3 code, which never computed this at all.
+test("erasureQueueSummary counts a non-overdue request under the amber threshold as near deadline", () => {
+  const summary = erasureQueueSummary([
+    { status: "pending", overdue: false, seconds_left: AMBER_THRESHOLD_SECONDS - 1 },
+    { status: "pending", overdue: false, seconds_left: AMBER_THRESHOLD_SECONDS + 1 },
+    { status: "failed", overdue: true, seconds_left: -1 },
+  ]);
+  assert.deepEqual(summary, { pending: 3, overdue: 1, nearDeadline: 1 });
+});
+
+test("erasureQueueSummary never counts a done request as near deadline even with little time left", () => {
+  const summary = erasureQueueSummary([
+    { status: "done", overdue: false, seconds_left: 1 },
+  ]);
+  assert.deepEqual(summary, { pending: 0, overdue: 0, nearDeadline: 0 });
 });
 
 test("chatLatencySummary reads the 'total' stage's avg and finds the slowest real stage", () => {

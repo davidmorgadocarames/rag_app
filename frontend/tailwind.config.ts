@@ -45,6 +45,17 @@ const config: Config = {
           line: "var(--line)",
           "text-strong": "var(--text-strong)",
           "text-muted": "var(--text-muted)",
+          // T13.12.1 (13-J3): named, pre-composited amber washes -- see globals.css's own
+          // comment for why `bg-vault-amber/10` (an opacity modifier on a var() colour)
+          // compiles to no CSS rule at all, and why these exist as plain, un-modified colours
+          // instead (a plain `bg-vault-amber-wash-10` class needs no opacity math).
+          "amber-wash-10": "var(--amber-wash-10)",
+          "amber-wash-12": "var(--amber-wash-12)",
+          "amber-wash-14": "var(--amber-wash-14)",
+          // T13.12.1 (13-J3): same fix, for `border-vault-line/60`/`/70` (also an opacity
+          // modifier on a var() colour, also compiled to no rule) -- see globals.css.
+          "row-divider": "var(--row-divider)",
+          "stage-divider": "var(--stage-divider)",
         },
       },
       fontFamily: {
@@ -60,6 +71,12 @@ const config: Config = {
         "admin-card": "10px",
         "admin-card-inner": "8px",
         "admin-btn": "6px",
+        // T13.12.1 (13-J3 correction): the mockup's left-hand section nav button is its OWN
+        // 8px radius (Main.dc.html `sections[].style`: `border-radius: 8px`), a DIFFERENT
+        // value from every other admin button's 6px (`admin-btn`) -- 13-J2's DA-13-J-1 fix
+        // used `admin-btn` (6px) for the nav item too, which this block corrects (the e2e
+        // radius assertion in e2e/admin-dashboard.spec.ts is updated to match).
+        "admin-nav": "8px",
       },
     },
   },

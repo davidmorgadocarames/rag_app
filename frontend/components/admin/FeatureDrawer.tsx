@@ -25,7 +25,9 @@ export default function FeatureDrawer({ feature, relatedAlerts }: FeatureDrawerP
     <aside
       data-testid="admin-feature-drawer"
       aria-label="Feature detail"
-      className="flex min-w-0 flex-1 flex-col gap-4 rounded-lg border border-vault-steel-dark bg-vault-surface-raised p-4 lg:max-w-sm"
+      // T13.12.2: `rounded-admin-card` (10px) -- Tailwind's own `rounded-lg` default (8px)
+      // never matched the mockup's own drawer radius (Main.dc.html line 120).
+      className="flex min-w-0 flex-1 flex-col gap-4 rounded-admin-card border border-vault-steel-dark bg-vault-surface-raised p-4 lg:max-w-sm"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-1">
@@ -75,7 +77,10 @@ export default function FeatureDrawer({ feature, relatedAlerts }: FeatureDrawerP
           metricEntries.map(([key, value]) => (
             <div
               key={key}
-              className="flex justify-between gap-3 border-b border-vault-line/60 py-1 font-mono text-xs"
+              // T13.12.1: `border-vault-row-divider` replaces `border-vault-line with a /60 modifier` (an
+              // opacity modifier on a var() colour -- compiled to no rule, same bug as the
+              // triage row divider).
+              className="flex justify-between gap-3 border-b border-vault-row-divider py-1 font-mono text-xs"
             >
               <span className="break-all text-vault-text-muted">{key}</span>
               <span className="text-vault-text-strong">{value ?? "n/a"}</span>

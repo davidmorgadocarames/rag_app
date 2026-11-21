@@ -20,10 +20,11 @@ import {
   type AdminErasureResponse,
   type ErasureRequestOut,
 } from "@/lib/api";
+// T13.12.2 (13-J3): shared with the "Erasure queue" KPI tile's own near-deadline count
+// (AdminDashboard.tsx/adminKpi.ts) -- a single threshold, never two copies that could drift.
+import { AMBER_THRESHOLD_SECONDS } from "@/lib/adminKpi";
 
 import StatusBadge from "./StatusBadge";
-
-const AMBER_THRESHOLD_SECONDS = 4 * 3600; // age > 20h of a 24h deadline
 
 interface ErasurePanelProps {
   erasure: AdminErasureResponse | null;
@@ -113,7 +114,9 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
             <tr
               key={row.id}
               data-testid={`erasure-row-${row.id}`}
-              className="border-t border-vault-line/60"
+              // T13.12.1: `border-vault-row-divider` replaces `border-vault-line with a /60 modifier` (an
+              // opacity modifier on a var() colour -- compiled to no rule).
+              className="border-t border-vault-row-divider"
             >
               <td className="py-1 font-mono text-vault-text-strong">{row.id.slice(0, 8)}</td>
               <td>
@@ -193,11 +196,19 @@ function ErasureActionButton({
     );
   }
 
+  // T13.12.2: matches the mockup's own two button kinds exactly (Main.dc.html's erasure
+  // table) -- "Purge now" is the one FILLED amber primary action on this whole dashboard,
+  // "Retry" is the same outline secondary style every other admin button uses.
+  const isPrimary = action === "purge-now";
   return (
     <button
       type="button"
       onClick={() => setConfirming({ id: row.id, action })}
-      className="cursor-pointer border border-vault-steel-dark px-2 py-1 hover:border-vault-steel"
+      className={
+        isPrimary
+          ? "min-h-9 cursor-pointer rounded-admin-btn bg-vault-amber px-3 py-1.5 font-semibold text-vault-bg"
+          : "min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-vault-amber-bright hover:border-vault-steel"
+      }
     >
       {label}
     </button>
