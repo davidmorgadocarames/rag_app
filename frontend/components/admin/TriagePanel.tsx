@@ -70,7 +70,15 @@ export default function TriagePanel({
               // mockup's own filter-chip style string exactly (Main.dc.html `filters[].style`)
               // -- `bg-vault-amber-wash-14` replaces the pre-13-J3 `bg-vault-amber with a /10 modifier` (an
               // opacity modifier on a var() colour, compiled to no rule at all).
-              className={`flex min-h-9 cursor-pointer items-center rounded-full border px-3 py-1.5 text-xs ${toneTextClass} ${
+              // Fix (user 2026-11-22, first attempt wrong): a `flex` button collapses the
+              // whitespace-only text node between `{f.label}` and `<span>{count}</span>` --
+              // rendered as "All38"/"Critical1". `gap-1` between two flex children only adds a
+              // CSS layout gap, not a real text-content space (still "All38" to `textContent`/
+              // assistive tech/copy-paste, caught by the new e2e assertion below) -- the
+              // mockup's own style string never uses `display:flex` for this chip either
+              // (`Main.dc.html` `filters[].style`), so this drops `flex`/`items-center` and
+              // keeps the mockup's own literal `{{f.label}} <span>` markup (a real space).
+              className={`inline-block min-h-9 cursor-pointer rounded-full border px-3 py-1.5 text-xs ${toneTextClass} ${
                 pressed
                   ? "border-vault-amber bg-vault-amber-wash-14"
                   : "border-vault-steel-dark hover:border-vault-steel"
