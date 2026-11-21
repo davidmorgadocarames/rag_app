@@ -211,6 +211,17 @@ catalogue analysis; this is the implementation summary.
   `request()`/`streamChat()` are the only two call sites; every page wires the same
   `onWaking`/`onRecovered`/`onWakeFailed` hooks to the shared `<WakeBanner>`
   (`frontend/components/WakeBanner.tsx`, `aria-live="polite"`).
+- **Pending-visual timer for a HELD cold start** (`frontend/lib/pendingWake.ts`,
+  T13.11.5/DEBT-060, 13-J2): the retry policy above never fires at all when the Container
+  Apps activator simply HOLDS a request (no error, no response) during a scale-from-zero --
+  `createPendingWakeTimer` (injectable `setTimeout`/`clearTimeout`, `node --test`-able) arms
+  a one-shot ~3 s (`PENDING_WAKE_DELAY_MS`) timer per logical call; `lib/useWakeState.ts`'s
+  `startPending()`/`clearPending()` bracket it around login, the chat stream's wait for its
+  first byte/token, and the admin dashboard's initial load. `combinePendingWakeState()`
+  merges this purely-visual flag with the retry state above into the one state
+  `<WakeBanner>` renders, with the retry state always winning -- a real 502-shaped retry
+  already "waking"/"failed" is never masked or duplicated by the timer. No retry, no resend:
+  this module never touches the network.
 - **Custom 404 page** (`frontend/app/not-found.tsx`, T13.10.1/T13.10.2/DEBT-057): Next's App
   Router renders it automatically, with a real HTTP 404 status, for any request matching no
   route — never a soft-404 200; `/api/*`'s own catch-all route (`app/api/[...path]/route.ts`)

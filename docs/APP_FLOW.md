@@ -161,6 +161,17 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      (401/403/404/422/429…) is never treated as waking up. The same mechanism covers login,
      the admin dashboard's data loads, and every other `/api/*` call through
      `lib/api.ts`'s shared `request()`.
+   - **Also showing the same banner for a HELD (never refused) cold start** (T13.11.5,
+     DEBT-060, 13-J2): the retry policy above only reacts to a FAILED attempt, but a Container
+     Apps scale-from-zero does not always fail — the activator can instead just HOLD the
+     request (no byte sent back at all) until the replica is ready, so the retry policy never
+     fires either. A separate, purely-visual timer (`frontend/lib/pendingWake.ts`) flips the
+     SAME `<WakeBanner>` into "waking" if any BFF call (login, chat send/stream — until its
+     first byte/token, not the full answer — or an admin dashboard load) is still pending
+     ~3 s later, and clears the instant the response (or first byte/token) arrives. No retry,
+     no resend: it never touches the network, so a chat question still cannot be duplicated
+     by it. The two mechanisms share one banner, never two (a real retry's own "waking"/
+     "failed" state always wins over the visual timer).
      If the conversation was deleted elsewhere (404 before streaming), the client drops the id and
      says so; the next message starts a new conversation. Opening a conversation that cannot be
      decrypted (409) shows a clear message and an empty thread instead of a blank view.

@@ -542,3 +542,69 @@ drawer/button border); this block introduces one new token, `--line` (`#2b2f35`)
 card borders and row dividers, rather than a fourth near-identical shade for the `#23262b`
 case. The visual difference is negligible (both are dark neutral greys a few % apart) and
 borders are not subject to WCAG text-contrast rules.
+
+## 13-J2: wake banner on slow (held) responses + DA-13-J-1 radius fix (DEBT-060)
+
+**DA-13-J-1 fix — card/panel radius now matches the mockup.** 13-J's own colour work left the
+radius untouched: `TriagePanel`/`ErasurePanel`/`LatencyPanel`/`QualityPanel`/
+`DefenceLabPanel`/`AdminDashboard`'s card wrappers used Tailwind's own `rounded-lg` default
+(8px), not the mockup's 10px (`Main.dc.html` lines 59/70/86/120/166/215/260/305); the
+defence-lab inner probe card and several action buttons used plain `rounded` (4px), not the
+mockup's 8px/6px. Fixed with three named, admin-scope `tailwind.config.ts` tokens
+(`rounded-admin-card` 10px, `rounded-admin-card-inner` 8px, `rounded-admin-btn` 6px) applied
+across the DA's six flagged files, plus the KPI tile/nav sidebar/alert card (the same visual
+card family, not individually named by the DA but kept consistent rather than left at the old
+8px next to the newly-10px panels). `FeatureDrawer.tsx`'s own `rounded-lg` is deliberately
+left as is — outside the DA's reviewed file list; a future DA pass can decide whether the
+mockup's drawer radius differs. Proven by a new e2e assertion of the real computed
+`border-radius` on the triage panel card and a nav button (`e2e/admin-dashboard.spec.ts`).
+
+**13-J2 (T13.11.5/T13.11.6, user 2026-11-21 01:15) — the gap the 13-H retry policy cannot
+close.** `lib/wakeUp.ts`'s retry policy (13-H, above) only has an opinion once a BFF call has
+*failed*. Proven locally by the orchestrator the same day, with the real `next start` build
+and fake backends: a backend that REFUSES the connection shows the banner after 3 s (the
+13-H path, correctly); a backend that merely HOLDS the request for 20 s — exactly what the
+Container Apps activator does during a real scale-from-zero, queuing the request instead of
+answering with any error — shows nothing at all, just the button's own busy "…". This is what
+the user actually saw on Azure after a quiet period.
+
+**Design: a separate, purely-visual timer, never a second retry mechanism.** `frontend/lib/
+pendingWake.ts`'s `createPendingWakeTimer` is a one-shot timer (injectable `setTimeout`/
+`clearTimeout`, so `node --test` exercises it with no real delay) that calls `onPending` if a
+call is still pending `PENDING_WAKE_DELAY_MS` (3 s, one named constant) later, and `onCleared`
+the instant `clear()` is called after it already fired. It never touches the network, never
+retries, never resends — it is purely a "should the user be told this is taking a while"
+signal, bracketed around the exact same call the page would have made anyway.
+`frontend/lib/useWakeState.ts` owns one `createPendingWakeTimer` instance per page alongside
+the existing 13-H retry state, and combines the two into the single state `<WakeBanner>`
+renders via `combinePendingWakeState()`: the retry state (`"waking"`/`"failed"`) ALWAYS wins,
+so a real 502-shaped retry already showing its own banner is never masked or duplicated by
+the visual timer — there is exactly one banner on screen, ever (T13.11.6's "no double
+banner" case). Unmount cleanup calls the timer's `dispose()`, never `clear()`, so a
+still-armed timer is cancelled WITHOUT calling `onCleared` (which would be a `setState`
+after unmount).
+
+**What "pending" covers, per call site.** Login and the admin dashboard's initial load treat
+the WHOLE call (including any 13-H retries inside it) as pending, cleared only once it
+settles — `wake.startPending()`/`wake.clearPending()` wrap the single `await`. Chat
+send/stream is different, per the Done-when's own wording ("until the first byte/token
+arrives"): a streaming answer can legitimately keep going for several more seconds after the
+first byte without needing the banner, so `clearPending()` is called from `onConversation`/
+`onStage`/`onToken` (whichever the backend's SSE stream dispatches first — `generation.py`'s
+`answer_question_stream` always yields `stage: "classifying"` as its very first event, before
+any retrieval/generation work, so this fires within milliseconds of the connection
+succeeding) and defensively again from `onDone`/`onError`/`onWakeFailed`. The admin
+dashboard's own polling interval and "Refresh now" button are deliberately NOT wired to this
+timer — out of scope ("admin dashboard **loads**", and the user's own standing "do not touch
+polling" constraint from 13-J).
+
+**Tests.** `lib/pendingWake.test.ts` (12 cases): never fires before `clear()` cancels it
+(the negative-control shape), fires exactly once at the threshold, `clear()`/`dispose()`
+after firing (the latter silent, no `onCleared`), re-arming for a second call, the default
+delay, and `combinePendingWakeState`'s precedence rules (retry state always wins, including
+the "given-up `failed` is never downgraded back to `waking`" case). `e2e/wakeup-slow.spec.ts`:
+a `/api/chat/stream` route delayed ~6.5 s (never fulfilled with a fake response — the real
+request is let through unmodified, so the eventual answer is the real backend's own) proves
+the banner is absent before ~1.5 s, visible by ~4 s with no Retry button, and gone the moment
+the real answer streams in, exactly once; a negative control proves a normal-speed chat turn
+never shows it at all.
