@@ -713,9 +713,9 @@ side-by-side comparison with `Main.dc.html`.
    mockup's own literal `{{f.label}} <span>` markup (a real space), `min-h-9` alone still
    enforcing the 36px minimum height.
 2. **Feature drawer's "Docs: …" line removed (user decision, overrides the mockup).** The
-   user: "docs/RUNBOOK_AZURE.md#email no sirve para nada" (not clickable, not useful in this
-   drawer) — removed entirely from `FeatureDrawer.tsx`. `FeatureHealthOut.docs` itself is
-   untouched (still a real backend field, used nowhere else in the frontend) — presentation
+   user: its sample value (a private-runbook anchor link) "no sirve para nada" (not clickable,
+   not useful in this drawer) — removed entirely from `FeatureDrawer.tsx`. `FeatureHealthOut.docs`
+   itself is untouched (still a real backend field, used nowhere else in the frontend) — presentation
    only, no API change.
 3. **Quality/Erasure/Defence-lab tables/cards matched to `Main.dc.html` exactly (user: "not a
    new debt", done in this same fix block rather than left as the follow-up the first pass
