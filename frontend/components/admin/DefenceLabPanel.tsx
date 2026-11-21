@@ -95,7 +95,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
   return (
     <section
       data-testid="admin-defence-lab-panel"
-      className="flex flex-col gap-3 rounded-admin-card border border-vault-line bg-vault-surface p-4"
+      className="flex flex-col gap-3.5 rounded-admin-card border border-vault-line bg-vault-surface p-[18px]"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">DEFENCE LAB</h2>
@@ -148,7 +148,10 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
       ) : (
         <div
           data-testid="defence-lab-cards"
-          className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3"
+          // T13.12.2 (13-J3): the mockup's own `grid-template-columns: repeat(auto-fit,
+          // minmax(260px, 1fr))` (Main.dc.html line 311) -- fluid column count by available
+          // width, not fixed Tailwind breakpoints; `gap-2.5` (10px) matches the mockup's gap.
+          className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-2.5"
         >
           {cards.map((card) => (
             <div
@@ -156,16 +159,34 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
               data-testid={`defence-lab-card-${card.probeId}`}
               // T13.12.2: `p-3.5` (14px) matches the mockup's own probe card padding exactly
               // (Main.dc.html lab card: `padding: 14px`).
-              className="flex flex-col gap-1.5 rounded-admin-card-inner border border-vault-line bg-vault-surface-raised p-3.5"
+              className="flex flex-col gap-2 rounded-admin-card-inner border border-vault-line bg-vault-surface-raised p-3.5"
             >
               <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-xs text-vault-text-strong">{card.probeId}</span>
+                {/* T13.12.2: `font-semibold` (600) matches the mockup's own `p.name` weight --
+                    stays `font-mono` regardless (the app's monospace-everywhere exception; no
+                    separate human-readable probe name exists on the wire, `probe_id` is it). */}
+                <span className="font-mono text-xs font-semibold text-vault-text-strong">
+                  {card.probeId}
+                </span>
                 <StatusBadge tone={card.passed ? "ok" : "crit"} label={card.passed ? "Held" : "Mismatch"} />
               </div>
               <span className="text-xs text-vault-text-muted">{card.observedOutcome}</span>
-              {card.lastAt && (
-                <span className="font-mono text-[11px] text-vault-text-muted">{card.lastAt}</span>
-              )}
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-mono text-xs text-vault-text-muted">{card.lastAt ?? ""}</span>
+                {/* T13.12.2: the mockup's own per-card "Run probe" button -- the real backend
+                    has no per-probe run route (adminLabRun() always runs the whole lab), so
+                    this wires to the SAME existing global action as the button above, just
+                    exposed per-card to match the mockup's layout -- no new behaviour. */}
+                <button
+                  type="button"
+                  data-testid={`defence-lab-card-run-${card.probeId}`}
+                  disabled={running}
+                  onClick={() => runNow()}
+                  className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs text-vault-amber-bright hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Run probe
+                </button>
+              </div>
             </div>
           ))}
         </div>

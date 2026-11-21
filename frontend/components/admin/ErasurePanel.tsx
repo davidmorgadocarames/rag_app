@@ -46,6 +46,15 @@ function formatHours(seconds: number): string {
   return `${hours >= 0 ? "" : "-"}${Math.abs(hours).toFixed(1)}h`;
 }
 
+// T13.12.2 (13-J3): the mockup's "Rows left" column (Main.dc.html line 272/283) -- the total
+// rows still to purge across every `PURGE_STEPS` table, summed from the real
+// `rows_remaining` map the backend already returns (replaces the old "Last error" column,
+// which the mockup does not show at all; `last_error_class` stays a real field on the wire,
+// just not its own column here any more).
+function rowsLeft(row: ErasureRequestOut): number {
+  return Object.values(row.rows_remaining).reduce((total, count) => total + count, 0);
+}
+
 /** T13.8.8: a done row's own time column -- its completion fact, never a countdown (which
  * stops meaning anything once the request is no longer open). `completed_at` is optional on
  * the wire (older backends before T13.8.3(b)) -- falls back to a plain "Completed" rather than
@@ -66,6 +75,21 @@ function statusTone(status: string): "ok" | "warn" | "crit" | "off" {
 
 function statusLabel(status: string): string {
   return status.length === 0 ? status : status[0].toUpperCase() + status.slice(1);
+}
+
+// T13.12.2 (13-J3): the mockup's own `<th>` style (Main.dc.html line 269-274) -- 12px
+// uppercase, 0.06em tracking, muted, 500 weight, 8px/6px padding, a `--line` bottom border.
+function Th({ children, right }: { children: React.ReactNode; right?: boolean }) {
+  return (
+    <th
+      scope="col"
+      className={`border-b border-vault-line px-1.5 py-2 text-xs font-medium uppercase tracking-[0.06em] text-vault-text-muted ${
+        right ? "text-right" : "text-left"
+      }`}
+    >
+      {children}
+    </th>
+  );
 }
 
 type Action = "purge-now" | "retry";
@@ -91,61 +115,79 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
   return (
     <section
       data-testid="admin-erasure-panel"
-      className="flex flex-col gap-4 rounded-admin-card border border-vault-line bg-vault-surface p-4"
+      className="flex flex-col gap-3.5 rounded-admin-card border border-vault-line bg-vault-surface p-[18px]"
     >
-      <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">ERASURE</h2>
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">
+          ERASURE REQUESTS &middot; 24 H SLA
+        </h2>
+        <span className="text-xs text-vault-text-muted">
+          Request IDs only &mdash; no e-mail addresses shown
+        </span>
+      </div>
 
       {actionMessage && <p className="text-xs text-vault-amber-bright">{actionMessage}</p>}
       {actionError && <p className="text-xs text-vault-danger-text">{actionError}</p>}
 
-      <table className="w-full text-left text-xs text-vault-steel-light">
-        <thead>
-          <tr className="text-vault-text-muted">
-            <th className="py-1">Request</th>
-            <th>Status</th>
-            <th>Time left</th>
-            <th>Attempts</th>
-            <th>Last error</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {(erasure?.requests ?? []).map((row) => (
-            <tr
-              key={row.id}
-              data-testid={`erasure-row-${row.id}`}
-              // T13.12.1: `border-vault-row-divider` replaces `border-vault-line with a /60 modifier` (an
-              // opacity modifier on a var() colour -- compiled to no rule).
-              className="border-t border-vault-row-divider"
-            >
-              <td className="py-1 font-mono text-vault-text-strong">{row.id.slice(0, 8)}</td>
-              <td>
-                <StatusBadge tone={statusTone(row.status)} label={statusLabel(row.status)} />
-              </td>
-              <td className={`font-mono ${countdownClass(row)}`}>{timeCellText(row)}</td>
-              <td>{row.attempts}</td>
-              <td>{row.last_error_class ?? "-"}</td>
-              <td>
-                {row.status !== "done" && (
-                  <ErasureActionButton
-                    row={row}
-                    confirming={confirming}
-                    setConfirming={setConfirming}
-                    runAction={runAction}
-                  />
-                )}
-              </td>
-            </tr>
-          ))}
-          {(erasure?.requests ?? []).length === 0 && (
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+          <thead>
             <tr>
-              <td colSpan={6} className="py-2 text-vault-text-muted">
-                No erasure requests.
-              </td>
+              <Th>Request</Th>
+              <Th>Status</Th>
+              <Th>Deadline</Th>
+              <Th right>Rows left</Th>
+              <Th right>Attempts</Th>
+              <th scope="col" className="border-b border-vault-line px-1.5 py-2">
+                <span className="sr-only">Actions</span>
+              </th>
             </tr>
-          )}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {(erasure?.requests ?? []).map((row) => (
+              <tr key={row.id} data-testid={`erasure-row-${row.id}`}>
+                <td className="border-b border-vault-row-divider px-1.5 py-2.5 font-mono text-vault-text-strong">
+                  {row.id.slice(0, 8)}
+                </td>
+                <td className="border-b border-vault-row-divider px-1.5 py-2.5">
+                  <StatusBadge tone={statusTone(row.status)} label={statusLabel(row.status)} />
+                </td>
+                <td
+                  className={`border-b border-vault-row-divider px-1.5 py-2.5 font-mono ${countdownClass(row)}`}
+                >
+                  {timeCellText(row)}
+                </td>
+                <td className="border-b border-vault-row-divider px-1.5 py-2.5 text-right font-mono text-vault-text-strong">
+                  {rowsLeft(row)}
+                </td>
+                <td className="border-b border-vault-row-divider px-1.5 py-2.5 text-right font-mono text-vault-text-strong">
+                  {row.attempts}
+                </td>
+                <td className="border-b border-vault-row-divider px-1.5 py-2.5 text-right">
+                  {row.status !== "done" && (
+                    <ErasureActionButton
+                      row={row}
+                      confirming={confirming}
+                      setConfirming={setConfirming}
+                      runAction={runAction}
+                    />
+                  )}
+                  {row.status === "done" && (
+                    <span className="text-xs text-vault-text-muted">nothing to do</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {(erasure?.requests ?? []).length === 0 && (
+              <tr>
+                <td colSpan={6} className="px-1.5 py-2 text-vault-text-muted">
+                  No erasure requests.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {erasure?.last_purger_run && (
         <p className="text-xs text-vault-text-muted">
@@ -154,6 +196,11 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
           {erasure.last_purger_run.errors} error(s).
         </p>
       )}
+
+      <p className="text-xs text-vault-text-muted">
+        Done rows show when they finished, never a countdown. &quot;Purge now&quot; only runs
+        the batch delete; requests are created with &quot;Erase account&quot;.
+      </p>
 
       <EraseAccountForm onDone={onChanged} />
     </section>
