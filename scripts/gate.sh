@@ -742,6 +742,10 @@ step_e2e() {
   # DEC-024 (the QR code actually renders from the real backend-issued provisioning URI).
   # wakeup.spec.ts (T13.9.2/DEBT-056): the wake-up UX against a `page.route()`-injected
   # slow/503 "backend" (chat + login), incl. the negative control -- no extra env needed.
+  # wakeup-slow.spec.ts (T13.11.6/DEBT-060, 13-J2): the OTHER cold-start shape -- a request
+  # HELD (never refused) by `page.route()`, proving the purely-visual pending timer shows
+  # the same banner after ~3s with no Retry button, then the real (delayed, never faked)
+  # answer arrives exactly once; plus its own negative control.
   # not-found.spec.ts (T13.10.3/DEBT-057): the custom 404 page -- real HTTP 404 status, single
   # "Back to login" link, no path echo, /api/... negative control, phone width, no extra env.
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
@@ -754,7 +758,7 @@ step_e2e() {
     E2E_PLAIN_USER_EMAIL="$E2E_PLAIN_USER_EMAIL" \
     E2E_WAKEUP_EMAIL="$E2E_WAKEUP_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
-      e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/not-found.spec.ts)
+      e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/wakeup-slow.spec.ts e2e/not-found.spec.ts)
 }
 
 # T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for
