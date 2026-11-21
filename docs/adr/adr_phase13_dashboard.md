@@ -698,8 +698,49 @@ effect fetches separately, reusing the already-enrolled e2e admin account rather
 a new seeded one. Screenshots of every section were taken against this seeded state for
 side-by-side comparison with `Main.dc.html`.
 
-**Known gaps NOT fixed in this pass (reported, not silently dropped).** The Quality/Erasure/
-Defence-lab panels' own `<table>`/card layouts still fall short of the mockup's exact cell
-padding and per-row divider treatment (e.g. the mockup's `#23262b` row divider on every
-`<td>`, not just the ones this block touched) — a larger table-layout rework than "colours,
-second pass" scoped for, left as a follow-up rather than expanded here.
+**Fix block (user screenshot review, 2026-11-22): three more issues.**
+
+1. **Filter chip/count text rendered glued together ("All38", not "All 38").** The mockup's
+   own markup (`{{f.label}} <span>{{f.count}}</span>`) has a real space character between the
+   label and the count. The first attempt at T13.12.2's chip restyle put `display:flex` on
+   the button for `min-h-9`/`items-center` — but a flex container drops a whitespace-only
+   anonymous box between flex items, so the literal JSX space collapsed, rendering "All38"/
+   "Critical1" (same bug shape proven by a first (wrong) fix attempt: replacing the two text
+   nodes with two flex children + `gap-1` gives a CSS layout gap, not a real text-content
+   space — still "All38" to `textContent`/assistive tech/copy-paste, caught by a new e2e
+   `toHaveText(/^All \d+$/)` assertion). The mockup's own filter-chip style string never sets
+   `display:flex` either — fixed by dropping `flex`/`items-center` entirely and keeping the
+   mockup's own literal `{{f.label}} <span>` markup (a real space), `min-h-9` alone still
+   enforcing the 36px minimum height.
+2. **Feature drawer's "Docs: …" line removed (user decision, overrides the mockup).** The
+   user: "docs/RUNBOOK_AZURE.md#email no sirve para nada" (not clickable, not useful in this
+   drawer) — removed entirely from `FeatureDrawer.tsx`. `FeatureHealthOut.docs` itself is
+   untouched (still a real backend field, used nowhere else in the frontend) — presentation
+   only, no API change.
+3. **Quality/Erasure/Defence-lab tables/cards matched to `Main.dc.html` exactly (user: "not a
+   new debt", done in this same fix block rather than left as the follow-up the first pass
+   reported).** `QualityPanel.tsx`: a header-level tone pill ("Passed"/"Regressed", was
+   missing — only the per-row State pill existed before), the table's own `<th>`/`<td>`
+   padding (8/6px) and divider colours (`--line` header border, `--row-divider` row border),
+   right-aligned numeric columns, and the mockup's own dashed empty-state box (border-dashed,
+   8px radius, 14px padding) replacing the plain empty-state paragraph. `ErasurePanel.tsx`:
+   renamed header to "ERASURE REQUESTS · 24 H SLA" + the "Request IDs only" subtitle, a new
+   "Rows left" column (summed from the real `rows_remaining` map the backend already returns,
+   previously unused in the UI — replaces the old "Last error" column the mockup never shows;
+   `last_error_class` stays a real wire field, just not its own column here any more), a
+   visually-hidden ("Actions") header cell matching the mockup's own accessible-but-invisible
+   technique, and the mockup's own closing paragraph ("Done rows show when they finished…").
+   `DefenceLabPanel.tsx`: the mockup's own fluid `grid-template-columns:
+   repeat(auto-fit,minmax(260px,1fr))` (was fixed Tailwind breakpoints), `gap-2.5`/`p-3.5`
+   padding, 600-weight probe name (kept `font-mono` regardless — the monospace-everywhere
+   exception; no separate human-readable probe name exists on the wire, `probe_id` is it),
+   and a per-card "Run probe" button — the real backend has no per-probe run route
+   (`adminLabRun()` always runs the whole lab), so each card's button wires to the SAME
+   existing global action, exposed per-card to match the mockup's layout only, no new
+   behaviour. The screenshot test's own fixture also flips `admin-defence-lab` to "ok" (so
+   the tab is reachable for its own screenshot) and introduces `azure-internal-ingress` as
+   the scenario's "off" example instead (fixture-only — the real backend's
+   `azure-internal-ingress` entry has no health probe at all and would never be "down" for
+   real, see `features.py`).
+
+No remaining known gaps in these three sections after this fix block.

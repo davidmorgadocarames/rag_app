@@ -83,6 +83,12 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
     "background-color",
     "rgba(217, 154, 63, 0.14)",
   );
+  // Fix (user 2026-11-22, from the screenshot review): the mockup's own
+  // `{{f.label}} <span>{{f.count}}</span>` renders a real space ("All 38"); the pre-fix JSX
+  // had a bare space between two text nodes inside a `flex` button, which flex layout
+  // collapses -- rendered as "All38"/"Critical1" glued together. Asserts the real visible
+  // text has the space, against whatever the live registry count actually is.
+  await expect(page.getByTestId("triage-filter-all")).toHaveText(/^All \d+$/);
 
   // A filter narrows the list (T13.8.5): a freshly seeded stack has no Critical feature.
   await page.getByTestId("triage-filter-crit").click();
@@ -108,6 +114,9 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
   await page.getByTestId("triage-row-admin-api").click();
   await expect(page.getByTestId("admin-feature-drawer")).toBeVisible();
   await expect(page.getByTestId("admin-feature-drawer-id")).toHaveText("admin-api");
+  // User decision (2026-11-22, overrides the mockup): the drawer's "Docs: …" line is removed
+  // entirely ("no sirve para nada") -- proves it stays gone.
+  await expect(page.getByTestId("admin-feature-drawer").getByText(/^Docs:/)).toHaveCount(0);
   // T13.12.1/T13.12.3: the selected row's own amber tint -- fails on the pre-13-J3 code (same
   // `bg-vault-amber/10` opacity-modifier bug, no background at all).
   await expect(page.getByTestId("triage-row-admin-api")).toHaveCSS(
@@ -283,17 +292,36 @@ test("the seeded dashboard matches the mockup's palette across every section (vi
         docs: "docs/adr/adr_phase9_rerank.md",
       },
       {
+        // T13.12 fix (13-J3, user 2026-11-22): "ok" here (not "off") so the Defence lab tab
+        // itself is available in this scenario -- the user asked for a defence-lab screenshot
+        // too, which needs the panel actually reachable. "azure-internal-ingress" below is the
+        // scenario's "off" example instead (same tone the mockup itself uses "admin-defence-
+        // lab" for -- fixture-only: the real backend's azure-internal-ingress entry has no
+        // health probe at all and would never be "down" for real, see features.py).
         id: "admin-defence-lab",
         name: "Defence lab",
         phase: "13",
         status: "enabled",
-        probe_status: "down",
-        probe_detail: "off by design on this stack",
+        probe_status: "ok",
+        probe_detail: "probe ok",
         metrics: {},
         dev_only: true,
         azure_only: false,
-        expected_here: false,
+        expected_here: true,
         docs: "docs/security/DEFENCE_LAB.md",
+      },
+      {
+        id: "azure-internal-ingress",
+        name: "Internal ingress (backend has no public URL)",
+        phase: "12b",
+        status: "enabled",
+        probe_status: "down",
+        probe_detail: "off by design on this stack",
+        metrics: {},
+        dev_only: false,
+        azure_only: true,
+        expected_here: false,
+        docs: "docs/TRD.md",
       },
     ];
     const seededAlerts = [
@@ -413,6 +441,34 @@ test("the seeded dashboard matches the mockup's palette across every section (vi
     await page.route("**/api/admin/eval", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(seededEval) }),
     );
+    const seededLabRun = {
+      detail: "ok",
+      git_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+      all_matched: false,
+      results: [
+        {
+          probe_id: "login-brute-force",
+          expected_outcome: "locked after repeated bad passwords",
+          observed_outcome: "held · 2 min ago",
+          passed: true,
+        },
+        {
+          probe_id: "burst-requests",
+          expected_outcome: "429 after burst",
+          observed_outcome: "held · 2 min ago",
+          passed: true,
+        },
+        {
+          probe_id: "session-replay-after-logout",
+          expected_outcome: "revoked session rejected",
+          observed_outcome: "not run yet",
+          passed: false,
+        },
+      ],
+    };
+    await page.route("**/api/admin/lab/run", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(seededLabRun) }),
+    );
 
     await page.goto("/admin");
     await expect(page.getByTestId("admin-triage-panel")).toBeVisible();
@@ -426,7 +482,7 @@ test("the seeded dashboard matches the mockup's palette across every section (vi
       "Critical",
     );
     await expect(page.getByTestId("triage-row-rag-rerank")).toContainText("Warning");
-    await expect(page.getByTestId("triage-row-admin-defence-lab")).toContainText("Off here");
+    await expect(page.getByTestId("triage-row-azure-internal-ingress")).toContainText("Off here");
     await expect(page.getByTestId("triage-row-admin-api")).toContainText("OK");
 
     // T13.12.2: the "Erasure queue" KPI sub-line now shows the near-deadline request, tinted
@@ -454,10 +510,17 @@ test("the seeded dashboard matches the mockup's palette across every section (vi
     await expect(page.getByTestId("admin-erasure-panel")).toBeVisible();
     await page.screenshot({ path: "test-results/admin-screens/05-erasure.png", fullPage: true });
 
-    // Defence lab is only in the nav when the registry feature probes "ok" (T13.3.1) -- this
-    // seeded scenario deliberately sets it to "off" (the mockup's own "admin-defence-lab"
-    // sample, Main.dc.html EXTRA), so the tab itself is hidden here by design; no screenshot.
-    await expect(page.getByTestId("admin-nav-lab")).toHaveCount(0);
+    // Defence lab (T13.3.1): available here (probe "ok") so it can be screenshotted too, per
+    // the user's 2026-11-22 request -- "Run defence lab" uses the mocked `/admin/lab/run`
+    // above, giving a populated card grid (2 held, 1 mismatch) rather than the empty state.
+    await page.getByTestId("admin-nav-lab").click();
+    await expect(page.getByTestId("admin-defence-lab-panel")).toBeVisible();
+    await page.getByTestId("defence-lab-run-button").click();
+    await expect(page.getByTestId("defence-lab-cards")).toBeVisible();
+    await expect(page.getByTestId("defence-lab-card-session-replay-after-logout")).toContainText(
+      "Mismatch",
+    );
+    await page.screenshot({ path: "test-results/admin-screens/06-defence-lab.png", fullPage: true });
   } finally {
     await context.close();
   }
