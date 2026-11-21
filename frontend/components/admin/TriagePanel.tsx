@@ -44,7 +44,7 @@ export default function TriagePanel({
     <section
       data-testid="admin-triage-panel"
       aria-label="Feature triage"
-      className="flex min-w-0 flex-[2] flex-col gap-3 rounded-lg border border-vault-line bg-vault-surface p-4"
+      className="flex min-w-0 flex-[2] flex-col gap-3 rounded-admin-card border border-vault-line bg-vault-surface p-4"
     >
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">FEATURES &amp; PROBES</h2>

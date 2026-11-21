@@ -52,6 +52,15 @@ const config: Config = {
         sans: ["ui-monospace", "SF Mono", "Menlo", "Consolas", "monospace"],
         mono: ["ui-monospace", "SF Mono", "Menlo", "Consolas", "monospace"],
       },
+      // DA-13-J-1 fix (13-J2): the mockup's own card/panel radius (Main.dc.html lines
+      // 59/70/86/120/166/215/260/305 -- 10px cards, 8px inner probe card, 6px buttons),
+      // admin dashboard scope only. Named so no component ever hard-codes a hex/px radius
+      // directly -- Tailwind's own `rounded-lg`/`rounded` defaults (8px/4px) never matched.
+      borderRadius: {
+        "admin-card": "10px",
+        "admin-card-inner": "8px",
+        "admin-btn": "6px",
+      },
     },
   },
   plugins: [],

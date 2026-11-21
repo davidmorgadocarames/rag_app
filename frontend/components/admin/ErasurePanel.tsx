@@ -90,7 +90,7 @@ export default function ErasurePanel({ erasure, onChanged }: ErasurePanelProps) 
   return (
     <section
       data-testid="admin-erasure-panel"
-      className="flex flex-col gap-4 rounded-lg border border-vault-line bg-vault-surface p-4"
+      className="flex flex-col gap-4 rounded-admin-card border border-vault-line bg-vault-surface p-4"
     >
       <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">ERASURE</h2>
 

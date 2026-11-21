@@ -62,6 +62,12 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
   await expect(page.getByTestId("admin-triage-panel")).toBeVisible();
   await expect(page.getByTestId("triage-row-admin-api")).toBeVisible();
 
+  // DA-13-J-1 fix (13-J2): the mockup's own card radius (10px) and button radius (6px) --
+  // `rounded-admin-card`/`rounded-admin-btn` (tailwind.config.ts). Fails on the pre-fix code
+  // (Tailwind's own `rounded-lg`/`rounded` defaults: 8px/4px).
+  await expect(page.getByTestId("admin-triage-panel")).toHaveCSS("border-radius", "10px");
+  await expect(page.getByTestId("admin-nav-pipeline")).toHaveCSS("border-radius", "6px");
+
   // A filter narrows the list (T13.8.5): a freshly seeded stack has no Critical feature.
   await page.getByTestId("triage-filter-crit").click();
   await expect(page.getByTestId("triage-row-admin-api")).toHaveCount(0);

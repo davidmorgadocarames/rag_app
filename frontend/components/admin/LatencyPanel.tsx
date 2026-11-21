@@ -150,7 +150,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
     <section
       data-testid="admin-latency-panel"
       aria-label="Chat pipeline latency"
-      className="flex flex-col gap-3 rounded-lg border border-vault-line bg-vault-surface p-4"
+      className="flex flex-col gap-3 rounded-admin-card border border-vault-line bg-vault-surface p-4"
     >
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">
@@ -175,7 +175,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
               type="button"
               data-testid="pipeline-expand-all"
               onClick={() => setAll(true)}
-              className="cursor-pointer rounded border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel"
+              className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel"
             >
               Expand all
             </button>
@@ -183,7 +183,7 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
               type="button"
               data-testid="pipeline-stages-only"
               onClick={() => setAll(false)}
-              className="cursor-pointer rounded border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
+              className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1 text-xs tracking-[0.1em] text-vault-steel-light hover:border-vault-steel"
             >
               Stages only
             </button>

@@ -41,7 +41,7 @@ export default function QualityPanel({ evalResult, features }: QualityPanelProps
   return (
     <section
       data-testid="admin-quality-panel"
-      className="flex flex-col gap-3 rounded-lg border border-vault-line bg-vault-surface p-4"
+      className="flex flex-col gap-3 rounded-admin-card border border-vault-line bg-vault-surface p-4"
     >
       <h2 className="text-sm tracking-[0.18em] text-vault-text-strong">
         ANSWER QUALITY &middot; GOLDEN SET
