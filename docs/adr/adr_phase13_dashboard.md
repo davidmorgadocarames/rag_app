@@ -536,12 +536,16 @@ change data/polling/behaviour"). Warn/crit/off are proven correct at the unit le
 end-to-end. A follow-up phase could add an admin-only "force a probe status" test
 hook if full-tone e2e coverage becomes a priority.
 
-**Minor approximation (reported, not silently changed).** The mockup actually uses THREE
-border/divider shades (`#2b2f35` card border, `#23262b` row-level divider, `#454c56`
-drawer/button border); this block introduces one new token, `--line` (`#2b2f35`), for both
-card borders and row dividers, rather than a fourth near-identical shade for the `#23262b`
-case. The visual difference is negligible (both are dark neutral greys a few % apart) and
-borders are not subject to WCAG text-contrast rules.
+**Minor approximation (reported, not silently changed) — SUPERSEDED, see 13-J3 below.** The
+mockup actually uses THREE border/divider shades (`#2b2f35` card border, `#23262b` row-level
+divider, `#454c56` drawer/button border); this block introduces one new token, `--line`
+(`#2b2f35`), for both card borders and row dividers, rather than a fourth near-identical shade
+for the `#23262b` case. The visual difference is negligible (both are dark neutral greys a
+few % apart) and borders are not subject to WCAG text-contrast rules. **In practice the actual
+implementation went further than this note describes, applying a `/60`/`/70` opacity modifier
+to `--line` for row/stage dividers to approximate the lighter `#23262b`/`#1d2025` shades — an
+instance of the exact same `var()`-opacity-modifier bug 13-J3 found and fixed (below), so those
+dividers rendered with no line at all, not merely an approximate colour.**
 
 ## 13-J2: wake banner on slow (held) responses + DA-13-J-1 radius fix (DEBT-060)
 
@@ -615,3 +619,87 @@ request is let through unmodified, so the eventual answer is the real backend's 
 the banner is absent before ~1.5 s, visible by ~4 s with no Retry button, and gone the moment
 the real answer streams in, exactly once; a negative control proves a normal-speed chat turn
 never shows it at all.
+
+## 13-J3: colours, second pass (T13.12.1–T13.12.4, DEBT-059 reopened, DEBT-062)
+
+**Why reopened.** 13-J/13-J2 were promoted (`442d942`), but the user's own smoke test called
+the live dashboard "mucho menos colorido" than the approved mockup. The orchestrator traced
+this to a genuine bug, not a subjective styling gap: several of 13-J's own tinted-background
+classes compiled to **no CSS rule at all**.
+
+**Root cause: Tailwind 3 cannot apply an opacity modifier to a `var()` colour.** A Tailwind
+colour defined as a CSS custom property (`tailwind.config.ts`: `vault.amber: "var(--amber)"`,
+`vault.line: "var(--line)"`) has no literal RGB triplet for Tailwind's JIT compiler to scale
+when a class asks for a fractional opacity (`bg-vault-amber/10`, `border-vault-line/60`) — it
+silently emits nothing, with no build warning or error. Confirmed by the orchestrator
+compiling the admin sources directly with the Tailwind CLI. This had THREE live
+consequences, not just the one first noticed:
+- `TriagePanel.tsx`'s selected row and `AdminDashboard.tsx`'s active nav item both used
+  `bg-vault-amber/10` — no tint at all (should have been 0.10 and 0.12 respectively, two
+  DIFFERENT values the mockup actually uses).
+- `TriagePanel.tsx`'s pressed filter chip used the same `bg-vault-amber/10` (should have been
+  0.14).
+- Grepping every admin component for the same shape (`/<n>` after any `vault-*` colour) found
+  it ALSO broke every row/metrics/pipeline-stage divider: `TriagePanel`/`FeatureDrawer`/
+  `ErasurePanel`'s `border-vault-line/60` and `LatencyPanel`'s `border-vault-line/70` — these
+  had rendered with NO divider line at all since 13-G2/13-G3, undetected because 13-J's own
+  ADR note ("Minor approximation" above) had assumed a single, slightly-transparent `--line`
+  token was an acceptable stand-in for the mockup's separate `#23262b`/`#1d2025` shades — the
+  actual code never even achieved that approximation; it rendered nothing.
+
+**Rule going forward (enforced, not just documented): no class in any admin component may
+ever apply an opacity modifier to a `vault-*` colour.** Every tint now has its own named,
+pre-composited token instead — `--amber-wash-10`/`-12`/`-14` (selected row / active nav /
+pressed chip) and `--row-divider`/`--stage-divider` (`#23262b`/`#1d2025`, the mockup's own
+literal divider shades, replacing the single-token approximation 13-J shipped with) — mirrored
+in `tailwind.config.ts`. `lib/adminTailwindCompile.test.ts` enforces the rule two ways: a
+static grep that fails the moment any admin `.tsx` file writes a `vault-*` class with a
+trailing `/<digits>`, and an actual Tailwind compile (via the `postcss`/`tailwindcss`
+packages, in-process) of every `vault-*` class those files use, asserting each one produces a
+real CSS rule — with a negative control that recompiles the original `bg-vault-amber/10`
+fixture and asserts it produces none, proving the compile-check method would truly have
+caught this. Both halves of the test fail on the pre-T13.12.1 code.
+
+**DA-13-J-1's nav radius correction.** 13-J2's own radius fix (above) applied the generic
+6px `rounded-admin-btn` to the left-hand section nav item; re-reading `Main.dc.html`'s
+`sections[].style` directly shows the nav item has its OWN 8px radius, distinct from every
+other admin button's 6px. Given its own named token, `rounded-admin-nav` (8px), and a 44px
+min-height (`sections[].style`: `min-height: 44px`) the nav item never had before. The e2e
+radius assertion for `admin-nav-pipeline` is updated from the (incorrect) 6px to 8px.
+
+**Remaining T13.12.2 gaps closed in the same pass:** the header's target/radar SVG icon (28px,
+amber stroke, `aria-hidden`, absent entirely before this block); filter-chip/row sizing
+(36px/52px min-height, the mockup's own padding) and the row name's 500 font-weight; the
+feature drawer's radius (`rounded-lg`'s 8px default → `rounded-admin-card`'s 10px — left
+unfixed by 13-J2 as "outside the DA's reviewed file list"); the page's 1440px max-width
+(`max-w-6xl`'s 1152px never matched it); KPI tile padding (16/18px); the alert banner's
+padding (10/14px); and every secondary button (Refresh now, Expand all/Stages only, Run
+probe/Show history, Open feature/Open erasure, Retry) restyled to the mockup's one shared
+secondary-button look (6px radius, amber-bright text, `#454c56` border, 36px min-height) —
+"Purge now" alone gets the mockup's OTHER, filled-amber primary button style.
+
+**The erasure KPI sub-line was silently dropping information.** The mockup's "Erasure queue"
+tile always shows BOTH clauses ("0 overdue · 1 near deadline"); the pre-13-J3 code only ever
+rendered "`N` overdue", so a queue with nothing overdue yet but something about to be showed
+no tint and no mention of it at all. `lib/adminKpi.ts`'s `erasureQueueSummary` now also
+counts `nearDeadline` (the same `AMBER_THRESHOLD_SECONDS` `ErasurePanel.tsx`'s own countdown
+colouring already used, re-exported from `adminKpi.ts` so the two thresholds cannot drift
+apart), and the sub-line's tone follows it (crit if overdue, else warn if near-deadline, else
+muted) — matching the mockup's own tone-when-non-zero rule exactly.
+
+**Visual evidence (T13.12.3).** `e2e/admin-dashboard.spec.ts`'s real-stack test now asserts
+the ACTUAL computed `background-color` of the selected row, the active nav item and the
+pressed filter chip (all three fail on the pre-fix code — no background at all). A freshly
+seeded e2e stack cannot naturally produce a critical/warning/off feature, two alerts or a
+near-deadline erasure request all at once; a second test mocks the backend's own SSE snapshot
+frame (`event: snapshot\ndata: {...}`, the exact shape `rag_app.api.admin._sse_frame`/
+`lib/adminStream.ts` already define) plus the three REST calls the dashboard's first-load
+effect fetches separately, reusing the already-enrolled e2e admin account rather than adding
+a new seeded one. Screenshots of every section were taken against this seeded state for
+side-by-side comparison with `Main.dc.html`.
+
+**Known gaps NOT fixed in this pass (reported, not silently dropped).** The Quality/Erasure/
+Defence-lab panels' own `<table>`/card layouts still fall short of the mockup's exact cell
+padding and per-row divider treatment (e.g. the mockup's `#23262b` row divider on every
+`<td>`, not just the ones this block touched) — a larger table-layout rework than "colours,
+second pass" scoped for, left as a follow-up rather than expanded here.
