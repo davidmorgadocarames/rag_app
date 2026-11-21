@@ -62,11 +62,27 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
   await expect(page.getByTestId("admin-triage-panel")).toBeVisible();
   await expect(page.getByTestId("triage-row-admin-api")).toBeVisible();
 
-  // DA-13-J-1 fix (13-J2): the mockup's own card radius (10px) and button radius (6px) --
-  // `rounded-admin-card`/`rounded-admin-btn` (tailwind.config.ts). Fails on the pre-fix code
-  // (Tailwind's own `rounded-lg`/`rounded` defaults: 8px/4px).
+  // DA-13-J-1 fix (13-J2): the mockup's own card radius (10px) -- `rounded-admin-card`
+  // (tailwind.config.ts). Fails on the pre-fix code (Tailwind's own `rounded-lg` default: 8px).
   await expect(page.getByTestId("admin-triage-panel")).toHaveCSS("border-radius", "10px");
-  await expect(page.getByTestId("admin-nav-pipeline")).toHaveCSS("border-radius", "6px");
+  // T13.12.1 correction (13-J3): the nav item's OWN radius is the mockup's 8px
+  // (`rounded-admin-nav`, Main.dc.html `sections[].style`), a DIFFERENT value from the
+  // generic 6px `rounded-admin-btn` 13-J2 mistakenly reused here (that assertion used to read
+  // "6px" -- updated now that the root cause is understood).
+  await expect(page.getByTestId("admin-nav-pipeline")).toHaveCSS("border-radius", "8px");
+
+  // T13.12.1/T13.12.3 (13-J3): the active nav item (Triage, the default section) and the
+  // pressed filter chip ("All", the default filter) now actually paint their amber tint --
+  // fails on the pre-13-J3 code, where `bg-vault-amber/10` (an opacity modifier on a var()
+  // colour) compiled to no CSS rule at all, so both had NO background whatsoever.
+  await expect(page.getByTestId("admin-nav-triage")).toHaveCSS(
+    "background-color",
+    "rgba(217, 154, 63, 0.12)",
+  );
+  await expect(page.getByTestId("triage-filter-all")).toHaveCSS(
+    "background-color",
+    "rgba(217, 154, 63, 0.14)",
+  );
 
   // A filter narrows the list (T13.8.5): a freshly seeded stack has no Critical feature.
   await page.getByTestId("triage-filter-crit").click();
@@ -92,6 +108,15 @@ test("an admin can enrol MFA, step up, and see the redesigned dashboard shell", 
   await page.getByTestId("triage-row-admin-api").click();
   await expect(page.getByTestId("admin-feature-drawer")).toBeVisible();
   await expect(page.getByTestId("admin-feature-drawer-id")).toHaveText("admin-api");
+  // T13.12.1/T13.12.3: the selected row's own amber tint -- fails on the pre-13-J3 code (same
+  // `bg-vault-amber/10` opacity-modifier bug, no background at all).
+  await expect(page.getByTestId("triage-row-admin-api")).toHaveCSS(
+    "background-color",
+    "rgba(217, 154, 63, 0.1)",
+  );
+  // T13.12.2: the drawer's own radius (10px) -- a DIFFERENT, matching value to the triage
+  // panel's (not the pre-13-J3 `rounded-lg` default of 8px).
+  await expect(page.getByTestId("admin-feature-drawer")).toHaveCSS("border-radius", "10px");
   // T13.8.8/DA-13-G2-3: the drawer also shows the registry's own lifecycle status (a
   // DIFFERENT field from the probe status badge above it) -- admin-api is "enabled".
   await expect(page.getByTestId("admin-feature-drawer-lifecycle-status")).toContainText(
@@ -192,4 +217,248 @@ test("an already-enrolled admin steps up in a brand-new session without re-enrol
   // so this genuinely proves the probe returned 403 for a non-admin, not merely "nobody
   // checked yet".
   await expect(page.getByRole("link", { name: "Admin panel" })).toHaveCount(0);
+});
+
+// T13.12.3 (13-J3): visual evidence against a SEEDED state (>= 1 critical, 1 warning, 1 off,
+// 2 alerts, 1 erasure request near its deadline) -- a freshly seeded e2e stack never produces
+// any of these for real (no probe is actually down, no erasure request is actually 20h+ old),
+// so this test mocks the backend's OWN wire shapes instead of the real `/admin/*` data:
+//   - `/api/admin/stream` (SSE, local `ADMIN_LIVE_MODE=sse`, scripts/gate.sh): fulfilled with
+//     one real `event: snapshot` frame (the exact `rag_app.api.admin._sse_frame` shape,
+//     `lib/adminStream.ts`) carrying the seeded features/erasure/alerts.
+//   - `/api/admin/erasure`/`/api/admin/latency`/`/api/admin/eval`: the dashboard's OWN first-
+//     load effect (AdminDashboard.tsx) fetches these three separately on mount regardless of
+//     live mode, so they are mocked too (with the SAME erasure payload as the SSE snapshot).
+// Reuses ADMIN_EMAIL's account (already enrolled by the first test in this file; tests run
+// sequentially, no `fullyParallel`) via `stepUpOnlyMfa` in a brand-new browser context --
+// never re-enrols, never adds to the real backend's probe/erasure state.
+test("the seeded dashboard matches the mockup's palette across every section (visual evidence)", async ({
+  browser,
+}) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  try {
+    await loginAndReachChat(page, ADMIN_EMAIL as string, ADMIN_PASSWORD as string);
+    await expect(page).toHaveURL(/\/chat$/);
+    await stepUpOnlyMfa(page, adminSecret as string);
+
+    const seededFeatures = [
+      {
+        id: "admin-api",
+        name: "Admin API",
+        phase: "13",
+        status: "enabled",
+        probe_status: "ok",
+        probe_detail: "probe ok",
+        metrics: {},
+        dev_only: false,
+        azure_only: false,
+        expected_here: true,
+        docs: "docs/TRD.md#admin-api",
+      },
+      {
+        id: "identity-email-verification-reset",
+        name: "E-mail verification + reset",
+        phase: "12",
+        status: "enabled",
+        probe_status: "down",
+        probe_detail: "down: SMTP send failed 3 times",
+        metrics: { 'secrag_email_send_total{result="error"}': 3 },
+        dev_only: false,
+        azure_only: false,
+        expected_here: true,
+        docs: "docs/RUNBOOK_AZURE.md#email",
+      },
+      {
+        id: "rag-rerank",
+        name: "Rerank stage",
+        phase: "9",
+        status: "enabled",
+        probe_status: "degraded",
+        probe_detail: "degraded: p95 2.1s, above the 2s target",
+        metrics: {},
+        dev_only: false,
+        azure_only: false,
+        expected_here: true,
+        docs: "docs/adr/adr_phase9_rerank.md",
+      },
+      {
+        id: "admin-defence-lab",
+        name: "Defence lab",
+        phase: "13",
+        status: "enabled",
+        probe_status: "down",
+        probe_detail: "off by design on this stack",
+        metrics: {},
+        dev_only: true,
+        azure_only: false,
+        expected_here: false,
+        docs: "docs/security/DEFENCE_LAB.md",
+      },
+    ];
+    const seededAlerts = [
+      {
+        code: "email_failures",
+        severity: "amber",
+        message: "E-mail send failures: 3 since this replica started.",
+        feature_ids: ["identity-email-verification-reset"],
+      },
+      {
+        code: "erasure_approaching",
+        severity: "amber",
+        message: "1 erasure request has less than 6h left before its 24h deadline.",
+        feature_ids: ["privacy-asynchronous-erasure"],
+      },
+    ];
+    const seededErasure = {
+      requests: [
+        {
+          id: "er_7f3a91c2",
+          requested_at: "2026-11-17T06:00:00Z",
+          age_seconds: 68400,
+          seconds_left: 10000, // < AMBER_THRESHOLD_SECONDS (4h) -- "near deadline"
+          status: "running",
+          rows_remaining: { users: 214 },
+          attempts: 2,
+          last_error_class: "SMTPError",
+          overdue: false,
+        },
+        {
+          id: "er_1b08d4e7",
+          requested_at: "2026-11-17T17:00:00Z",
+          age_seconds: 21600,
+          seconds_left: 64800,
+          status: "pending",
+          rows_remaining: { users: 1032 },
+          attempts: 0,
+          last_error_class: null,
+          overdue: false,
+        },
+        {
+          id: "er_c44e0f19",
+          requested_at: "2026-11-16T22:00:00Z",
+          age_seconds: 3600,
+          seconds_left: 0,
+          status: "done",
+          rows_remaining: {},
+          attempts: 1,
+          last_error_class: null,
+          overdue: false,
+          completed_at: "2026-11-17T22:10:00Z",
+        },
+      ],
+      last_purger_run: null,
+    };
+    const seededLatency = {
+      stages: [{ stage: "total", count: 128, avg_seconds: 4.62, p50_seconds: 4.1, p95_seconds: 6.0 }],
+      pipeline: [
+        {
+          stage: "classifying",
+          steps: [
+            {
+              stage: "classifying",
+              step: "classify_intent",
+              count: 128,
+              avg_seconds: 0.06,
+              p50_seconds: 0.05,
+              p95_seconds: 0.09,
+            },
+          ],
+        },
+        {
+          stage: "generating",
+          steps: [
+            {
+              stage: "generating",
+              step: "token_stream",
+              count: 120,
+              avg_seconds: 1.9,
+              p50_seconds: 1.7,
+              p95_seconds: 2.95,
+            },
+          ],
+        },
+      ],
+    };
+    const seededEval = {
+      last_run_at: "2026-11-17T09:46:00Z",
+      passed: true,
+      metrics: [
+        { key: "hit_rate@5", value: 0.92, floor: 0.85, baseline: 0.9, below_floor: false, regressed: false },
+        {
+          key: "abstention_accuracy",
+          value: 0.88,
+          floor: 0.8,
+          baseline: 0.91,
+          below_floor: false,
+          regressed: true,
+        },
+      ],
+    };
+
+    await page.route("**/api/admin/stream", async (route) => {
+      const payload = { features: seededFeatures, erasure: seededErasure, alerts: seededAlerts };
+      // Same frame shape as `rag_app.api.admin._sse_frame` (`event: <type>\ndata: <json>\n\n`)
+      // -- `retry: 60000` so a reconnect (the fulfilled body ends the connection) never
+      // re-fires within this test's own lifetime.
+      const body = `retry: 60000\n\nevent: snapshot\ndata: ${JSON.stringify(payload)}\n\n`;
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body });
+    });
+    await page.route("**/api/admin/erasure", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(seededErasure) }),
+    );
+    await page.route("**/api/admin/latency", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(seededLatency) }),
+    );
+    await page.route("**/api/admin/eval", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(seededEval) }),
+    );
+
+    await page.goto("/admin");
+    await expect(page.getByTestId("admin-triage-panel")).toBeVisible();
+    // The SSE snapshot replaced the SSR shell's real (clean) data -- both alerts now show.
+    await expect(page.getByTestId("admin-alert-banner")).toBeVisible();
+    await expect(page.getByTestId("admin-alert-email_failures")).toBeVisible();
+    await expect(page.getByTestId("admin-alert-erasure_approaching")).toBeVisible();
+
+    // At least one of each tone is present (T13.12.3's seed requirement).
+    await expect(page.getByTestId("triage-row-identity-email-verification-reset")).toContainText(
+      "Critical",
+    );
+    await expect(page.getByTestId("triage-row-rag-rerank")).toContainText("Warning");
+    await expect(page.getByTestId("triage-row-admin-defence-lab")).toContainText("Off here");
+    await expect(page.getByTestId("triage-row-admin-api")).toContainText("OK");
+
+    // T13.12.2: the "Erasure queue" KPI sub-line now shows the near-deadline request, tinted
+    // amber (0 overdue, 1 near deadline -- fails on the pre-13-J3 text, which dropped the
+    // near-deadline clause entirely and so never coloured the sub-line for this case).
+    const erasureKpiSub = page.getByTestId("admin-kpi-tiles").getByText(/near deadline/);
+    await expect(erasureKpiSub).toBeVisible();
+    await expect(erasureKpiSub).toHaveCSS("color", "rgb(240, 185, 104)");
+
+    await page.screenshot({ path: "test-results/admin-screens/01-triage.png", fullPage: true });
+
+    await page.getByTestId("triage-row-identity-email-verification-reset").click();
+    await expect(page.getByTestId("admin-feature-drawer-why")).toHaveCount(0); // real failure, no "why"
+    await page.screenshot({ path: "test-results/admin-screens/02-triage-drawer.png", fullPage: true });
+
+    await page.getByTestId("admin-nav-pipeline").click();
+    await expect(page.getByTestId("admin-latency-panel")).toBeVisible();
+    await page.screenshot({ path: "test-results/admin-screens/03-pipeline.png", fullPage: true });
+
+    await page.getByTestId("admin-nav-quality").click();
+    await expect(page.getByTestId("admin-quality-panel")).toBeVisible();
+    await page.screenshot({ path: "test-results/admin-screens/04-quality.png", fullPage: true });
+
+    await page.getByTestId("admin-nav-erasure").click();
+    await expect(page.getByTestId("admin-erasure-panel")).toBeVisible();
+    await page.screenshot({ path: "test-results/admin-screens/05-erasure.png", fullPage: true });
+
+    // Defence lab is only in the nav when the registry feature probes "ok" (T13.3.1) -- this
+    // seeded scenario deliberately sets it to "off" (the mockup's own "admin-defence-lab"
+    // sample, Main.dc.html EXTRA), so the tab itself is hidden here by design; no screenshot.
+    await expect(page.getByTestId("admin-nav-lab")).toHaveCount(0);
+  } finally {
+    await context.close();
+  }
 });
