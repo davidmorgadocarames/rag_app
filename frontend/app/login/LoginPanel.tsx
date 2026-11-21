@@ -46,7 +46,16 @@ export default function LoginPanel() {
     setShowResend(false);
     try {
       if (mode === "login") {
-        await login(email, password, { onWaking: wake.onWaking, onRecovered: wake.onRecovered });
+        // T13.11.5 (DEBT-060): purely visual -- shows the SAME banner if this call is still
+        // pending ~3s later, even when the Container Apps activator just HOLDS the request
+        // (no error, no retry signal at all) during a scale-from-zero. clearPending() runs
+        // whatever the outcome, so a fast login never shows it at all.
+        wake.startPending();
+        try {
+          await login(email, password, { onWaking: wake.onWaking, onRecovered: wake.onRecovered });
+        } finally {
+          wake.clearPending();
+        }
         wake.reset();
         // The session is a cookie the BFF/backend just set (T12.1.3/T12.1.7) -- nothing to
         // store client-side; /chat's own guard (middleware + a real API call) takes it from

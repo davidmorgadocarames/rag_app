@@ -190,16 +190,31 @@ export default function ChatPage() {
     setBusy(true);
     setStage("classifying");
     wake.reset();
+    // T13.11.5 (DEBT-060): purely visual -- pending "until the first byte/token arrives"
+    // (never until the full answer: a real cold start is exactly as likely to HOLD the
+    // request, with no error at all, as to refuse it -- see lib/pendingWake.ts's header).
+    // Cleared the instant ANY stream event dispatches below, whichever comes first.
+    wake.startPending();
 
     await streamChat(
       { question, conversation_id: conversationId ?? undefined },
       {
         // The id arrives first (T11.2.16): keep it even if the turn then fails, so the next
         // message continues this conversation instead of starting a new one.
-        onConversation: (id) => setActiveId(id),
-        onStage: (s) => setStage(s),
-        onToken: (t) => appendToken(t),
+        onConversation: (id) => {
+          wake.clearPending();
+          setActiveId(id);
+        },
+        onStage: (s) => {
+          wake.clearPending();
+          setStage(s);
+        },
+        onToken: (t) => {
+          wake.clearPending();
+          appendToken(t);
+        },
         onDone: (d) => {
+          wake.clearPending();
           patchLastAssistant({
             content: d.answer,
             citations: d.citations,
@@ -216,6 +231,7 @@ export default function ChatPage() {
           setStage(null);
         },
         onError: (detail, conversationId, dropConversation) => {
+          wake.clearPending();
           patchLastAssistant({ content: detail, streaming: false, error: true });
           // After a 404 (the conversation was deleted elsewhere) the id is dropped, so the
           // next message starts a new conversation instead of failing again (DA-G2-7).
@@ -236,6 +252,7 @@ export default function ChatPage() {
         onWaking: wake.onWaking,
         onRecovered: wake.onRecovered,
         onWakeFailed: () => {
+          wake.clearPending(); // cancel/clear the visual timer -- onFailed below wins either way
           setMessages((prev) => prev.slice(0, -1)); // drop the empty "streaming" placeholder
           wake.onFailed();
           setBusy(false);

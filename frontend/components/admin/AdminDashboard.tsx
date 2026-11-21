@@ -97,7 +97,7 @@ function AlertBanner({
           <div
             key={alert.code}
             data-testid={`admin-alert-${alert.code}`}
-            className={`flex flex-wrap items-center gap-3 rounded-lg border p-2.5 text-xs ${
+            className={`flex flex-wrap items-center gap-3 rounded-admin-card border p-2.5 text-xs ${
               tone === "crit" ? "border-vault-crit-border bg-vault-crit-bg" : "border-vault-warn-border bg-vault-warn-bg"
             }`}
           >
@@ -108,7 +108,7 @@ function AlertBanner({
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
                 onClick={() => onJumpToFeature(target.featureId as string)}
-                className="cursor-pointer rounded border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
+                className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
               >
                 Open feature
               </button>
@@ -117,7 +117,7 @@ function AlertBanner({
                 type="button"
                 data-testid={`admin-alert-${alert.code}-open`}
                 onClick={() => onJumpToSection(target.section as Section)}
-                className="cursor-pointer rounded border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
+                className="cursor-pointer rounded-admin-btn border border-vault-steel-dark px-2.5 py-1 text-vault-amber-bright hover:border-vault-steel"
               >
                 Open erasure
               </button>
@@ -144,7 +144,7 @@ function KpiTile({
   subClass?: string;
 }) {
   return (
-    <div className="flex flex-col gap-1 rounded-lg border border-vault-line bg-vault-surface p-3">
+    <div className="flex flex-col gap-1 rounded-admin-card border border-vault-line bg-vault-surface p-3">
       <span className="text-xs uppercase tracking-[0.08em] text-vault-text-muted">{label}</span>
       <span className="font-mono text-2xl font-semibold text-vault-text-strong">{value}</span>
       <span className={`text-xs ${subClass}`}>{sub}</span>
@@ -241,11 +241,11 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
     return () => clearInterval(id);
   }, []);
 
-  // wake's onWaking/onRecovered/onFailed/reset are stable (useCallback, no deps) -- used
-  // directly rather than the `wake` object itself so this callback's own identity does not
-  // change every time the waking banner toggles (which would otherwise restart the poll
-  // interval below on every wake/recover).
-  const { onWaking, onRecovered, onFailed, reset: resetWake } = wake;
+  // wake's onWaking/onRecovered/onFailed/reset(/startPending/clearPending) are stable
+  // (useCallback, no deps) -- used directly rather than the `wake` object itself so this
+  // callback's own identity does not change every time the waking banner toggles (which
+  // would otherwise restart the poll interval below on every wake/recover).
+  const { onWaking, onRecovered, onFailed, reset: resetWake, startPending, clearPending } = wake;
   const refreshAll = useCallback(async () => {
     try {
       // DA-13-E-2: alerts come with /admin/features (same probe sweep) -- no separate poll.
@@ -292,8 +292,14 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   // right on this very first render (e.g. the first admin visit after a long idle period)
   // shows the banner too, in both SSE and polling mode -- these three GETs are not gated by
   // `liveMode` at all.
+  // T13.11.5 (DEBT-060): ALSO the "admin dashboard loads" pending-visual case -- armed once
+  // for the whole trio, cleared only once all three have settled (success or an already-
+  // handled WakeUpError), via Promise.allSettled on their own (already-caught) promises.
+  // Deliberately NOT wired into `refreshAll`/the poll interval/"Refresh now" below: this
+  // block's scope is page LOAD only, never touching the existing polling behaviour.
   useEffect(() => {
-    adminErasure({ onWaking, onRecovered })
+    startPending();
+    const erasureDone = adminErasure({ onWaking, onRecovered })
       .then((e) => {
         setErasure(e);
         setLastSync(Date.now());
@@ -302,7 +308,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       .catch((err) => {
         if (err instanceof WakeUpError) onFailed();
       });
-    adminLatency({ onWaking, onRecovered })
+    const latencyDone = adminLatency({ onWaking, onRecovered })
       .then((l) => {
         setLatency(l);
         setLastSync(Date.now());
@@ -311,7 +317,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       .catch((err) => {
         if (err instanceof WakeUpError) onFailed();
       });
-    adminEval({ onWaking, onRecovered })
+    const evalDone = adminEval({ onWaking, onRecovered })
       .then((ev) => {
         setEvalResult(ev);
         setLastSync(Date.now());
@@ -320,7 +326,8 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       .catch((err) => {
         if (err instanceof WakeUpError) onFailed();
       });
-  }, [onWaking, onRecovered, onFailed, resetWake]);
+    void Promise.allSettled([erasureDone, latencyDone, evalDone]).then(() => clearPending());
+  }, [onWaking, onRecovered, onFailed, resetWake, startPending, clearPending]);
 
   // T13.4.1: SSE, local only.
   useEffect(() => {
@@ -464,7 +471,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <nav
           aria-label="Dashboard sections"
-          className="flex w-full flex-col gap-1 rounded-lg border border-vault-line bg-vault-surface p-2 lg:w-56 lg:flex-shrink-0"
+          className="flex w-full flex-col gap-1 rounded-admin-card border border-vault-line bg-vault-surface p-2 lg:w-56 lg:flex-shrink-0"
         >
           {SECTION_DEFS.filter((s) => s.key !== "lab" || labAvailable).map((s) => (
             <button
@@ -473,7 +480,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
               data-testid={`admin-nav-${s.key}`}
               aria-current={section === s.key ? "page" : undefined}
               onClick={() => setSection(s.key)}
-              className={`flex items-center justify-between gap-2 rounded px-3 py-2 text-left text-sm ${
+              className={`flex items-center justify-between gap-2 rounded-admin-btn px-3 py-2 text-left text-sm ${
                 section === s.key
                   ? "bg-vault-amber/10 font-semibold text-vault-amber-bright"
                   : "text-vault-steel-light hover:text-vault-amber-bright"
