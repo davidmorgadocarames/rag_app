@@ -20,6 +20,7 @@ import { conversationLoadError } from "@/lib/chatStream";
 import { createRetryGuard } from "@/lib/retryGuard";
 import { useWakeState } from "@/lib/useWakeState";
 import { useWakeSteps } from "@/lib/useWakeSteps";
+import { sendWakePing } from "@/lib/wakePing";
 
 interface UiMessage {
   role: "user" | "assistant";
@@ -110,6 +111,13 @@ export default function ChatPage() {
   useEffect(() => {
     void refreshConversations();
   }, [refreshConversations]);
+
+  // T13.13.2 (DEBT-061): same one-per-page-load wake ping as /login (lib/wakePing.ts) --
+  // nudges Ollama/bge-m3 awake as soon as the chat page itself loads, not only once the
+  // first question is sent.
+  useEffect(() => {
+    sendWakePing();
+  }, []);
 
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight });

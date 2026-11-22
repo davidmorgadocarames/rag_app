@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import VaultDoor from "@/components/VaultDoor";
 import WakeBanner from "@/components/WakeBanner";
@@ -9,6 +9,7 @@ import { login, register, resendVerification } from "@/lib/api";
 import { createRetryGuard } from "@/lib/retryGuard";
 import { useWakeState } from "@/lib/useWakeState";
 import { WakeUpError } from "@/lib/wakeUp";
+import { sendWakePing } from "@/lib/wakePing";
 
 export default function LoginPanel() {
   const router = useRouter();
@@ -38,6 +39,14 @@ export default function LoginPanel() {
   // drives the button's `disabled` look.
   const retryGuardRef = useRef(createRetryGuard());
   const [retrying, setRetrying] = useState(false);
+
+  // T13.13.2 (DEBT-061): one light wake ping per page load -- nudges Ollama/bge-m3 awake in
+  // parallel with whatever else is cold-starting, well before the visitor even submits the
+  // login form. Fire-and-forget (see lib/wakePing.ts); an empty dependency array means this
+  // runs exactly once per mount, not on every re-render.
+  useEffect(() => {
+    sendWakePing();
+  }, []);
 
   async function submitLogin() {
     setBusy(true);
