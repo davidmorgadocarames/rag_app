@@ -9,6 +9,8 @@
 //
 // T13.8.8: a "done" row now shows "Completed <completed_at>" -- a fact about the past -- never
 // a countdown (which only ever makes sense for an OPEN request still racing the deadline).
+// T13.J4-fix (DA-13-J3J4-3): <completed_at> is now the mockup's own "17 Nov 22:10" shape
+// (lib/adminTime.ts, UTC), not the raw ISO wire value.
 
 import { useState } from "react";
 
@@ -23,6 +25,9 @@ import {
 // T13.12.2 (13-J3): shared with the "Erasure queue" KPI tile's own near-deadline count
 // (AdminDashboard.tsx/adminKpi.ts) -- a single threshold, never two copies that could drift.
 import { AMBER_THRESHOLD_SECONDS } from "@/lib/adminKpi";
+// T13.J4-fix (DA-13-J3J4-3): the mockup's own "Completed 17 Nov 22:10" shape, not the raw
+// ISO wire value.
+import { formatCompletedAt } from "@/lib/adminTime";
 
 import StatusBadge from "./StatusBadge";
 
@@ -61,7 +66,7 @@ function rowsLeft(row: ErasureRequestOut): number {
  * fabricating a timestamp. */
 function timeCellText(row: ErasureRequestOut): string {
   if (row.status === "done") {
-    return row.completed_at ? `Completed ${row.completed_at}` : "Completed";
+    return row.completed_at ? `Completed ${formatCompletedAt(row.completed_at)}` : "Completed";
   }
   return formatHours(row.seconds_left);
 }
