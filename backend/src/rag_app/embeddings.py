@@ -30,6 +30,10 @@ class OllamaEmbedder:
     the SAME setting: neither endpoint builds its own ``OllamaEmbedder`` with an override —
     they reach it through the one retrieval path (``rag_app.retrieval``), which never
     passes a timeout either.
+
+    T13.13.3: every call also sends ``keep_alive`` (``Settings.embed_keep_alive``, default
+    "3h") unless an explicit ``keep_alive`` is passed -- see that setting's docstring for
+    why this is one constant value, always sent, rather than a demo-only override.
     """
 
     def __init__(
@@ -37,11 +41,13 @@ class OllamaEmbedder:
         host: str | None = None,
         model: str | None = None,
         timeout: float | None = None,
+        keep_alive: str | None = None,
     ) -> None:
         settings = get_settings()
         self.host = (host or settings.ollama_host).rstrip("/")
         self.model = model or settings.embed_model
         self.timeout = settings.embed_timeout_seconds if timeout is None else timeout
+        self.keep_alive = settings.embed_keep_alive if keep_alive is None else keep_alive
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Return one embedding vector per input text."""
@@ -49,7 +55,7 @@ class OllamaEmbedder:
             return []
         response = httpx.post(
             f"{self.host}/api/embed",
-            json={"model": self.model, "input": texts},
+            json={"model": self.model, "input": texts, "keep_alive": self.keep_alive},
             timeout=self.timeout,
         )
         response.raise_for_status()

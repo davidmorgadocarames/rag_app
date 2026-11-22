@@ -119,6 +119,19 @@ class Settings(JobSettings):
     # faster) -- a deliberate follow-up, not done here. Must stay <= EMBED_TIMEOUT_MAX_SECONDS
     # (DA-11bH-4): above it the Azure ~240s ingress cutoff always wins the race first.
     embed_timeout_seconds: int = 170
+    # T13.13.3 (DEBT-061, demo mode): how long Ollama keeps `bge-m3` resident after an
+    # `/api/embed` call (`OllamaEmbedder.embed()` sends this on EVERY call, not only the
+    # warm-up one -- one code path, never a demo-only branch). Ollama's own server-side
+    # default is 5 minutes, which unloads the model mid-demo even with the Ollama Container
+    # App pinned at min-replicas 1 (`demo-mode.sh on`) if nobody asks a question for a
+    # while. "3h" matches `demo-mode.sh`'s fixed `DEMO_HOURS` window -- deliberately a single
+    # constant, always sent, rather than a demo-only override: this needs NO Azure config
+    # change (no env var to flip on `on`/back on `off`) because Azure's own cost driver is
+    # the Container App's replica-seconds while it is actually running, not how long Ollama
+    # happens to keep one small model resident in memory inside an already-running
+    # container -- outside a demo the container itself scales back to 0 well before 3h of
+    # inactivity elapses, so this is cost-neutral there too (measured/estimated in the ADR).
+    embed_keep_alive: str = "3h"
     # T11.5.1/T11.5.3 (11b block F): adopted winner. v2-m3 fp32 (any top_k/max_length)
     # could not clear the 1.5s/2-thread floor -- see the ADR (decision 8) for the full
     # matrix. bge-reranker-base, dynamically int8-quantized, is the ONLY family with a

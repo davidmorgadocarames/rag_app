@@ -25,11 +25,22 @@
 #            backend's health through the frontend's own BFF route (`/api/health`,
 #            DEC-005/T12.5.6 -- `scripts/cd/health_check.sh`; the backend has no public
 #            FQDN of its own to poll once ingress goes internal, T12.6b.5).
+#         3b. T13.13.2/DEBT-061: nudges the embeddings model awake too, via the SAME
+#             frontend BFF (`/api/wake` -> backend `GET /wake` -> a background Ollama embed,
+#             `rag_app.warmup`) -- best-effort only, never fails or rolls back `on` if it does
+#             not answer in time (the first real question would still wake it the normal
+#             way). `bge-m3` then STAYS loaded for the whole 3h window regardless of gaps
+#             between questions: `Settings.embed_keep_alive` (default "3h", sent on every
+#             `/api/embed` call, not only this one) already covers it without this script
+#             touching any env var/secret -- see that setting's docstring for why this needs
+#             no Azure config change and costs nothing extra (billing follows replica
+#             uptime, not how long Ollama keeps one small model resident in memory).
 #         4. Prints "ready — ask a question in the browser" + the end time.
 #         If step 3 fails (an app never reaches Running, or /api/health never answers), `on`
 #         rolls back everything it changed — every app it scaled goes back to min-replicas
 #         0, every tag it wrote is removed — then exits non-zero. It never leaves apps up
-#         with a valid future tag but no actually-ready demo (DA-11bH-2).
+#         with a valid future tag but no actually-ready demo (DA-11bH-2). Step 3b can never
+#         trigger a rollback (see above).
 # off     Sets min-replicas back to 0 (max stays 1) and REMOVES the tag on every app, then
 #         re-reads min-replicas to confirm the scale-down was accepted (the apps keep
 #         running until Azure's own idle cooldown — this script does not wait for that).
@@ -59,9 +70,12 @@ DEMO_HOURS=3
 POLL="${AZURE_DEMO_POLL_SECONDS:-10}"
 RUNNING_TIMEOUT="${AZURE_DEMO_RUNNING_TIMEOUT_SECONDS:-240}"
 HEALTH_TIMEOUT="${AZURE_DEMO_HEALTH_TIMEOUT_SECONDS:-240}"
+# T13.13.2/DEBT-061: short and best-effort on purpose -- unlike HEALTH_TIMEOUT above, a
+# wake-ping timeout never fails `on` (see step 3b in the usage block).
+WAKE_TIMEOUT="${AZURE_DEMO_WAKE_TIMEOUT_SECONDS:-30}"
 HOURLY_COST_EUR="${DEMO_MODE_HOURLY_COST_EUR:-0.17}"
 
-usage() { sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "::error::$*" >&2; exit 1; }
 say() { echo "[demo-mode] $*"; }
 
@@ -115,6 +129,7 @@ if [ "$dry_run" = 1 ]; then
       done
       say "would wait for each app's runningStatus = Running (<= ${RUNNING_TIMEOUT}s)"
       say "would run: $HEALTH_CHECK https://<frontend fqdn>/api/health --timeout $HEALTH_TIMEOUT"
+      say "would run (best-effort, never fails 'on'): $HEALTH_CHECK https://<frontend fqdn>/api/wake --timeout $WAKE_TIMEOUT --expect-status 204"
       say "would print: ready — ask a question in the browser (until $end)"
       say "on failure: would roll back (scale every touched app to 0, remove every tag written)"
       ;;
@@ -241,6 +256,15 @@ do_on() {
     --query properties.configuration.ingress.fqdn -o tsv)" \
     || { echo "::error::cannot read the frontend's FQDN" >&2; return 1; }
   bash "$HEALTH_CHECK" "https://$frontend_fqdn/api/health" --timeout "$HEALTH_TIMEOUT" || return 1
+  # T13.13.2/DEBT-061 (step 3b, usage block above): best-effort only -- a failure here never
+  # fails or rolls back `on` (the /api/health check above already proved the demo is ready;
+  # worst case the embeddings model just wakes the normal way on the first real question).
+  if bash "$HEALTH_CHECK" "https://$frontend_fqdn/api/wake" --timeout "$WAKE_TIMEOUT" \
+      --expect-status 204 >/dev/null 2>&1; then
+    say "embeddings model nudged awake (bge-m3 will stay loaded for the whole 3h window)"
+  else
+    say "embeddings wake ping did not answer in time -- not fatal, it will still wake on the first real question"
+  fi
   say "ready — ask a question in the browser (demo ends $end)"
 }
 

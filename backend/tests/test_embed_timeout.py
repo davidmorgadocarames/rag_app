@@ -60,6 +60,10 @@ def test_validate_api_settings_rejects_embed_timeout_above_the_ingress_budget() 
         validate_api_settings(_settings(embed_timeout_seconds=235))
 
 
+def test_default_embed_keep_alive_is_3h() -> None:
+    assert _settings().embed_keep_alive == "3h"
+
+
 class _FakeResponse:
     def raise_for_status(self) -> None:
         pass
@@ -100,6 +104,40 @@ def test_an_explicit_timeout_overrides_the_setting(monkeypatch: pytest.MonkeyPat
     embedder.embed(["hello"])
 
     assert captured["timeout"] == 7
+
+
+def test_embed_sends_the_configured_keep_alive_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T13.13.3 (DEBT-061): every /api/embed call carries ``keep_alive`` -- red on the old
+    code, which never sent it at all (Ollama's own 5-minute server default applied silently,
+    unloading `bge-m3` mid-demo even with the Ollama Container App pinned at min-replicas 1)."""
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, json: Any = None, timeout: Any = None) -> _FakeResponse:
+        captured["json"] = json
+        return _FakeResponse()
+
+    monkeypatch.setattr(embeddings_module.httpx, "post", fake_post)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    embedder = embeddings_module.OllamaEmbedder()
+    embedder.embed(["hello"])
+
+    assert captured["json"]["keep_alive"] == "3h"
+
+
+def test_an_explicit_keep_alive_overrides_the_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, json: Any = None, timeout: Any = None) -> _FakeResponse:
+        captured["json"] = json
+        return _FakeResponse()
+
+    monkeypatch.setattr(embeddings_module.httpx, "post", fake_post)
+
+    embedder = embeddings_module.OllamaEmbedder(keep_alive="10m")
+    embedder.embed(["hello"])
+
+    assert captured["json"]["keep_alive"] == "10m"
 
 
 def test_chat_and_chat_stream_share_the_same_embedder_default(
