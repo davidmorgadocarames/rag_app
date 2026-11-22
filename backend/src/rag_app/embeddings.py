@@ -31,9 +31,10 @@ class OllamaEmbedder:
     they reach it through the one retrieval path (``rag_app.retrieval``), which never
     passes a timeout either.
 
-    T13.13.3: every call also sends ``keep_alive`` (``Settings.embed_keep_alive``, default
-    "3h") unless an explicit ``keep_alive`` is passed -- see that setting's docstring for
-    why this is one constant value, always sent, rather than a demo-only override.
+    T13.13.3 / DEC-049 (T13.J4-fix): every call also sends ``keep_alive``
+    (``Settings.embed_keep_alive``, default "5m" -- Ollama's own server default) unless an
+    explicit ``keep_alive`` is passed; see that setting's docstring for why "3h" is only ever
+    reached via an `EMBED_KEEP_ALIVE` env var `demo-mode.sh on` sets, never a code default.
     """
 
     def __init__(

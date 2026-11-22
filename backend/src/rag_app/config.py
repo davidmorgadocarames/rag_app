@@ -119,19 +119,20 @@ class Settings(JobSettings):
     # faster) -- a deliberate follow-up, not done here. Must stay <= EMBED_TIMEOUT_MAX_SECONDS
     # (DA-11bH-4): above it the Azure ~240s ingress cutoff always wins the race first.
     embed_timeout_seconds: int = 170
-    # T13.13.3 (DEBT-061, demo mode): how long Ollama keeps `bge-m3` resident after an
-    # `/api/embed` call (`OllamaEmbedder.embed()` sends this on EVERY call, not only the
-    # warm-up one -- one code path, never a demo-only branch). Ollama's own server-side
-    # default is 5 minutes, which unloads the model mid-demo even with the Ollama Container
-    # App pinned at min-replicas 1 (`demo-mode.sh on`) if nobody asks a question for a
-    # while. "3h" matches `demo-mode.sh`'s fixed `DEMO_HOURS` window -- deliberately a single
-    # constant, always sent, rather than a demo-only override: this needs NO Azure config
-    # change (no env var to flip on `on`/back on `off`) because Azure's own cost driver is
-    # the Container App's replica-seconds while it is actually running, not how long Ollama
-    # happens to keep one small model resident in memory inside an already-running
-    # container -- outside a demo the container itself scales back to 0 well before 3h of
-    # inactivity elapses, so this is cost-neutral there too (measured/estimated in the ADR).
-    embed_keep_alive: str = "3h"
+    # T13.13.3 (DEBT-061, demo mode) / T13.J4-fix (DEC-049, DA-13-J3J4-4): how long Ollama
+    # keeps `bge-m3` resident after an `/api/embed` call (`OllamaEmbedder.embed()` sends this
+    # on EVERY call, not only the warm-up one -- one code path, never a demo-only branch).
+    # "5m" matches Ollama's OWN server-side default -- the 13-J4 block's original "3h,
+    # always, everywhere" choice pinned `bge-m3` resident for up to 3h on the user's own dev
+    # PC (native Ollama) after any local dev/test run that touches the embedder, which the DA
+    # review flagged as silently tying up VRAM/RAM on a machine also used for gaming (user's
+    # own standing rule). DEC-049 (user, 2026-11-23): keep the default at Ollama's own 5
+    # minutes everywhere, including the dev PC, and scope the longer 3h window to an actual
+    # Azure demo only -- `scripts/azure/demo-mode.sh on` sets `EMBED_KEEP_ALIVE=3h` as a
+    # Container App env var on the BACKEND, in the SAME `az containerapp update` call it
+    # already makes to wake it (no extra revision); `off` removes the var, restoring this
+    # default.
+    embed_keep_alive: str = "5m"
     # T11.5.1/T11.5.3 (11b block F): adopted winner. v2-m3 fp32 (any top_k/max_length)
     # could not clear the 1.5s/2-thread floor -- see the ADR (decision 8) for the full
     # matrix. bge-reranker-base, dynamically int8-quantized, is the ONLY family with a
@@ -236,6 +237,11 @@ class Settings(JobSettings):
     rate_limit_capacity: int = 60
     rate_limit_refill_per_second: float = 1.0
     rate_limit_chat_cost: float = 5.0  # cost-aware: an LLM answer costs more than 1 token
+    # DEC-050 (T13.J4-fix, DA-13-J3J4-5): GET /wake's OWN much tighter bucket -- 1 request
+    # per 60s per key -- never the generic bucket above (60/1-per-second, generous enough
+    # for a single actor to sustain forever). See rag_app.api.deps.get_wake_rate_limiter.
+    wake_rate_limit_capacity: int = 1
+    wake_rate_limit_refill_per_second: float = 1.0 / 60.0
 
     # --- Global daily answer cap (R6-1, rag_app.usage_cap) ---
     # Answers per UTC day for ALL users together, counted in `usage_daily` before any LLM

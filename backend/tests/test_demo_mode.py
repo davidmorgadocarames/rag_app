@@ -46,8 +46,16 @@ def app_state(app):
 
 if args[:2] == ["containerapp", "update"]:
     app = val("-n")
-    app_state(app)["min"] = val("--min-replicas")
+    st = app_state(app)
+    st["min"] = val("--min-replicas")
     assert val("--max-replicas") == "1", "max-replicas must always be 1"
+    # DEC-049 (T13.J4-fix): EMBED_KEEP_ALIVE rides the SAME containerapp update call -- no
+    # extra revision -- so the fake just needs to record whichever flag was passed, if any.
+    if "--set-env-vars" in args:
+        st["env"] = val("--set-env-vars")
+    if "--remove-env-vars" in args:
+        assert val("--remove-env-vars") == "EMBED_KEEP_ALIVE"
+        st["env"] = ""
 elif args[:2] == ["containerapp", "show"]:
     app = val("-n")
     query = val("--query")
@@ -204,15 +212,90 @@ def test_max_replicas_is_always_exactly_one(tmp_path: Path) -> None:
 
 
 @needs_tools
-def test_demo_mode_never_touches_env_vars_or_secrets(tmp_path: Path) -> None:
+def test_demo_mode_never_touches_secrets_or_a_non_backend_apps_env_vars(tmp_path: Path) -> None:
+    """DEC-049 (T13.J4-fix) narrowed the old "never touches env vars" rule: the script now
+    DOES set/remove `EMBED_KEEP_ALIVE` on the BACKEND app only (same `containerapp update`
+    call it already makes) -- but never on Ollama/frontend, and never a secret, anywhere."""
     env = _env(tmp_path)
     for action in ("on", "off", "status"):
         proc = _run(action, env=env)
         assert proc.returncode == 0, proc.stderr
     for line in _log(tmp_path):
-        assert "--set-env-vars" not in line
         assert "--secrets" not in line
         assert "secret" not in line.lower()
+        if "--set-env-vars" in line or "--remove-env-vars" in line:
+            assert f"-n {APPS['backend']} " in line, f"env var flag used on a non-backend app: {line}"
+            assert "EMBED_KEEP_ALIVE" in line
+
+
+@needs_tools
+def test_on_sets_embed_keep_alive_on_the_backend_in_the_same_update_call(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    proc = _run("on", env=env)
+    assert proc.returncode == 0, proc.stderr
+    state = _state(tmp_path)
+    assert state[APPS["backend"]].get("env") == "EMBED_KEEP_ALIVE=3h"
+    assert state[APPS["ollama"]].get("env") in (None, "")
+    assert state[APPS["frontend"]].get("env") in (None, "")
+    # "no extra revision": exactly ONE `containerapp update` call for the backend, carrying
+    # both --min-replicas and --set-env-vars together.
+    backend_updates = [
+        line
+        for line in _log(tmp_path)
+        if line.startswith("containerapp update") and f"-n {APPS['backend']} " in line
+    ]
+    assert len(backend_updates) == 1
+    assert "--set-env-vars EMBED_KEEP_ALIVE=3h" in backend_updates[0]
+
+
+@needs_tools
+def test_off_removes_embed_keep_alive_from_the_backend_in_the_same_update_call(
+    tmp_path: Path,
+) -> None:
+    env = _env(tmp_path)
+    assert _run("on", env=env).returncode == 0
+    proc = _run("off", env=env)
+    assert proc.returncode == 0, proc.stderr
+    state = _state(tmp_path)
+    assert state[APPS["backend"]].get("env") == ""
+    backend_off_updates = [
+        line
+        for line in _log(tmp_path)
+        if line.startswith("containerapp update")
+        and f"-n {APPS['backend']} " in line
+        and "--min-replicas 0" in line
+    ]
+    assert len(backend_off_updates) == 1
+    assert "--remove-env-vars EMBED_KEEP_ALIVE" in backend_off_updates[0]
+
+
+@needs_tools
+def test_on_rollback_also_removes_embed_keep_alive_from_the_backend(tmp_path: Path) -> None:
+    """DA-11bH-2's own rollback guarantee, extended to the new env var (DEC-049): a rolled
+    back 'on' must leave the backend exactly as it found it, not just min-replicas 0."""
+    env = _env(tmp_path, AZURE_DEMO_HEALTH_TIMEOUT_SECONDS="0", FAKE_CURL_STATUS="500")
+    proc = _run("on", env=env)
+    assert proc.returncode != 0
+    assert "rolled back" in proc.stderr or "rolling back" in proc.stdout
+    state = _state(tmp_path)
+    assert state[APPS["backend"]]["min"] == "0"
+    assert state[APPS["backend"]].get("env") in (None, "")
+
+
+@needs_tools
+def test_dry_run_on_mentions_embed_keep_alive_for_the_backend_only(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    proc = _run("on", "--dry-run", env=env)
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    backend_lines = [line for line in lines if f"-n {APPS['backend']} " in line]
+    other_lines = [
+        line
+        for line in lines
+        if f"-n {APPS['ollama']} " in line or f"-n {APPS['frontend']} " in line
+    ]
+    assert any("EMBED_KEEP_ALIVE" in line for line in backend_lines)
+    assert not any("EMBED_KEEP_ALIVE" in line for line in other_lines)
 
 
 @needs_tools

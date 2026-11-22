@@ -18,32 +18,39 @@
 #            --min-replicas 1 --max-replicas 1` (max is ALWAYS pinned to 1 here — this
 #            script never raises it, and an app already at min=1 is left alone: re-running
 #            `on` while a demo is active only moves the end time, never restarts the apps).
+#            DEC-049 (DA-13-J3J4-4, T13.J4-fix): for the BACKEND app only, that SAME call
+#            also carries `--set-env-vars EMBED_KEEP_ALIVE=3h` (no extra revision) -- the
+#            embed-keep-alive window is Azure/demo-only now (`Settings.embed_keep_alive`
+#            defaults to Ollama's own 5-minute default everywhere else, including the dev
+#            PC); Ollama/frontend never get this var.
 #         2. Every app's `secrag-demo-until` tag is (re)written to now + 3h FIXED (no
 #            option) via `az tag update --operation merge` (merge: no other tag is ever
-#            touched, and no env var/secret is ever touched by this script at all).
+#            touched, and no secret is ever touched by this script at all).
 #         3. Waits for each app's `runningStatus` to become `Running` (bounded), then the
 #            backend's health through the frontend's own BFF route (`/api/health`,
 #            DEC-005/T12.5.6 -- `scripts/cd/health_check.sh`; the backend has no public
 #            FQDN of its own to poll once ingress goes internal, T12.6b.5).
 #         3b. T13.13.2/DEBT-061: nudges the embeddings model awake too, via the SAME
-#             frontend BFF (`/api/wake` -> backend `GET /wake` -> a background Ollama embed,
-#             `rag_app.warmup`) -- best-effort only, never fails or rolls back `on` if it does
-#             not answer in time (the first real question would still wake it the normal
-#             way). `bge-m3` then STAYS loaded for the whole 3h window regardless of gaps
-#             between questions: `Settings.embed_keep_alive` (default "3h", sent on every
-#             `/api/embed` call, not only this one) already covers it without this script
-#             touching any env var/secret -- see that setting's docstring for why this needs
-#             no Azure config change and costs nothing extra (billing follows replica
-#             uptime, not how long Ollama keeps one small model resident in memory).
+#             frontend BFF (`/api/wake` -> backend `GET /wake`) -- best-effort only, never
+#             fails or rolls back `on` if it does not answer in time (the first real
+#             question would still wake it the normal way). DEC-050 (T13.J4-fix): `/wake`
+#             itself no longer triggers the Ollama warm-up (it only wakes the BACKEND
+#             container) -- this ping now exists purely to wake the backend early; the real
+#             embeddings warm-up happens after a successful login or on an authenticated
+#             `/chat` page load. `bge-m3` then STAYS loaded for the whole 3h window
+#             regardless of gaps between questions thanks to step 1's `EMBED_KEEP_ALIVE=3h`.
 #         4. Prints "ready — ask a question in the browser" + the end time.
 #         If step 3 fails (an app never reaches Running, or /api/health never answers), `on`
 #         rolls back everything it changed — every app it scaled goes back to min-replicas
-#         0, every tag it wrote is removed — then exits non-zero. It never leaves apps up
-#         with a valid future tag but no actually-ready demo (DA-11bH-2). Step 3b can never
-#         trigger a rollback (see above).
-# off     Sets min-replicas back to 0 (max stays 1) and REMOVES the tag on every app, then
-#         re-reads min-replicas to confirm the scale-down was accepted (the apps keep
-#         running until Azure's own idle cooldown — this script does not wait for that).
+#         0, every tag it wrote is removed, `EMBED_KEEP_ALIVE` is removed from the backend
+#         again — then exits non-zero. It never leaves apps up with a valid future tag but
+#         no actually-ready demo (DA-11bH-2). Step 3b can never trigger a rollback (see
+#         above).
+# off     Sets min-replicas back to 0 (max stays 1), removes `EMBED_KEEP_ALIVE` from the
+#         BACKEND app (same `containerapp update` call, DEC-049) and REMOVES the
+#         `secrag-demo-until` tag on every app, then re-reads min-replicas to confirm the
+#         scale-down was accepted (the apps keep running until Azure's own idle cooldown —
+#         this script does not wait for that).
 # status  Per app: min-replicas, the `secrag-demo-until` tag (if any). Overall state checks
 #         ALL THREE apps (DA-11bH-1 — a one-way latch that never downgraded `on` used to
 #         hide an asleep app): `on` only if every app is min-replicas 1 with a future tag;
@@ -122,7 +129,11 @@ if [ "$dry_run" = 1 ]; then
     on)
       say "would run (only for an app whose min-replicas is not already 1):"
       for app in "${apps[@]}"; do
-        say "  would run: az containerapp update -g $rg -n $app --min-replicas 1 --max-replicas 1"
+        if [ "$app" = "$backend_app" ]; then
+          say "  would run: az containerapp update -g $rg -n $app --min-replicas 1 --max-replicas 1 --set-env-vars EMBED_KEEP_ALIVE=3h"
+        else
+          say "  would run: az containerapp update -g $rg -n $app --min-replicas 1 --max-replicas 1"
+        fi
       done
       for app in "${apps[@]}"; do
         say "  would run: az tag update --resource-id <id of $app> --operation merge --tags $TAG_KEY=$end"
@@ -131,11 +142,15 @@ if [ "$dry_run" = 1 ]; then
       say "would run: $HEALTH_CHECK https://<frontend fqdn>/api/health --timeout $HEALTH_TIMEOUT"
       say "would run (best-effort, never fails 'on'): $HEALTH_CHECK https://<frontend fqdn>/api/wake --timeout $WAKE_TIMEOUT --expect-status 204"
       say "would print: ready — ask a question in the browser (until $end)"
-      say "on failure: would roll back (scale every touched app to 0, remove every tag written)"
+      say "on failure: would roll back (scale every touched app to 0, remove EMBED_KEEP_ALIVE from the backend, remove every tag written)"
       ;;
     off)
       for app in "${apps[@]}"; do
-        say "would run: az containerapp update -g $rg -n $app --min-replicas 0 --max-replicas 1"
+        if [ "$app" = "$backend_app" ]; then
+          say "would run: az containerapp update -g $rg -n $app --min-replicas 0 --max-replicas 1 --remove-env-vars EMBED_KEEP_ALIVE"
+        else
+          say "would run: az containerapp update -g $rg -n $app --min-replicas 0 --max-replicas 1"
+        fi
         say "would run: az tag update --resource-id <id of $app> --operation delete --tags $TAG_KEY"
       done
       say "would check: every app's min-replicas is now 0"
@@ -168,9 +183,13 @@ resource_id_of() {
 # (never by exiting the whole script): `on` needs to catch a failure after it has already
 # scaled/tagged apps and roll back, so none of these die() directly (DA-11bH-2). Callers
 # that have nothing to roll back (`off`, `status`) chain `|| die ...` themselves.
+# DEC-049 (T13.J4-fix): extra `az` flags (e.g. `--set-env-vars EMBED_KEEP_ALIVE=3h` on `on`,
+# `--remove-env-vars EMBED_KEEP_ALIVE` on `off`) ride along in the SAME call -- no caller
+# ever issues a second `containerapp update` just to touch an env var.
 set_min_replicas() {
   local app="$1" min="$2" now
-  if ! az containerapp update -g "$rg" -n "$app" --min-replicas "$min" --max-replicas 1 -o none; then
+  shift 2
+  if ! az containerapp update -g "$rg" -n "$app" --min-replicas "$min" --max-replicas 1 "$@" -o none; then
     echo "::error::az containerapp update failed for $app" >&2
     return 1
   fi
@@ -217,10 +236,15 @@ wait_running() {
 # rollback_on() is best-effort: it runs after `do_on` has already failed, so it ignores
 # further az failures (logged, not fatal) rather than compounding the original error.
 rollback_on() {
-  local app id
+  local app id env_args
   say "rolling back 'on': scaling every app back to 0 and removing $TAG_KEY"
   for app in "${apps[@]}"; do
-    az containerapp update -g "$rg" -n "$app" --min-replicas 0 --max-replicas 1 -o none 2>/dev/null \
+    env_args=()
+    # DEC-049: undo the backend-only EMBED_KEEP_ALIVE set in do_on's scale-up loop too --
+    # a rolled-back 'on' must leave the backend exactly as it found it, not just min=0.
+    [ "$app" = "$backend_app" ] && env_args=(--remove-env-vars EMBED_KEEP_ALIVE)
+    az containerapp update -g "$rg" -n "$app" --min-replicas 0 --max-replicas 1 \
+        "${env_args[@]}" -o none 2>/dev/null \
       || say "rollback: could not scale $app back to 0 — check it manually"
     id="$(resource_id_of "$app" 2>/dev/null)" || continue
     az tag update --resource-id "$id" --operation delete --tags "$TAG_KEY" -o none 2>/dev/null \
@@ -232,7 +256,7 @@ rollback_on() {
 # (DA-11bH-2) before dying. Because it is called as `do_on || …`, bash suspends `set -e`
 # for its body: a failing command inside it returns normally instead of aborting the script.
 do_on() {
-  local app current end frontend_fqdn
+  local app current end frontend_fqdn env_args
   end="$(plus_3h_iso)"
   for app in "${apps[@]}"; do
     current="$(min_replicas_of "$app")" || { echo "::error::cannot read min-replicas of $app" >&2; return 1; }
@@ -240,7 +264,12 @@ do_on() {
       say "$app: already min-replicas 1 — extending only, no restart"
     else
       say "$app: waking (min-replicas 0 -> 1, max stays 1)"
-      set_min_replicas "$app" 1 || return 1
+      env_args=()
+      # DEC-049 (DA-13-J3J4-4): the backend-only env var riding this SAME `containerapp
+      # update` call -- no extra revision. Only set when this app is actually being scaled
+      # up here; an already-active backend (the branch above) keeps whatever it already has.
+      [ "$app" = "$backend_app" ] && env_args=(--set-env-vars "EMBED_KEEP_ALIVE=3h")
+      set_min_replicas "$app" 1 "${env_args[@]}" || return 1
     fi
   done
   for app in "${apps[@]}"; do
@@ -275,7 +304,11 @@ case "$action" in
   off)
     for app in "${apps[@]}"; do
       say "$app: sleeping (min-replicas -> 0, max stays 1)"
-      set_min_replicas "$app" 0 || die "failed to scale $app to 0"
+      env_args=()
+      # DEC-049: remove the backend-only EMBED_KEEP_ALIVE var in the SAME call -- restores
+      # Settings.embed_keep_alive's own default (Ollama's 5 minutes) once the var is gone.
+      [ "$app" = "$backend_app" ] && env_args=(--remove-env-vars EMBED_KEEP_ALIVE)
+      set_min_replicas "$app" 0 "${env_args[@]}" || die "failed to scale $app to 0"
       delete_tag "$app" || die "failed to remove the tag on $app"
     done
     say "demo mode off"

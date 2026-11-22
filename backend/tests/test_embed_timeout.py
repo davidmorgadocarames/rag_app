@@ -60,8 +60,11 @@ def test_validate_api_settings_rejects_embed_timeout_above_the_ingress_budget() 
         validate_api_settings(_settings(embed_timeout_seconds=235))
 
 
-def test_default_embed_keep_alive_is_3h() -> None:
-    assert _settings().embed_keep_alive == "3h"
+def test_default_embed_keep_alive_is_ollamas_own_5_minute_default() -> None:
+    """DEC-049 (DA-13-J3J4-4): the default is Ollama's own 5-minute server default EVERYWHERE,
+    including the dev PC -- only `demo-mode.sh on` raises it to "3h" via an Azure Container
+    App env var (test_demo_mode.py), never a code-level default."""
+    assert _settings().embed_keep_alive == "5m"
 
 
 class _FakeResponse:
@@ -109,7 +112,9 @@ def test_an_explicit_timeout_overrides_the_setting(monkeypatch: pytest.MonkeyPat
 def test_embed_sends_the_configured_keep_alive_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """T13.13.3 (DEBT-061): every /api/embed call carries ``keep_alive`` -- red on the old
     code, which never sent it at all (Ollama's own 5-minute server default applied silently,
-    unloading `bge-m3` mid-demo even with the Ollama Container App pinned at min-replicas 1)."""
+    unloading `bge-m3` mid-demo even with the Ollama Container App pinned at min-replicas 1).
+    DEC-049: the SENT value now matches Ollama's own 5-minute default by default too --
+    "3h" is only ever reached via the `EMBED_KEEP_ALIVE` env var `demo-mode.sh on` sets."""
     captured: dict[str, Any] = {}
 
     def fake_post(url: str, json: Any = None, timeout: Any = None) -> _FakeResponse:
@@ -118,6 +123,28 @@ def test_embed_sends_the_configured_keep_alive_by_default(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(embeddings_module.httpx, "post", fake_post)
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("EMBED_KEEP_ALIVE", raising=False)
+
+    embedder = embeddings_module.OllamaEmbedder()
+    embedder.embed(["hello"])
+
+    assert captured["json"]["keep_alive"] == "5m"
+
+
+def test_embed_sends_3h_when_embed_keep_alive_is_set_by_demo_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEC-049: `demo-mode.sh on` raises the window to 3h purely via the `EMBED_KEEP_ALIVE`
+    env var -- no code-level branch, the setting is read exactly like every other one."""
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, json: Any = None, timeout: Any = None) -> _FakeResponse:
+        captured["json"] = json
+        return _FakeResponse()
+
+    monkeypatch.setattr(embeddings_module.httpx, "post", fake_post)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("EMBED_KEEP_ALIVE", "3h")
 
     embedder = embeddings_module.OllamaEmbedder()
     embedder.embed(["hello"])
