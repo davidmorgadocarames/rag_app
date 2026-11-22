@@ -8,7 +8,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request, Response
 
-from rag_app import __version__, authz, csp_report, metrics, reranking, timing
+from rag_app import __version__, authz, csp_report, metrics, reranking, timing, wake, warmup
 from rag_app.api import admin, auth, conversations
 from rag_app.api.deps import (
     AnswerFn,
@@ -56,10 +56,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     warms up the ONE shared cross-encoder reranker (T11.4.1): the first real chat request
     pays no model-load/first-inference cost, because it is already resident by the time
     this coroutine yields and the app starts serving traffic.
+
+    T13.13.1 (DEBT-061): fires a background warm-up embed to Ollama
+    (``rag_app.warmup.trigger_warm_up``) BEFORE the (synchronous, blocking) reranker
+    warm-up above -- order matters here, measured in the ADR (13-J4): Ollama is a
+    SEPARATE Container App, also scaled to zero on Azure, and its own cold start (image
+    pull/container start + loading ``bge-m3``) is the slowest single thing in the whole
+    pipeline (~19.7s avg). Firing the background thread first lets Ollama's cold start run
+    CONCURRENTLY with the full remainder of this backend's own start-up (reranker
+    load/warm-up, everything else below) instead of only overlapping whatever tiny gap is
+    left between "this backend is ready" and "a request's classify step reaches
+    ``embed_query()``" -- the fix is a few lines, reordering costs nothing, and the
+    overlap window this buys is exactly the reranker warm-up's own duration. This call
+    returns immediately either way (it only starts a background thread): readiness/
+    ``/health`` never waits on it, and a failure there is only logged, never raised here.
     """
     settings = get_settings()
     startup_checks(settings)
     metrics.start_metrics_server(settings.metrics_port, addr=settings.metrics_bind_addr)
+    warmup.trigger_warm_up()
     reranking.get_shared_reranker().warm_up()
     yield
 
@@ -119,6 +134,7 @@ def create_app() -> FastAPI:
     authz.declare_permission("DELETE", "/account", "user:base")
     app.include_router(conversations.router)
     app.include_router(csp_report.router)
+    app.include_router(wake.router)
     app.include_router(admin.router)
     # T13.3.1: the defence lab's routes are registered ONLY when LAB_ENABLED is on -- the
     # default is off, and the start-up guard (check_dev_only_flags, called from `lifespan`

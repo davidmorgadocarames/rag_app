@@ -78,7 +78,7 @@ EMAIL_FAILED_TOTAL = Counter(
 # the five metrics above did. Every label below is a small, fixed, developer-chosen
 # vocabulary -- never a user id, e-mail address or IP (log hygiene, same reasoning as
 # CLIENT_IP_SIGNATURE_TOTAL's ``result`` label):
-#   route_group  chat / login / email / csp_report / account / mfa (RATE_LIMIT_HITS_TOTAL)
+#   route_group  chat / login / email / csp_report / account / mfa / wake (RATE_LIMIT_HITS_TOTAL)
 #   reason       disposable_email / signup_velocity (SIGNUP_BLOCKED_TOTAL)
 #   result       success / failure (MFA_STEP_UP_TOTAL, MFA_REENROLL_TOTAL)
 RATE_LIMIT_HITS_TOTAL = Counter(
@@ -144,6 +144,19 @@ ERASURE_OLDEST_AGE_SECONDS = Gauge(
 ERASURE_FAILURES_TOTAL = Counter(
     "secrag_erasure_failures_total",
     "Erasure tombstones the purger marked 'failed' (D-ER).",
+    registry=REGISTRY,
+)
+
+# T13.13.1/T13.13.2 (DEBT-061): a background warm-up embed to Ollama, fired from the API
+# lifespan (once, at start-up) and from GET /wake (on a cold `/login`/`/chat` page load) --
+# see ``rag_app.warmup``. ``result`` is "ok"/"failed"/"skipped" (a skip means one was already
+# in flight, the single-flight guard did its job, not an error). Deliberately NOT the same
+# channel as the per-answer ``secrag_chat_stage_seconds``/``secrag_chat_step_seconds``
+# histograms -- a warm-up is never a real answer, so it must never be averaged into either.
+OLLAMA_WARMUP_TOTAL = Counter(
+    "secrag_ollama_warmup_total",
+    "Background warm-up embed calls to Ollama (T13.13.1/T13.13.2), by result.",
+    ["result"],
     registry=REGISTRY,
 )
 

@@ -210,6 +210,23 @@ def rate_limit_csp_report(
 RATE_LIMIT_DEPENDENCIES.add(rate_limit_csp_report)
 
 
+def rate_limit_wake(
+    request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
+) -> None:
+    """``GET /wake`` (T13.13.2, DEBT-061): same shape as ``rate_limit_csp_report`` -- no
+    account to key by (unauthenticated by design, no session), the real client IP alone --
+    so a hostile caller cannot use the wake ping to spam Ollama with warm-up embed calls
+    (the single-flight guard in ``rag_app.warmup`` already collapses concurrent callers to
+    one in-flight call; this additionally bounds how often a single IP can even reach that
+    guard)."""
+    if not limiter.allow(f"wake:{_client_ip(request)}", cost=1.0):
+        metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="wake").inc()
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
+
+
+RATE_LIMIT_DEPENDENCIES.add(rate_limit_wake)
+
+
 async def rate_limit_login(
     request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
 ) -> None:

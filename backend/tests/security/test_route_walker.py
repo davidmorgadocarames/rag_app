@@ -44,6 +44,11 @@ pytestmark = pytest.mark.security
 PUBLIC_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
+        # T13.13.2 (DEBT-061): the wake ping -- unauthenticated by design (same reasoning as
+        # /csp-report below: it must work before any session exists, from /login itself),
+        # rate-limited (rag_app.api.deps.rate_limit_wake) and leaks nothing (always a plain
+        # 204, see rag_app.wake's docstring).
+        ("GET", "/wake"),
         ("POST", "/auth/register"),
         ("POST", "/auth/login"),
         ("POST", "/auth/logout"),

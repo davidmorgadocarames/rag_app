@@ -196,6 +196,33 @@ def test_the_api_lifespan_warms_up_the_shared_reranker(monkeypatch: pytest.Monke
     assert calls == [True]
 
 
+def test_the_api_lifespan_fires_the_background_ollama_warm_up_before_the_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T13.13.1 (DEBT-061): the lifespan triggers ``rag_app.warmup.trigger_warm_up`` BEFORE
+    the (synchronous, blocking) reranker warm-up -- order matters (see the lifespan's own
+    docstring and ADR 13-J4): Ollama's own cold start is the slowest thing in the whole
+    pipeline, so firing its warm-up first lets it run concurrently with the ENTIRE rest of
+    this backend's own start-up, not just whatever gap is left afterwards. This call must
+    never block the lifespan on the embed call itself (proven in ``test_warmup.py`` at the
+    unit level; here only the call site/order is checked, with fakes that return fast)."""
+    from rag_app.api import app as app_module
+
+    calls: list[str] = []
+
+    class _FakeReranker:
+        def warm_up(self) -> None:
+            calls.append("reranker")
+
+    monkeypatch.setattr(app_module, "get_settings", lambda: _settings())
+    monkeypatch.setattr(app_module, "check_master_key_fingerprint", lambda *_a: "match")
+    monkeypatch.setattr(app_module.reranking, "get_shared_reranker", lambda: _FakeReranker())
+    monkeypatch.setattr(app_module.warmup, "trigger_warm_up", lambda: calls.append("ollama"))
+    with TestClient(create_app()):
+        pass
+    assert calls == ["ollama", "reranker"]
+
+
 def test_metrics_bind_addr_defaults_to_all_interfaces_but_is_configurable() -> None:
     """DA-11bA-2: compose's separate `prometheus` container needs a non-loopback bind to
     reach this port at all, so the default stays "0.0.0.0" — but it must be overridable

@@ -444,6 +444,16 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         docs="docs/TRD.md",
     ),
     FeatureEntry(
+        id="stack-coldstart-warmup",
+        name="Cold-start warm-up (background Ollama embed, lifespan + GET /wake)",
+        phase="13-J4",
+        status="enabled",
+        health_probe=route_probe("GET", "/wake"),
+        metrics=("secrag_ollama_warmup_total",),
+        router_tags=("stack",),
+        docs="docs/TRD.md",
+    ),
+    FeatureEntry(
         id="stack-postgres",
         name="Postgres",
         phase="11a",
