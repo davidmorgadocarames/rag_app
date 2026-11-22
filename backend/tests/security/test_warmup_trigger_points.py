@@ -54,7 +54,9 @@ def test_a_successful_login_triggers_the_ollama_warm_up(
     api_env: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[object] = []
-    monkeypatch.setattr("rag_app.api.auth.warmup.trigger_warm_up", lambda *a: calls.append(a) or True)
+    monkeypatch.setattr(
+        "rag_app.api.auth.warmup.trigger_warm_up", lambda *a: calls.append(a) or True
+    )
     client = _client()
     creds = _creds()
     assert client.post("/auth/register", json=creds).status_code == 202
@@ -67,7 +69,9 @@ def test_a_failed_login_never_triggers_the_ollama_warm_up(
     api_env: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[object] = []
-    monkeypatch.setattr("rag_app.api.auth.warmup.trigger_warm_up", lambda *a: calls.append(a) or True)
+    monkeypatch.setattr(
+        "rag_app.api.auth.warmup.trigger_warm_up", lambda *a: calls.append(a) or True
+    )
     client = _client()
     creds = _creds()
     assert client.post("/auth/register", json=creds).status_code == 202
@@ -80,7 +84,9 @@ def test_login_for_an_unknown_email_never_triggers_the_ollama_warm_up(
     api_env: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[object] = []
-    monkeypatch.setattr("rag_app.api.auth.warmup.trigger_warm_up", lambda *a: calls.append(a) or True)
+    monkeypatch.setattr(
+        "rag_app.api.auth.warmup.trigger_warm_up", lambda *a: calls.append(a) or True
+    )
     client = _client()
     response = client.post("/auth/login", json=_creds())
     assert response.status_code == 401

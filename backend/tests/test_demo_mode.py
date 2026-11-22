@@ -224,7 +224,9 @@ def test_demo_mode_never_touches_secrets_or_a_non_backend_apps_env_vars(tmp_path
         assert "--secrets" not in line
         assert "secret" not in line.lower()
         if "--set-env-vars" in line or "--remove-env-vars" in line:
-            assert f"-n {APPS['backend']} " in line, f"env var flag used on a non-backend app: {line}"
+            assert (
+                f"-n {APPS['backend']} " in line
+            ), f"env var flag used on a non-backend app: {line}"
             assert "EMBED_KEEP_ALIVE" in line
 
 
