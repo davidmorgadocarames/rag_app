@@ -179,11 +179,47 @@ def test_an_embedding_failure_ends_with_an_error_event_and_the_next_message_reus
     _assert_no_orphans(db_engine, user)
 
 
+def test_the_stream_emits_embed_query_step_events_around_the_real_retrieving_stage(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T13.12.5 (DEBT-062): through the REAL ``/chat/stream`` SSE wire format -- the chat
+    wake banner (frontend) parses exactly this shape. Exactly one start/end pair, both
+    typed ``"step"`` with ``stage``/``step``/``phase`` fields, sitting between the
+    "retrieving" and "reranking" stage events -- unlike the other tests in this file, this
+    one needs a REAL (non-raising) embed, so only the reranker/LLM are faked."""
+    from rag_app import generation, reranking
+
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.1] * 1024)
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
+    monkeypatch.setattr(
+        reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
+    )
+    user = _make_user(db_engine)
+    events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
+    assert events[-1]["type"] == "done"
+
+    steps = [e for e in events if e["type"] == "step"]
+    assert steps == [
+        {"type": "step", "stage": "retrieving", "step": "embed_query", "phase": "start"},
+        {"type": "step", "stage": "retrieving", "step": "embed_query", "phase": "end"},
+    ]
+    kinds = [(e["type"], e.get("stage") or e.get("phase")) for e in events]
+    retrieving_idx = kinds.index(("stage", "retrieving"))
+    reranking_idx = kinds.index(("stage", "reranking"))
+    assert kinds[retrieving_idx + 1 : retrieving_idx + 3] == [
+        ("step", "start"),
+        ("step", "end"),
+    ]
+    assert retrieving_idx + 3 == reranking_idx
+    _assert_no_orphans(db_engine, user)
+
+
 def test_an_llm_failure_ends_with_an_error_event(
     client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from rag_app import generation, reranking
 
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
     monkeypatch.setattr(
         reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks

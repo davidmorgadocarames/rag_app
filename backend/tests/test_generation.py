@@ -16,6 +16,8 @@ from rag_app import generation, reranking, timing
 from rag_app.generation import (
     INSUFFICIENT,
     StreamResult,
+    StreamStage,
+    StreamStep,
     StreamToken,
     _stream_answer_tokens,
     classify_intent,
@@ -319,6 +321,7 @@ def test_answer_question_emits_the_expected_atomic_steps(
 def test_answer_question_stream_emits_the_expected_atomic_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
     monkeypatch.setattr(
         reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
@@ -364,6 +367,57 @@ def test_answer_question_stream_chitchat_emits_classify_and_canned_reply_steps()
     assert after.get(build_prompt, 0.0) == before.get(build_prompt, 0.0)
 
 
+# --- T13.12.5 (DEBT-062): StreamStep sub-step events (embed_query start/end) ----------------
+
+
+def test_answer_question_stream_emits_embed_query_start_and_end_exactly_once_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The security path brackets the (potentially slow, cold-start) embed call with
+    exactly one start and one end ``StreamStep``, in the right place: after the
+    "retrieving" stage, before any further stage event."""
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    monkeypatch.setattr(
+        reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
+    )
+    chat = _FakeChatStreamSeq([["Use prepared statements ", "[1]."], ["GROUNDED"]])
+
+    events = list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "How do I prevent SQL injection?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    steps = [e for e in events if isinstance(e, StreamStep)]
+    assert [(s.stage, s.step, s.phase) for s in steps] == [
+        ("retrieving", "embed_query", "start"),
+        ("retrieving", "embed_query", "end"),
+    ]
+    # The embed step sits strictly between the "retrieving" stage event and the next
+    # ("reranking") stage event -- never before/after the wrong stage.
+    kinds = [
+        ("stage", e.stage) if isinstance(e, StreamStage) else ("step", e.phase)
+        for e in events
+        if isinstance(e, (StreamStage, StreamStep))
+    ]
+    retrieving_idx = kinds.index(("stage", "retrieving"))
+    reranking_idx = kinds.index(("stage", "reranking"))
+    assert kinds[retrieving_idx + 1] == ("step", "start")
+    assert kinds[retrieving_idx + 2] == ("step", "end")
+    assert retrieving_idx + 2 < reranking_idx
+
+
+def test_answer_question_stream_chitchat_never_emits_a_step_event() -> None:
+    """The chit-chat fast path never touches retrieval/embedding at all -- no StreamStep,
+    ever (DA-less regression guard: a future refactor that accidentally always embeds would
+    fail this)."""
+    events = list(generation.answer_question_stream(None, "hi", chat=_FakeChatSync("")))  # type: ignore[arg-type]
+    assert not [e for e in events if isinstance(e, StreamStep)]
+
+
 def test_answer_question_emits_one_timing_record_with_no_pii(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -393,6 +447,7 @@ def test_answer_question_stream_emits_one_timing_record(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger="rag_app.timing")
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
     monkeypatch.setattr(
         reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
@@ -453,6 +508,7 @@ def test_answer_question_stream_uses_the_shared_reranker_by_default(
 ) -> None:
     monkeypatch.setattr(reranking, "_shared_reranker", None)
     shared = reranking.get_shared_reranker()
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
     seen: list[object] = []
 

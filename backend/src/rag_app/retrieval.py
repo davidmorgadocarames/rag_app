@@ -93,6 +93,22 @@ def _load_chunks(session: Session, uids: list[str]) -> dict[str, RetrievedChunk]
     return result
 
 
+def embed_query(embedder: OllamaEmbedder, query: str) -> list[float]:
+    """Embed one query string -- the ``retrieving``/``embed_query`` atomic step (T13.8.1).
+
+    T13.12.5: pulled out of :func:`hybrid_search` so the streaming pipeline
+    (``generation.answer_question_stream``) can call it directly and bracket it with its
+    own SSE sub-step events (``StreamStep``) -- this is the dominant cold-start cost (Ollama
+    waking ``bge-m3``), and the ONLY way to surface a real "still working" signal to the UI
+    while it runs is for the caller's own generator frame to ``yield`` around it; a callback
+    passed into ``hybrid_search`` could not do that (a plain function cannot ``yield`` on a
+    generator's behalf). Every non-streaming caller still gets this for free via
+    ``hybrid_search``, unchanged.
+    """
+    with timing.stage("embed"), timing.step("retrieving", "embed_query"):
+        return embedder.embed_one(query)
+
+
 def hybrid_search(
     session: Session,
     query: str,
@@ -101,18 +117,25 @@ def hybrid_search(
     top_k: int | None = None,
     candidate_k: int | None = None,
     version: str | None = None,
+    query_vector: list[float] | None = None,
 ) -> list[RetrievedChunk]:
-    """Return the top chunks for a query, fusing vector and BM25 rankings."""
+    """Return the top chunks for a query, fusing vector and BM25 rankings.
+
+    ``query_vector`` (T13.12.5): when the caller already computed it (see
+    :func:`embed_query`'s docstring), it is reused as-is and ``embedder`` is never touched
+    -- every other caller is unaffected, the embed call still happens right here, exactly
+    as before.
+    """
     settings = get_settings()
     top_k = top_k or settings.rerank_top_n
     candidate_k = candidate_k or settings.top_k
-    embedder = embedder or OllamaEmbedder()
 
-    # T13.8.1: the atomic-step wraps below are a SEPARATE channel (``secrag_chat_step_seconds``,
+    # T13.8.1: the atomic-step wrap below is a SEPARATE channel (``secrag_chat_step_seconds``,
     # pipeline stage "retrieving") -- the outer ``timing.stage(...)`` calls and their meaning
     # (the existing ``secrag_chat_stage_seconds`` histogram) are unchanged.
-    with timing.stage("embed"), timing.step("retrieving", "embed_query"):
-        query_vector = embedder.embed_one(query)
+    if query_vector is None:
+        embedder = embedder or OllamaEmbedder()
+        query_vector = embed_query(embedder, query)
 
     with timing.stage("hybrid_search"):
         with timing.step("retrieving", "vector_search"):

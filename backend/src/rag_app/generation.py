@@ -22,9 +22,10 @@ from sqlalchemy.orm import Session
 
 from rag_app import timing
 from rag_app.config import get_settings
+from rag_app.embeddings import OllamaEmbedder
 from rag_app.llm import ChatClient, Message, Usage, make_chat_client
 from rag_app.metrics import observe_stage, observe_step
-from rag_app.retrieval import RetrievedChunk, hybrid_search
+from rag_app.retrieval import RetrievedChunk, embed_query, hybrid_search
 
 if TYPE_CHECKING:
     from rag_app.reranking import CrossEncoderReranker
@@ -382,6 +383,20 @@ class StreamStage:
 
 
 @dataclass
+class StreamStep:
+    """A real sub-step boundary within a stage (T13.12.5, DEBT-062): start/end markers for
+    the slow steps a cold start needs to communicate to the UI -- today only
+    ``("retrieving", "embed_query")``, the dominant cold-start cost (Ollama waking
+    ``bge-m3``). Reuses the SAME (stage, step) vocabulary as the latency metrics
+    (``metrics.py``'s ``secrag_chat_step_seconds`` histogram) -- no separate naming, no
+    timing guesses: these are the real moments the pipeline enters/leaves the step."""
+
+    stage: str
+    step: str
+    phase: str  # "start" | "end"
+
+
+@dataclass
 class StreamToken:
     """A delta of the answer text as it is generated (preview only)."""
 
@@ -396,7 +411,7 @@ class StreamResult:
     usage: Usage
 
 
-StreamEvent = StreamStage | StreamToken | StreamResult
+StreamEvent = StreamStage | StreamStep | StreamToken | StreamResult
 
 
 def _stream_answer_tokens(
@@ -511,7 +526,19 @@ def answer_question_stream(
             return
 
         yield StreamStage(stage="retrieving")
-        chunks = hybrid_search(session, query, top_k=settings.top_k, version=version)
+        # T13.12.5 (DEBT-062): the embed call is pulled out of hybrid_search and made HERE,
+        # in this generator's own frame, so the "start"/"end" StreamStep events below are
+        # yielded (and so reach the SSE queue, see api/conversations.py's `_pipeline_events`)
+        # right around the actual Ollama call, not after the whole (fast) rest of
+        # hybrid_search runs too -- a plain callback passed into hybrid_search could not do
+        # this (only the generator's own `yield` can suspend it mid-call).
+        embedder = OllamaEmbedder()
+        yield StreamStep(stage="retrieving", step="embed_query", phase="start")
+        query_vector = embed_query(embedder, query)
+        yield StreamStep(stage="retrieving", step="embed_query", phase="end")
+        chunks = hybrid_search(
+            session, query, top_k=settings.top_k, version=version, query_vector=query_vector
+        )
 
         if use_rerank and chunks:
             from rag_app.reranking import get_shared_reranker

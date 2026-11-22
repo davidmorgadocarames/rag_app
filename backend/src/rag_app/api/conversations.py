@@ -71,6 +71,7 @@ from rag_app.generation import (
     Answer,
     StreamResult,
     StreamStage,
+    StreamStep,
     StreamToken,
     answer_question_stream,
     classify_intent,
@@ -412,6 +413,19 @@ def _chat_events(
                     elif isinstance(event, StreamStage):
                         stage = event.stage
                         yield _sse({"type": "stage", "stage": event.stage})
+                    elif isinstance(event, StreamStep):
+                        # T13.12.5 (DEBT-062): a real sub-step boundary WITHIN the current
+                        # stage (today only retrieving/embed_query) -- existing clients
+                        # ignore an unknown "type" (frontend/lib/chatStream.ts's `dispatch`),
+                        # so this is additive, never a breaking change to the SSE contract.
+                        yield _sse(
+                            {
+                                "type": "step",
+                                "stage": event.stage,
+                                "step": event.step,
+                                "phase": event.phase,
+                            }
+                        )
                     elif isinstance(event, StreamToken):
                         yield _sse({"type": "token", "text": event.text})
                     elif isinstance(event, StreamResult):

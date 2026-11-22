@@ -123,6 +123,7 @@ def test_chat_path_bounds_generation_and_groundedness() -> None:
 
 
 def test_stream_path_bounds_generation_and_groundedness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
     chat = _RecordingChat()
     events = list(
@@ -161,6 +162,7 @@ def test_chat_path_passes_num_ctx_per_call_type() -> None:
 
 
 def test_stream_path_passes_num_ctx_per_call_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
     chat = _RecordingChat()
     list(
