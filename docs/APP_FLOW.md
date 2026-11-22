@@ -192,6 +192,18 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      shows it (the 3 s timer is long since cancelled by then), while a genuinely slow cold
      start keeps the user informed the whole time instead of going quiet right as the real
      wait begins.
+   - **Cold-start warm-up, started earlier still** (T13.13.1/T13.13.2, DEBT-061): the pipeline
+     above is serial by nature (backend start → classify → retrieve → embed) — every cold
+     start used to stack the backend's OWN wake-up on top of Ollama's, one after the other.
+     Two overlapping nudges remove that stacking: (1) the API lifespan fires a background,
+     non-blocking warm-up embed to Ollama the moment the backend itself finishes starting
+     (`rag_app.warmup.trigger_warm_up`, same process as the reranker warm-up above, but never
+     blocking readiness and never raising on failure — only logged); (2) `/login` and `/chat`
+     each send one light, rate-limited, unauthenticated `GET /wake` on page load (through the
+     BFF's own `/api/wake`, `frontend/lib/wakePing.ts`) that triggers the SAME warm-up again
+     if Ollama went cold since the backend woke up. Both share one single-flight guard, so
+     neither ever queues a second concurrent embed call behind an already-waking Ollama; a
+     caller of `/wake` learns nothing beyond "accepted" (always 204) either way.
 4. The user + assistant messages are **persisted encrypted** (per-user key). Follow-ups continue the same
    conversation; **New chat** starts a fresh one.
 

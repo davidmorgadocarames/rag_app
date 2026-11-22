@@ -136,6 +136,33 @@ Rerun triggers: change to prompts, LLM model, embedding model, chunking, retriev
   digest is unchanged (`7907646426070047a77226ac3e684fbbe8410524f7b4a74d02837e43f2146bab`).
   Demo mode (README "Demo mode") sidesteps the cold start entirely for a bounded window.
   Full numbers: ADR 11 decision 9.
+- **Serial cold-start warm-up (T13.13.1–T13.13.3, DEBT-061, 13-J4):** even with the fixes
+  above, the real path stayed serial — backend container start (torch import + reranker
+  load/warm-up) → classify → retrieving → only THEN `retrieval.embed_query()` calls Ollama
+  (a SEPARATE Container App, also scaled to zero), stacking two cold starts one after
+  another instead of overlapping them. Three changes (`rag_app.warmup`):
+  1. **Lifespan warm-up**: the API lifespan fires a background, non-blocking warm-up embed
+     to Ollama right after the (synchronous) reranker warm-up — it never delays
+     readiness/`/health`, and a failure is only logged (`secrag_ollama_warmup_total{result=
+     "failed"}`), never raised. A module-wide single-flight guard (`threading.Lock` +
+     `_in_progress`) means at most one warm-up embed call is ever in flight — a second
+     trigger while one is running is skipped (`result="skipped"`), not queued.
+  2. **Wake ping (`GET /wake`)**: `/login` and `/chat` each send one light, unauthenticated,
+     rate-limited (`rag_app.api.deps.rate_limit_wake`, per real IP) ping on page load
+     (through the BFF's own `/api/wake`, never relaying the backend's response — always a
+     plain 204, no leak either way), reusing the SAME single-flight guard, so Ollama gets
+     nudged again even if it went cold again after the backend itself finished waking.
+  3. **`embed_keep_alive`** (default `"3h"`, sent on EVERY `/api/embed` call via
+     `OllamaEmbedder`, not only the warm-up one): Ollama's own server-side default
+     (5 minutes) would unload `bge-m3` mid-demo even with the Ollama Container App pinned at
+     `min-replicas 1` (`demo-mode.sh on`) if nobody asks a question for a while. One constant
+     value, always sent — deliberately NOT a demo-only override (no env var to flip on `on`/
+     back on `off`): outside a demo the Container App itself scales back to 0 on its own
+     idle cooldown well before 3h elapses, so this is cost-neutral there too (Azure bills
+     replica-seconds, not how long Ollama happens to keep one small model resident in an
+     already-running container). `demo-mode.sh on` additionally fires the wake ping once,
+     right after its existing `/api/health` check, best-effort (never fails or rolls back
+     `on`). Local before/after first-token measurement + method: ADR 13-J4.
 - **The `latency` gate step** (T11.6b.1) is a real pass/fail check: a routine run's p50/p95
   per stage is compared against a committed, 2-thread-pinned *adopted* baseline
   (`eval/latency_adopted_baseline.json`, distinct from the frozen "before" baseline) with a

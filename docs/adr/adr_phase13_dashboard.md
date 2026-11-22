@@ -824,3 +824,110 @@ inherently flaky; the exhaustive ordering/transition proof for that step lives i
 Out of scope for this block (13-J4, DEBT-061, same branch): warming Ollama's embedder
 concurrently with the backend's own cold start, rather than serially after classification —
 a separate, backend-only change that does not touch this banner.
+
+## 13-J4: cold-start warm-up (T13.13.1–T13.13.5, DEBT-061)
+
+**Problem.** Even with 13-J3b's real pipeline steps shown to the user, the actual cold path
+stayed serial: backend container start (torch import + reranker load/warm-up, in the API
+lifespan) → classify → retrieving → only THEN `retrieval.embed_query()` calls Ollama — a
+SEPARATE Container App, also scaled to zero on Azure. Ollama's own cold start (image pull +
+container start + loading `bge-m3`) is the slowest single thing in the whole pipeline (admin
+KPI: ~19.7s avg for the "embed" stage) and it used to only START once the backend had
+already finished waking up and a real question's classify/retrieve stage reached it — two
+cold starts stacked one after another instead of overlapping. Azure OpenAI (the chat LLM) is
+always on, so there is no equivalent "fake LLM conversation" fix here — only Ollama/`bge-m3`
+is ever cold.
+
+**Fix 1 — background warm-up at backend start (T13.13.1, `rag_app.warmup`).** The API
+lifespan fires one warm-up embed call to Ollama on a background thread
+(`warmup.trigger_warm_up`), **before** the (synchronous, blocking) reranker warm-up runs —
+order matters: firing it first lets Ollama's own cold start run concurrently with the
+*entire* remainder of the backend's own start-up, not just whatever gap happens to be left
+afterwards (see the "before/after" measurement below, which proves this with the two
+orderings side by side). `trigger_warm_up()` itself never blocks (it only starts a daemon
+thread and returns) and never raises (any exception is caught and only logged,
+`secrag_ollama_warmup_total{result="failed"}`) — readiness/`/health` never waits on it and
+a failure there never fails the API start-up. A module-wide single-flight guard
+(`threading.Lock` + a plain `_in_progress` flag) means at most one warm-up embed call is
+ever outstanding — a second trigger while one is running is skipped
+(`result="skipped"`), never queued, since the one already in flight warms Ollama up for
+everyone regardless. Deliberately NOT wrapped in `rag_app.timing`'s stage/step recorder
+(unlike the reranker's own `warm_up()`, which wraps purely for symmetry): a fresh OS thread
+does not inherit the parent's `contextvars`, so there is never a recorder to find here even
+if this ran mid-answer — a warm-up can never be averaged into a real answer's
+`secrag_chat_stage_seconds`/`secrag_chat_step_seconds`.
+
+**Fix 2 — wake ping on page load (T13.13.2, `rag_app.wake`, `GET /wake`).** `/login` and
+`/chat` each send one light GET to the BFF's own `/api/wake` on page load
+(`frontend/lib/wakePing.ts`, fire-and-forget, never awaited by the caller), forwarded
+verbatim to the backend's unauthenticated `GET /wake`, which re-triggers the SAME
+single-flight warm-up (in case Ollama went cold again after the backend itself finished
+waking — e.g. the backend stayed up on a request from a different app while Ollama's own
+Container App scaled back to zero on its own idle cooldown). The route always answers a
+plain 204, whichever branch it took internally (warm-up started, skipped, or even an
+unexpected exception from `trigger_warm_up` — caught defensively, logged, still 204): a
+caller learns nothing about Ollama's/the backend's internal state beyond "accepted", so
+this adds no new attack surface besides a cheap, rate-limited (`rag_app.api.deps.
+rate_limit_wake`, keyed by real IP like `/csp-report`) ping. Registered in
+`rag_app.features.REGISTRY` (`stack-coldstart-warmup`) and the route walker's
+`PUBLIC_ALLOWLIST` (unauthenticated by design, same reasoning as `/csp-report`: it must work
+from `/login` itself, before any session exists).
+
+**Fix 3 — `embed_keep_alive`, demo mode (T13.13.3).** Ollama's own server-side `keep_alive`
+default (5 minutes) would unload `bge-m3` mid-demo even with the Ollama Container App pinned
+at `min-replicas 1` (`demo-mode.sh on`) if nobody asks a question for a while. Considered two
+options: (A) `OLLAMA_KEEP_ALIVE` as a Container App env var, flipped on `demo-mode.sh on`/
+reverted on `off` — an Azure config change on every toggle, and the thing this script's own
+comment block is proud of NOT doing ("no env var/secret is ever touched by this script at
+all", `test_demo_mode_never_touches_env_vars_or_secrets`); (B) a `Settings.embed_keep_alive`
+field, sent as the `keep_alive` field on **every** `/api/embed` call via `OllamaEmbedder`
+(not only the warm-up one — one code path, never a demo-only branch), default `"3h"`
+(matching `demo-mode.sh`'s fixed `DEMO_HOURS` window). **Adopted: B.** Needs no Azure config
+change at all (one backend code change, deployed once, like any other code change) and is
+cost-neutral outside a demo: Azure Container Apps bills replica-seconds while a replica is
+actually running, not how long Ollama happens to keep one small (1.2 GB) model resident in
+memory inside an already-running container — outside a demo the Ollama Container App scales
+back to `min-replicas 0` on its own idle cooldown well before 3h of inactivity elapses, so a
+longer in-process `keep_alive` is simply moot by then. **Estimated extra cost: €0/h** (no
+change to replica scaling, hours pinned, or app count — the existing demo-mode cost estimate,
+`DEMO_MODE_HOURLY_COST_EUR` ≈ €0.17/h for the 3 apps together, is unaffected).
+`demo-mode.sh on` additionally fires the wake ping once, through the same frontend BFF, right
+after its existing `/api/health` check — best-effort only (`AZURE_DEMO_WAKE_TIMEOUT_SECONDS`,
+default 30s): a failure/timeout there never fails or rolls back `on` (the `/api/health` check
+already proved the demo is ready; worst case `bge-m3` just wakes the normal way on the first
+real question).
+
+**T13.13.4 — measured, local simulation.** Method: native `ollama serve` (bge-m3, RTX 4060),
+restarted between trials to guarantee the model is genuinely unloaded ("cold"); the backend's
+own process-start is simulated directly against `rag_app`'s real internals (no HTTP, no
+auth) — `CrossEncoderReranker().warm_up()` for the reranker (identical call the real lifespan
+makes) and `OllamaEmbedder().embed_one(...)` for the "first real question's embed call",
+timed from the moment the simulated backend becomes "ready". Two orderings, 2 trials each:
+
+| Ordering | reranker warm-up (backend "ready") | first question's `embed_query` | total |
+|---|---|---|---|
+| OLD (serial: reranker, then nothing happens with Ollama until a real question arrives) | ~3.85s | ~2.00s (cold) | **~5.84s avg** |
+| NEW (13-J4: `warmup.trigger_warm_up()` fired first, concurrently with the reranker load) | ~3.86s | ~0.05s (already warm) | **~3.98s avg** |
+
+Saved locally: **~1.87s (~32%)** — bounded by the smaller of the two local cold-start costs
+(reranker load, ~3.85s, happens to exceed Ollama's local cold embed, ~2.0s, so the overlap
+fully hides the Ollama side here). On Azure the expected saving is much larger: Ollama's own
+Container App cold start (image pull + container start + model load, ~19.7s avg per the
+admin KPI) is the LARGER of the two costs there, so the overlap should hide most or all of
+it instead — the real Azure number comes from the user's post-promotion smoke (≥ 6 min idle,
+before vs after this block), not simulated here.
+
+**Tests (T13.13.5).** Backend: `test_warmup.py` (non-blocking — `trigger_warm_up` returns
+before a deliberately blocked fake embed call completes; single-flight — a second trigger
+while one is in flight is skipped, only one real call happens; failure-tolerant — a raising
+fake embed call never propagates, is only logged, and the guard releases again for the next
+call; the dedicated `secrag_ollama_warmup_total` metric, never the chat histograms);
+`test_wake.py` (unauthenticated 204 with no body either way; per-IP rate limit + its own
+`route_group="wake"` counter; defence-in-depth even if `trigger_warm_up` itself ever raised);
+`test_startup.py` (the lifespan fires the warm-up BEFORE the reranker, proving the fixed
+order); `test_embed_timeout.py` (every `/api/embed` call carries the configured
+`keep_alive`, overridable); `test_demo_mode.py` (the wake ping fires after the health check
+and is best-effort — `on` still succeeds and still keeps every app awake even when the wake
+ping itself fails; `--dry-run` mentions it). Frontend: `lib/wakePing.test.ts` (exactly one
+GET, fire-and-forget — a rejected promise or a synchronously-throwing fetch implementation
+never escapes). Docs: `docs/APP_FLOW.md` §2.4, `docs/TRD.md` §7.
