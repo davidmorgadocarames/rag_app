@@ -12,7 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
-from rag_app import lockout, metrics
+from rag_app import lockout, metrics, warmup
 from rag_app import sessions as session_service
 from rag_app.api.deps import (
     SessionDep,
@@ -504,6 +504,11 @@ def login(request: LoginRequest, session: SessionDep, response: Response) -> Mes
     session.commit()
     set_session_cookie(response, raw_session)
     set_csrf_cookie(response, raw_session)
+    # DEC-050 (T13.J4-fix, DA-13-J3J4-5): a SUCCESSFUL login triggers the Ollama warm-up
+    # (rag_app.warmup's single-flight guard, same one the API lifespan uses at start-up) --
+    # never an unauthenticated /wake ping any more. Non-blocking, failure-tolerant (see that
+    # module's own contract); never delays or fails a login response either way.
+    warmup.trigger_warm_up()
     return MessageResponse(detail="Logged in.")
 
 

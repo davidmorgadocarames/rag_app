@@ -1,8 +1,11 @@
-"""``rag_app.warmup`` (T13.13.1/T13.13.2, DEBT-061): a background warm-up embed call to
-Ollama that must be non-blocking, failure-tolerant and single-flight -- fired from the API
-lifespan (once, at start-up) and from ``GET /wake`` (on every ``/login``/``/chat`` page
-load). No live Ollama needed: ``OllamaEmbedder.embed_one`` is replaced by a fake that lets
-each test control timing precisely (an ``Event`` the fake blocks on, released on demand).
+"""``rag_app.warmup`` (T13.13.1/T13.13.2, DEBT-061; DEC-050/T13.J4-fix narrowed the call
+sites): a background warm-up embed call to Ollama that must be non-blocking,
+failure-tolerant and single-flight -- fired from the API lifespan (once, at start-up), a
+SUCCESSFUL login and an authenticated ``/chat`` page load (``GET /conversations``) --
+never any more from the unauthenticated ``GET /wake`` (see test_wake.py's own negative
+control). No live Ollama needed: ``OllamaEmbedder.embed_one`` is replaced by a fake that
+lets each test control timing precisely (an ``Event`` the fake blocks on, released on
+demand).
 """
 
 from __future__ import annotations

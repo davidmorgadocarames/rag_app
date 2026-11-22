@@ -50,7 +50,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import iterate_in_threadpool
 from starlette.types import Receive, Scope, Send
 
-from rag_app import metrics
+from rag_app import metrics, warmup
 from rag_app.api.auth import CurrentUserDep
 from rag_app.api.deps import SessionDep, rate_limit_account, rate_limit_chat
 from rag_app.api.schemas import (
@@ -610,7 +610,16 @@ def chat_stream(
 def list_conversations(session: SessionDep, user: CurrentUserDep) -> list[ConversationOut]:
     """Never a 500 because of one bad row (T11.2.16): a conversation whose title or first
     message cannot be decrypted — or every one, when the data key cannot be unwrapped — is
-    listed as unreadable with a placeholder title."""
+    listed as unreadable with a placeholder title.
+
+    DEC-050 (T13.J4-fix, DA-13-J3J4-5): this is the backend call the frontend's `/chat` page
+    already makes on every page load with a valid session (``refreshConversations``,
+    `frontend/app/chat/page.tsx`) -- reusing it (rather than a new route) triggers the
+    Ollama warm-up the moment an AUTHENTICATED chat page loads, same single-flight guard as
+    the API lifespan and a successful login, never from an unauthenticated request (this
+    route is gated by ``CurrentUserDep`` above -- getting here already proves a valid
+    session)."""
+    warmup.trigger_warm_up()
     key = _user_key_or_none(user)
     conversations = list(
         session.scalars(

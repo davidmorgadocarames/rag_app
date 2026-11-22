@@ -113,8 +113,10 @@ export default function ChatPage() {
   }, [refreshConversations]);
 
   // T13.13.2 (DEBT-061): same one-per-page-load wake ping as /login (lib/wakePing.ts) --
-  // nudges Ollama/bge-m3 awake as soon as the chat page itself loads, not only once the
-  // first question is sent.
+  // nudges the backend container awake as soon as the chat page itself loads. DEC-050
+  // (T13.J4-fix): the Ollama/bge-m3 warm-up itself comes from `refreshConversations`'s own
+  // authenticated `GET /conversations` call just above, never from this unauthenticated
+  // ping.
   useEffect(() => {
     sendWakePing();
   }, []);

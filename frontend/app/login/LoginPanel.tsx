@@ -40,10 +40,12 @@ export default function LoginPanel() {
   const retryGuardRef = useRef(createRetryGuard());
   const [retrying, setRetrying] = useState(false);
 
-  // T13.13.2 (DEBT-061): one light wake ping per page load -- nudges Ollama/bge-m3 awake in
-  // parallel with whatever else is cold-starting, well before the visitor even submits the
-  // login form. Fire-and-forget (see lib/wakePing.ts); an empty dependency array means this
-  // runs exactly once per mount, not on every re-render.
+  // T13.13.2 (DEBT-061): one light wake ping per page load -- nudges the backend container
+  // awake in parallel with whatever else is cold-starting, well before the visitor even
+  // submits the login form. DEC-050 (T13.J4-fix): the Ollama/bge-m3 warm-up itself now
+  // fires server-side, only after a SUCCESSFUL login (`rag_app.api.auth.login`), never from
+  // this unauthenticated ping. Fire-and-forget (see lib/wakePing.ts); an empty dependency
+  // array means this runs exactly once per mount, not on every re-render.
   useEffect(() => {
     sendWakePing();
   }, []);

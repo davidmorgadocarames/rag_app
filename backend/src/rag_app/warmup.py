@@ -13,12 +13,23 @@ a real question, in the background, as early as possible:
 
 - the API lifespan calls it once, right after the reranker warm-up, before the app
   starts serving traffic (T13.13.1);
-- ``GET /wake`` (``rag_app.wake``) calls it again on every ``/login``/``/chat`` page
-  load (T13.13.2), in case Ollama went cold again since the backend itself woke up.
+- a SUCCESSFUL ``POST /auth/login`` calls it again (``rag_app.api.auth.login``), in case
+  Ollama went cold again since the backend itself woke up;
+- an authenticated ``GET /conversations`` -- the call the frontend's `/chat` page already
+  makes on every page load with a valid session -- calls it too
+  (``rag_app.api.conversations.list_conversations``).
 
-Both call sites share the SAME single-flight guard below, so a cold backend restarting
-under load, or several page loads within the embed timeout window, never pile up N
-concurrent warm-up calls against an already-waking Ollama -- a warm-up already in
+DEC-050 (T13.J4-fix, DA-13-J3J4-5, 2026-11-23): ``GET /wake`` (``rag_app.wake``) USED TO be
+a third call site (T13.13.2) -- re-triggering this on every unauthenticated page load let a
+single actor sustaining ~1 req/s keep Ollama awake forever against the generic shared rate
+limiter, defeating scale-to-zero at a real € cost. `/wake` now only proves "the backend
+process answered" and never calls this module at all; every remaining call site above is
+either server-controlled (the lifespan) or requires a valid session (login success,
+authenticated `/chat` load) -- never reachable from an unauthenticated request.
+
+Every call site shares the SAME single-flight guard below, so a cold backend restarting
+under load, or several authenticated page loads within the embed timeout window, never
+pile up N concurrent warm-up calls against an already-waking Ollama -- a warm-up already in
 flight is skipped, not queued (the one in flight warms it up for everyone regardless).
 
 **Non-blocking, failure-tolerant.** :func:`trigger_warm_up` itself never blocks (it only

@@ -210,21 +210,42 @@ def rate_limit_csp_report(
 RATE_LIMIT_DEPENDENCIES.add(rate_limit_csp_report)
 
 
-def rate_limit_wake(
-    request: Request, limiter: Annotated[RateLimiter, Depends(get_rate_limiter)]
+_wake_rate_limiter: RateLimiter | None = None
+
+
+def get_wake_rate_limiter() -> RateLimiter:
+    """DEC-050 (T13.J4-fix, DA-13-J3J4-5): ``GET /wake``'s OWN bucket -- a separate
+    ``RateLimiter`` instance, not just a different key on the shared one
+    (``get_rate_limiter``), because capacity/refill are INSTANCE-level, applied to every
+    key on that instance alike. Default 1 request / 60s per key
+    (``wake_rate_limit_capacity``/``wake_rate_limit_refill_per_second``) -- far tighter than
+    the generic 60-capacity/1-per-second bucket every other unauthenticated route uses,
+    which a single actor sustaining ~1 req/s could exploit forever. Now that `/wake` only
+    ever proves "the backend process answered" (DEC-050 -- it no longer triggers the Ollama
+    warm-up at all), a tight bucket costs genuine callers nothing: one ping per page load is
+    already far below this limit."""
+    global _wake_rate_limiter
+    if _wake_rate_limiter is None:
+        settings = get_settings()
+        _wake_rate_limiter = RateLimiter(
+            settings.wake_rate_limit_capacity, settings.wake_rate_limit_refill_per_second
+        )
+    return _wake_rate_limiter
+
+
+def rate_limit_wake_narrow(
+    request: Request, limiter: Annotated[RateLimiter, Depends(get_wake_rate_limiter)]
 ) -> None:
-    """``GET /wake`` (T13.13.2, DEBT-061): same shape as ``rate_limit_csp_report`` -- no
+    """``GET /wake`` (DEC-050, T13.J4-fix): same shape as ``rate_limit_csp_report`` -- no
     account to key by (unauthenticated by design, no session), the real client IP alone --
-    so a hostile caller cannot use the wake ping to spam Ollama with warm-up embed calls
-    (the single-flight guard in ``rag_app.warmup`` already collapses concurrent callers to
-    one in-flight call; this additionally bounds how often a single IP can even reach that
-    guard)."""
+    but through :func:`get_wake_rate_limiter`'s own much tighter bucket instead of the
+    shared one every other unauthenticated route uses."""
     if not limiter.allow(f"wake:{_client_ip(request)}", cost=1.0):
         metrics.RATE_LIMIT_HITS_TOTAL.labels(route_group="wake").inc()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
 
-RATE_LIMIT_DEPENDENCIES.add(rate_limit_wake)
+RATE_LIMIT_DEPENDENCIES.add(rate_limit_wake_narrow)
 
 
 async def rate_limit_login(
