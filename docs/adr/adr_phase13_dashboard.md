@@ -744,3 +744,83 @@ side-by-side comparison with `Main.dc.html`.
    real, see `features.py`).
 
 No remaining known gaps in these three sections after this fix block.
+
+## 13-J3b: the real cold-start pipeline inside the chat wake banner (T13.12.5–T13.12.7, DEBT-062)
+
+**Problem.** 13-J2's purely-visual pending timer (`lib/pendingWake.ts`) clears the chat wake
+banner on the FIRST SSE event the stream produces — `{"type":"stage","stage":"classifying"}`,
+which arrives almost instantly even on a true Azure cold start (the backend container is
+already up and running by the time it can emit anything at all). The genuinely slow part —
+the embedding call, which on Azure wakes its OWN scaled-to-zero Ollama Container App and
+loads `bge-m3` (admin KPI: "slowest stage: embed", ~19.7 s avg) — happens strictly AFTER that
+first event, inside the "retrieving" stage. So the banner disappeared right as the real wait
+began, leaving the user staring at nothing for ~20 s.
+
+**Backend: real sub-step events, not a timing guess (T13.12.5).** `rag_app.retrieval.hybrid_search`
+always opened `timing.stage("embed")`/`timing.step("retrieving", "embed_query")` around the
+embed call itself, but a plain callback passed into it cannot make
+`generation.answer_question_stream` — a generator — suspend mid-call; only the generator's
+own `yield` can do that. The embed call is pulled out into a standalone
+`retrieval.embed_query(embedder, query)`; the streaming pipeline now calls it directly,
+bracketed with a new `StreamStep(stage, step, phase)` event (`yield`ed before and after),
+while `hybrid_search` gains an optional `query_vector` parameter so it reuses the
+already-computed vector instead of embedding twice. Every other caller of `hybrid_search`
+(the non-streaming `answer_question`, `features.py`'s typo-tolerance probe, `reranking.py`'s
+eval harness, `eval/latency.py`, `eval/rerank_matrix.py`) is unaffected — none of them pass
+`query_vector`, so the embed call still happens exactly where and when it always did.
+`api/conversations.py` forwards the event over SSE as `{"type":"step","stage":"retrieving",
+"step":"embed_query","phase":"start"|"end"}` — additive to the wire contract (an unrecognised
+`"type"` was already a no-op in `lib/chatStream.ts`'s `dispatch`, proven by a new test).
+Backend tests prove: exactly one start and one end, in order, strictly between the
+"retrieving" and "reranking" stage events; never emitted at all on the chit-chat "responding"
+fast path (no retrieval happens there); and the real `/chat/stream` SSE frames carry the
+events in that shape end to end.
+
+**Frontend: the steps live INSIDE the existing banner, chat only (T13.12.6).** `lib/wakeSteps.ts`
+is a pure reducer (`events -> step states`, no DOM/timers) over the stream's own stage/step
+events — never a timing guess, a step only becomes "current" when its own real SSE event
+arrives. Six rows: *Backend starting* (container + reranker warm-up, "current" until the
+first SSE event of any kind arrives — there is no dedicated backend-ready event, any event
+retires it), *Waking the embeddings model* (current exactly while `embed_query`'s start/end
+bracket is open), *Retrieving*, *Reranking*, *Generating*, *Checking* (one each per remaining
+backend stage; the chit-chat "responding" stage is treated as *Generating* — skipping
+straight there and marking embed/retrieving/reranking "done", since chit-chat never touches
+them). Moving to a step marks every earlier step "done", so a skipped stage (no rerank, or
+the chit-chat fast path) is never left stuck "pending" forever. `lib/useWakeSteps.ts` wraps
+the reducer with React state plus a 1 s elapsed-seconds ticker for the current step's
+display — the tick is `aria-hidden`, so the shared `aria-live="polite"` region only announces
+an actual step change, never a per-second mutation. `components/WakeBanner.tsx` renders the
+list under its existing text ONLY when a `steps` prop is passed and `state === "waking"`;
+`LoginPanel`/`AdminDashboard` never pass it, so they keep the exact pre-13-J3b plain banner.
+
+**Behaviour change: the banner now stays up until the first token, not the first event.**
+`app/chat/page.tsx` used to call `wake.clearPending()` on `onConversation`/`onStage` — the
+very thing 13-J3b needed to stop doing, since those fire before the slow embed even starts.
+It now clears only on the first streamed token, or on `done`/`error` (the one path with no
+tokens at all: an abstention with no matching chunks, or a mid-pipeline failure) — "stays
+until the answer starts streaming, then clears" (DEBT-062's own wording). A fast, warm
+response still never shows the banner at all: `clearPending()` still runs well under the
+existing 3 s pending threshold in that case, just triggered by the first token instead of the
+first event. The 13-H retry state (`waking`/`failed`) still wins over this purely-visual
+layer — one banner on screen, ever — and this feature never resends/retries the question.
+
+**Tests (T13.12.7).** `lib/wakeSteps.test.ts`: the pure state machine — initial state, backend
+retiring on any event, the full walk through every step in order, a skipped reranking stage,
+the chit-chat path, a stale/out-of-order event (defensive no-op), and `currentSince` tracking
+the injected clock. `lib/chatStream.test.ts`: the new `"step"` event dispatches `onStep` with
+`(stage, step, phase)`; an unrecognised event `"type"` is still a complete no-op (dispatches
+nothing, crashes nothing). `e2e/wakeup-pipeline.spec.ts` (registered in `scripts/gate.sh`'s
+`step_e2e`): against the REAL backend, held past the ~3 s threshold exactly like
+`wakeup-slow.spec.ts`, asserting the step list shows "Backend starting" current and every
+other step pending while nothing has arrived yet, and that the banner (with its whole step
+list) disappears exactly once once the real answer streams, with the question sent exactly
+once; plus its own negative control (a fast chat never shows the banner or its steps). This
+file deliberately does not try to also catch the transient "embed current" render over a
+real, locally-fast Ollama embed call — Playwright polls on a ~100 ms cadence, well above what
+a warm local embed typically takes, so that specific mid-flight assertion would be
+inherently flaky; the exhaustive ordering/transition proof for that step lives in
+`lib/wakeSteps.test.ts` instead, which controls its own clock.
+
+Out of scope for this block (13-J4, DEBT-061, same branch): warming Ollama's embedder
+concurrently with the backend's own cold start, rather than serially after classification —
+a separate, backend-only change that does not touch this banner.

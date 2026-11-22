@@ -126,7 +126,12 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      `conversation_id` (the conversation and the user message are stored first, in one
      transaction); then `stage` (classifying/retrieving/reranking/generating/checking) and `token`
      deltas; the stream ends with exactly one `done` (the authoritative answer) or `error` event, both
-     carrying the `conversation_id`.
+     carrying the `conversation_id`. A security question ALSO carries a `step` event
+     (`{"stage":"retrieving","step":"embed_query","phase":"start"|"end"}`, T13.12.5, DEBT-062):
+     the one real sub-step boundary the UI needs — the moment the backend's embedder call
+     (the one that wakes Ollama's own scaled-to-zero `bge-m3` replica on a cold start) starts
+     and ends. Additive to the contract above: an older/other client simply ignores an
+     unrecognised event type.
    - **Every failure** — data key cannot be unwrapped, storage, embeddings/retrieval, reranking, LLM —
      ends the stream with an `error` event (`code` + user-facing `detail`), never a cut stream. The
      failed turn is stored as an **assistant error marker**, so no conversation holds a user message
@@ -166,15 +171,27 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      Apps scale-from-zero does not always fail — the activator can instead just HOLD the
      request (no byte sent back at all) until the replica is ready, so the retry policy never
      fires either. A separate, purely-visual timer (`frontend/lib/pendingWake.ts`) flips the
-     SAME `<WakeBanner>` into "waking" if any BFF call (login, chat send/stream — until its
-     first byte/token, not the full answer — or an admin dashboard load) is still pending
-     ~3 s later, and clears the instant the response (or first byte/token) arrives. No retry,
-     no resend: it never touches the network, so a chat question still cannot be duplicated
-     by it. The two mechanisms share one banner, never two (a real retry's own "waking"/
-     "failed" state always wins over the visual timer).
+     SAME `<WakeBanner>` into "waking" if any BFF call (login, chat send/stream, or an admin
+     dashboard load) is still pending ~3 s later. For login and the admin dashboard it clears
+     the instant the response (or first byte) arrives. No retry, no resend: it never touches
+     the network, so a chat question still cannot be duplicated by it. The two mechanisms
+     share one banner, never two (a real retry's own "waking"/"failed" state always wins over
+     the visual timer).
      If the conversation was deleted elsewhere (404 before streaming), the client drops the id and
      says so; the next message starts a new conversation. Opening a conversation that cannot be
      decrypted (409) shows a clear message and an empty thread instead of a blank view.
+   - **The real pipeline, inside that same banner, for chat specifically** (T13.12.5–T13.12.7,
+     DEBT-062): unlike login/admin, the chat banner does NOT clear on the first SSE event — it
+     stays up for the whole slow pipeline, listing six real steps under its text (done ✓,
+     the current one with an elapsed-seconds tick, pending muted): *Backend starting*
+     (container + reranker warm-up, shown until the first SSE event of any kind arrives) →
+     *Waking the embeddings model* (current exactly while the `step` event above is open) →
+     *Retrieving* → *Reranking* → *Generating* → *Checking*. It clears on the **first streamed
+     token** instead (or on `done`/`error` for the one path with no tokens at all — an
+     abstention with no matching chunks, or a failure) — so a fast, warm turn still never
+     shows it (the 3 s timer is long since cancelled by then), while a genuinely slow cold
+     start keeps the user informed the whole time instead of going quiet right as the real
+     wait begins.
 4. The user + assistant messages are **persisted encrypted** (per-user key). Follow-ups continue the same
    conversation; **New chat** starts a fresh one.
 

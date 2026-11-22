@@ -222,6 +222,21 @@ catalogue analysis; this is the implementation summary.
   `<WakeBanner>` renders, with the retry state always winning -- a real 502-shaped retry
   already "waking"/"failed" is never masked or duplicated by the timer. No retry, no resend:
   this module never touches the network.
+- **Real pipeline sub-steps inside the chat wake banner** (T13.12.5–T13.12.7, DEBT-062): a
+  THIRD `/chat/stream` SSE event type, `{"type":"step","stage","step","phase":"start"|"end"}`
+  (`generation.StreamStep`, additive to the existing `conversation`/`stage`/`token`/`done`/
+  `error` events — an unrecognised `type` was already a no-op in `lib/chatStream.ts`'s
+  `dispatch`), brackets `retrieval.embed_query` (pulled out of `hybrid_search` so the
+  streaming generator's own `yield` can suspend around it — the dominant cold-start cost,
+  Ollama waking `bge-m3`). Chat only: `lib/wakeSteps.ts` is a pure reducer
+  (`events -> step states`) rendering six rows under the existing banner text once it is
+  visible — Backend starting / Waking the embeddings model / Retrieving / Reranking /
+  Generating / Checking — done ✓, current (with an `aria-hidden` elapsed-seconds tick),
+  pending muted. `lib/pendingWake.ts`'s clear point moves, for chat specifically, from the
+  first SSE event to the first streamed token (or `done`/`error` for the no-token
+  abstention/failure paths) — the banner now stays up for the whole slow pipeline instead of
+  disappearing just as the real wait begins. Login/the admin dashboard are untouched (the
+  plain banner, no steps).
 - **Custom 404 page** (`frontend/app/not-found.tsx`, T13.10.1/T13.10.2/DEBT-057): Next's App
   Router renders it automatically, with a real HTTP 404 status, for any request matching no
   route — never a soft-404 200; `/api/*`'s own catch-all route (`app/api/[...path]/route.ts`)
