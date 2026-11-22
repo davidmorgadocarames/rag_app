@@ -17,6 +17,11 @@ export interface StreamEvent {
 export interface StreamHandlers {
   onConversation?: (id: string) => void;
   onStage?: (stage: string) => void;
+  // T13.12.5 (DEBT-062): a real sub-step boundary WITHIN the current stage (today only
+  // retrieving/embed_query, the dominant cold-start cost). Additive to the SSE contract --
+  // an older client (or this one, before 13-J3b) simply never wires `onStep` and ignores
+  // the frame entirely (see `dispatch` below: an unrecognised `type` does nothing).
+  onStep?: (stage: string, step: string, phase: "start" | "end") => void;
   onToken?: (text: string) => void;
   onDone?: (event: StreamEvent) => void;
   onError?: (detail: string, conversationId: string | null) => void;
@@ -116,7 +121,10 @@ export async function consumeChatStream(
       handlers.onConversation?.(id);
     }
     if (event.type === "stage") handlers.onStage?.(String(event.stage));
-    else if (event.type === "token") handlers.onToken?.(String(event.text));
+    else if (event.type === "step") {
+      const phase = event.phase === "end" ? "end" : "start";
+      handlers.onStep?.(String(event.stage), String(event.step), phase);
+    } else if (event.type === "token") handlers.onToken?.(String(event.text));
     else if (event.type === "done") {
       finished = true;
       handlers.onDone?.(event);

@@ -18,6 +18,8 @@
 // fix is the synchronous ref guard in the caller, which blocks a duplicate call even for two
 // activations in the same tick, before this `disabled` attribute could possibly have committed.
 
+import { WAKE_STEP_LABELS, WAKE_STEP_ORDER, type WakeStepsState } from "@/lib/wakeSteps";
+
 export type WakeState = "idle" | "waking" | "failed";
 
 export default function WakeBanner({
@@ -25,16 +27,23 @@ export default function WakeBanner({
   onRetry,
   retrying = false,
   testId = "wake-banner",
+  steps,
+  elapsedSeconds = 0,
 }: {
   state: WakeState;
   onRetry?: () => void;
   retrying?: boolean;
   testId?: string;
+  // T13.12.6 (DEBT-062): the real pipeline sub-steps, listed under the existing text in the
+  // SAME box -- CHAT ONLY (`undefined` everywhere else: LoginPanel/AdminDashboard keep the
+  // plain banner, unchanged, by simply never passing this prop).
+  steps?: WakeStepsState;
+  elapsedSeconds?: number;
 }) {
   if (state === "idle") return null;
 
   return (
-    <p
+    <div
       role="status"
       aria-live="polite"
       data-testid={testId}
@@ -60,6 +69,41 @@ export default function WakeBanner({
           {retrying ? "Retrying…" : "Retry"}
         </button>
       )}
-    </p>
+      {steps && state === "waking" && (
+        <ul
+          data-testid={`${testId}-steps`}
+          className="flex w-full flex-col gap-0.5 border-t border-vault-steel-dark pt-2"
+        >
+          {WAKE_STEP_ORDER.map((id) => {
+            const status = steps.statuses[id];
+            return (
+              <li
+                key={id}
+                data-testid={`${testId}-step-${id}`}
+                data-status={status}
+                className={
+                  status === "current"
+                    ? "text-vault-amber"
+                    : status === "done"
+                      ? "text-vault-steel-light"
+                      : "text-vault-steel-dark"
+                }
+              >
+                <span aria-hidden="true">{status === "done" ? "✓ " : status === "current" ? "▸ " : "· "}</span>
+                {WAKE_STEP_LABELS[id]}
+                {status === "current" && (
+                  // Elapsed seconds tick every second (lib/useWakeSteps.ts) -- `aria-hidden`
+                  // so a screen reader's live-region announcement reacts to a STEP CHANGE
+                  // only, never a per-second mutation (T13.12.6's "no announcement spam").
+                  <span aria-hidden="true" className="ml-1 text-vault-steel-dark">
+                    ({elapsedSeconds}s)
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }

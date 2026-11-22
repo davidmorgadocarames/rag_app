@@ -32,6 +32,8 @@ function record() {
     handlers: {
       onConversation: (id: string) => calls.push(`conversation:${id}`),
       onStage: (stage: string) => calls.push(`stage:${stage}`),
+      onStep: (stage: string, step: string, phase: string) =>
+        calls.push(`step:${stage}:${step}:${phase}`),
       onToken: (text: string) => calls.push(`token:${text}`),
       onDone: () => calls.push("done"),
       onError: (detail: string, id: string | null) => calls.push(`error:${id}:${detail}`),
@@ -50,6 +52,40 @@ test("the id from the first event is kept and reported with the error", async ()
     handlers,
   );
   assert.deepEqual(calls, ["conversation:c1", "stage:retrieving", "error:c1:down"]);
+});
+
+test("T13.12.5: a step event dispatches onStep with stage/step/phase", async () => {
+  const { calls, handlers } = record();
+  await consumeChatStream(
+    body(
+      sse({ type: "conversation", conversation_id: "c1" }),
+      sse({ type: "stage", stage: "retrieving" }),
+      sse({ type: "step", stage: "retrieving", step: "embed_query", phase: "start" }),
+      sse({ type: "step", stage: "retrieving", step: "embed_query", phase: "end" }),
+      sse({ type: "done", conversation_id: "c1" }),
+    ),
+    handlers,
+  );
+  assert.deepEqual(calls, [
+    "conversation:c1",
+    "stage:retrieving",
+    "step:retrieving:embed_query:start",
+    "step:retrieving:embed_query:end",
+    "done",
+  ]);
+});
+
+test("T13.12.5: an unknown event type is ignored -- an older client never crashes or misfires another handler", async () => {
+  const { calls, handlers } = record();
+  await consumeChatStream(
+    body(
+      sse({ type: "conversation", conversation_id: "c1" }),
+      sse({ type: "some_future_event", stage: "retrieving", whatever: 42 }),
+      sse({ type: "done", conversation_id: "c1" }),
+    ),
+    handlers,
+  );
+  assert.deepEqual(calls, ["conversation:c1", "done"]);
 });
 
 test("frames split across chunks are reassembled; done ends the stream", async () => {

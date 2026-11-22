@@ -19,6 +19,7 @@ import {
 import { conversationLoadError } from "@/lib/chatStream";
 import { createRetryGuard } from "@/lib/retryGuard";
 import { useWakeState } from "@/lib/useWakeState";
+import { useWakeSteps } from "@/lib/useWakeSteps";
 
 interface UiMessage {
   role: "user" | "assistant";
@@ -77,6 +78,9 @@ export default function ChatPage() {
   // the LLM): the Retry button below re-sends the SAME, still-visible question exactly once,
   // on the user's own explicit click.
   const wake = useWakeState();
+  // T13.12.6 (DEBT-062): the real pipeline sub-steps shown INSIDE the wake banner above, once
+  // it is actually visible (`wake.state !== "idle"`) -- chat only, see lib/useWakeSteps.ts.
+  const wakeSteps = useWakeSteps();
   const lastQuestionRef = useRef<{ question: string; conversationId: string | null } | null>(
     null,
   );
@@ -190,10 +194,14 @@ export default function ChatPage() {
     setBusy(true);
     setStage("classifying");
     wake.reset();
+    wakeSteps.reset();
     // T13.11.5 (DEBT-060): purely visual -- pending "until the first byte/token arrives"
     // (never until the full answer: a real cold start is exactly as likely to HOLD the
     // request, with no error at all, as to refuse it -- see lib/pendingWake.ts's header).
-    // Cleared the instant ANY stream event dispatches below, whichever comes first.
+    // T13.12.6 (DEBT-062): UNLIKE 13-J2, this is no longer cleared on the first SSE event
+    // (conversation/stage) -- it stays pending (showing the real pipeline steps below, once
+    // visible) until the FIRST TOKEN, or `done` (the one path with no tokens at all: an
+    // abstention with no matching chunks), or `error`.
     wake.startPending();
 
     await streamChat(
@@ -202,19 +210,24 @@ export default function ChatPage() {
         // The id arrives first (T11.2.16): keep it even if the turn then fails, so the next
         // message continues this conversation instead of starting a new one.
         onConversation: (id) => {
-          wake.clearPending();
+          wakeSteps.onOther();
           setActiveId(id);
         },
         onStage: (s) => {
-          wake.clearPending();
+          wakeSteps.onStage(s);
           setStage(s);
+        },
+        onStep: (stage, step, phase) => {
+          wakeSteps.onStep(stage, step, phase);
         },
         onToken: (t) => {
           wake.clearPending();
+          wakeSteps.onOther();
           appendToken(t);
         },
         onDone: (d) => {
           wake.clearPending();
+          wakeSteps.onOther();
           patchLastAssistant({
             content: d.answer,
             citations: d.citations,
@@ -232,6 +245,7 @@ export default function ChatPage() {
         },
         onError: (detail, conversationId, dropConversation) => {
           wake.clearPending();
+          wakeSteps.onOther();
           patchLastAssistant({ content: detail, streaming: false, error: true });
           // After a 404 (the conversation was deleted elsewhere) the id is dropped, so the
           // next message starts a new conversation instead of failing again (DA-G2-7).
@@ -383,7 +397,13 @@ export default function ChatPage() {
             {busy && stage && wake.state === "idle" && (
               <p className="text-xs tracking-[0.1em] text-vault-amber">{STAGE_LABELS[stage] ?? stage}</p>
             )}
-            <WakeBanner state={wake.state} onRetry={() => void onRetryWake()} retrying={retrying} />
+            <WakeBanner
+              state={wake.state}
+              onRetry={() => void onRetryWake()}
+              retrying={retrying}
+              steps={wakeSteps.state}
+              elapsedSeconds={wakeSteps.elapsedSeconds}
+            />
             {error && <p className="text-sm text-vault-danger-text">{error}</p>}
           </div>
         </div>

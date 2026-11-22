@@ -514,6 +514,8 @@ export interface StreamCallbacks {
   // nothing could be stored, e.g. the data key is unavailable for a new conversation).
   onConversation?: (id: string) => void;
   onStage?: (stage: string) => void;
+  // T13.12.5 (DEBT-062): see lib/chatStream.ts's own StreamHandlers.onStep.
+  onStep?: (stage: string, step: string, phase: "start" | "end") => void;
   onToken?: (text: string) => void;
   onDone?: (data: ChatDone) => void;
   // Always called when the turn fails, with the conversation id when known;
@@ -586,6 +588,7 @@ export async function streamChat(
     await consumeChatStream(response.body, {
       onConversation: cb.onConversation,
       onStage: cb.onStage,
+      onStep: cb.onStep,
       onToken: cb.onToken,
       onDone: (event) => cb.onDone?.(event as unknown as ChatDone),
       onError: cb.onError,

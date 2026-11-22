@@ -746,6 +746,10 @@ step_e2e() {
   # HELD (never refused) by `page.route()`, proving the purely-visual pending timer shows
   # the same banner after ~3s with no Retry button, then the real (delayed, never faked)
   # answer arrives exactly once; plus its own negative control.
+  # wakeup-pipeline.spec.ts (T13.12.6/T13.12.7, 13-J3b, DEBT-062): the real pipeline steps
+  # INSIDE that same banner (chat only) -- same HOLD technique, asserting the step list's
+  # initial "Backend starting" state and its fully-done state once the real answer streams;
+  # plus its own negative control.
   # not-found.spec.ts (T13.10.3/DEBT-057): the custom 404 page -- real HTTP 404 status, single
   # "Back to login" link, no path echo, /api/... negative control, phone width, no extra env.
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
@@ -758,7 +762,8 @@ step_e2e() {
     E2E_PLAIN_USER_EMAIL="$E2E_PLAIN_USER_EMAIL" \
     E2E_WAKEUP_EMAIL="$E2E_WAKEUP_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
-      e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/wakeup-slow.spec.ts e2e/not-found.spec.ts)
+      e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/wakeup-slow.spec.ts e2e/wakeup-pipeline.spec.ts \
+      e2e/not-found.spec.ts)
 }
 
 # T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for
