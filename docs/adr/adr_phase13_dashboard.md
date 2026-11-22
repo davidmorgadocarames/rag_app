@@ -931,3 +931,73 @@ and is best-effort — `on` still succeeds and still keeps every app awake even 
 ping itself fails; `--dry-run` mentions it). Frontend: `lib/wakePing.test.ts` (exactly one
 GET, fire-and-forget — a rejected promise or a synchronously-throwing fetch implementation
 never escapes). Docs: `docs/APP_FLOW.md` §2.4, `docs/TRD.md` §7.
+
+## 13-J4-fix: joint DA findings + DEC-049/DEC-050 outcomes (2026-11-23)
+
+The joint DA review of 13-J3a+13-J3b+13-J4 (verdict GO-with-edits) found two real
+cost/abuse risks in 13-J4 itself (DA-13-J3J4-4/-5, both routed to a `DEC-` row) plus three
+smaller mockup-fidelity gaps in 13-J3a's dashboard panels (DA-13-J3J4-1/-2/-3, pre-dating
+this block but surfaced by the same review). This fix block closes all five.
+
+**DEC-049 (`embed_keep_alive`, DA-13-J3J4-4, high).** The original "one constant value,
+always sent" design (above) defaulted `embed_keep_alive` to `"3h"` with no env/profile
+override anywhere — including on the user's own dev PC (native Ollama, the dev default).
+Any local dev/test run that touched the embedder pinned `bge-m3` (~1.2 GB) resident for up
+to 3h instead of Ollama's own 5-minute default, which can tie up VRAM/RAM before a gaming
+session on a PC also used for that. **Decided: option A** — default `embed_keep_alive`
+back to `"5m"` (Ollama's own server default) everywhere, including the dev PC; scope the
+longer window to an actual Azure demo instead: `demo-mode.sh on` sets
+`EMBED_KEEP_ALIVE=3h` as a Container App env var on the BACKEND app ONLY, inside the SAME
+`az containerapp update` call it already makes to scale it up (no extra revision, no extra
+Azure cost — `on` already issues that call for a newly-waking app); `off` removes the var
+(restoring the code default); a rolled-back `on` (DA-11bH-2's own guarantee) removes it
+again too. `Settings.embed_keep_alive` itself needed no branching at all — it already reads
+whatever the environment provides, exactly like every other setting.
+
+**DEC-050 (`GET /wake`, DA-13-J3J4-5, high).** `/wake` reused the generic shared rate
+limiter (60 capacity/1 req/s refill per key) to re-trigger `rag_app.warmup.trigger_warm_up`
+on EVERY unauthenticated call. A single actor sustaining ~1 req/s was far more than enough
+to keep re-triggering it forever, waking the separate, also-scaled-to-zero Ollama Container
+App and holding it past its own idle cooldown — defeating the entire scale-to-zero cost
+model at a real € cost, with no account or CAPTCHA needed. **Decided: the orchestrator's
+option A** (not the DA's own wording, which only asked for a tighter bucket): `/wake` now
+wakes the BACKEND ONLY — reaching the handler at all already proves the container answered,
+which is the one thing this route exists to prove — and never calls `rag_app.warmup` at
+all any more. It also gets its own dedicated, much tighter bucket
+(`rag_app.api.deps.rate_limit_wake_narrow` / `get_wake_rate_limiter`, default 1 request per
+60 seconds per key, a SEPARATE `RateLimiter` instance — capacity/refill are instance-level,
+so a different key on the shared limiter would not have been tight enough on its own). The
+Ollama warm-up itself moved to two call sites that both REQUIRE a valid, server-verified
+fact about the caller: a SUCCESSFUL `POST /auth/login` (`rag_app.api.auth.login`, right
+after the session/CSRF cookies are set) and an authenticated `GET /conversations`
+(`rag_app.api.conversations.list_conversations`) — the exact call the frontend's `/chat`
+page already makes on every page load with a valid session (`refreshConversations`). The
+pre-existing, broader risk this DEC- row's own options also named ("any route wakes the
+backend", and the separate `_client_ip` production-fallback gap, DA-13-J3J4-5 part b) are
+covered by the Autonomy-guard budget alert and tracked as their own item
+(`DEBT-063`, Phase 15) respectively — out of this fix block's scope.
+
+**DA-13-J3J4-1 (per-probe defence-lab run, medium) and DA-13-J3J4-2 (probe name/
+description, low).** See `rag_app.defence_lab`/`rag_app.api.lab` and
+`frontend/components/admin/DefenceLabPanel.tsx` — summarised in this ADR's own "Tests"
+sections above the fix block they belong to; full detail in the commit history
+(`feat(backend,frontend): per-probe defence-lab run + real probe names`).
+
+**DA-13-J3J4-3 (erasure "Completed" timestamp, low).** `ErasurePanel.tsx` rendered the raw
+ISO wire value verbatim instead of the mockup's own "17 Nov 22:10" shape (day, short month,
+HH:mm, UTC, no year/seconds) — `frontend/lib/adminTime.ts::formatCompletedAt` now does the
+formatting; unit-tested against the mockup's own exact sample instant.
+
+**Tests.** Backend: `test_wake.py` (a negative control — an unauthenticated `/wake` call
+never reaches `trigger_warm_up` any more; its own tighter bucket, via a dedicated
+dependency override); `test_warmup.py` (docstring/call-site update only, same single-flight
+guarantees as before); `tests/security/test_warmup_trigger_points.py` (new — a successful
+login triggers the warm-up, a failed/unknown-email login never does, an authenticated
+`/conversations` call triggers it, an unauthenticated one never reaches it at all);
+`test_embed_timeout.py` (the new "5m" default, the env override still reaching "3h");
+`test_demo_mode.py` (the backend-only env var riding the SAME `containerapp update` call on
+`on`/`off`/rollback, never touching Ollama/frontend); `tests/security/test_lab_api.py` /
+`test_defence_lab.py` (the per-probe route's own negative control, unknown-id 404, and
+name/description on both the run response and the history listing). Frontend:
+`lib/adminTime.test.ts`. Docs: `docs/APP_FLOW.md` §2.4, `docs/TRD.md` §7 (both updated in
+this fix block too).
