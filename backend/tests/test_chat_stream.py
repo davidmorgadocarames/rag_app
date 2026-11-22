@@ -224,7 +224,14 @@ def test_the_stream_emits_embed_query_step_events_around_the_real_retrieving_sta
         {"type": "step", "stage": "retrieving", "step": "embed_query", "phase": "start"},
         {"type": "step", "stage": "retrieving", "step": "embed_query", "phase": "end"},
     ]
-    kinds = [(e["type"], e.get("stage") or e.get("phase")) for e in events]
+    # Built from "type" first, never a truthy-coalesce over "stage"/"phase" -- a "step"
+    # event's own "stage" ("retrieving") is itself truthy, so `stage or phase` would have
+    # silently picked that instead of the phase (found running this for real).
+    kinds = [
+        ("stage", e["stage"]) if e["type"] == "stage" else ("step", e["phase"])
+        for e in events
+        if e["type"] in ("stage", "step")
+    ]
     retrieving_idx = kinds.index(("stage", "retrieving"))
     reranking_idx = kinds.index(("stage", "reranking"))
     assert kinds[retrieving_idx + 1 : retrieving_idx + 3] == [
