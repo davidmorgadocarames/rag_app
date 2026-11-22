@@ -46,8 +46,9 @@ PUBLIC_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/health"),
         # T13.13.2 (DEBT-061): the wake ping -- unauthenticated by design (same reasoning as
         # /csp-report below: it must work before any session exists, from /login itself),
-        # rate-limited (rag_app.api.deps.rate_limit_wake) and leaks nothing (always a plain
-        # 204, see rag_app.wake's docstring).
+        # rate-limited through its own tight bucket (DEC-050, T13.J4-fix:
+        # rag_app.api.deps.rate_limit_wake_narrow) and leaks nothing (always a plain 204,
+        # see rag_app.wake's docstring). No longer triggers the Ollama warm-up at all.
         ("GET", "/wake"),
         ("POST", "/auth/register"),
         ("POST", "/auth/login"),

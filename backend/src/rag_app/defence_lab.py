@@ -65,27 +65,35 @@ _EVIDENCE_MAX_CHARS = 2000
 # this block -- docs/security/THREAT_MODEL.md section 5.5 -- the only two of these categories
 # that had no catalogue id at all before (CSRF/sessions lived only in the section 4 STRIDE
 # prose, outside the parsed table).
-CATALOGUE_PROBE_IDS: tuple[str, ...] = (
-    "OWASP-A02",  # security misconfiguration (headers/CSP, backend half)
-    "OWASP-A05",  # injection (ORM/parameterised queries)
-    "OWASP-A07",  # authentication failures (timing, verified-email)
-    "API-1",  # broken object level authorization (404, not a 403, enumeration-safe)
-    "API-2",  # broken authentication
-    "API-4",  # unrestricted resource consumption (rate limiting, daily cap)
-    "API-5",  # broken function level authorization (permission map)
-    "API-6",  # unrestricted access to sensitive business flows (lockout back-off)
-    "API-8",  # security misconfiguration (docs/CORS)
-    "API-10",  # unsafe consumption of upstream APIs
-    "LLM-10",  # unbounded consumption (max_tokens -- cost limits, counted locally)
-    "REC-02",  # daily answer cap on by default
-    "REC-04",  # recovery-code single-use (no TOCTOU)
-    "REC-05",  # login lockout counter (no TOCTOU)
-    "REC-06",  # verification/reset token consume (no TOCTOU)
-    "REC-08",  # route walker (auth + permission + rate limit on every route)
-    "REC-09",  # exposed-files check
-    "REC-11",  # CSRF double-submit token + Origin check
-    "REC-12",  # server-side sessions (revocation)
-)
+#
+# T13.J4-fix (DA-13-J3J4-2): each value is a short, static "what this attacks" one-liner --
+# the SAME text that used to live only as an inline comment next to each id above, now a
+# real value the admin defence-lab card can render (``Probe.description`` below) instead of
+# the raw catalogue id alone. ``CATALOGUE_PROBE_IDS`` is this dict's own key order -- one
+# list, never a second one that could silently drift out of sync.
+CATALOGUE_PROBE_DESCRIPTIONS: dict[str, str] = {
+    "OWASP-A02": "security misconfiguration (headers/CSP, backend half)",
+    "OWASP-A05": "injection (ORM/parameterised queries)",
+    "OWASP-A07": "authentication failures (timing, verified-email)",
+    "API-1": "broken object level authorization (404, not a 403, enumeration-safe)",
+    "API-2": "broken authentication",
+    "API-4": "unrestricted resource consumption (rate limiting, daily cap)",
+    "API-5": "broken function level authorization (permission map)",
+    "API-6": "unrestricted access to sensitive business flows (lockout back-off)",
+    "API-8": "security misconfiguration (docs/CORS)",
+    "API-10": "unsafe consumption of upstream APIs",
+    "LLM-10": "unbounded consumption (max_tokens -- cost limits, counted locally)",
+    "REC-02": "daily answer cap on by default",
+    "REC-04": "recovery-code single-use (no TOCTOU)",
+    "REC-05": "login lockout counter (no TOCTOU)",
+    "REC-06": "verification/reset token consume (no TOCTOU)",
+    "REC-08": "route walker (auth + permission + rate limit on every route)",
+    "REC-09": "exposed-files check",
+    "REC-11": "CSRF double-submit token + Origin check",
+    "REC-12": "server-side sessions (revocation)",
+}
+
+CATALOGUE_PROBE_IDS: tuple[str, ...] = tuple(CATALOGUE_PROBE_DESCRIPTIONS)
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,13 @@ class Probe:
     id: str
     expected_outcome: str
     test_id: str  # "path::test_function", resolved from the catalogue row
+    # T13.J4-fix (DA-13-J3J4-2): display-only fields the admin defence-lab card renders
+    # instead of the raw id (``Main.dc.html``'s own ``p.name``/``p.what``) -- never used by
+    # ``run_catalogue_probes``/the pytest subprocess, which still key everything by ``id``/
+    # ``test_id`` alone. Default "" so a Probe built outside ``catalogue_probes`` (e.g. a
+    # test's own fake) never has to supply them.
+    name: str = ""
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -141,9 +156,32 @@ def catalogue_probes(
                 id=probe_id,
                 expected_outcome=f"mitigated: {row.test_id} passes",
                 test_id=row.test_id,
+                name=row.entry or probe_id,
+                description=CATALOGUE_PROBE_DESCRIPTIONS.get(probe_id, ""),
             )
         )
     return probes
+
+
+def probe_display_info(
+    ids: Sequence[str], catalogue: Path = CATALOGUE_FILE
+) -> dict[str, tuple[str, str]]:
+    """Maps every id in ``ids`` to ``(name, description)`` for display (DA-13-J3J4-2) --
+    used for HISTORY rows (``GET /admin/lab/runs``), which only ever store a bare
+    ``probe_id`` in ``defence_runs``. Unlike :func:`catalogue_probes`, this NEVER raises for
+    a missing/non-mitigated id: a history row can legitimately name an id whose catalogue
+    status changed (or which was removed from ``CATALOGUE_PROBE_IDS``) since it last ran --
+    it still deserves a readable card, falling back to the bare id as its own name and ""
+    as its description."""
+    rows = {
+        row.entry_id: row for row in extract_rows(catalogue.read_text(encoding="utf-8"), catalogue)
+    }
+    info: dict[str, tuple[str, str]] = {}
+    for probe_id in ids:
+        row = rows.get(probe_id)
+        name = row.entry if row is not None and row.entry else probe_id
+        info[probe_id] = (name, CATALOGUE_PROBE_DESCRIPTIONS.get(probe_id, ""))
+    return info
 
 
 def git_sha(root: Path = REPO_ROOT) -> str:

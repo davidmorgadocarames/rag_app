@@ -15,12 +15,14 @@ from typing import Any
 import pytest
 
 from rag_app.defence_lab import (
+    CATALOGUE_PROBE_DESCRIPTIONS,
     CATALOGUE_PROBE_IDS,
     CatalogueProbeError,
     Probe,
     ProbeOutcome,
     ProbeResult,
     catalogue_probes,
+    probe_display_info,
     record_results,
     run_catalogue_probes,
 )
@@ -40,6 +42,35 @@ def test_catalogue_probes_resolves_every_curated_id_to_a_mitigated_row() -> None
 def test_catalogue_probes_raises_for_an_unknown_id() -> None:
     with pytest.raises(CatalogueProbeError, match="NOT-A-REAL-ID"):
         catalogue_probes(["NOT-A-REAL-ID"])
+
+
+# --- T13.J4-fix (DA-13-J3J4-2): the admin card shows a human name + a static one-line
+# description, not just the raw catalogue id. Red on the pre-fix `Probe` (no `name`/
+# `description` fields at all). ---
+
+
+def test_catalogue_probes_fills_in_a_name_and_description_for_every_curated_id() -> None:
+    probes = catalogue_probes()
+    for probe in probes:
+        assert probe.name, f"{probe.id} has no display name"
+        assert probe.name != probe.id, f"{probe.id}'s name fell back to the bare id"
+        assert probe.description == CATALOGUE_PROBE_DESCRIPTIONS[probe.id]
+
+
+def test_every_curated_id_has_a_static_description() -> None:
+    assert set(CATALOGUE_PROBE_DESCRIPTIONS) == set(CATALOGUE_PROBE_IDS)
+    for description in CATALOGUE_PROBE_DESCRIPTIONS.values():
+        assert description and description == description.strip()
+
+
+def test_probe_display_info_falls_back_to_the_bare_id_for_an_unknown_probe() -> None:
+    """A HISTORY row can legitimately name an id removed from the catalogue since it last
+    ran -- `probe_display_info` must never raise, unlike `catalogue_probes`."""
+    info = probe_display_info(["OWASP-A05", "NOT-A-REAL-ID"])
+    name, description = info["OWASP-A05"]
+    assert name and name != "OWASP-A05"
+    assert description == CATALOGUE_PROBE_DESCRIPTIONS["OWASP-A05"]
+    assert info["NOT-A-REAL-ID"] == ("NOT-A-REAL-ID", "")
 
 
 def test_catalogue_probes_raises_for_a_non_mitigated_id(tmp_path: Path) -> None:

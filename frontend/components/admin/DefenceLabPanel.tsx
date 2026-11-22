@@ -9,11 +9,20 @@
 // T13.8.8: restyled as a card grid using the SAME status badges the rest of the dashboard
 // uses (StatusBadge, "ok"/"crit" tones) -- "OK = the defence held" is the same vocabulary as
 // the Triage section, not a separate one invented just for this panel.
+//
+// T13.J4-fix (DA-13-J3J4-1/-2): each card now has a REAL per-probe run route
+// (`POST /admin/lab/run/{probe_id}`) -- pressing one card's button runs ONLY that probe,
+// never the whole lab (the 13-J3 panel wired every card to the same whole-lab action, which
+// silently re-ran and refreshed every OTHER card too). Cards also show the catalogue's own
+// human name + a static one-line "what this attacks" description (the mockup's `p.name`/
+// `p.what`), falling back to the raw id when either is missing (an older backend, or a
+// seeded e2e fixture).
 
 import { useCallback, useState } from "react";
 
 import {
   adminLabRun,
+  adminLabRunProbe,
   adminLabRuns,
   type DefenceLabRunResponse,
   type DefenceProbeResultOut,
@@ -29,48 +38,82 @@ interface DefenceLabPanelProps {
 
 interface ProbeCard {
   probeId: string;
+  name: string;
+  description: string;
   passed: boolean;
   observedOutcome: string;
   lastAt: string | null;
 }
 
-/** Builds one card per probe from whichever data is freshest: the just-finished run's own
- * results (`lastRun`) take priority over the history list, and within the history list only
- * the MOST RECENT run per probe is kept (the list may contain many past runs per probe). */
-function buildCards(lastRun: DefenceLabRunResponse | null, history: DefenceRunOut[]): ProbeCard[] {
-  if (lastRun) {
-    return lastRun.results.map((r: DefenceProbeResultOut) => ({
-      probeId: r.probe_id,
-      passed: r.passed,
-      observedOutcome: r.observed_outcome,
-      lastAt: null,
-    }));
-  }
-  const latestByProbe = new Map<string, DefenceRunOut>();
+function cardFromResult(r: DefenceProbeResultOut, lastAt: string | null): ProbeCard {
+  return {
+    probeId: r.probe_id,
+    name: r.name && r.name.length > 0 ? r.name : r.probe_id,
+    description: r.description ?? "",
+    passed: r.passed,
+    observedOutcome: r.observed_outcome,
+    lastAt,
+  };
+}
+
+function cardFromHistoryRow(row: DefenceRunOut): ProbeCard {
+  return {
+    probeId: row.probe_id,
+    name: row.name && row.name.length > 0 ? row.name : row.probe_id,
+    description: row.description ?? "",
+    passed: row.passed,
+    observedOutcome: row.observed_outcome,
+    lastAt: row.run_at,
+  };
+}
+
+/** The most recent history row per probe id (the list may contain many past runs per
+ * probe) -- same dedup rule as before T13.J4-fix, just factored out so `loadRuns` can merge
+ * it into the persistent per-probe card map below instead of replacing it wholesale. */
+function latestHistoryByProbe(history: DefenceRunOut[]): Map<string, DefenceRunOut> {
+  const latest = new Map<string, DefenceRunOut>();
   for (const run of history) {
-    const prev = latestByProbe.get(run.probe_id);
-    if (!prev || run.run_at > prev.run_at) latestByProbe.set(run.probe_id, run);
+    const prev = latest.get(run.probe_id);
+    if (!prev || run.run_at > prev.run_at) latest.set(run.probe_id, run);
   }
-  return [...latestByProbe.values()]
-    .sort((a, b) => a.probe_id.localeCompare(b.probe_id))
-    .map((r) => ({
-      probeId: r.probe_id,
-      passed: r.passed,
-      observedOutcome: r.observed_outcome,
-      lastAt: r.run_at,
-    }));
+  return latest;
 }
 
 export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
   const lab = features.find((f) => f.id === "admin-defence-lab");
-  const [runs, setRuns] = useState<DefenceRunOut[]>([]);
-  const [lastRun, setLastRun] = useState<DefenceLabRunResponse | null>(null);
+  // T13.J4-fix: a PERSISTENT per-probe map, keyed by probe id -- a whole-lab run overwrites
+  // every entry it returns; a single-probe run overwrites ONLY that one entry; `loadRuns`
+  // only fills in ids this session has no fresher entry for yet. This is what actually
+  // guarantees "running one probe never touches any other card" -- the old code recomputed
+  // every card from `lastRun` alone, which only ever held a WHOLE run's results.
+  const [cards, setCards] = useState<Map<string, ProbeCard>>(new Map());
   const [loaded, setLoaded] = useState(false);
+  // Set ONLY by the whole-lab run (never the per-probe one, DA-13-J3J4-1): a single-probe
+  // run must never render the "Last run @ sha: N probe(s), all matched" summary line, which
+  // would misleadingly imply the whole lab just ran.
+  const [lastRun, setLastRun] = useState<DefenceLabRunResponse | null>(null);
   const [running, setRunning] = useState(false);
+  const [runningProbeId, setRunningProbeId] = useState<string | null>(null);
+  const anyRunInProgress = running || runningProbeId !== null;
+
+  const mergeResults = useCallback((results: DefenceProbeResultOut[], lastAt: string | null) => {
+    setCards((prev) => {
+      const next = new Map(prev);
+      for (const r of results) next.set(r.probe_id, cardFromResult(r, lastAt));
+      return next;
+    });
+  }, []);
 
   const loadRuns = useCallback(async () => {
     const response = await adminLabRuns();
-    setRuns(response.runs);
+    const latest = latestHistoryByProbe(response.runs);
+    setCards((prev) => {
+      const next = new Map(prev);
+      for (const [probeId, row] of latest) {
+        if (!next.has(probeId)) next.set(probeId, cardFromHistoryRow(row));
+      }
+      return next;
+    });
     setLoaded(true);
   }, []);
 
@@ -79,18 +122,31 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
     try {
       const result = await adminLabRun();
       setLastRun(result);
-      await loadRuns();
+      mergeResults(result.results, null);
     } finally {
       setRunning(false);
     }
-  }, [loadRuns]);
+  }, [mergeResults]);
+
+  const runProbe = useCallback(
+    async (probeId: string) => {
+      setRunningProbeId(probeId);
+      try {
+        const result = await adminLabRunProbe(probeId);
+        mergeResults(result.results, null);
+      } finally {
+        setRunningProbeId(null);
+      }
+    },
+    [mergeResults],
+  );
 
   if (!lab || lab.probe_status !== "ok") {
     // T13.3.1: the lab is off (or unreachable) -- never render the tab at all.
     return null;
   }
 
-  const cards = buildCards(lastRun, runs);
+  const sortedCards = [...cards.values()].sort((a, b) => a.probeId.localeCompare(b.probeId));
 
   return (
     <section
@@ -112,7 +168,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
         <button
           type="button"
           data-testid="defence-lab-run-button"
-          disabled={running}
+          disabled={anyRunInProgress}
           onClick={() => runNow()}
           className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs tracking-[0.1em] text-vault-amber-bright hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
         >
@@ -140,7 +196,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
         </p>
       )}
 
-      {cards.length === 0 ? (
+      {sortedCards.length === 0 ? (
         <p data-testid="defence-lab-empty-state" className="text-xs text-vault-text-muted">
           No probes run yet on this replica -- press &quot;Run defence lab&quot; or &quot;Show
           history&quot;.
@@ -153,7 +209,7 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
           // width, not fixed Tailwind breakpoints; `gap-2.5` (10px) matches the mockup's gap.
           className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-2.5"
         >
-          {cards.map((card) => (
+          {sortedCards.map((card) => (
             <div
               key={card.probeId}
               data-testid={`defence-lab-card-${card.probeId}`}
@@ -161,30 +217,40 @@ export default function DefenceLabPanel({ features }: DefenceLabPanelProps) {
               // (Main.dc.html lab card: `padding: 14px`).
               className="flex flex-col gap-2 rounded-admin-card-inner border border-vault-line bg-vault-surface-raised p-3.5"
             >
-              <div className="flex items-center justify-between gap-2">
-                {/* T13.12.2: `font-semibold` (600) matches the mockup's own `p.name` weight --
-                    stays `font-mono` regardless (the app's monospace-everywhere exception; no
-                    separate human-readable probe name exists on the wire, `probe_id` is it). */}
-                <span className="font-mono text-xs font-semibold text-vault-text-strong">
-                  {card.probeId}
-                </span>
+              <div className="flex items-start justify-between gap-2">
+                {/* T13.12.2/DA-13-J3J4-2: `p.name` is the mockup's primary heading
+                    (`font-semibold`, the mockup's own weight 600) -- stays `font-mono` (the
+                    app's monospace-everywhere exception). The raw catalogue id is kept as a
+                    smaller secondary mono line underneath, never dropped entirely. */}
+                <div className="flex flex-col">
+                  <span className="font-mono text-xs font-semibold text-vault-text-strong">
+                    {card.name}
+                  </span>
+                  <span className="font-mono text-[10px] text-vault-text-muted">
+                    {card.probeId}
+                  </span>
+                </div>
                 <StatusBadge tone={card.passed ? "ok" : "crit"} label={card.passed ? "Held" : "Mismatch"} />
               </div>
+              {card.description && (
+                // DA-13-J3J4-2: `p.what` -- a static one-line "what this attacks" summary,
+                // a different fact from `observedOutcome` below (the latest RUN's outcome).
+                <span className="text-xs text-vault-text-muted">{card.description}</span>
+              )}
               <span className="text-xs text-vault-text-muted">{card.observedOutcome}</span>
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-xs text-vault-text-muted">{card.lastAt ?? ""}</span>
-                {/* T13.12.2: the mockup's own per-card "Run probe" button -- the real backend
-                    has no per-probe run route (adminLabRun() always runs the whole lab), so
-                    this wires to the SAME existing global action as the button above, just
-                    exposed per-card to match the mockup's layout -- no new behaviour. */}
+                {/* T13.J4-fix (DA-13-J3J4-1): the mockup's own per-card "Run probe" button --
+                    now a REAL per-probe route (POST /admin/lab/run/{probe_id}); pressing it
+                    never touches any other card. */}
                 <button
                   type="button"
                   data-testid={`defence-lab-card-run-${card.probeId}`}
-                  disabled={running}
-                  onClick={() => runNow()}
+                  disabled={anyRunInProgress}
+                  onClick={() => runProbe(card.probeId)}
                   className="min-h-9 cursor-pointer rounded-admin-btn border border-vault-steel-dark px-3 py-1.5 text-xs text-vault-amber-bright hover:border-vault-steel disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  Run probe
+                  {runningProbeId === card.probeId ? "Running…" : "Run probe"}
                 </button>
               </div>
             </div>

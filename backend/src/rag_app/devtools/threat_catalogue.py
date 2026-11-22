@@ -51,6 +51,11 @@ class CatalogueRow:
     status: str
     phase: str
     test_id: str
+    # T13.J4-fix (DA-13-J3J4-2): the table's own "Entry" column (a short human-readable
+    # title, e.g. "Security Misconfiguration") -- kept so `rag_app.defence_lab` can show a
+    # real name on the admin defence-lab card instead of the raw catalogue id. Defaults to
+    # "" for a malformed row (``_malformed`` below never has a reliable "Entry" cell).
+    entry: str = ""
 
     def __str__(self) -> str:
         return f"{self.source}:{self.line}: {self.entry_id}"
@@ -115,7 +120,7 @@ def extract_rows(text: str, source: Path) -> list[CatalogueRow]:
         if len(cells) != expected_cols or len(cells) < 7 or not cells[0]:
             rows.append(_malformed(source, number, cells))
             continue
-        entry_id, _entry, status, _difficulty, _attack, phase, test_id = cells[:7]
+        entry_id, entry, status, _difficulty, _attack, phase, test_id = cells[:7]
         rows.append(
             CatalogueRow(
                 source=source,
@@ -124,6 +129,7 @@ def extract_rows(text: str, source: Path) -> list[CatalogueRow]:
                 status=status.lower(),
                 phase=phase,
                 test_id=test_id,
+                entry=entry,
             )
         )
     return rows

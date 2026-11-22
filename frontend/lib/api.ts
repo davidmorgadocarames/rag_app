@@ -459,6 +459,11 @@ export interface DefenceProbeResultOut {
   expected_outcome: string;
   observed_outcome: string;
   passed: boolean;
+  // T13.J4-fix (DA-13-J3J4-2): the mockup's own `p.name`/`p.what` -- optional on the wire
+  // (an older backend, or a seeded e2e fixture, may omit them); the panel falls back to the
+  // raw `probe_id` when absent.
+  name?: string;
+  description?: string;
 }
 
 export interface DefenceLabRunResponse {
@@ -475,6 +480,8 @@ export interface DefenceRunOut {
   observed_outcome: string;
   passed: boolean;
   run_at: string;
+  name?: string;
+  description?: string;
 }
 
 export interface DefenceRunsResponse {
@@ -483,6 +490,13 @@ export interface DefenceRunsResponse {
 
 export function adminLabRun(): Promise<DefenceLabRunResponse> {
   return request("/admin/lab/run", { method: "POST" });
+}
+
+// T13.J4-fix (DA-13-J3J4-1): runs exactly ONE catalogue probe -- the mockup's own per-card
+// "Run probe" button. Same admin-only/step-up/CSRF gating as adminLabRun() above (the
+// backend's POST /admin/lab/run/{probe_id}), just scoped to a single probe id.
+export function adminLabRunProbe(probeId: string): Promise<DefenceLabRunResponse> {
+  return request(`/admin/lab/run/${encodeURIComponent(probeId)}`, { method: "POST" });
 }
 
 export function adminLabRuns(): Promise<DefenceRunsResponse> {

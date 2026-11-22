@@ -448,18 +448,26 @@ test("the seeded dashboard matches the mockup's palette across every section (vi
       results: [
         {
           probe_id: "login-brute-force",
+          // T13.J4-fix (DA-13-J3J4-2): a human name + one-line description, same wire shape
+          // `rag_app.defence_lab.catalogue_probes` now sends -- never just the raw id.
+          name: "Login lockout",
+          description: "login lockout counter (no TOCTOU)",
           expected_outcome: "locked after repeated bad passwords",
           observed_outcome: "held · 2 min ago",
           passed: true,
         },
         {
           probe_id: "burst-requests",
+          name: "Rate limiting",
+          description: "unrestricted resource consumption (rate limiting, daily cap)",
           expected_outcome: "429 after burst",
           observed_outcome: "held · 2 min ago",
           passed: true,
         },
         {
           probe_id: "session-replay-after-logout",
+          name: "Server-side sessions",
+          description: "server-side sessions (revocation)",
           expected_outcome: "revoked session rejected",
           observed_outcome: "not run yet",
           passed: false,
@@ -469,6 +477,23 @@ test("the seeded dashboard matches the mockup's palette across every section (vi
     await page.route("**/api/admin/lab/run", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(seededLabRun) }),
     );
+    // T13.J4-fix (DA-13-J3J4-1): the per-probe route -- not clicked by this spec (only the
+    // whole-lab button is), but mocked anyway so a future per-card click never silently hits
+    // the real network in a seeded e2e run.
+    await page.route("**/api/admin/lab/run/*", (route) => {
+      const probeId = route.request().url().split("/").pop() ?? "";
+      const match = seededLabRun.results.find((r) => r.probe_id === probeId);
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail: "ok",
+          git_sha: seededLabRun.git_sha,
+          all_matched: match?.passed ?? false,
+          results: match ? [match] : [],
+        }),
+      });
+    });
 
     await page.goto("/admin");
     await expect(page.getByTestId("admin-triage-panel")).toBeVisible();

@@ -366,6 +366,11 @@ class DefenceProbeResultOut(BaseModel):
     expected_outcome: str
     observed_outcome: str
     passed: bool
+    # T13.J4-fix (DA-13-J3J4-2): the mockup's own `p.name`/`p.what` -- a human-readable
+    # title and a static one-line "what this attacks" summary, both read from the
+    # THREAT_MODEL catalogue source (``rag_app.defence_lab``), never the raw probe id alone.
+    name: str = ""
+    description: str = ""
 
 
 class DefenceLabRunResponse(BaseModel):
@@ -382,6 +387,8 @@ class DefenceRunOut(BaseModel):
     observed_outcome: str
     passed: bool
     run_at: dt.datetime
+    name: str = ""
+    description: str = ""
 
 
 class DefenceRunsResponse(BaseModel):
