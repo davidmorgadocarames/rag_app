@@ -857,23 +857,24 @@ does not inherit the parent's `contextvars`, so there is never a recorder to fin
 if this ran mid-answer — a warm-up can never be averaged into a real answer's
 `secrag_chat_stage_seconds`/`secrag_chat_step_seconds`.
 
-**Fix 2 — wake ping on page load (T13.13.2, `rag_app.wake`, `GET /wake`).** `/login` and
-`/chat` each send one light GET to the BFF's own `/api/wake` on page load
-(`frontend/lib/wakePing.ts`, fire-and-forget, never awaited by the caller), forwarded
-verbatim to the backend's unauthenticated `GET /wake`, which re-triggers the SAME
-single-flight warm-up (in case Ollama went cold again after the backend itself finished
-waking — e.g. the backend stayed up on a request from a different app while Ollama's own
-Container App scaled back to zero on its own idle cooldown). The route always answers a
-plain 204, whichever branch it took internally (warm-up started, skipped, or even an
-unexpected exception from `trigger_warm_up` — caught defensively, logged, still 204): a
-caller learns nothing about Ollama's/the backend's internal state beyond "accepted", so
-this adds no new attack surface besides a cheap, rate-limited (`rag_app.api.deps.
-rate_limit_wake`, keyed by real IP like `/csp-report`) ping. Registered in
-`rag_app.features.REGISTRY` (`stack-coldstart-warmup`) and the route walker's
-`PUBLIC_ALLOWLIST` (unauthenticated by design, same reasoning as `/csp-report`: it must work
-from `/login` itself, before any session exists).
+**Fix 2 — wake ping on page load (T13.13.2, `rag_app.wake`, `GET /wake`) — superseded by
+DEC-050, see the "13-J4-fix" section below.** `/login` and `/chat` each send one light GET
+to the BFF's own `/api/wake` on page load (`frontend/lib/wakePing.ts`, fire-and-forget,
+never awaited by the caller), forwarded verbatim to the backend's unauthenticated
+`GET /wake`, which re-triggers the SAME single-flight warm-up (in case Ollama went cold
+again after the backend itself finished waking — e.g. the backend stayed up on a request
+from a different app while Ollama's own Container App scaled back to zero on its own idle
+cooldown). The route always answers a plain 204, whichever branch it took internally
+(warm-up started, skipped, or even an unexpected exception from `trigger_warm_up` — caught
+defensively, logged, still 204): a caller learns nothing about Ollama's/the backend's
+internal state beyond "accepted", so this adds no new attack surface besides a cheap,
+rate-limited (`rag_app.api.deps.rate_limit_wake`, keyed by real IP like `/csp-report`)
+ping. Registered in `rag_app.features.REGISTRY` (`stack-coldstart-warmup`) and the route
+walker's `PUBLIC_ALLOWLIST` (unauthenticated by design, same reasoning as `/csp-report`: it
+must work from `/login` itself, before any session exists).
 
-**Fix 3 — `embed_keep_alive`, demo mode (T13.13.3).** Ollama's own server-side `keep_alive`
+**Fix 3 — `embed_keep_alive`, demo mode (T13.13.3) — superseded by DEC-049, see the
+"13-J4-fix" section below.** Ollama's own server-side `keep_alive`
 default (5 minutes) would unload `bge-m3` mid-demo even with the Ollama Container App pinned
 at `min-replicas 1` (`demo-mode.sh on`) if nobody asks a question for a while. Considered two
 options: (A) `OLLAMA_KEEP_ALIVE` as a Container App env var, flipped on `demo-mode.sh on`/
