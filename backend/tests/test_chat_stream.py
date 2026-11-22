@@ -186,14 +186,35 @@ def test_the_stream_emits_embed_query_step_events_around_the_real_retrieving_sta
     wake banner (frontend) parses exactly this shape. Exactly one start/end pair, both
     typed ``"step"`` with ``stage``/``step``/``phase`` fields, sitting between the
     "retrieving" and "reranking" stage events -- unlike the other tests in this file, this
-    one needs a REAL (non-raising) embed, so only the reranker/LLM are faked."""
+    one needs a REAL (non-raising) embed AND a real (non-raising) LLM call, so the chat
+    client is faked too (this file's own ``OLLAMA_HOST=CLOSED_PORT`` would otherwise fail
+    the "generating" stage for real, like ``test_an_llm_failure_ends_with_an_error_event``
+    deliberately does)."""
     from rag_app import generation, reranking
+
+    class _TwoCallChat:
+        """Generate's answer first, groundedness's verdict second -- same shape as the
+        other real-paths test in this file below."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat_stream(self, *_a: object, usage: Any = None, **_kw: object) -> Any:
+            self.calls += 1
+            if usage is not None:
+                usage.add(generation.Usage(prompt_tokens=10, completion_tokens=5))
+            if self.calls == 1:
+                yield "Use prepared statements "
+                yield "to stop SQL injection [1]."
+            else:
+                yield "GROUNDED"
 
     monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.1] * 1024)
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
     monkeypatch.setattr(
         reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
     )
+    monkeypatch.setattr(generation, "make_chat_client", lambda *_a, **_k: _TwoCallChat())
     user = _make_user(db_engine)
     events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
     assert events[-1]["type"] == "done"

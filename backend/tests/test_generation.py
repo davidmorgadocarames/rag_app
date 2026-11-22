@@ -401,7 +401,7 @@ def test_answer_question_stream_emits_embed_query_start_and_end_exactly_once_in_
     kinds = [
         ("stage", e.stage) if isinstance(e, StreamStage) else ("step", e.phase)
         for e in events
-        if isinstance(e, (StreamStage, StreamStep))
+        if isinstance(e, StreamStage | StreamStep)
     ]
     retrieving_idx = kinds.index(("stage", "retrieving"))
     reranking_idx = kinds.index(("stage", "reranking"))
