@@ -128,6 +128,78 @@ def test_remove_refuses_with_uncommitted_changes_unless_forced(tmp_path: Path) -
 
 
 @needs_tools
+def test_remove_refuses_on_the_main_working_tree_and_leaves_it_intact(tmp_path: Path) -> None:
+    # SECRAG_WT_ROOT pointing at the main tree's own PARENT, with a block name equal to
+    # the main tree's basename, makes $WT_ROOT/$block resolve to the main tree itself --
+    # the exact misconfiguration DA-PB-1 described (e.g. SECRAG_WT_ROOT=$HOME/proyectos
+    # + block=rag_app). Before the fix, `git worktree remove --force` on the main tree
+    # fails (exit 128, "is a main working tree") and the old code fell back to a blind
+    # `rm -rf`, deleting the main tree. This must now be refused before either happens.
+    repo = _make_main_repo(tmp_path)
+    proc = _wt(repo, "remove", repo.name, SECRAG_WT_ROOT=str(tmp_path))
+    assert proc.returncode == 1
+    assert "main working tree" in proc.stdout + proc.stderr
+    assert repo.exists()
+    assert (repo / "README.md").exists()
+
+
+@needs_tools
+def test_remove_refuses_on_an_ancestor_of_the_main_working_tree(tmp_path: Path) -> None:
+    # SECRAG_WT_ROOT=tmp_path with block="." makes $WT_ROOT/$block resolve to tmp_path
+    # itself, which is an ANCESTOR of the main repo (tmp_path/main) rather than the main
+    # tree exactly -- the other half of the DA-PB-1 guard.
+    repo = _make_main_repo(tmp_path)
+    proc = _wt(repo, "remove", ".", SECRAG_WT_ROOT=str(tmp_path))
+    assert proc.returncode == 1
+    assert "ancestor of the main working tree" in proc.stdout + proc.stderr
+    assert repo.exists()
+    assert (repo / "README.md").exists()
+
+
+@needs_tools
+def test_remove_refuses_a_directory_git_does_not_know_is_a_worktree(tmp_path: Path) -> None:
+    # A plain directory under SECRAG_WT_ROOT that was never created by `worktree.sh add`
+    # (so it has no entry in `git worktree list --porcelain`) must never be deleted --
+    # the old blind `|| rm -rf "$wt"` fallback would have removed it unconditionally.
+    repo = _make_main_repo(tmp_path)
+    wt_root = tmp_path / "wt"
+    stray = wt_root / "not-a-worktree"
+    stray.mkdir(parents=True)
+    (stray / "keepme.txt").write_text("not a worktree\n", encoding="utf-8")
+
+    proc = _wt(repo, "remove", "not-a-worktree", SECRAG_WT_ROOT=str(wt_root))
+    assert proc.returncode == 1
+    assert "not a worktree registered" in proc.stdout + proc.stderr
+    assert (stray / "keepme.txt").exists()
+
+
+@needs_tools
+def test_remove_never_deletes_the_branch_or_its_commits(tmp_path: Path) -> None:
+    # DA-PB-2: `remove` only deletes the checkout, never the branch ref/commits shared
+    # in .git -- make an unpushed commit inside the worktree, remove it, and confirm the
+    # branch and that commit are still reachable from the main repo afterward.
+    repo = _make_main_repo(tmp_path)
+    wt_root = tmp_path / "wt"
+    assert _wt(repo, "add", "survive-block", SECRAG_WT_ROOT=str(wt_root)).returncode == 0
+    wt_dir = wt_root / "survive-block"
+
+    (wt_dir / "unpushed.txt").write_text("unpushed work\n", encoding="utf-8")
+    _git(wt_dir, "add", "-A")
+    _git(wt_dir, "commit", "-q", "-m", "unpushed work")
+    commit_sha = _git(wt_dir, "rev-parse", "HEAD").stdout.strip()
+
+    proc = _wt(repo, "remove", "survive-block", SECRAG_WT_ROOT=str(wt_root))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not wt_dir.exists()
+
+    branches = _git(repo, "branch", "--list", "survive-block").stdout
+    assert "survive-block" in branches
+    assert _git(repo, "cat-file", "-e", commit_sha).returncode == 0
+    log = _git(repo, "log", "survive-block", "--oneline").stdout
+    assert "unpushed work" in log
+
+
+@needs_tools
 def test_add_symlinks_env_files_from_the_main_tree(tmp_path: Path) -> None:
     repo = _make_main_repo(tmp_path)
     # "backend/" must be a TRACKED directory (as it is in the real repo) so the new
