@@ -15,6 +15,15 @@
 #                                                        gate's own stack, an Azure URL) --
 #                                                        never brings anything up; BLOCKED if
 #                                                        URL is not reachable
+#   ... --base-url URL --allow-remote-writes            required in addition to --base-url
+#                                                        for any feature whose covering
+#                                                        spec(s) are marked "mutating" in
+#                                                        docs/FEATURE_MAP.md (account
+#                                                        creation, e-mail sending, erasure,
+#                                                        lab runs...) -- see the DA-HB-2
+#                                                        mutation gate below. Without this
+#                                                        flag, a mutating feature against
+#                                                        --base-url is BLOCKED, never run.
 #
 # Exit codes:
 #   0  PASS      the covering spec(s) ran and passed
@@ -45,7 +54,7 @@ REPO_ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)" || exit 1
 cd "$REPO_ROOT" || exit 1
 
 usage() {
-  echo "usage: $(basename "$0") <feature-id> [--base-url URL]" >&2
+  echo "usage: $(basename "$0") <feature-id> [--base-url URL [--allow-remote-writes]]" >&2
   echo "       (feature ids: see docs/FEATURE_MAP.md, or 'python -m rag_app.features map')" >&2
   exit 2
 }
@@ -54,12 +63,20 @@ FEATURE_ID="${1:-}"
 [ -n "$FEATURE_ID" ] || usage
 shift
 BASE_URL=""
+# DA-HB-2: a feature whose covering spec(s) create/change real remote state (account
+# creation, e-mail sending, erasure, lab runs...) must never run against a remote
+# --base-url without the operator explicitly accepting that -- see the mutation gate below.
+ALLOW_REMOTE_WRITES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --base-url)
       [ $# -ge 2 ] || usage
       BASE_URL="$2"
       shift 2
+      ;;
+    --allow-remote-writes)
+      ALLOW_REMOTE_WRITES=1
+      shift
       ;;
     -h | --help) usage ;;
     *)
@@ -95,8 +112,12 @@ mkdir -p "$EVIDENCE_DIR" || {
 }
 
 blocked() {
-  echo "BLOCKED: $1" >&2
-  printf '%s\n' "BLOCKED: $1" >"$EVIDENCE_DIR/verdict.log"
+  # DA-HB-1: use the FULL message ($*, every argument joined), never just $1 -- a call site
+  # passing its reason as several separate arguments (readability) must not get silently
+  # truncated to the first one in the evidence this tool exists to produce.
+  local msg="$*"
+  echo "BLOCKED: $msg" >&2
+  printf '%s\n' "BLOCKED: $msg" >"$EVIDENCE_DIR/verdict.log"
   echo "evidence: $EVIDENCE_DIR"
   exit 2
 }
@@ -108,12 +129,11 @@ FOUND="$(echo "$INFO_JSON" | jq -r '.found')"
 [ "$FOUND" = "true" ] || blocked "unknown feature id '$FEATURE_ID' -- see docs/FEATURE_MAP.md"
 
 PROBE="$(echo "$INFO_JSON" | jq -r '.probe')"
+MODE="$(echo "$INFO_JSON" | jq -r '.mode')"
 mapfile -t SPECS < <(echo "$INFO_JSON" | jq -r '.e2e[]')
 
 if [ "${#SPECS[@]}" -eq 0 ]; then
-  blocked "no covering e2e spec for '$FEATURE_ID' (docs/FEATURE_MAP.md's coverage table) --" \
-    "this feature is checked by its own probe instead: $PROBE" \
-    "(run 'python -m rag_app.devtools.registry_check' for a real probe run)"
+  blocked "no covering e2e spec for '$FEATURE_ID' (docs/FEATURE_MAP.md's coverage table) -- this feature is checked by its own probe instead: $PROBE (run 'python -m rag_app.devtools.registry_check' for a real probe run)"
 fi
 
 SPEC_ARGS=()
@@ -126,9 +146,24 @@ RUN_LOG="$EVIDENCE_DIR/run.log"
 EXIT_CODE=0
 
 if [ -n "$BASE_URL" ]; then
+  # DA-HB-2: refuse a MUTATING feature against a remote --base-url unless the operator
+  # explicitly opted in -- checked BEFORE the reachability probe below so a mutating feature
+  # is refused on its own merits, never by accident just because the target happened to be
+  # unreachable. This does not change the no-"--base-url" (local bring-up) path at all.
+  if [ "$MODE" = "mutating" ] && [ "$ALLOW_REMOTE_WRITES" -ne 1 ]; then
+    blocked "'$FEATURE_ID' is covered by a MUTATING spec (docs/FEATURE_MAP.md marks it" \
+      "'mutating' -- it creates/changes real remote state: account creation, e-mail sending," \
+      "erasure, a lab run, or similar) and --base-url targets an ALREADY RUNNING app; refusing" \
+      "to run it against $BASE_URL without --allow-remote-writes (only pass that flag if you" \
+      "accept this run will mutate $BASE_URL's real state)"
+  fi
+  if [ "$MODE" = "mutating" ]; then
+    echo "WARNING: --allow-remote-writes is set -- running a MUTATING spec against a REMOTE" \
+      "target ($BASE_URL); this WILL create/change real remote state (account creation," \
+      "e-mail sending, erasure, or a lab run)." | tee -a "$EVIDENCE_DIR/run.log" >&2
+  fi
   if ! curl -fsS --max-time 5 -o /dev/null "$BASE_URL/"; then
-    blocked "missing prerequisite: $BASE_URL is not reachable (start the app, or omit" \
-      "--base-url to bring up the local stack via 'scripts/gate.sh --only e2e')"
+    blocked "missing prerequisite: $BASE_URL is not reachable (start the app, or omit --base-url to bring up the local stack via 'scripts/gate.sh --only e2e')"
   fi
   echo "target: $BASE_URL (already running, not brought up by this script)" | tee -a "$RUN_LOG"
   GATE_LOCK_LABEL="verify:$FEATURE_ID" scripts/dev/with-lock.sh bash -c "

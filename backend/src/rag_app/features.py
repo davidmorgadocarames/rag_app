@@ -1018,6 +1018,9 @@ def check_registry(
 # below rather than silently going stale.
 
 
+FeatureMode = Literal["read-only", "mutating"]
+
+
 @dataclass(frozen=True)
 class FeatureDoc:
     page: str
@@ -1034,6 +1037,15 @@ class FeatureDoc:
     e2e: tuple[str, ...] = ()
     """`frontend/e2e/*.spec.ts` file names that cover this feature end-to-end. Empty means no
     e2e coverage today -- picked up by the coverage table below, not hidden."""
+    mode: FeatureMode = "read-only"
+    """DA-HB-2: whether running this feature's covering ``e2e`` spec(s) can change real
+    remote state -- ``"mutating"`` for any spec that creates an account, sends a real e-mail,
+    erases data, or runs the defence lab (checked against the actual spec file below, not
+    guessed); ``"read-only"`` (the default) for everything else, including a spec that only
+    logs in with an already-seeded account. ``scripts/dev/verify.sh`` refuses to run a
+    ``"mutating"`` feature against a remote ``--base-url`` unless ``--allow-remote-writes``
+    is passed -- irrelevant for the local bring-up path, which always uses the gate's own
+    disposable stack regardless of this field."""
 
 
 _GROUP_LABELS: dict[str, str] = {
@@ -1129,6 +1141,8 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="citations reference real, relevant chunks (pgvector + BM25, RRF-fused)",
         key_files=("backend/src/rag_app/retrieval.py",),
         e2e=("auth.spec.ts",),
+        # auth.spec.ts registers a brand-new account to reach /chat (DA-HB-2).
+        mode="mutating",
     ),
     "rag-rerank": FeatureDoc(
         page="/chat",
@@ -1137,6 +1151,7 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="the top cited chunk is the cross-encoder's top pick, not just RRF's",
         key_files=("backend/src/rag_app/reranking.py",),
         e2e=("auth.spec.ts",),
+        mode="mutating",
     ),
     "rag-generation-groundedness": FeatureDoc(
         page="/chat",
@@ -1145,6 +1160,7 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="an answer grounded in the retrieved chunks, or abstention when it is not",
         key_files=("backend/src/rag_app/generation.py",),
         e2e=("auth.spec.ts",),
+        mode="mutating",
     ),
     "rag-abstention": FeatureDoc(
         page="/chat",
@@ -1167,6 +1183,7 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="conversation -> stage -> token... -> done SSE events; token usage per answer",
         key_files=("backend/src/rag_app/api/app.py", "frontend/lib/api.ts"),
         e2e=("auth.spec.ts",),
+        mode="mutating",
     ),
     "rag-agentic-router": FeatureDoc(
         page="N/A -- retained-not-adopted, not wired into /chat",
@@ -1197,6 +1214,10 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="per-stage p50/p95 waterfall from this replica's own histogram",
         key_files=("backend/src/rag_app/eval/latency.py", "backend/src/rag_app/metrics.py"),
         e2e=("admin-dashboard.spec.ts",),
+        # admin-dashboard.spec.ts enrols real MFA and erases a real account elsewhere in the
+        # same file -- DA-HB-2 marks the whole spec "mutating", not just the parts this entry
+        # itself walks through, since verify.sh runs the whole covering spec file.
+        mode="mutating",
     ),
     "quality-misspelling-probe": FeatureDoc(
         page="N/A -- CI/offline (`registry` gate step)",
@@ -1213,6 +1234,7 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="generic 202 on register; account usable after verification",
         key_files=("frontend/app/login/", "backend/src/rag_app/api/app.py"),
         e2e=("auth.spec.ts",),
+        mode="mutating",
     ),
     "identity-login-sessions": FeatureDoc(
         page="/login",
@@ -1221,6 +1243,9 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="redirect to /chat; __Host-secrag_session + __Host-secrag_csrf cookies set",
         key_files=("frontend/components/VaultDoor.tsx",),
         e2e=("auth.spec.ts", "wakeup.spec.ts"),
+        # auth.spec.ts (one of the two covering specs) registers a real account -- DA-HB-2
+        # marks the whole feature "mutating" since verify.sh runs every covering spec.
+        mode="mutating",
     ),
     "identity-lockout": FeatureDoc(
         page="/login",
@@ -1236,6 +1261,9 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="a real QR <svg>, 'Two-factor authentication is enabled.', then 'MFA verified.'",
         key_files=(_ACCOUNT_SECURITY, "frontend/components/QrCode.tsx"),
         e2e=("mfa.spec.ts", "admin-dashboard.spec.ts"),
+        # mfa.spec.ts registers a real account and enrols real MFA; admin-dashboard.spec.ts
+        # also enrols/erases for real (DA-HB-2 finding).
+        mode="mutating",
     ),
     "identity-email-verification-reset": FeatureDoc(
         page="/verify, /forgot-password, /reset",
@@ -1244,6 +1272,9 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="email delivered (Mailpit locally); generic response either way",
         key_files=("backend/src/rag_app/emailer.py",),
         e2e=("auth.spec.ts",),
+        # auth.spec.ts sends a real verification e-mail (Mailpit locally, ACS SMTP on
+        # Azure) as part of its "register, verify via Mailpit" test (DA-HB-2 finding).
+        mode="mutating",
     ),
     "identity-password-policy-reset": FeatureDoc(
         page="/signup, /reset",
@@ -1259,6 +1290,8 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="403/redirect to the denied placeholder, never admin content",
         key_files=("backend/src/rag_app/authz.py",),
         e2e=("admin.spec.ts",),
+        # admin.spec.ts registers real accounts to prove the denied-placeholder path.
+        mode="mutating",
     ),
     # --- Abuse -------------------------------------------------------------------------------
     "abuse-rate-limiting": FeatureDoc(
@@ -1304,6 +1337,9 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="202 Accepted; crypto-shred immediately; remaining rows purged within 24h",
         key_files=("backend/src/rag_app/erasure.py",),
         e2e=("admin-dashboard.spec.ts",),
+        # admin-dashboard.spec.ts actually erases a real account's data in this spec file
+        # (DA-HB-2 finding) -- the clearest "mutating" case in the whole registry.
+        mode="mutating",
     ),
     "privacy-deletion-replay": FeatureDoc(
         page="N/A -- restore-safety, no direct UI",
@@ -1320,6 +1356,8 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="CSP/nosniff/referrer-policy/no-store headers present, zero CSP violations",
         key_files=("backend/src/rag_app/api/app.py", "frontend/middleware.ts"),
         e2e=("security-headers.spec.ts",),
+        # security-headers.spec.ts registers a real account as part of its logged-in walk.
+        mode="mutating",
     ),
     "browser-csp-reports": FeatureDoc(
         page="N/A -- browser-sent, no user-facing page",
@@ -1328,6 +1366,7 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="POST /csp-report accepted; secrag_csp_reports_total increments",
         key_files=("backend/src/rag_app/api/app.py",),
         e2e=("security-headers.spec.ts",),
+        mode="mutating",
     ),
     "browser-exposed-files": FeatureDoc(
         page="N/A -- infrastructure",
@@ -1352,6 +1391,9 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="the denied placeholder for anyone else; the real dashboard for an admin",
         key_files=(_ADMIN_PAGE, "backend/src/rag_app/api/app.py"),
         e2e=("admin.spec.ts", "admin-dashboard.spec.ts"),
+        # admin.spec.ts registers real accounts; admin-dashboard.spec.ts enrols/erases real
+        # accounts (DA-HB-2 finding).
+        mode="mutating",
     ),
     "admin-defence-lab": FeatureDoc(
         page="/admin -> Defence lab tab (local only, LAB_ENABLED)",
@@ -1360,6 +1402,11 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="pass/fail per THREAT_MODEL-catalogue probe id, with history",
         key_files=(_ADMIN_PAGE,),
         e2e=("admin-dashboard.spec.ts",),
+        # admin-dashboard.spec.ts's lab section mocks the network route, but the SAME spec
+        # file also enrols/erases real accounts elsewhere -- DA-HB-2 marks the whole feature
+        # "mutating" since verify.sh runs the entire covering spec file, not just this
+        # feature's own test block within it.
+        mode="mutating",
     ),
 }
 
@@ -1421,6 +1468,13 @@ def generate_feature_map(
         "4. A feature with no e2e spec (see the coverage table below) can still be checked"
         " with its own health/quality probe: `python -m rag_app.devtools.registry_check`."
     )
+    lines.append(
+        "5. DA-HB-2: the **mode** column below says whether a feature's covering spec(s)"
+        " create/change real remote state (`mutating` -- account creation, e-mail sending,"
+        " erasure, a lab run) or only read it (`read-only`). Against a remote `--base-url`,"
+        " `scripts/dev/verify.sh` refuses a `mutating` feature unless `--allow-remote-writes`"
+        " is also passed; a `read-only` feature needs no flag."
+    )
     lines.append("")
 
     groups: dict[str, list[FeatureEntry]] = {}
@@ -1432,14 +1486,17 @@ def generate_feature_map(
     for group in groups:
         lines.append(f"### {group}")
         lines.append("")
-        lines.append("| id | name | phase | status | page | health/quality probe | e2e spec(s) |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append(
+            "| id | name | phase | status | page | health/quality probe | e2e spec(s) | mode |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
         for entry in groups[group]:
             doc = docs[entry.id]
             e2e = ", ".join(f"`{spec}`" for spec in doc.e2e) if doc.e2e else "—"
             lines.append(
                 f"| `{entry.id}` | {_html_escape(entry.name)} | {entry.phase} | {entry.status}"
-                f" | {_html_escape(doc.page)} | {_probe_description(entry)} | {e2e} |"
+                f" | {_html_escape(doc.page)} | {_probe_description(entry)} | {e2e}"
+                f" | {doc.mode} |"
             )
         lines.append("")
         for entry in groups[group]:
@@ -1450,6 +1507,16 @@ def generate_feature_map(
             lines.append(f"- User steps: {doc.steps}")
             lines.append(f"- Observable result: {doc.observable}")
             lines.append(f"- Key source files: {', '.join(f'`{f}`' for f in doc.key_files)}")
+            lines.append(
+                f"- Remote-write mode: `{doc.mode}` ("
+                + (
+                    "running its covering e2e spec(s) against a remote --base-url"
+                    " creates/changes real state -- needs --allow-remote-writes"
+                    if doc.mode == "mutating"
+                    else "safe to run against a remote --base-url with no extra flag"
+                )
+                + ")"
+            )
             lines.append(f"- Docs: `{entry.docs}`")
             lines.append("")
 
@@ -1503,6 +1570,7 @@ def _cli_info(feature_id: str) -> int:
                 "key_files": list(doc.key_files),
                 "probe": _probe_description(entry),
                 "e2e": list(doc.e2e),
+                "mode": doc.mode,
             }
         )
     )
