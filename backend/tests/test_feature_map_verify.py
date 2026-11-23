@@ -30,9 +30,42 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _VERIFY = _REPO_ROOT / "scripts" / "dev" / "verify.sh"
 _UNREACHABLE_URL = "http://127.0.0.1:1"  # nothing listens here; curl fails instantly
 
+
+def _resolve_verify_sh_venv_python() -> Path:
+    """Mirrors `scripts/dev/verify.sh`'s OWN venv resolution (GATE_VENV, else
+    `<main-root>/backend/.venv`) so the skip check below asks exactly the same question the
+    script itself will ask -- never a looser/different one that could pass here and still
+    fail inside the subprocess."""
+    gate_venv = os.environ.get("GATE_VENV")
+    if gate_venv:
+        return Path(gate_venv) / "bin" / "python"
+    common_dir = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    main_root = Path(common_dir).parent if common_dir else _REPO_ROOT
+    return main_root / "backend" / ".venv" / "bin" / "python"
+
+
+_VENV_PYTHON = _resolve_verify_sh_venv_python()
+
+# verify.sh itself BLOCKs (before ever creating an evidence directory) if `jq`/`curl`/`npx`
+# are not on PATH, or if its own venv does not resolve -- a CI job that runs backend pytest
+# straight against the system interpreter (no `backend/.venv`, no Node/npx at all, e.g. this
+# repo's "Backend (lint, types, tests incl. DB)" job) hits that BEFORE this test's own
+# assertions ever run, which would otherwise surface as a confusing FileNotFoundError instead
+# of a clean skip.
 pytestmark = pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None or shutil.which("curl") is None,
-    reason="needs bash, jq and curl",
+    shutil.which("bash") is None
+    or shutil.which("jq") is None
+    or shutil.which("curl") is None
+    or shutil.which("npx") is None
+    or not os.access(_VENV_PYTHON, os.X_OK),
+    reason="needs bash/jq/curl/npx on PATH and a resolvable backend venv"
+    " (scripts/dev/verify.sh's own prerequisites)",
 )
 
 
