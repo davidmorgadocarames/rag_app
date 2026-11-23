@@ -3,6 +3,11 @@
 This maps the user journey: the screens, what each does, what happens on each action, and which page
 comes next.
 
+> **Companion:** [`docs/FEATURE_MAP.md`](FEATURE_MAP.md) is the per-feature index generated from the
+> feature registry (`backend/src/rag_app/features.py`) and this file: for any one feature it lists the
+> page/prerequisites/steps/observable result/key files and which `frontend/e2e/*.spec.ts` file(s) cover
+> it, plus how to re-verify it with `scripts/dev/verify.sh <feature-id>`.
+
 ## 1. Screen map
 
 ```
