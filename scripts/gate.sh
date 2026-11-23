@@ -1177,6 +1177,19 @@ acquire_gate_lock() {
 publish_gate_status() {
   local mode="$1" fail="$2" total="$3" result=FAIL
   [ "$fail" -eq 0 ] && result=PASS
+  # T13.14.4: release the global gate lock BEFORE forking gate_publish.sh. Every
+  # lock-protected resource (the gate compose project/ports, native Ollama) is already done
+  # with by this point; gate_publish.sh can itself `setsid nohup … &` a detached publisher
+  # that waits up to 15 min for the SHA to reach GitHub, and an fd opened via `exec {var}>`
+  # is inherited (not close-on-exec) by every process forked after it -- closing it here is
+  # what stops that detached, long-lived watcher from silently holding the lock for the rest
+  # of its wait and blocking every other gate.sh/with-lock.sh run for nothing (found by the
+  # T13.14.6 trial: a concurrent pre-push queued behind a `--full` run that had already
+  # exited, because its detached publisher was still alive and had inherited the fd).
+  if [ -n "${GATE_LOCK_FD:-}" ]; then
+    exec {GATE_LOCK_FD}>&- 2>/dev/null || true
+    unset GATE_LOCK_FD
+  fi
   bash "$REPO_ROOT/scripts/cd/gate_publish.sh" --mode "$mode" --result "$result" \
     --start-sha "$GATE_START_SHA" --start-dirty "$GATE_START_DIRTY" --total "$total" \
     --state-dir "$GIT_COMMON/secrag-gate" || true

@@ -346,6 +346,44 @@ def test_a_second_invocation_queues_behind_the_first_and_prints_the_holder(
 
 
 @needs_tools
+def test_the_lock_outlives_neither_a_detached_publisher_nor_the_gate_run(
+    tmp_path: Path,
+) -> None:
+    """Regression (found by the T13.14.6 real trial): `publish_gate_status` forks
+    scripts/cd/gate_publish.sh, which can itself `setsid nohup … &` a detached publisher
+    that waits up to 15 min for the SHA to reach GitHub. That detached process inherits a
+    copy of the lock fd (fds are not close-on-exec by default) unless gate.sh explicitly
+    closes it first -- otherwise a completed gate run keeps blocking every other
+    gate.sh/with-lock.sh run for as long as the detached publisher is alive, long after the
+    gate itself printed GATE: PASS and exited. This repo stubs gate_publish.sh with the
+    same `setsid nohup … &` shape (no network/gh needed) to prove the fd is closed first."""
+    repo = _make_repo(tmp_path)
+    (repo / "scripts" / "cd").mkdir(parents=True)
+    publisher = repo / "scripts" / "cd" / "gate_publish.sh"
+    publisher.write_text(
+        "#!/usr/bin/env bash\n" "setsid nohup sleep 30 </dev/null >/dev/null 2>&1 &\n" "exit 0\n",
+        encoding="utf-8",
+    )
+    publisher.chmod(0o755)
+    lock_file = tmp_path / "gate.lock"
+
+    proc = _gate(repo, "--only", "git-modes", GATE_LOCK_FILE=str(lock_file))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    # The detached `sleep 30` must still be alive (proving it really did inherit a copy of
+    # whatever fd it got) while a brand-new gate.sh invocation acquires the SAME lock file
+    # immediately, with no wait message at all.
+    still_detached = subprocess.run(["pgrep", "-f", "sleep 30"], capture_output=True, text=True)
+    assert still_detached.returncode == 0, "the detached stub exited early -- test is void"
+    try:
+        proc2 = _gate(repo, "--only", "git-modes", GATE_LOCK_FILE=str(lock_file))
+        assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+        assert "waiting for the gate lock" not in proc2.stderr
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 30"], capture_output=True)
+
+
+@needs_tools
 def test_the_lock_is_released_as_soon_as_the_holder_process_group_is_killed(
     tmp_path: Path,
 ) -> None:
