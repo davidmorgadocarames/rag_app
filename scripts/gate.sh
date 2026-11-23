@@ -70,6 +70,21 @@ GATE_MAILPIT_API_PORT="${GATE_MAILPIT_API_PORT:-18026}"
 export GATE_MAILPIT_SMTP_PORT GATE_MAILPIT_API_PORT
 FULL_TARGET_SECONDS=1800   # X5: --full target in Phase 11
 
+# --- global gate lock (T13.14.4, Paralelo-B problem #2) --------------------------------
+# One scripts/gate.sh run at a time, any mode, incl. the pre-push path: concurrent gates
+# share the same fixed compose project/ports/volume (COMPOSE_PROJECT, GATE_DB_PORT, ...)
+# and the same native Ollama, and would corrupt each other (down -v races, port clashes).
+# scripts/dev/with-lock.sh takes the SAME lock for an agent's own Docker/e2e/dev-server
+# runs outside gate.sh. Released automatically on process exit or kill -9 (flock/fd
+# semantics on the held file descriptor -- no trap needed). Plain unit tests (no Docker)
+# never need this lock. GATE_LOCK_TEST_SLEEP is a test-only hook (default 0 = no-op): the
+# real code path never sets it. Only GATE_LOCK_FILE's own directory is ever created (never
+# a separately-defaulted GATE_LOCK_DIR) so an explicit override never touches $HOME.
+GATE_LOCK_FILE="${GATE_LOCK_FILE:-${XDG_RUNTIME_DIR:-$HOME/.cache}/secrag/gate.lock}"
+GATE_LOCK_HOLDER_FILE="$GATE_LOCK_FILE.holder"
+GATE_LOCK_TIMEOUT="${GATE_LOCK_TIMEOUT:-3600}"   # seconds; 60 min default, configurable
+GATE_LOCK_TEST_SLEEP="${GATE_LOCK_TEST_SLEEP:-0}"
+
 # name | needs the gate stack: - (no) / db (gate DB) / seed (DB + seed + Ollama) /
 #        docker (own throwaway compose projects, not in --fast) | budget (s)
 STEP_TABLE="
@@ -1114,6 +1129,45 @@ make_seed() {
   echo "seed written: $SEED ($chunks chunks, $model, alembic $head) in $((SECONDS - t0))s"
 }
 
+# --- global gate lock (T13.14.4, Paralelo-B problem #2) --------------------------------
+
+# acquire_gate_lock <mode>: blocks on GATE_LOCK_FILE (printing a clear wait message that
+# names the current holder) for up to GATE_LOCK_TIMEOUT seconds, then FAILs cleanly.
+# Holder info (block/label, branch, pid, mode, start time) is written to
+# GATE_LOCK_HOLDER_FILE right after the lock is taken, so the next waiter can report who
+# holds it. The lock is held on GATE_LOCK_FD, an fd opened in THIS process (via `exec
+# {var}>file`): `flock` the external command, run as a child, locks that same open file
+# description, but the lock survives the child's exit because this process's own copy of
+# the fd stays open -- the classic bash `exec N>file; flock N` idiom. It is released the
+# moment every fd referencing it closes, i.e. on normal exit or `kill -9` of this process;
+# no cleanup trap is needed. Caveat: an fd opened this way is inherited (not close-on-exec)
+# by every child this process forks (e.g. a `run_step`'s own `bash "$SELF" --run-step`), so
+# a `kill -9` of ONLY the top gate.sh pid while such a child is still alive leaves the lock
+# held until that child also exits -- killing the whole tree/process group (`pkill -9 -f
+# "gate.sh"`, or a negative-pid `kill`) releases it immediately regardless, which is the
+# normal way an agent stops a hung gate run.
+acquire_gate_lock() {
+  local mode="${1:-fast}" holder
+  mkdir -p "$(dirname "$GATE_LOCK_FILE")" 2>/dev/null
+  exec {GATE_LOCK_FD}>"$GATE_LOCK_FILE" \
+    || { echo "FAIL: cannot open gate lock file $GATE_LOCK_FILE" >&2; return 1; }
+  if ! flock -n "$GATE_LOCK_FD"; then
+    holder="$(cat "$GATE_LOCK_HOLDER_FILE" 2>/dev/null)"
+    echo "gate: waiting for the gate lock held by ${holder:-another run} (timeout ${GATE_LOCK_TIMEOUT}s; set GATE_LOCK_TIMEOUT to change)" >&2
+    if ! flock -w "$GATE_LOCK_TIMEOUT" "$GATE_LOCK_FD"; then
+      echo "FAIL: timed out after ${GATE_LOCK_TIMEOUT}s waiting for the gate lock held by ${holder:-another run}" >&2
+      return 1
+    fi
+  fi
+  printf 'block=%s branch=%s pid=%s mode=%s start=%s\n' \
+    "${GATE_LOCK_LABEL:-$(basename "$REPO_ROOT")}" \
+    "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)" \
+    "$$" "$mode" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"$GATE_LOCK_HOLDER_FILE" 2>/dev/null
+  [ "$GATE_LOCK_TEST_SLEEP" -gt 0 ] 2>/dev/null && sleep "$GATE_LOCK_TEST_SLEEP"
+  return 0
+}
+
 # --- secrag/gate-full commit status (D-2026-09-27-7 b) ---------------------------------
 
 # publish_gate_status <mode> <fail> <seconds>: every gate run ends here; only a --full PASS
@@ -1291,6 +1345,10 @@ case "${1:-}" in
     exit $?
     ;;
 esac
+
+# Every real run (fast/full/only/seed, incl. the pre-push path) takes the global gate lock
+# first (T13.14.4) -- re-entrant self-invocations and informational flags above never do.
+acquire_gate_lock "${1:-fast}" || exit 1
 
 GATE_LOG_DIR="${GATE_LOG_DIR:-$HOME/secrag-gate-logs}"
 # DA-E-2: the directory and every log file are private (0700 / 0600) -- a local umask for

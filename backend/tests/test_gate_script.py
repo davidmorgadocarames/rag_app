@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -46,13 +48,18 @@ def _make_repo(tmp_path: Path, hooks_path: str | None = ".githooks") -> Path:
     return repo
 
 
-def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+def _gate_env(repo: Path, **env: str) -> dict[str, str]:
     # Drop what an enclosing gate run exports (GATE_MAIN_ROOT, GATE_VENV, GATE_MODE, …) so
-    # the copy checks only the throwaway repository.
+    # the copy checks only the throwaway repository. XDG_RUNTIME_DIR is dropped too
+    # (T13.14.4): gate.sh's global lock defaults to ${XDG_RUNTIME_DIR:-$HOME/.cache}/secrag
+    # -- if the real ambient session value leaked through, every test below would share
+    # ONE real, per-login-session lock directory regardless of the scratch HOME used for
+    # everything else, and could even queue behind a real gate.sh run on the dev machine.
     base = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("GATE_") and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE"}
+        if not k.startswith("GATE_")
+        and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE", "XDG_RUNTIME_DIR"}
     }
     # DA-E-1: every call gets its own scratch HOME by default, so gate.sh's default
     # GATE_LOG_DIR=$HOME/secrag-gate-logs (T11c.E1) never writes a test-generated log into
@@ -60,13 +67,33 @@ def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str
     # evidence. A test that exercises the logging behaviour itself passes its own HOME (or
     # GATE_LOG_DIR) in **env, which wins (dict union below keeps the last value).
     scratch_home = {"HOME": str(repo.parent / "scratch-home")}
+    return {**base, "GATE_VENV": str(repo / "no-venv"), **scratch_home, **env}
+
+
+def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", str(repo / "scripts" / "gate.sh"), *args],
         cwd=repo,
-        env={**base, "GATE_VENV": str(repo / "no-venv"), **scratch_home, **env},
+        env=_gate_env(repo, **env),
         capture_output=True,
         text=True,
         timeout=120,
+    )
+
+
+def _gate_popen(repo: Path, *args: str, **env: str) -> subprocess.Popen[str]:
+    # new_session=True (setsid): the process and anything it forks (e.g. the test-only
+    # GATE_LOCK_TEST_SLEEP `sleep`) share ONE process group, so a test can release the lock
+    # deterministically with a single killpg instead of racing a lone `kill -9 <pid>`
+    # against a still-running forked child that inherited a copy of the lock fd.
+    return subprocess.Popen(
+        ["bash", str(repo / "scripts" / "gate.sh"), *args],
+        cwd=repo,
+        env=_gate_env(repo, **env),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
     )
 
 
@@ -130,12 +157,17 @@ def test_only_fails_in_the_main_tree_when_the_venv_drifted_from_the_pins(tmp_pat
     fake_python.parent.mkdir(parents=True)
     fake_python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")  # venv_sync: drift
     fake_python.chmod(0o755)
-    # No GATE_VENV: the gate resolves the main tree's venv (the fake one above).
+    # No GATE_VENV: the gate resolves the main tree's venv (the fake one above). HOME is
+    # still scratch (and XDG_RUNTIME_DIR dropped) so the lock/log dirs stay out of the
+    # real ~/.cache and ~/secrag-gate-logs (DA-E-1 / T13.14.4), even though this test calls
+    # subprocess.run directly instead of the _gate() helper.
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("GATE_") and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE"}
+        if not k.startswith("GATE_")
+        and k not in {"GITHUB_ACTIONS", "GIT_DIR", "GIT_WORK_TREE", "XDG_RUNTIME_DIR"}
     }
+    env["HOME"] = str(tmp_path / "scratch-home")
     proc = subprocess.run(
         ["bash", str(repo / "scripts" / "gate.sh"), "--only", "git-modes"],
         cwd=repo,
@@ -219,7 +251,17 @@ def test_gate_log_dir_is_configurable(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     home = tmp_path / "home"
     custom = tmp_path / "custom-gate-logs"
-    proc = _gate(repo, "--only", "git-modes", HOME=str(home), GATE_LOG_DIR=str(custom))
+    # T13.14.4: the global lock also defaults under $HOME (GATE_LOCK_DIR) -- overridden here
+    # too, like GATE_LOG_DIR, so this test still proves HOME itself is never touched when
+    # every HOME-derived default is overridden.
+    proc = _gate(
+        repo,
+        "--only",
+        "git-modes",
+        HOME=str(home),
+        GATE_LOG_DIR=str(custom),
+        GATE_LOCK_FILE=str(tmp_path / "gate.lock"),
+    )
     assert proc.returncode == 0, proc.stdout
     assert not home.exists()  # the default directory is never created when overridden
     assert list(custom.glob("gate-*.log"))
@@ -262,6 +304,104 @@ def test_only_security_headers_and_zap_baseline_are_unknown_in_a_repo_without_th
     proc = _gate(_make_repo(tmp_path), "--only", "security-headers,zap-baseline,not-a-real-step")
     assert proc.returncode == 2, proc.stdout
     assert "unknown step: not-a-real-step" in proc.stdout + proc.stderr
+
+
+# --- global gate lock (T13.14.4, Paralelo-B) --------------------------------------------
+
+
+@needs_tools
+def test_a_second_invocation_queues_behind_the_first_and_prints_the_holder(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    lock_file = tmp_path / "gate.lock"
+    holder = _gate_popen(
+        repo,
+        "--only",
+        "git-modes",
+        GATE_LOCK_FILE=str(lock_file),
+        GATE_LOCK_TEST_SLEEP="2",
+    )
+    try:
+        # The holder file is written right after the lock is taken; poll instead of a
+        # fixed sleep so the test isn't racy under a slow/loaded machine.
+        deadline = time.time() + 5
+        while not (tmp_path / "gate.lock.holder").exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert (tmp_path / "gate.lock.holder").exists(), "holder never acquired the lock"
+
+        t_b_start = time.time()
+        waiter = _gate_popen(
+            repo, "--only", "git-modes", GATE_LOCK_FILE=str(lock_file), GATE_LOCK_TIMEOUT="10"
+        )
+        out, err = waiter.communicate(timeout=15)
+        elapsed = time.time() - t_b_start
+        assert waiter.returncode == 0, out + err
+        assert "waiting for the gate lock held by" in err
+        assert f"pid={holder.pid}" in err, err  # names the real holder, not a placeholder
+        assert elapsed >= 1.0, f"the second run finished in {elapsed:.2f}s -- it never queued"
+    finally:
+        holder.communicate(timeout=10)
+    assert holder.returncode == 0
+
+
+@needs_tools
+def test_the_lock_is_released_as_soon_as_the_holder_process_group_is_killed(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    lock_file = tmp_path / "gate.lock"
+    holder = _gate_popen(
+        repo,
+        "--only",
+        "git-modes",
+        GATE_LOCK_FILE=str(lock_file),
+        GATE_LOCK_TEST_SLEEP="30",
+    )
+    deadline = time.time() + 5
+    while not (tmp_path / "gate.lock.holder").exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert (tmp_path / "gate.lock.holder").exists(), "holder never acquired the lock"
+
+    os.killpg(os.getpgid(holder.pid), signal.SIGKILL)
+    holder.wait(timeout=10)
+
+    waiter = _gate_popen(
+        repo, "--only", "git-modes", GATE_LOCK_FILE=str(lock_file), GATE_LOCK_TIMEOUT="5"
+    )
+    out, err = waiter.communicate(timeout=15)
+    assert waiter.returncode == 0, out + err
+    assert "timed out" not in err  # acquired well inside the 5s timeout, not by exhausting it
+
+
+@needs_tools
+def test_a_waiter_fails_cleanly_when_the_timeout_is_shorter_than_the_hold(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    lock_file = tmp_path / "gate.lock"
+    holder = _gate_popen(
+        repo,
+        "--only",
+        "git-modes",
+        GATE_LOCK_FILE=str(lock_file),
+        GATE_LOCK_TEST_SLEEP="5",
+    )
+    try:
+        deadline = time.time() + 5
+        while not (tmp_path / "gate.lock.holder").exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert (tmp_path / "gate.lock.holder").exists(), "holder never acquired the lock"
+
+        waiter = _gate_popen(
+            repo, "--only", "git-modes", GATE_LOCK_FILE=str(lock_file), GATE_LOCK_TIMEOUT="1"
+        )
+        out, err = waiter.communicate(timeout=15)
+        assert waiter.returncode == 1, out + err
+        assert "FAIL: timed out after 1s waiting for the gate lock held by" in err
+    finally:
+        holder.communicate(timeout=15)
+    assert holder.returncode == 0
 
 
 def test_the_real_hook_and_gate_are_executable_in_git() -> None:
