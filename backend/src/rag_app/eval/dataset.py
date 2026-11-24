@@ -26,9 +26,7 @@ DEFAULT_GOLDEN_SET_V2 = REPO_ROOT / "eval" / "golden_set_v2.jsonl"
 
 # Router intents a golden-set v2 turn can expect (T14.2.3's `{intent, ...}` shape; "greeting" is
 # not a separate intent — a lone greeting is `chitchat`, fast-pathed by regex before the router).
-ALLOWED_INTENTS = frozenset(
-    {"security", "chitchat", "followup", "ambiguous", "off_topic"}
-)
+ALLOWED_INTENTS = frozenset({"security", "chitchat", "followup", "ambiguous", "off_topic"})
 ALLOWED_LANGUAGES = frozenset({"en", "es"})
 
 

@@ -17,7 +17,7 @@ The pre-14 pipeline classifies intent by regex and defaults to `security` for an
 not an exact greeting, so a single typo ("hol") routes straight into RAG and abstains; the SSE
 stream handler forwards only `request.question`, so a follow-up ("What about OS commands?") loses
 its subject; and the 14-item v1 golden set (English, single-turn, no chit-chat/typo/follow-up
-coverage) cannot measure any of this (findings F14.1–F14.7, `PHASE_PLANNING.md` §14). Fixing the
+coverage) cannot measure any of this (findings F14.1–F14.7 from the Phase 14 design review). Fixing the
 pipeline (later blocks) without first being able to measure it would mean shipping on faith.
 
 ## Decision — golden set v2 dialogue schema (T14.0.2/T14.0.3)
@@ -58,8 +58,8 @@ replacing it or forking a parallel format:
   exercise retrieval across a broad corpus, and every Spanish item is hand-written (the corpus
   itself is English-only), not a translated real document.
 - **Not yet consumed by the pipeline.** This block adds the schema and the fixture only; nothing
-  in `rag_app.eval.runner`, `generation.py` or the API reads `Dialogue` objects yet. The floors in
-  `PHASE_PLANNING.md` §14.0 are not measured until 14-A2 (runner + metrics) runs against this
+  in `rag_app.eval.runner`, `generation.py` or the API reads `Dialogue` objects yet. The floors
+  set for this sub-phase are not measured until 14-A2 (runner + metrics) runs against this
   fixture — a `Dialogue`/`Turn` that type-checks and passes its own schema tests is not proof the
   *questions* are well-chosen until a real eval run scores them.
 - **DEBT-006 probe is unverified.** `trunc-sqli-error-messages` targets a detail expected to sit
@@ -67,9 +67,9 @@ replacing it or forking a parallel format:
   `docs/TRD.md` §3), but this block has no DB/LLM access to actually run retrieval against it —
   whether it reproduces the truncation-recall loss is confirmed (or not) only when 14-A2 runs the
   real eval.
-- **Item count is a first pass, not a ceiling.** `PHASE_PLANNING.md` §14.0 names "~60 single-turn
-  items + 10 dialogues" for the whole 14.0 sub-phase; this block ships 38 + 10 = 48. The gap is
-  intentional headroom for the user's review pass (P14-D4), not a scope cut.
+- **Item count is a first pass, not a ceiling.** The Phase 14.0 plan calls for roughly 60
+  single-turn items + 10 dialogues for the whole sub-phase; this block ships 38 + 10 = 48. The gap
+  is intentional headroom for the user's review pass (P14-D4), not a scope cut.
 
 ## Rollback
 
