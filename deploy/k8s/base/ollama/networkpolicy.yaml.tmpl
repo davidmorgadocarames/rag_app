@@ -1,0 +1,31 @@
+# Egress-to-Ollama allow rule (T16.0.4), templated like endpointslice.yaml.tmpl because the host
+# IP is resolved fresh by scripts/k8s/cluster-up.sh on every (re)creation. Restricts the
+# backend's egress (once the backend Deployment exists, T16.1.1, labelled
+# app.kubernetes.io/name: backend) to the host's Ollama port only — not a blanket "reach any
+# host IP" rule.
+#
+# KNOWN BOUNDARY (self-reported, see docs/adr/adr_phase16_kubernetes.md "16-A" section): k3d's
+# default CNI (flannel, via k3s) does NOT enforce NetworkPolicy — this object is accepted by the
+# API server but has no effect on traffic until a NetworkPolicy-capable CNI (e.g. Calico) is
+# installed, T16.4.1's job (block 16-E). Applying it now is safe and documents the intended rule
+# ahead of time; it must be re-verified once a real CNI is in place.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-egress-ollama
+  namespace: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: ${OLLAMA_HOST_IP}/32
+      ports:
+        - protocol: TCP
+          port: 11434

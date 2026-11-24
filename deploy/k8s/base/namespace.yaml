@@ -1,0 +1,9 @@
+# The app namespace (T16.0.3/T16.0.4 need it to exist for the Ollama Service + smoke test).
+# Pod Security `restricted` labels are added at T16.4.2 (block 16-E) — not here, so this block's
+# plain smoke-test pod is never blocked by a policy this block did not come to implement.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag

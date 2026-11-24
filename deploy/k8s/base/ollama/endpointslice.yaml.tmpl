@@ -1,0 +1,23 @@
+# Template for the hand-managed EndpointSlice behind ollama-host (T16.0.4). Rendered by
+# scripts/k8s/cluster-up.sh with `envsubst` (only ${OLLAMA_HOST_IP} is substituted — the `$`
+# in apiVersion/kind is never touched) and applied with `kubectl apply -f -`; never committed
+# with a real IP, which changes every time Docker Desktop restarts.
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: ollama-host
+  namespace: secrag
+  labels:
+    kubernetes.io/service-name: ollama-host
+    app.kubernetes.io/name: ollama-host
+    app.kubernetes.io/part-of: secrag
+addressType: IPv4
+ports:
+  - name: http
+    protocol: TCP
+    port: 11434
+endpoints:
+  - addresses:
+      - "${OLLAMA_HOST_IP}"
+    conditions:
+      ready: true

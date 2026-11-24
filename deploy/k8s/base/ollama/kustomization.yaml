@@ -1,0 +1,7 @@
+# Ollama-access component base (T16.0.4). The EndpointSlice and NetworkPolicy are rendered from
+# their .tmpl siblings by scripts/k8s/cluster-up.sh (host IP substitution) and applied directly —
+# kustomize only builds the static Service here. 16.1.1 folds this directory in as a base.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - service.yaml

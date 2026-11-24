@@ -1,0 +1,19 @@
+# Selector-less Service for the native Ollama process running on the WSL2/Docker-Desktop host
+# (T16.0.4, reusing the T11.0.12 compose pattern: no Ollama container in the cluster). Because
+# this Service has no `selector`, Kubernetes' own EndpointSlice controller leaves it alone — the
+# matching EndpointSlice (same name, label `kubernetes.io/service-name: ollama-host`) is managed
+# by hand: scripts/k8s/cluster-up.sh resolves the host IP each time the cluster is (re)created
+# and applies it, because container IPs are not stable across a `cluster-down`/`cluster-up` cycle.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-host
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: ollama-host
+    app.kubernetes.io/part-of: secrag
+spec:
+  ports:
+    - name: http
+      port: 11434
+      protocol: TCP
