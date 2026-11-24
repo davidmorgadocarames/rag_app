@@ -23,7 +23,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: frontend
-          image: localhost:5050/secrag/frontend:placeholder
+          image: secrag-registry:5050/secrag/frontend:placeholder
           ports:
             - name: http
               containerPort: 3000

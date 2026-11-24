@@ -1,0 +1,82 @@
+# CloudNativePG Cluster (T16.1.4). 1 primary + 1 replica, spread across the 2 k3d agent nodes
+# (never the server node -- a `requiredDuringScheduling` pod anti-affinity on the instance role
+# label CNPG itself sets, same convention CNPG's own docs use for "across nodes" HA). Image:
+# the pgvector-enabled custom build from deploy/k8s/images/cnpg-postgres-pgvector/Dockerfile
+# (T16.1.4, TF32), pushed into the k3d-managed local registry by scripts/k8s/cluster-up.sh; the
+# in-cluster registry hostname is `secrag-registry:5050` (k3d's containerd mirror config), NOT
+# `localhost:5050` (that only resolves on the Docker host, where the image was built/pushed).
+#
+# bootstrap.initdb.secret names OUR OWN sealed/external secret (T16.1.3's secrag-db-credentials)
+# instead of letting CNPG generate a random one, so the SAME username/password the app Deployments
+# and the roles/migrate Jobs already read as DATABASE_URL (secrag-db-credentials.database-url) is
+# also the database's real owner credential -- one source of truth, no secret duplication beyond
+# the one unavoidable copy (the composed URL also contains the password).
+#
+# Barman Cloud backup target: the in-cluster S3 store (T16.1.5, SeaweedFS -- 16-A's T16.0.5
+# choice). See scheduledbackup.yaml for the actual backup schedule ("backup CronJobs",
+# T16.1.6 -- CNPG's own ScheduledBackup CR is the mechanism, not a bare Kubernetes CronJob; see
+# that file's header comment for the full mapping rationale).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: secrag-pg
+  namespace: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag
+spec:
+  instances: 2
+  imageName: secrag-registry:5050/secrag/cnpg-postgres-pgvector:16.10-pgvector0.8.7
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: 2Gi
+  affinity:
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+  bootstrap:
+    initdb:
+      database: rag
+      owner: rag
+      secret:
+        name: secrag-db-credentials
+      postInitApplicationSQL:
+        - "CREATE EXTENSION IF NOT EXISTS vector;"
+  # pgvector needs no shared_preload_libraries entry (CNPG manages that parameter itself and
+  # rejects a manual value -- "fixed configuration parameter", confirmed live): it is a pure
+  # SQL-level extension (CREATE EXTENSION vector), no background worker.
+  postgresql:
+    parameters:
+      log_error_verbosity: "terse"
+  # KNOWN BOUNDARY, found by the cluster smoke (self-reported, see the ADR): the compose/Azure
+  # model treats the "owner" role as a full Postgres superuser (the official postgres image's
+  # POSTGRES_USER always is one), which is what lets db/roles.sql's `CREATE ROLE ...` run as
+  # that same owner. CNPG's bootstrap owner is deliberately NOT a superuser (CNPG keeps its own
+  # internal `postgres` superuser private). db/roles.sql is outside this block's touches
+  # (deploy/k8s/**) and is read-only, unmodified -- so the fix lives here instead: CNPG's
+  # declarative role management grants the owner CREATEROLE (only the one extra attribute
+  # db/roles.sql's `DO $roles$` block needs), confirmed live against this cluster.
+  managed:
+    roles:
+      - name: rag
+        ensure: present
+        createrole: true
+        login: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://secrag-backups/
+      endpointURL: http://seaweedfs.secrag.svc.cluster.local:8333
+      s3Credentials:
+        accessKeyId:
+          name: seaweedfs-credentials
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: seaweedfs-credentials
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+    retentionPolicy: "14d"

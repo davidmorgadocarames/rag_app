@@ -4,6 +4,15 @@
 # subdirectory's own kustomization.yaml and comments.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+# BUG FOUND BY THE CLUSTER SMOKE (16-B): a generated resource (jobs/kustomization.yaml's
+# roles-scripts configMapGenerator) has no `metadata.namespace` of its own (configMapGenerator
+# never sets one) -- it silently landed in the `default` namespace on `kubectl apply`, not
+# `secrag`, with NO error (`kubectl apply` happily creates a cluster-scoped-looking object
+# wherever the current context's default namespace is). `namespace:` here applies Kustomize's
+# namespace transformer to EVERY resource in this base (hand-written ones already say
+# `namespace: secrag` explicitly, so this is a no-op for them; it is NOT a no-op for any
+# existing or future generated resource).
+namespace: secrag
 resources:
   - namespace.yaml
   - ollama
@@ -11,3 +20,4 @@ resources:
   - frontend
   - jobs
   - gateway
+  - cnpg

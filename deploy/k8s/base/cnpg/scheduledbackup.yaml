@@ -1,0 +1,24 @@
+# "Backup CronJobs" for T16.1.6, mapped onto CNPG's own ScheduledBackup CR rather than a bare
+# Kubernetes CronJob running scripts/db/backup.sh: T16.1.4 already decided the backup mechanism
+# is Barman Cloud to the in-cluster S3 store (PHASE_PLANNING 16.1), and scripts/db/backup.sh's
+# `--blob` mode is Azure-Blob-specific (different storage API, different retention lifecycle
+# rule) -- re-pointing it at a different object store would duplicate what Barman Cloud/CNPG
+# already does natively and correctly for a Postgres cluster it manages (continuous WAL
+# archiving + scheduled base backups, point-in-time recovery). Operationally this IS a
+# "scheduled backup job": CNPG's own backup controller creates a `Backup` object on this
+# schedule and runs it as a Job under the hood. Daily at 03:00, same time-of-day as the existing
+# Azure backup Job's post-promotion cron (deploy/azure/jobs/backup.yaml: "0 3 * * *").
+# Retention: Cluster.spec.backup.retentionPolicy = 14d (X9), set in cluster.yaml.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: secrag-pg-backup
+  namespace: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag
+spec:
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: secrag-pg
+  method: barmanObjectStore

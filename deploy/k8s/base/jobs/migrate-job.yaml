@@ -27,7 +27,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: migrate
-          image: localhost:5050/secrag/jobs:placeholder
+          image: secrag-registry:5050/secrag/jobs:placeholder
           command: ["alembic", "upgrade", "head"]
           envFrom:
             - configMapRef:
