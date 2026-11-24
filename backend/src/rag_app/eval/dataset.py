@@ -66,9 +66,12 @@ def load_golden_set(path: Path = DEFAULT_GOLDEN_SET) -> list[GoldenItem]:
 class Turn:
     """One user message inside a dialogue and what the pipeline is expected to do with it.
 
-    `expected_doc`/`answerable`/`ground_truth` only apply to turns the pipeline is expected to
-    retrieve/answer (`expected_intent in {"security", "followup"}`); chit-chat/ambiguous/off-topic
-    turns leave them `None`.
+    `expected_doc`/`ground_truth` only apply to turns the pipeline is expected to retrieve/answer
+    (`expected_intent in {"security", "followup"}`) and are `None` otherwise. `answerable` follows
+    the same rule for turns that DO carry it, but a chit-chat/ambiguous/off-topic turn MAY also set
+    it explicitly to `False` (as every `off_topic` item in `eval/golden_set_v2.jsonl` does, to say
+    plainly "never give an uncited answer here") rather than leaving it `None` — both spellings are
+    valid; no test or metric distinguishes them (DA-14-A1-2).
     """
 
     message: str

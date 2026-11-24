@@ -60,7 +60,7 @@ sentence sits near the end can be scored on a prefix that omits it and never rea
 a silent recall loss the current 14-item golden set cannot detect. Golden-set items that
 specifically exercise this ("late sentence in a long chunk") are **deferred to Phase 14.0**
 (golden-set expansion), not added now (user decision, 2026-10-05). **14-A1 adds one probe item**
-(`trunc-sqli-error-messages` in `eval/golden_set_v2.jsonl`, §15.1) targeting a detail that
+(`trunc-sqli-error-messages` in `eval/golden_set_v2.jsonl`, §6.1) targeting a detail that
 typically sits late in a long cheat-sheet section; full confirmation (does it actually miss
 retrieval under the real reranker) happens when 14-A2 runs the eval against it, not in this
 schema-only block.
