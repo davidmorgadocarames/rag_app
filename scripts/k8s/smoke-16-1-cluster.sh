@@ -59,6 +59,26 @@ else
   bad "db-roles-applied" "expected 2 roles (secrag_purger, secrag_backup), found $roles_present"
 fi
 
+echo "[smoke-16-1-cluster] T16.1.6 CronJobs exist with the right schedule/suspend state"
+purge_schedule="$(kubectl -n "$NS" get cronjob purge -o jsonpath='{.spec.schedule}' 2>/dev/null || true)"
+if [ "$purge_schedule" = "0 * * * *" ]; then
+  ok "purge-cronjob-hourly"
+else
+  bad "purge-cronjob-hourly" "schedule is '$purge_schedule', expected '0 * * * *'"
+fi
+audit_suspended="$(kubectl -n "$NS" get cronjob audit-retention -o jsonpath='{.spec.suspend}' 2>/dev/null || true)"
+if [ "$audit_suspended" = "true" ]; then
+  ok "audit-retention-cronjob-suspended-as-documented"
+else
+  bad "audit-retention-cronjob-suspended-as-documented" "suspend='$audit_suspended', expected 'true' (no audit_log table until Phase 15)"
+fi
+cnpg_sched_backup="$(kubectl -n "$NS" get scheduledbackup secrag-pg-backup -o jsonpath='{.spec.cluster.name}' 2>/dev/null || true)"
+if [ "$cnpg_sched_backup" = "secrag-pg" ]; then
+  ok "cnpg-scheduledbackup-targets-secrag-pg"
+else
+  bad "cnpg-scheduledbackup-targets-secrag-pg" "got '$cnpg_sched_backup'"
+fi
+
 echo "[smoke-16-1-cluster] waiting for in-cluster services"
 for svc in mailpit valkey seaweedfs kube-state-metrics prometheus; do
   if kubectl -n "$NS" wait --for=condition=Available "deployment/$svc" --timeout=120s >/dev/null 2>&1; then

@@ -8,6 +8,8 @@ resources:
   - configmap.yaml
   - roles-job.yaml
   - migrate-job.yaml
+  - purge-cronjob.yaml
+  - audit-retention-cronjob.yaml
 configMapGenerator:
   - name: roles-scripts
     files:

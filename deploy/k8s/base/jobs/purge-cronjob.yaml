@@ -1,0 +1,65 @@
+# Hourly erasure purge CronJob (T16.1.6). Mirrors deploy/azure/jobs/purge.yaml's command exactly
+# (`python -m rag_app.erasure purge` -- batched, resumable, advisory-locked: an overlapping run
+# is skipped, never double-processed) and its schedule ("0 * * * *"), on the slim `jobs` image,
+# running as the least-privilege role `secrag_purger` (T16.1.1's roles Job grants it LOGIN).
+# Unlike the local compose stack's own `purger` service (a long-lived loop container, T11.2b.6),
+# this is a real Kubernetes CronJob -- closer to the Azure Container Apps Schedule Job shape.
+# Tombstone exports go to an emptyDir (`/tombstones`) -- fine for a local/dev cluster (the
+# compose stack's own ./.tombstones bind mount plays the same throwaway-export role locally);
+# a cluster-level PVC for cross-run tombstone retention (TOMBSTONE_EXPORT_RETENTION_DAYS = 30,
+# backend/src/rag_app/retention.py) is a follow-up, not required for this block's Done-when.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: purge
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: purge
+    app.kubernetes.io/part-of: secrag
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: purge
+            app.kubernetes.io/part-of: secrag
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: purge
+              image: secrag-registry:5050/secrag/jobs:placeholder
+              command: ["python", "-m", "rag_app.erasure", "purge", "--export-dir", "/tombstones"]
+              envFrom:
+                - configMapRef:
+                    name: jobs-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: app-secrets
+                      key: SECRAG_PURGER_DATABASE_URL
+              volumeMounts:
+                - name: tombstones
+                  mountPath: /tombstones
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: tombstones
+              emptyDir: {}

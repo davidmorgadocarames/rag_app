@@ -1,0 +1,66 @@
+# Audit retention CronJob (T16.1.6) -- KNOWN BOUNDARY, self-reported per the orchestrator's
+# instruction (DEC-051's same spirit): Phase 15's "audit log = append-only Postgres table"
+# (D15.2, PHASE_PLANNING 15.2) has NOT merged to `main` yet as of this branch's base (confirmed:
+# no audit_log table in backend/src/rag_app/db/models.py, no retention CLI command anywhere in
+# backend/src/rag_app -- grepped the real repo, read-only, before writing this file). There is
+# today no table to retain and no command to run against it. `suspend: true` ships the manifest
+# SHAPE now (so kustomize build/kubeconform/kube-linter exercise it, and the CronJob exists and
+# is ready the moment Phase 15 lands) without pretending it does real work it cannot do yet.
+# The command below is a PLACEHOLDER module path (`rag_app.audit retain`) that does not exist
+# yet -- whichever Phase-15 block adds the real audit log + retention command must (a) implement
+# that module/command and (b) flip `suspend` to `false` here. Schedule mirrors the purge
+# CronJob's cadence class (daily, not hourly -- retention is a housekeeping sweep, not a
+# user-facing SLA) at 02:00, ahead of the CNPG ScheduledBackup's 03:00 (T16.1.4) so a backup
+# always reflects the already-retained state.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-retention
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: audit-retention
+    app.kubernetes.io/part-of: secrag
+  annotations:
+    secrag.io/known-boundary: "suspended until Phase 15's audit_log table + retention command land (see this file's header comment)"
+spec:
+  schedule: "0 2 * * *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: audit-retention
+            app.kubernetes.io/part-of: secrag
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: audit-retention
+              image: secrag-registry:5050/secrag/jobs:placeholder
+              command: ["python", "-m", "rag_app.audit", "retain"]
+              envFrom:
+                - configMapRef:
+                    name: jobs-config
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: secrag-db-credentials
+                      key: database-url
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 128Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                capabilities:
+                  drop: ["ALL"]
