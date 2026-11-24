@@ -4,8 +4,9 @@
 # (DATABASE_URL, ENV).
 #
 # Must run and complete AFTER the roles Job and BEFORE the backend Deployment is rolled out
-# (same apply-order note as roles-job.yaml; enforced by scripts/k8s/deploy-local.sh, not by
-# Kustomize itself).
+# (same apply-order note as roles-job.yaml; enforced by scripts/k8s/deploy-local.sh -- DA-16-B-1
+# fix, 16-B-fix -- not by Kustomize itself: `deploy-local.sh` fail-closes, exit code 6, if this
+# Job does not reach Complete in time, and never applies backend/frontend in that case).
 apiVersion: batch/v1
 kind: Job
 metadata:

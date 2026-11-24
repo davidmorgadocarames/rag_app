@@ -252,3 +252,78 @@ five in-cluster services actually reached `Running`/`Ready`. `scripts/k8s/smoke-
 re-runs this whole chain (19 checks) on demand; `scripts/k8s/smoke-16-1.sh` covers the
 cluster-free half (kustomize build + kubeconform + kube-linter on both overlays, the T16.1.2
 "aks has no dev-only flag" Done-when).
+
+### 16-B-fix — DA-16-B-1 apply-ordering script + structural SealedSecret test (T16.1.1/T16.1.6)
+
+**The blocker (DA-16-B.md).** The 16-B section above, and the manifests themselves
+(`migrate-job.yaml`, `roles-job.yaml`, `backend/deployment.yaml`, `cluster-up.sh`) all claimed
+Job ordering was "enforced by `scripts/k8s/deploy-local.sh`" — a script that did not exist
+anywhere in the repo (`status/failures.md` F20). `smoke-16-1-cluster.sh` only ever did a single
+flat `kustomize build | kubectl apply` of the whole overlay: roles Job, migrate Job and
+backend/frontend Deployments were all submitted at once, with no ordering at all. The bug was
+never observable because backend/frontend/jobs images are still `:placeholder` — real pods never
+start, so a real "backend before migration finished" race was never exercised.
+
+**The fix: `scripts/k8s/deploy-local.sh`.** A single ordered-apply script, idempotent, enforcing
+exactly the sequence the manifests already described: namespace → wait for the 3 controllers'
+CRDs/Deployments to be ready (pre-installed by `cluster-up.sh`, this is a readiness check, not an
+install) → every other non-order-critical resource (SealedSecrets, ConfigMaps, RBAC, Services,
+CronJobs, the Gateway/HTTPRoute stack — none of these has a correctness dependency on the stages
+below) → the CNPG `Cluster` + `ScheduledBackup`, wait Ready → the `roles` Job, wait Complete → the
+`migrate` Job, wait Complete → the backend/frontend Deployments, `kubectl rollout status` both.
+Every wait is **fail-closed**: a distinct exit code per stage (3 controllers, 4 CNPG, 5 roles, 6
+migrate, 7 rollout) and the script stops immediately — it never reaches a later stage — if a wait
+does not succeed in time. `smoke-16-1-cluster.sh` now calls this script instead of the flat
+apply, and treats exit code 6 (migrate Job did not Complete) as the expected, documented X1
+outcome today (placeholder `jobs` image can never pull), not a smoke failure — every other
+non-zero exit code still fails the smoke.
+
+Splits the kustomize-built multi-document YAML into per-document files, indexed by
+`kind`/`metadata.name` via `awk` (no `yq` in this environment, same convention as the rest of
+this repo's k8s scripts), so each stage can `kubectl apply -f` only the resources it owns.
+
+**Proof the ordering is real, not just asserted (this fix's own Done-when).** Two kinds of
+evidence, since the app images are still placeholders and the real race can therefore never be
+observed end-to-end on this cluster today:
+1. **Offline, dry-run trace** (`backend/tests/test_k8s_deploy_order.py`, runs under the `pytest`
+   gate step, no cluster/kustomize needed): `deploy-local.sh --dry-run --trace FILE` walks the
+   exact same function-call order the real path uses (each stage logs its own keyword before the
+   real/skipped action), and the test asserts the full sequence — in particular that
+   `CHECK_MIGRATE_JOB_COMPLETE` always precedes `APPLY_APPS`. This fails on the pre-fix code
+   trivially: the script did not exist.
+2. **Real cluster run, up to the Jobs.** Against a live k3d cluster (CNPG image rebuilt/pushed by
+   hand — no scripted build/push step exists yet, see the F20 fix below), `deploy-local.sh`
+   really reached `Cluster in healthy state`, really completed the `roles` Job, then really timed
+   out waiting on the `migrate` Job (placeholder `jobs` image, `ImagePullBackOff`) and exited 6 —
+   confirmed with `kubectl get deployment backend frontend` returning `NotFound` immediately
+   after: the ordering genuinely prevented the backend/frontend Deployments from ever being
+   applied, not merely from becoming Ready.
+
+**Structural SealedSecret test (DEC-055).** Independent of whichever gitleaks-allowlist option
+the user picks for DEC-055, `backend/tests/test_k8s_sealed_secrets.py` (wired into the `pytest`
+gate step) asserts every YAML document in any `deploy/k8s/**/sealed-secrets.yaml` is
+`bitnami.com/v1alpha1` `SealedSecret` with only `spec.encryptedData` populated (no `stringData`,
+no plain `data`, on the spec or its `template`), and that no plain `kind: Secret` with a
+`data`/`stringData` block exists anywhere under `deploy/k8s`. A deterministic YAML-shape
+assertion, not a heuristic — it would catch a real `kind: Secret`/`stringData` landing in that
+file even if gitleaks' own rule were ever disabled or missed it.
+
+**F20 self-check, 2 more findings fixed (same class as the original blocker, found while
+auditing every path this fix's own comments reference).**
+- `deploy/k8s/base/backend/configmap.yaml` referenced
+  `deploy/k8s/base/secrets/app-secrets.sealedsecret.yaml` — that path never existed; the real
+  file is `deploy/k8s/overlays/local/sealed-secrets.yaml` (T16.1.3). Fixed.
+- `deploy/k8s/images/cnpg-postgres-pgvector/Dockerfile` and `backend/deployment.yaml` both
+  claimed the pgvector/backend image build+push was performed by an existing script
+  (`cluster-up.sh` / `deploy-local.sh`). Neither script builds or pushes any image — the pgvector
+  image used by every verification in this ADR (16-B and 16-B-fix) was built and pushed by hand.
+  **Self-reported boundary, not yet fixed in code:** a scripted local build+push step for the
+  pgvector/backend/frontend/jobs images does not exist yet; a later block (T16.1.7/16.2-adjacent)
+  should add one. Comments corrected to say so plainly instead of asserting a mechanism that
+  isn't there.
+
+**Known boundary (self-reported, not a regression).** `deploy-local.sh`'s migrate-Job wait will
+legitimately fail-closed (exit 6) on every real local run until that scripted build+push step
+above exists and produces a real `jobs` image — this is the CORRECT behaviour (refuse the
+backend rollout, not "usually" refuse), not a bug to silence; `smoke-16-1-cluster.sh`'s own
+comment header says so.

@@ -15,8 +15,10 @@
 # Must run and complete BEFORE the migrate Job (ALTER DEFAULT PRIVILEGES must be set by the
 # OWNER role before any table is created) and before the backend Deployment is rolled out.
 # Kustomize has no native Job-ordering primitive; scripts/k8s/deploy-local.sh (T16.1's own apply
-# script, see the ADR) applies+waits for this Job, then the migrate Job, then the apps -- the
-# same "images -> migrate Job -> apps -> Jobs" order X1 already uses for the Azure CD pipeline.
+# script, DA-16-B-1 fix / 16-B-fix, see the ADR) applies+waits for this Job, then the migrate
+# Job, then the apps -- the same "images -> migrate Job -> apps -> Jobs" order X1 already uses
+# for the Azure CD pipeline. Fail-closed: deploy-local.sh exits non-zero (never reaching the
+# migrate/apps stages) if this Job does not Complete in time.
 apiVersion: batch/v1
 kind: Job
 metadata:

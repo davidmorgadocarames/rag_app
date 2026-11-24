@@ -1,8 +1,10 @@
 # Backend Deployment (T16.1.1). No HPA here (KEDA owns scaling from T16.3, TF37) -- a plain,
 # fixed-replica Deployment. Image is a PLACEHOLDER (same X1 pattern as deploy/azure/jobs/*.yaml):
-# the local registry build/push step (scripts/k8s/deploy-local.sh) or CD-by-digest on a future
-# Azure path sets the real tag/digest; this file is never applied with the placeholder tag as
-# the real running image.
+# a local image build/push step (not yet written -- T16.1.7/16.2) or CD-by-digest on a future
+# Azure path sets the real tag/digest. F20 fix, 16-B-fix: scripts/k8s/deploy-local.sh does NOT
+# build or push images -- it only applies this Deployment (and waits for the migrate Job to
+# Complete first, fail-closed); until a real tag/digest exists, this file's own placeholder
+# pods never start (ErrImagePull/ImagePullBackOff, X1 convention), which is expected, not a bug.
 #
 # Probes are intentionally simple (startup+readiness+liveness all on GET /health) -- T16.2
 # (health/lifecycle, T16.2.1) owns the real probe split (startup: model load, generous;

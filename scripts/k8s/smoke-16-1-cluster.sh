@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# In-cluster smoke for block 16-B (T16.1.1-T16.1.6): "the local overlay comes up" against an
-# already-up cluster (scripts/k8s/cluster-up.sh, which installs the Envoy Gateway/Sealed
-# Secrets/CloudNativePG controllers). Applies the local overlay for real and checks every piece
+# In-cluster smoke for block 16-B/16-B-fix (T16.1.1-T16.1.6): "the local overlay comes up"
+# against an already-up cluster (scripts/k8s/cluster-up.sh, which installs the Envoy Gateway/
+# Sealed Secrets/CloudNativePG controllers). Applies the local overlay for real -- via
+# scripts/k8s/deploy-local.sh (DA-16-B-1 fix: the apply-ordering script, not a flat
+# `kustomize build | kubectl apply` -- the ordering itself is this script's own regression test,
+# see backend/tests/test_k8s_deploy_order.py for the offline proof) -- and checks every piece
 # that `kustomize build`/kubeconform/kube-linter (scripts/k8s/smoke-16-1.sh) cannot: SealedSecrets
 # really decrypt, CNPG really reaches "Cluster in healthy state" with pgvector installed, the
 # roles Job really runs db/roles.sql against it, and the in-cluster services (Valkey, SeaweedFS,
 # kube-state-metrics, Prometheus, Mailpit) really start and (for Prometheus) really scrape
-# kube-state-metrics successfully. Does NOT require the backend/frontend/jobs images to be real
-# (they are still placeholders, X1 convention) -- ErrImagePull/ImagePullBackOff on those three is
-# expected and not treated as a failure here; building real app images is a separate CI/CD
-# concern outside this block.
+# kube-state-metrics successfully.
+#
+# X1 placeholder-image note: the backend/frontend/jobs images are all still `:placeholder`, so
+# the migrate Job can never pull and deploy-local.sh correctly fail-closes (exit code 6,
+# EXIT_MIGRATE_JOB_FAILED) BEFORE ever applying the backend/frontend Deployments -- that specific
+# exit code is treated as an expected, documented X1 outcome below, not a smoke failure; any
+# OTHER exit code from deploy-local.sh is. Building real app images is a separate CI/CD concern
+# outside this block.
 #
 #   scripts/k8s/smoke-16-1-cluster.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NS="secrag"
+EXIT_MIGRATE_JOB_FAILED=6   # must stay in sync with deploy-local.sh's own exit code
 pass=0
 fail=0
 
@@ -25,19 +32,30 @@ bad() { echo "FAIL $1: $2"; fail=$((fail + 1)); }
 
 kubectl get namespace >/dev/null 2>&1 || { echo "no cluster reachable -- run cluster-up.sh first" >&2; exit 2; }
 
-echo "[smoke-16-1-cluster] applying the local overlay"
-kustomize build --load-restrictor LoadRestrictionsNone "$REPO_ROOT/deploy/k8s/overlays/local" \
-  | kubectl apply -f - >/dev/null
+echo "[smoke-16-1-cluster] applying the local overlay via scripts/k8s/deploy-local.sh (ordered)"
+deploy_rc=0
+MIGRATE_TIMEOUT="${MIGRATE_TIMEOUT:-20s}" "$SCRIPT_DIR/deploy-local.sh" || deploy_rc=$?
+case "$deploy_rc" in
+  0)
+    ok "deploy-local-apply-order (full success, including backend/frontend rollout)"
+    ;;
+  "$EXIT_MIGRATE_JOB_FAILED")
+    ok "deploy-local-apply-order (migrate Job did not complete -- expected with the X1 placeholder jobs image; backend/frontend correctly NOT applied)"
+    ;;
+  *)
+    bad "deploy-local-apply-order" "deploy-local.sh exited $deploy_rc (expected 0 or $EXIT_MIGRATE_JOB_FAILED)"
+    ;;
+esac
 
-echo "[smoke-16-1-cluster] waiting for the roles Job"
-if kubectl -n "$NS" wait --for=condition=Complete job/roles --timeout=120s >/dev/null 2>&1; then
+echo "[smoke-16-1-cluster] roles Job (already applied+waited by deploy-local.sh -- re-checking, not re-applying)"
+if [ "$(kubectl -n "$NS" get job roles -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)" = "True" ]; then
   ok "roles-job-completes"
 else
   bad "roles-job-completes" "$(kubectl -n "$NS" logs job/roles 2>&1 | tail -5)"
 fi
 
-echo "[smoke-16-1-cluster] waiting for the CNPG cluster"
-if kubectl -n "$NS" wait --for=condition=Ready cluster/secrag-pg --timeout=180s >/dev/null 2>&1; then
+echo "[smoke-16-1-cluster] CNPG cluster (already applied+waited by deploy-local.sh -- re-checking, not re-applying)"
+if kubectl -n "$NS" get cluster secrag-pg -o jsonpath='{.status.phase}' 2>/dev/null | grep -q "Cluster in healthy state"; then
   ok "cnpg-cluster-ready"
 else
   bad "cnpg-cluster-ready" "$(kubectl -n "$NS" get cluster secrag-pg -o jsonpath='{.status.phase}')"

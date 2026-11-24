@@ -13,8 +13,12 @@
 # binary built against the EXACT server headers this image runs, which an externally-built .deb
 # cannot guarantee.
 #
-# Built + pushed into the k3d-managed local registry by scripts/k8s/cluster-up.sh (never on
-# Azure -- Phase 16 is local-only); the resulting LOCAL tag is referenced by
+# Built + pushed into the k3d-managed local registry BY HAND today (`docker build` +
+# `docker push localhost:5050/...` -- F20 fix, 16-B-fix: no script does this automatically yet;
+# neither cluster-up.sh nor scripts/k8s/deploy-local.sh builds or pushes any image, they only
+# apply manifests against whatever is already in the registry). A later block
+# (T16.1.7/16.2-adjacent) should turn this into a scripted build+push step; never on Azure --
+# Phase 16 is local-only. The resulting LOCAL tag is referenced by
 # deploy/k8s/base/cnpg/cluster.yaml. A locally built image has no meaningful upstream digest to
 # pin ahead of time (unlike a published registry image) -- reproducibility instead comes from
 # this Dockerfile's own pinned FROM digest + pinned pgvector tag, not from pinning the resulting
