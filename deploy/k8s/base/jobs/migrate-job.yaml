@@ -1,0 +1,51 @@
+# Migration Job (T16.1.1/T16.1.6): runs on the slim `jobs` image (Dockerfile.jobs), same image
+# as the backup/purge Jobs and the Azure migration Container Apps Job (deploy/azure/jobs/
+# migrate.yaml) -- never the backend image (T11.2.5's rule). Reads JobSettings only
+# (DATABASE_URL, ENV).
+#
+# Must run and complete AFTER the roles Job and BEFORE the backend Deployment is rolled out
+# (same apply-order note as roles-job.yaml; enforced by scripts/k8s/deploy-local.sh, not by
+# Kustomize itself).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: migrate
+    app.kubernetes.io/part-of: secrag
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+        app.kubernetes.io/part-of: secrag
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: migrate
+          image: localhost:5050/secrag/jobs:placeholder
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: jobs-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: secrag-db-credentials
+                  key: database-url
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]

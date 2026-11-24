@@ -1,0 +1,81 @@
+# Database roles Job (T16.1.1, resolves DEC-051's note): runs db/roles.sql + the LOGIN/password
+# grants for secrag_purger and secrag_backup, exactly like the compose `db-roles` one-shot
+# service -- same image (pgvector/pgvector:pg16, which has perl + psql, unlike the slim `jobs`
+# image), same script, same roles.sql file, mounted from the repo via the `roles-scripts`
+# ConfigMap generated in kustomization.yaml (keys: roles.sql, apply_roles.sh,
+# scram_verifier.pl), so there is only ever one copy of each file.
+#
+# KNOWN BOUNDARY (DEC-051, self-reported per the orchestrator's instruction, see the ADR): this
+# Job packages TODAY's db/roles.sql, which only has `secrag_purger`/`secrag_backup` (NOLOGIN by
+# default). Phase 15's restricted app role + retention role + grants land in db/roles.sql only
+# at 15-P -- this Job will start applying them automatically the day that file changes (it reads
+# the repo's own db/roles.sql at kustomize-build time, nothing hardcoded), but the Phase-15
+# hardening itself is not yet in this cluster's roles.
+#
+# Must run and complete BEFORE the migrate Job (ALTER DEFAULT PRIVILEGES must be set by the
+# OWNER role before any table is created) and before the backend Deployment is rolled out.
+# Kustomize has no native Job-ordering primitive; scripts/k8s/deploy-local.sh (T16.1's own apply
+# script, see the ADR) applies+waits for this Job, then the migrate Job, then the apps -- the
+# same "images -> migrate Job -> apps -> Jobs" order X1 already uses for the Azure CD pipeline.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: roles
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: roles
+    app.kubernetes.io/part-of: secrag
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: roles
+        app.kubernetes.io/part-of: secrag
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: roles
+          image: docker.io/pgvector/pgvector@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
+          command: ["bash", "/secrag/scripts/db/apply_roles.sh"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: secrag-db-credentials
+                  key: database-url
+            - name: SECRAG_PURGER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: SECRAG_PURGER_PASSWORD
+                  optional: true
+            - name: SECRAG_BACKUP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: SECRAG_BACKUP_PASSWORD
+                  optional: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: roles-scripts
+              mountPath: /secrag/db/roles.sql
+              subPath: roles.sql
+            - name: roles-scripts
+              mountPath: /secrag/scripts/db/apply_roles.sh
+              subPath: apply_roles.sh
+            - name: roles-scripts
+              mountPath: /secrag/scripts/db/scram_verifier.pl
+              subPath: scram_verifier.pl
+      volumes:
+        - name: roles-scripts
+          configMap:
+            name: roles-scripts
+            defaultMode: 0555

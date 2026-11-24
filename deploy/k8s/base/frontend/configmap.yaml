@@ -1,0 +1,14 @@
+# Frontend non-secret configuration (T16.1.1). BACKEND_URL is the in-cluster backend Service
+# DNS name -- the BFF route handlers (app/api/[...path]) call it server-side only, never from the
+# browser bundle (same pattern as docker-compose.yml's frontend.environment.BACKEND_URL).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: secrag
+data:
+  BACKEND_URL: "http://backend.secrag.svc.cluster.local:8000"
+  CLIENT_IP_TRUSTED_HOPS: "0"

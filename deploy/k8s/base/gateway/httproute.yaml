@@ -1,0 +1,41 @@
+# Single HTTPRoute: every path goes to the frontend Service (the Next.js BFF's
+# app/api/[...path] catch-all already proxies /api/* to the backend server-side -- see
+# docker-compose.yml's own frontend.BACKEND_URL comment). Two rules, same backendRef, different
+# `timeouts` (Gateway API v1 GEP-1742, supported by Envoy Gateway): the SSE chat stream
+# (POST /api/chat/stream, T11.3's streaming answer) needs a long request timeout for an
+# open-ended stream; everything else keeps a normal request timeout so a hung backend fails
+# fast instead of holding a connection forever.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: secrag
+  namespace: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag
+spec:
+  parentRefs:
+    - name: secrag-gateway
+  hostnames:
+    - "secrag.localtest.me"
+  rules:
+    # SSE stream: long request/backend timeout, no idle cutoff from the Gateway's side.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/chat/stream
+      timeouts:
+        request: 300s
+        backendRequest: 300s
+      backendRefs:
+        - name: frontend
+          port: 3000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      timeouts:
+        request: 30s
+        backendRequest: 30s
+      backendRefs:
+        - name: frontend
+          port: 3000

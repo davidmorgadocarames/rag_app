@@ -1,0 +1,18 @@
+# T16.1.1/T16.1.6. The roles-scripts ConfigMap is generated FROM the repo's real db/roles.sql +
+# scripts/db/apply_roles.sh + scripts/db/scram_verifier.pl (relative paths below) -- read-only,
+# never copied/duplicated into deploy/k8s/** -- so the roles Job always packages today's actual
+# files (DEC-051).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - configmap.yaml
+  - roles-job.yaml
+  - migrate-job.yaml
+configMapGenerator:
+  - name: roles-scripts
+    files:
+      - roles.sql=../../../../db/roles.sql
+      - apply_roles.sh=../../../../scripts/db/apply_roles.sh
+      - scram_verifier.pl=../../../../scripts/db/scram_verifier.pl
+generatorOptions:
+  disableNameSuffixHash: true

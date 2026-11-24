@@ -1,0 +1,36 @@
+# Envoy Gateway (P16-D2, pinned chart -- scripts/k8s/cluster-up.sh installs the controller +
+# CRDs, see the ADR's "Living-graph deviation" note for why that script change lives outside
+# deploy/k8s/**). This file only defines the GatewayClass + Gateway *resources*: any
+# NetworkPolicy-capable CNI / controller version is a cluster-level concern, not a kustomize
+# base concern.
+#
+# hostname "secrag.localtest.me" is a public wildcard DNS name that resolves to 127.0.0.1 -- the
+# usual convention for local Gateway API testing (see backend/configmap.yaml's comment on
+# FRONTEND_ORIGIN/PUBLIC_APP_URL for the known boundary: no host port is mapped to this
+# Gateway's LoadBalancer Service yet).
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: secrag-envoy
+  labels:
+    app.kubernetes.io/part-of: secrag
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: secrag-gateway
+  namespace: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag
+spec:
+  gatewayClassName: secrag-envoy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "secrag.localtest.me"
+      allowedRoutes:
+        namespaces:
+          from: Same

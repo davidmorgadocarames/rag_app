@@ -1,0 +1,84 @@
+# Backend Deployment (T16.1.1). No HPA here (KEDA owns scaling from T16.3, TF37) -- a plain,
+# fixed-replica Deployment. Image is a PLACEHOLDER (same X1 pattern as deploy/azure/jobs/*.yaml):
+# the local registry build/push step (scripts/k8s/deploy-local.sh) or CD-by-digest on a future
+# Azure path sets the real tag/digest; this file is never applied with the placeholder tag as
+# the real running image.
+#
+# Probes are intentionally simple (startup+readiness+liveness all on GET /health) -- T16.2
+# (health/lifecycle, T16.2.1) owns the real probe split (startup: model load, generous;
+# readiness: DB + dependencies; liveness: process only) plus maxUnavailable: 0, preStop and PDBs.
+# This Deployment's rolling-update strategy is left at the Kubernetes default for the same reason.
+#
+# securityContext is deliberately partial: allowPrivilegeEscalation/capabilities are safe to set
+# unconditionally, but `runAsNonRoot: true` is NOT set here because backend/Dockerfile does not
+# yet declare a non-root USER (unlike Dockerfile.jobs's USER 10001) -- setting it now would make
+# every backend pod CrashLoop. KNOWN BOUNDARY (self-reported, see the ADR): T16.4 (block 16-E,
+# Pod Security `restricted` on the app namespace) needs a non-root backend image; until then this
+# namespace cannot yet carry the `restricted` PSA label without breaking this Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: secrag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/part-of: secrag
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: backend
+          image: localhost:5050/secrag/backend:placeholder
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef:
+                name: backend-config
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: secrag-db-credentials
+                  key: database-url
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

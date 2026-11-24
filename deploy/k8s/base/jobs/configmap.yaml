@@ -1,0 +1,12 @@
+# Shared non-secret config for every Job/CronJob in this directory (T16.1.1/T16.1.6). Jobs read
+# JobSettings only (DATABASE_URL, ENV) -- never JWT_SECRET/DATA_MASTER_KEY (T11.2.2's rule,
+# reused as-is for the k3d Jobs).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jobs-config
+  namespace: secrag
+  labels:
+    app.kubernetes.io/part-of: secrag
+data:
+  ENV: "prod"

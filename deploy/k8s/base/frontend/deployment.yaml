@@ -1,0 +1,60 @@
+# Frontend Deployment (T16.1.1). No HPA (KEDA/T16.3 owns it, CPU-based for the frontend per
+# PHASE_PLANNING 16.3). Probes on the BFF's own /api/health route (frontend/app/api/health).
+# Image is a PLACEHOLDER, same convention as backend/deployment.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: secrag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/part-of: secrag
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: frontend
+          image: localhost:5050/secrag/frontend:placeholder
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: frontend-config
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            failureThreshold: 20
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

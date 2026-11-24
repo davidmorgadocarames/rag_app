@@ -1,0 +1,36 @@
+# Backend non-secret configuration (T16.1.1). Mirrors docker-compose.yml's backend service env
+# block, minus every value that is a credential/secret (those are in
+# deploy/k8s/base/secrets/app-secrets.sealedsecret.yaml, consumed via envFrom secretRef).
+#
+# OLLAMA_HOST points at the selector-less Service from T16.0.4 (base/ollama) -- the SAME native
+# WSL/host Ollama the compose stack reaches, never a containerised one (D16.1).
+#
+# FRONTEND_ORIGIN / PUBLIC_APP_URL use the Gateway's hostname (base/gateway/gateway.yaml,
+# "secrag.localtest.me" -- a public wildcard DNS name that resolves to 127.0.0.1, the usual
+# convention for local k8s HTTP testing), not the in-cluster Service DNS name: both values are
+# compared against the browser's Origin/Host header, which is the externally-visible hostname,
+# never a cluster-internal one. KNOWN BOUNDARY (self-reported, see the ADR): cluster-up.sh does
+# not map a host port to the Gateway's LoadBalancer Service yet (no `-p` flag at `k3d cluster
+# create` time) -- this block's own cluster smoke test reaches the Gateway via `kubectl
+# port-forward` + a spoofed Host header, which does not need a mapped port. Real interactive
+# browser access additionally needs `-p "<port>:80@loadbalancer"` added to cluster-up.sh (left
+# for a later block/developer need, not required by any T16.1 Done-when).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: secrag
+data:
+  ENV: "prod"
+  OLLAMA_HOST: "http://ollama-host.secrag.svc.cluster.local:11434"
+  DAILY_ANSWER_CAP: "1000"
+  FRONTEND_ORIGIN: "http://secrag.localtest.me"
+  METRICS_PORT: "9100"
+  PROMETHEUS_URL: "http://prometheus.secrag.svc.cluster.local:9090"
+  ADMIN_LIVE_MODE: "sse"
+  SMTP_HOST: "mailpit.secrag.svc.cluster.local"
+  SMTP_PORT: "1025"
+  PUBLIC_APP_URL: "http://secrag.localtest.me"
