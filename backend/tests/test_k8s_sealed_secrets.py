@@ -55,7 +55,9 @@ def test_sealed_secrets_file_is_sealedsecret_only(path: Path) -> None:
         assert "stringData" not in spec, f"{path}: SealedSecret spec must not carry stringData"
         assert "data" not in spec, f"{path}: SealedSecret spec must not carry plain data"
         template = spec.get("template", {})
-        assert "stringData" not in template, f"{path}: SealedSecret template must not carry stringData"
+        assert (
+            "stringData" not in template
+        ), f"{path}: SealedSecret template must not carry stringData"
         assert "data" not in template, f"{path}: SealedSecret template must not carry plain data"
 
 

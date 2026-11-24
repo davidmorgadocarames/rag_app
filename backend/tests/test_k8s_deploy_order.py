@@ -46,9 +46,11 @@ def _run_trace() -> list[str]:
             timeout=30,
             check=False,
         )
-        assert result.returncode == 0, (
-            f"--dry-run exited {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        msg = (
+            f"--dry-run exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+        assert result.returncode == 0, msg
         return trace_file.read_text(encoding="utf-8").splitlines()
 
 
