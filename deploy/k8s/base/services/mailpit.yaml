@@ -1,0 +1,66 @@
+# In-cluster Mailpit (T16.1.5) -- same pinned digest as docker-compose.yml's own mailpit
+# service (T12.1.11), so the two dev stacks always run the exact same image. SMTP sink + web UI
+# for verification/reset links, never real outbound mail. ClusterIP only -- never a LoadBalancer
+# (no external exposure, same intent as compose's 127.0.0.1-only ports).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailpit
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: mailpit
+    app.kubernetes.io/part-of: secrag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mailpit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mailpit
+        app.kubernetes.io/part-of: secrag
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mailpit
+          image: axllent/mailpit@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
+          ports:
+            - name: http
+              containerPort: 8025
+            - name: smtp
+              containerPort: 1025
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailpit
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: mailpit
+    app.kubernetes.io/part-of: secrag
+spec:
+  selector:
+    app.kubernetes.io/name: mailpit
+  ports:
+    - name: http
+      port: 8025
+      targetPort: http
+    - name: smtp
+      port: 1025
+      targetPort: smtp

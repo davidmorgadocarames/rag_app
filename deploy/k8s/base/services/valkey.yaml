@@ -1,0 +1,83 @@
+# In-cluster Valkey (T16.1.5, D16.3/P16-D3): shared abuse-limiter state behind the
+# `LimiterStore` interface (actual wiring is T16.3, block 16-D -- this row only deploys the
+# store itself). No persistence by design (PHASE_PLANNING 16.1: "atomic token bucket via Lua,
+# TTL keys, password, no persistence") -- a plain Deployment with an emptyDir, never a
+# StatefulSet/PVC: losing the bucket state on a restart just means every limiter resets, which
+# is the documented degrade-safe behaviour, not data loss. Password from valkey-credentials
+# (T16.1.3's sealed secret pattern); NetworkPolicy restricting access to the backend only is
+# T16.4's job (block 16-E, same deferral as the ollama-host NetworkPolicy in T16.0.4).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: valkey
+    app.kubernetes.io/part-of: secrag
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: valkey
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: valkey
+        app.kubernetes.io/part-of: secrag
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: valkey
+          image: valkey/valkey@sha256:1c2b25b09f354c66fe994733acdf12fcfd4bdf6f3bd92b88a93a70378d884056
+          command:
+            - sh
+            - -c
+            - 'exec valkey-server --requirepass "$VALKEY_PASSWORD" --save "" --appendonly no'
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: valkey-credentials
+                  key: password
+          ports:
+            - name: valkey
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "valkey-cli -a \"$VALKEY_PASSWORD\" ping | grep -q PONG"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: valkey
+    app.kubernetes.io/part-of: secrag
+spec:
+  selector:
+    app.kubernetes.io/name: valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey

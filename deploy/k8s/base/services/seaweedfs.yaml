@@ -1,0 +1,94 @@
+# In-cluster S3-compatible store (T16.1.5, resolves T16.0.5's SeaweedFS choice -- MinIO's
+# distribution broke in 2025, see the ADR's 16-A section). Single all-in-one `weed server`
+# process (master + volume + filer + S3 gateway) -- fine for a local dev/test cluster, not meant
+# to be a production topology. No persistence beyond the pod's own emptyDir (same rationale as
+# valkey.yaml: this is Barman Cloud's backup TARGET, and losing it only means losing backup
+# history, never live app data -- the CNPG cluster itself is the source of truth). S3 identity
+# config (access/secret key pair) is the seaweedfs-s3-config sealed secret (T16.1.3 pattern),
+# mounted read-only; CNPG's own Barman Cloud client reads the SAME key pair from
+# seaweedfs-credentials (cnpg/cluster.yaml's s3Credentials).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/part-of: secrag
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seaweedfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seaweedfs
+        app.kubernetes.io/part-of: secrag
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9
+          args:
+            - server
+            - -dir=/data
+            - -s3
+            - -s3.config=/etc/seaweedfs/s3_config.json
+            - -s3.port=8333
+            - -volume.max=0
+            - -master.volumeSizeLimitMB=1024
+          ports:
+            - name: s3
+              containerPort: 8333
+            - name: master
+              containerPort: 9333
+            - name: volume
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: s3-config
+              mountPath: /etc/seaweedfs
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: s3-config
+          secret:
+            secretName: seaweedfs-s3-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: seaweedfs
+    app.kubernetes.io/part-of: secrag
+spec:
+  selector:
+    app.kubernetes.io/name: seaweedfs
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: s3
+    - name: master
+      port: 9333
+      targetPort: master
+    - name: volume
+      port: 8080
+      targetPort: volume

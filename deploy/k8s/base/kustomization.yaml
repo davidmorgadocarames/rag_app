@@ -21,3 +21,4 @@ resources:
   - jobs
   - gateway
   - cnpg
+  - services
