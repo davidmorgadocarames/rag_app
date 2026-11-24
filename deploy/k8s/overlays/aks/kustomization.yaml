@@ -1,0 +1,15 @@
+# AKS overlay (T16.1.2): RENDERED AND VALIDATED ONLY -- `kustomize build` / kubeconform /
+# kube-linter run against it (this block's own smoke, and 16-C's future "manifests" gate step),
+# but it is NEVER `kubectl apply`'d anywhere; nothing on Azure is created by this overlay, ever
+# (PHASE_PLANNING 16.1). ENV stays at the base's own default ("prod", fail-closed) -- no patch
+# needed, and scripts/k8s/smoke-16-1.sh asserts the rendered output never contains a dev-only
+# flag (ENV: dev, LLM_PROVIDER: fake, or any ADMIN_LIVE_MODE/DEBUG-style dev toggle).
+#
+# Secret-producing resources use External Secrets Operator (referencing Azure Key Vault) instead
+# of SealedSecrets -- see external-secrets.yaml, added by T16.1.3. "Referenced" means the
+# ExternalSecret/SecretStore objects name a Key Vault + identity that do not exist anywhere on
+# Azure yet; this overlay never talks to Azure at build or apply time (there is no apply time).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base

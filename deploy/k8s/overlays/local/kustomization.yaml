@@ -1,0 +1,24 @@
+# Local overlay (T16.1.2): applied for real against the k3d cluster. ENV=dev everywhere (the
+# base's own ConfigMaps default to ENV=prod -- Jobs/apps fail closed by default, same rule as
+# .env.example's ENV comment). Secret-producing resources (SealedSecrets, decrypted by the
+# in-cluster controller) are added here by T16.1.3 -- see sealed-secrets.yaml once that row
+# lands.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: ConfigMap
+      name: backend-config
+    patch: |-
+      - op: replace
+        path: /data/ENV
+        value: dev
+  - target:
+      kind: ConfigMap
+      name: jobs-config
+    patch: |-
+      - op: replace
+        path: /data/ENV
+        value: dev
