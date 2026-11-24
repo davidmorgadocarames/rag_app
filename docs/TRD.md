@@ -59,7 +59,11 @@ truncated (the LLM still sees the full chunk once selected), but a chunk whose o
 sentence sits near the end can be scored on a prefix that omits it and never reach the LLM —
 a silent recall loss the current 14-item golden set cannot detect. Golden-set items that
 specifically exercise this ("late sentence in a long chunk") are **deferred to Phase 14.0**
-(golden-set expansion), not added now (user decision, 2026-10-05).
+(golden-set expansion), not added now (user decision, 2026-10-05). **14-A1 adds one probe item**
+(`trunc-sqli-error-messages` in `eval/golden_set_v2.jsonl`, §15.1) targeting a detail that
+typically sits late in a long cheat-sheet section; full confirmation (does it actually miss
+retrieval under the real reranker) happens when 14-A2 runs the eval against it, not in this
+schema-only block.
 
 ## 4. Ingestion pipeline
 
@@ -100,6 +104,36 @@ ground truth (the key defense against *faithful-but-stale* answers).
   metric falls below its threshold (PRD §4).
 
 Rerun triggers: change to prompts, LLM model, embedding model, chunking, retrieval pipeline, or corpus.
+
+### 6.1 Golden set v2 (dialogue schema, Phase 14.0)
+
+`eval/golden_set.jsonl` (v1, 14 flat English security questions) is still read unchanged by the
+pipeline through `rag_app.eval.dataset.GoldenItem`/`load_golden_set`. **Golden set v2**
+(`eval/golden_set_v2.jsonl`, `rag_app.eval.dataset.Turn`/`Dialogue`/`load_dialogues`) replays
+whole **dialogues** instead of single questions, so the conversational assistant's router,
+rewriting and memory (Phase 14.2–14.3) can be measured alongside retrieval and generation:
+
+- A dialogue (`{"id", "turns": [...]}`) is a list of **turns**, each with `message`,
+  `expected_intent` (`security | chitchat | followup | ambiguous | off_topic`), `language`
+  (`en | es`) and, for turns the pipeline is expected to retrieve/answer, `expected_doc` /
+  `answerable` / `ground_truth`.
+- **A single-turn item is just a one-turn dialogue.** `load_dialogues()` is a strict superset of
+  the v1 loader: it also accepts a bare v1 record (no `"turns"` key) and wraps it into a one-turn
+  `Dialogue` on the fly (`expected_intent="security"`, `language="en"`, matching what every v1
+  item actually is) — v1 files load through either loader without being rewritten.
+- The 48-item `eval/golden_set_v2.jsonl` fixture (38 single-turn + 10 dialogues) covers
+  misspellings (`"hol"`/`"hell"` as a lone greeting vs. `"hell"` inside a real sentence,
+  `"injecion"`, `"preparde statements"`), Spanish questions, chit-chat (en/es), follow-ups
+  resolved 1 turn back and 3+ turns back (en/es), ambiguous turns, off-topic turns, abstention in
+  both languages, and one DEBT-006 probe (a late-chunk-detail question).
+- **Known limitation (self-reported):** the fixture is a first draft (Claude drafts, user
+  reviews — P14-D4) over a narrow single-topic corpus (OWASP injection + broken-access-control
+  cheat sheets and Top-10 pages only, §3) — it cannot exercise every retrieval edge the full
+  corpus eventually will, and its Spanish items are hand-written, not sourced from the corpus
+  (the corpus itself is English-only).
+- **Not yet wired into the pipeline:** this block (14-A1) only adds the schema + fixture; the
+  runner's migration to replay `Dialogue` objects, plus metrics (intent accuracy, noisy recall,
+  follow-up resolution, clarification rate, conversational-reply check), is T14.0.4 (block 14-A2).
 
 ## 7. Cost & latency
 
