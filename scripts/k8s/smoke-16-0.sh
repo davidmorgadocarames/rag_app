@@ -39,8 +39,29 @@ else
 fi
 
 # --- 3. Sealed Secrets key backup/restore round-trips a Secret's data ----------------
+# sealed-secrets-key.sh's `backup` picks items[0] of EVERY secret in kube-system carrying the
+# real bitnami active-key label — with no name filter, so it cannot be pointed at a disposable
+# secret while a real controller (T16.1.3+) already has its own active key labelled the same
+# way: "sealed-secrets-key..." sorts before "smoke-sealed-secrets-key" and items[0] silently
+# picked the REAL key once one existed (16-B fix: this smoke test used to run before T16.1.3
+# installed the controller, when the disposable secret was the ONLY one with that label).
+# Fix: temporarily strip the label from the real key (if any) so the disposable secret is
+# unambiguous, run the exact same round-trip as before, then restore the real key's label in
+# the trap regardless of outcome. The real key's DATA is never touched -- only its label, and
+# only for the few seconds this test runs.
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"; kubectl -n kube-system delete secret smoke-sealed-secrets-key --ignore-not-found >/dev/null 2>&1' EXIT
+real_key_name="$(kubectl -n kube-system get secret -l sealedsecrets.bitnami.com/sealed-secrets-key=active \
+  -o jsonpath='{.items[?(@.metadata.name!="smoke-sealed-secrets-key")].metadata.name}' 2>/dev/null | awk '{print $1}')"
+restore_real_label() {
+  if [ -n "$real_key_name" ]; then
+    kubectl -n kube-system label secret "$real_key_name" \
+      sealedsecrets.bitnami.com/sealed-secrets-key=active --overwrite >/dev/null 2>&1 || true
+  fi
+}
+trap 'rm -rf "$tmp"; kubectl -n kube-system delete secret smoke-sealed-secrets-key --ignore-not-found >/dev/null 2>&1; restore_real_label' EXIT
+if [ -n "$real_key_name" ]; then
+  kubectl -n kube-system label secret "$real_key_name" sealedsecrets.bitnami.com/sealed-secrets-key- >/dev/null
+fi
 age-keygen -o "$tmp/identity.key" 2>/dev/null
 recipient="$(grep '^# public key:' "$tmp/identity.key" | awk '{print $NF}')"
 chmod 600 "$tmp/identity.key"
@@ -67,6 +88,8 @@ else
     bad "sealed-secrets-key-roundtrip" "restored data does not match (got: ${got_key:-<empty>})"
   fi
 fi
+kubectl -n kube-system delete secret smoke-sealed-secrets-key --ignore-not-found >/dev/null 2>&1
+restore_real_label
 
 echo "----"
 echo "smoke-16-0: $pass passed, $fail failed"

@@ -5,22 +5,26 @@
 # verified with SHA-256 before it is unpacked; installs are atomic (staged, then renamed into
 # place) so an interrupted run is never mistaken for a finished install.
 #
-# Tools: k3d, kubectl, helm, kustomize, k6, kubeconform, kube-linter, cosign.
+# Tools: k3d, kubectl, helm, kustomize, k6, kubeconform, kube-linter, cosign, kubeseal (T16.1.3,
+# 16-B living-graph deviation -- see status/blocks/16-B.md: needed to seal the local overlay's
+# app secrets against the live Sealed Secrets controller; pinned to the SAME release as the
+# controller chart's app version, 0.41.2).
 #
 #   scripts/k8s/install-tools.sh                 # install everything missing
 #   scripts/k8s/install-tools.sh k3d kubectl      # only some tools
 #   scripts/k8s/install-tools.sh check            # report installed vs. pinned versions, no download
 #
 # Checksum provenance (recorded here, not just asserted): kubectl, k3d, helm, kustomize, k6,
-# kubeconform and cosign SHA-256s below were cross-checked against each project's own published
-# checksum file at pin time (kubectl.sha256 / checksums.txt / helm's .sha256sum / CHECKSUMS /
-# cosign_checksums.txt — one HTTPS GET per tool, same release tag). kube-linter v0.8.3 publishes
-# no plain checksum file for its Linux asset (only .sigstore.json bundles, which this cosign
-# version could not verify against — "failed to verify log inclusion", most likely a
-# bundle-format mismatch between an old release and a newer cosign, not evidence of tampering);
-# its SHA-256 below is self-computed from the HTTPS download at pin time, the same provenance
-# every other tool in scripts/prereqs/install.sh already relies on for assets with no published
-# checksum file. Re-verify before bumping any version.
+# kubeconform, cosign and kubeseal SHA-256s below were cross-checked against each project's own
+# published checksum file at pin time (kubectl.sha256 / checksums.txt / helm's .sha256sum /
+# CHECKSUMS / cosign_checksums.txt / sealed-secrets_0.41.2_checksums.txt — one HTTPS GET per
+# tool, same release tag). kube-linter v0.8.3 publishes no plain checksum file for its Linux
+# asset (only .sigstore.json bundles, which this cosign version could not verify against —
+# "failed to verify log inclusion", most likely a bundle-format mismatch between an old release
+# and a newer cosign, not evidence of tampering); its SHA-256 below is self-computed from the
+# HTTPS download at pin time, the same provenance every other tool in
+# scripts/prereqs/install.sh already relies on for assets with no published checksum file.
+# Re-verify before bumping any version.
 #
 # Downloads use IPv4 only (see scripts/prereqs/install.sh header: IPv6 from WSL2 to some
 # registries hangs). Idempotent: an installed version is left alone.
@@ -55,6 +59,9 @@ KUBELINTER_SHA256="1a6d8419b11971372971fdbc22682b684ebfb7cf1c39591662d1b6ca736c4
 
 COSIGN_VERSION="3.1.4"
 COSIGN_SHA256="424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa"
+
+KUBESEAL_VERSION="0.41.2"
+KUBESEAL_SHA256="666b5db6788ad1dedb56e2d97064e1cc3779aa77bbd6f4b56b62beeb1941ed79"
 
 TMP="$(mktemp -d)"
 STAGING="$OPT/.staging.$$"
@@ -187,6 +194,20 @@ install_cosign() {
   ln -sfn "$dir/cosign" "$BIN/cosign"
 }
 
+install_kubeseal() {
+  local dir="$OPT/kubeseal-v$KUBESEAL_VERSION"
+  if [ ! -x "$dir/kubeseal" ]; then
+    local tarball="kubeseal-$KUBESEAL_VERSION-linux-amd64.tar.gz" st
+    log "kubeseal $KUBESEAL_VERSION"
+    fetch "https://github.com/bitnami/sealed-secrets/releases/download/v$KUBESEAL_VERSION/$tarball" \
+      "$KUBESEAL_SHA256" "$TMP/$tarball"
+    st="$(stage kubeseal)"
+    tar -xzf "$TMP/$tarball" -C "$st"
+    commit "$st" "$dir"
+  fi
+  ln -sfn "$dir/kubeseal" "$BIN/kubeseal"
+}
+
 check() {
   local ok=0
   check_one() { # check_one <name> <want> <have>
@@ -205,6 +226,7 @@ check() {
   check_one kubeconform "$KUBECONFORM_VERSION" "$(kubeconform -v 2>/dev/null | awk '{print $1}' | tr -d v)"
   check_one kube-linter "$KUBELINTER_VERSION" "$(kube-linter version 2>/dev/null | tr -d v)"
   check_one cosign "$COSIGN_VERSION" "$(cosign version 2>/dev/null | awk '/GitVersion/ {print $2}' | tr -d v)"
+  check_one kubeseal "$KUBESEAL_VERSION" "$(kubeseal --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)"
   return "$ok"
 }
 
@@ -215,7 +237,7 @@ main() {
   fi
   local tools=("$@")
   if [ ${#tools[@]} -eq 0 ]; then
-    tools=(k3d kubectl helm kustomize k6 kubeconform kubelinter cosign)
+    tools=(k3d kubectl helm kustomize k6 kubeconform kubelinter cosign kubeseal)
   fi
   local t
   for t in "${tools[@]}"; do
@@ -228,6 +250,7 @@ main() {
       kubeconform) install_kubeconform ;;
       kube-linter | kubelinter) install_kubelinter ;;
       cosign) install_cosign ;;
+      kubeseal) install_kubeseal ;;
       *) echo "unknown tool: $t" >&2; exit 1 ;;
     esac
   done

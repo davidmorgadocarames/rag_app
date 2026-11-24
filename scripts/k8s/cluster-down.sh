@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Tear down the local k3d cluster for Phase 16 (T16.0.3). Backs up the Sealed Secrets key first
-# (no-op before T16.1.3, when the controller does not exist yet) so a later cluster-up.sh can
-# restore it. Leaves nothing behind: the cluster, its nodes and its k3d-managed registry are all
-# deleted (k3d ties the registry's lifecycle to the cluster that created it with
-# --registry-create; `k3d registry list` after this should be empty).
+# (a no-op if the controller is not installed, e.g. on a pre-T16.1.3 checkout) so a later
+# cluster-up.sh can restore it. Leaves nothing behind: the cluster, its nodes, its k3d-managed
+# registry and every Helm release installed by cluster-up.sh (Envoy Gateway, Sealed Secrets,
+# CloudNativePG -- T16.1.3/T16.1.4) are all deleted with the cluster itself (k3d ties the
+# registry's lifecycle to the cluster that created it with --registry-create; `k3d registry
+# list` after this should be empty).
 #
 #   scripts/k8s/cluster-down.sh
 #
-# Env (optional, see cluster-up.sh — only meaningful once T16.1.3 installs the controller):
+# Env (optional, see cluster-up.sh — only meaningful once the Sealed Secrets controller is up):
 #   SEALED_SECRETS_AGE_RECIPIENT   public key used to encrypt the backup
 #   SEALED_SECRETS_AGE_BACKUP      backup file path (default: ~/.secrag-k8s/sealed-secrets-key.age)
 set -euo pipefail

@@ -1,12 +1,12 @@
 # Local overlay (T16.1.2): applied for real against the k3d cluster. ENV=dev everywhere (the
 # base's own ConfigMaps default to ENV=prod -- Jobs/apps fail closed by default, same rule as
-# .env.example's ENV comment). Secret-producing resources (SealedSecrets, decrypted by the
-# in-cluster controller) are added here by T16.1.3 -- see sealed-secrets.yaml once that row
-# lands.
+# .env.example's ENV comment). Secret-producing resources are SealedSecrets (T16.1.3,
+# sealed-secrets.yaml), decrypted only by the in-cluster controller.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+  - sealed-secrets.yaml
 patches:
   - target:
       kind: ConfigMap
