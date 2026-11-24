@@ -98,9 +98,9 @@ T16.1.5 needs it to work as Barman Cloud's backup target (multipart upload, stan
 operations) for CloudNativePG. Pinned image for T16.1.5:
 `chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9`
 (resolved from tag `4.55`). No in-cluster deployment happens in this block — that is T16.1.5's
-job; this row only verifies and chooses. *Recommendation for the orchestrator:* fold this choice
-into `PHASE_PLANNING.md`'s Phase-16 decision list (e.g. as a new `P16-D5`) alongside P16-D1..D4,
-since it is a real architectural decision, not just a toolchain pin.
+job; this row only verifies and chooses. *Recommendation for the orchestrator:* record this
+choice in the Phase-16 decision log (e.g. as a new `P16-D5`) alongside P16-D1..D4, since it is a
+real architectural decision, not just a toolchain pin.
 
 **Memory budget (T16.0.6).** Idle-cluster RSS measured via `docker stats --no-stream` after the
 cluster settled (~20 s post-create): server 488 MiB, agent-0 97 MiB, agent-1 113 MiB, serverlb 24
