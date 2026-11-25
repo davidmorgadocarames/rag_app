@@ -285,14 +285,16 @@ def test_0007_grants_follow_the_migration_map(db_engine: Engine) -> None:
 
 
 def test_0008_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    """Targets 0008 directly (not "head", now 0009, T14.2.4): isolates 0008's own round
+    trip from 0009's (see the 0009 tests below)."""
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0008_admin_dashboard")
     engine = _engine(fresh_db)
     try:
         assert _version(engine) == "0008_admin_dashboard"
         command.downgrade(cfg, "-1")
         assert _version(engine) == "0007_mfa"
-        command.upgrade(cfg, "head")
+        command.upgrade(cfg, "0008_admin_dashboard")
         assert _version(engine) == "0008_admin_dashboard"
     finally:
         engine.dispose()
@@ -300,7 +302,7 @@ def test_0008_round_trip_on_an_empty_database(fresh_db: URL) -> None:
 
 def test_0008_downgrade_refuses_while_an_admin_action_exists(fresh_db: URL) -> None:
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0008_admin_dashboard")
     engine = _engine(fresh_db)
     try:
         with engine.begin() as conn:
@@ -316,7 +318,7 @@ def test_0008_downgrade_refuses_while_an_admin_action_exists(fresh_db: URL) -> N
 
 def test_0008_downgrade_refuses_while_a_defence_run_exists(fresh_db: URL) -> None:
     cfg = _alembic(fresh_db)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, "0008_admin_dashboard")
     engine = _engine(fresh_db)
     try:
         with engine.begin() as conn:
