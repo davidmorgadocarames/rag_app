@@ -1,6 +1,6 @@
-"""Migrations 0005 (T11.2.3), 0006 (T12.1.1), 0007 "part 1" (T12.3.4) and 0008 (T13.1.6), and
-the master-key fingerprint at start-up (T11.2.4), on harness databases (marker ``db``: gate
---full / CI)."""
+"""Migrations 0005 (T11.2.3), 0006 (T12.1.1), 0007 "part 1" (T12.3.4), 0008 (T13.1.6) and
+0009 (T14.2.4, block 14-C1), and the master-key fingerprint at start-up (T11.2.4), on harness
+databases (marker ``db``: gate --full / CI)."""
 
 from __future__ import annotations
 
@@ -367,6 +367,91 @@ def test_0008_grants_follow_the_migration_map(db_engine: Engine) -> None:
     # defence_runs: no purge step at all (no personal data) -- purger has no grant on it.
     assert not can(p, "defence_runs", "SELECT")
     assert can("secrag_backup", "defence_runs", "SELECT")
+
+
+# --- 0009 (T14.2.4: conversations.summary_encrypted, block 14-C1) -------------------------
+
+
+def test_0009_round_trip_on_an_empty_database(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        assert _version(engine) == "0009_conversation_summary"
+        command.downgrade(cfg, "-1")
+        assert _version(engine) == "0008_admin_dashboard"
+        command.upgrade(cfg, "head")
+        assert _version(engine) == "0009_conversation_summary"
+    finally:
+        engine.dispose()
+
+
+def test_0009_downgrade_refuses_while_a_conversation_holds_a_summary(fresh_db: URL) -> None:
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        user_id, conv_id = uuid.uuid4(), uuid.uuid4()
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO users (id, email, password_hash) VALUES (:u, :e, 'x')"),
+                {"u": user_id, "e": f"{user_id.hex}@example.test"},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO conversations (id, user_id, summary_encrypted)"
+                    " VALUES (:c, :u, :s)"
+                ),
+                {"c": conv_id, "u": user_id, "s": b"ciphertext"},
+            )
+        with pytest.raises(RuntimeError, match="refusing to downgrade 0009"):
+            command.downgrade(cfg, "-1")
+        assert _version(engine) == "0009_conversation_summary"  # nothing was changed
+    finally:
+        engine.dispose()
+
+
+def test_0009_downgrade_succeeds_when_no_summary_exists(fresh_db: URL) -> None:
+    """Negative control: the SAME conversation with a NULL summary (the normal case for most
+    conversations) does not block the downgrade — only a real, non-null summary does."""
+    cfg = _alembic(fresh_db)
+    command.upgrade(cfg, "head")
+    engine = _engine(fresh_db)
+    try:
+        user_id = uuid.uuid4()
+        with engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO users (id, email, password_hash) VALUES (:u, :e, 'x')"),
+                {"u": user_id, "e": f"{user_id.hex}@example.test"},
+            )
+            conn.execute(
+                text("INSERT INTO conversations (id, user_id) VALUES (:c, :u)"),
+                {"c": uuid.uuid4(), "u": user_id},
+            )
+        command.downgrade(cfg, "-1")
+        assert _version(engine) == "0008_admin_dashboard"
+    finally:
+        engine.dispose()
+
+
+def test_0009_summary_encrypted_follows_the_conversations_table_grants(
+    db_engine: Engine,
+) -> None:
+    """No new grant statement (X4): the column rides on 0005's existing table-level grants
+    (secrag_purger SELECT+DELETE, secrag_backup SELECT) -- confirmed at the COLUMN level
+    too, not just inferred from the table-level test above."""
+
+    def can_column(role: str, column: str, privilege: str) -> bool:
+        with db_engine.connect() as conn:
+            return bool(
+                conn.execute(
+                    text("SELECT has_column_privilege(:r, 'public.conversations', :c, :p)"),
+                    {"r": role, "c": column, "p": privilege},
+                ).scalar_one()
+            )
+
+    assert can_column("secrag_purger", "summary_encrypted", "SELECT")
+    assert can_column("secrag_backup", "summary_encrypted", "SELECT")
 
 
 def test_0006_grants_follow_the_migration_map(db_engine: Engine) -> None:

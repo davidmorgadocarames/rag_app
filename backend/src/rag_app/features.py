@@ -1215,11 +1215,16 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         observable="the message is classified (chitchat/security/followup/ambiguous/"
         "off_topic) by the LLM router instead of the old binary classifier -- a security"
         " question still retrieves+cites as before; a misclassified/invalid router reply"
-        " degrades to the same grounded security path (never bypasses retrieval/citation)",
+        " degrades to the same grounded security path (never bypasses retrieval/citation)."
+        " T14.2.5/T14.2.6 (block 14-C1): a follow-up in the SAME conversation (``/chat/"
+        "stream`` only -- `POST /chat` has no conversation) now has the previous turn and a"
+        " bounded structured summary available to the router, written back after every"
+        " answered turn (best-effort: a dropped/unreachable update never breaks the turn)",
         key_files=(
             "backend/src/rag_app/assistant/core.py",
             "backend/src/rag_app/assistant/router.py",
             "backend/src/rag_app/assistant/fast_path.py",
+            "backend/src/rag_app/assistant/memory.py",
         ),
         e2e=("auth.spec.ts",),
         # auth.spec.ts registers a brand-new account to reach /chat (DA-HB-2).

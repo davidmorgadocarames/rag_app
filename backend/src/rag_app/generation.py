@@ -517,16 +517,27 @@ def answer_question_stream(
     top_n: int | None = None,
     use_rerank: bool = True,
     version: str | None = None,
+    summary: str | None = None,
+    last_turn: str | None = None,
 ) -> Iterator[StreamEvent]:
     """Streaming RAG: emit stage/token events, then a final grounded (or abstained) result.
 
     Mirrors ``answer_question`` but yields progress so the UI can show what is happening
-    and stream the answer. ``answer_question`` itself is left untouched (eval gate).
+    and stream the answer. ``answer_question`` itself is left untouched (eval gate) and
+    stays memory-less — it has no conversation at all (TF24, 14-B2's own scope note);
+    nothing to read or write there.
 
     T14.2.1/T14.2.2 (block 14-B2): the old inline ``classify_intent`` check is replaced by
     the shared understanding step (``rag_app.assistant.core.understand`` -- fast path, then
     the LLM router); a chit-chat reply is now LLM-generated (P14-D1) instead of a fixed
     canned template. Everything from "retrieving" onward is UNCHANGED.
+
+    T14.2.5 (block 14-C1): ``summary``/``last_turn`` -- the conversation's own memory, read
+    by the caller (``api.conversations._load_memory``, scoped to ONE already-ownership-
+    checked conversation) BEFORE this turn -- are forwarded unchanged into ``understand()``,
+    which already accepted them as of 14-B2 (always ``None`` until this block). Retrieval
+    below still uses the ORIGINAL ``query``, never the router's own ``standalone_query``
+    (T14.2.7, block 14-C2 — not this block).
 
     T11.3.1: one JSON timing record per answer (classify, embed, hybrid search, rerank
     load/inference, time to first token, total) plus the same durations into the
@@ -545,7 +556,7 @@ def answer_question_stream(
     with timing.recorder(streaming=True, on_stage=observe_stage, on_step=observe_step):
         yield StreamStage(stage="classifying")
         with timing.stage("classify"):
-            decision = understand(chat, query)
+            decision = understand(chat, query, summary=summary, last_turn=last_turn)
         if decision.intent == "chitchat":
             yield StreamStage(stage="responding")
             with timing.stage("responding"):

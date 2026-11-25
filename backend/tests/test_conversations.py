@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from rag_app.api.conversations import (
     _decrypt_json,
+    _decrypted_turns,
     _encrypt_json,
+    _load_memory,
     _title_for,
     _total_tokens,
 )
@@ -60,3 +62,83 @@ def test_total_tokens_treats_null_as_zero() -> None:
         Message(role="assistant", content_encrypted=b"", prompt_tokens=100, completion_tokens=40),
     ]
     assert _total_tokens(messages) == 140
+
+
+# --- T14.2.5: memory read helpers (pure, no database) ---------------------------------------
+
+
+def test_decrypted_turns_skips_a_message_that_fails_to_decrypt() -> None:
+    key = generate_user_key()
+    other_key = generate_user_key()
+    messages = [
+        Message(role="user", content_encrypted=_encrypt_json(key, {"text": "q1"})),
+        # Encrypted with a DIFFERENT key -- simulates a damaged/foreign row.
+        Message(role="assistant", content_encrypted=_encrypt_json(other_key, {"text": "boom"})),
+        Message(role="assistant", content_encrypted=_encrypt_json(key, {"text": "a1"})),
+    ]
+    assert _decrypted_turns(key, messages) == [("user", "q1", False), ("assistant", "a1", False)]
+
+
+def test_decrypted_turns_carries_the_error_flag() -> None:
+    key = generate_user_key()
+    messages = [
+        Message(role="user", content_encrypted=_encrypt_json(key, {"text": "q1"})),
+        Message(
+            role="assistant",
+            content_encrypted=_encrypt_json(key, {"text": "oops", "error": True}),
+        ),
+    ]
+    assert _decrypted_turns(key, messages) == [
+        ("user", "q1", False),
+        ("assistant", "oops", True),
+    ]
+
+
+def test_load_memory_is_none_none_for_a_brand_new_conversation() -> None:
+    key = generate_user_key()
+    conv = Conversation(summary_encrypted=None)
+    assert _load_memory(key, conv, []) == (None, None)
+
+
+def test_load_memory_reads_the_summary_and_the_last_clean_turn() -> None:
+    key = generate_user_key()
+    conv = Conversation(summary_encrypted=encrypt(key, '{"topics": ["sqli"]}'))
+    messages = [
+        Message(role="user", content_encrypted=_encrypt_json(key, {"text": "q1"})),
+        Message(role="assistant", content_encrypted=_encrypt_json(key, {"text": "a1"})),
+    ]
+    summary, last_turn = _load_memory(key, conv, messages)
+    assert summary == '{"topics": ["sqli"]}'
+    assert last_turn == "User: q1\nAssistant: a1"
+
+
+def test_load_memory_never_crosses_conversations() -> None:
+    """Authorization (T14.2.5): memory is scoped to the ONE conversation passed in --
+    another conversation's messages/summary, even for the SAME user, never leak in because
+    the caller never passes them. This is enforced by construction (there is no lookup by
+    user_id here at all), demonstrated with two independent conversations."""
+    key = generate_user_key()
+    conv_a = Conversation(summary_encrypted=encrypt(key, '{"topics": ["a-only"]}'))
+    conv_b = Conversation(summary_encrypted=encrypt(key, '{"topics": ["b-only"]}'))
+    messages_a = [
+        Message(role="user", content_encrypted=_encrypt_json(key, {"text": "about A"})),
+        Message(role="assistant", content_encrypted=_encrypt_json(key, {"text": "reply A"})),
+    ]
+    messages_b = [
+        Message(role="user", content_encrypted=_encrypt_json(key, {"text": "about B"})),
+        Message(role="assistant", content_encrypted=_encrypt_json(key, {"text": "reply B"})),
+    ]
+    summary_a, last_turn_a = _load_memory(key, conv_a, messages_a)
+    summary_b, last_turn_b = _load_memory(key, conv_b, messages_b)
+    assert summary_a == '{"topics": ["a-only"]}' and "b-only" not in summary_a
+    assert summary_b == '{"topics": ["b-only"]}' and "a-only" not in summary_b
+    assert last_turn_a == "User: about A\nAssistant: reply A"
+    assert last_turn_b == "User: about B\nAssistant: reply B"
+
+
+def test_load_memory_treats_a_summary_from_another_key_as_unreadable_not_a_crash() -> None:
+    key = generate_user_key()
+    wrong_key = generate_user_key()
+    conv = Conversation(summary_encrypted=encrypt(wrong_key, '{"topics": ["x"]}'))
+    summary, _last_turn = _load_memory(key, conv, [])
+    assert summary is None

@@ -134,6 +134,14 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      reply (template fallback on failure) — no retrieval, no citations, no abstention. A
      misclassified or adversarial router reply can never bypass retrieval/citation: any
      failure degrades to the conservative "security" fallback carrying the user's raw message.
+   - **Remembers the conversation** (TRD §6.3, block 14-C1 — `/chat/stream` only; the one-shot
+     `POST /chat` has no conversation at all, so it never reads or writes memory). Before the
+     router runs, the server reads this conversation's own bounded summary (topics/entities/
+     OWASP edition/open questions) and its last clean turn — never another conversation's,
+     even for the same account. After the turn is answered and stored, the summary is updated
+     (one more small LLM call) **before** the `done`/`error` event below — best-effort: if that
+     update fails or comes back invalid, the OLD summary is kept untouched and the turn is
+     unaffected either way.
    - Security (and, until 14.3 builds their own replies, follow-up/ambiguous/off-topic)
      questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
    - Streams **Server-Sent Events** back. The **first** event is `conversation` with the

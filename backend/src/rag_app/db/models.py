@@ -124,6 +124,12 @@ class Conversation(Base):
     # Optional user-set title, encrypted with the per-user key (null -> derived from
     # the first message so nothing is stored in the clear).
     title_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # T14.2.4 (0009, block 14-C1): the running conversation memory -- a bounded, structured
+    # JSON summary (`rag_app.assistant.memory.ConversationSummary`), encrypted the same way
+    # as `title_encrypted`. Null until the first successful summary write (or whenever one
+    # has been dropped as invalid/unreachable); purged with the row itself (no separate
+    # purge step -- see 0009's own docstring).
+    summary_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

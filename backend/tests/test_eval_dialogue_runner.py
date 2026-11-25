@@ -1,19 +1,22 @@
 """Unit tests for the golden-set v2 runner + metrics (T14.0.4/T14.0.5, block 14-A2; updated
-for the real shared core/router in block 14-B2).
+for the real shared core/router in block 14-B2; memory read/write in block 14-C1).
 
 No DB/LLM: `compute_dialogue_metrics` is pure aggregation (same style as `test_eval.py`'s
 `compute_metrics` tests), `looks_like_clarifying_question`/`parse_no_claims_verdict` are pure
 parsers, and the `evaluate_dialogues` integration tests monkeypatch `retrieve` +
 `get_shared_reranker` (never a live DB/Ollama) with a fake chat client that now also
-implements `chat_json` (T14.2.3's router call) -- same pattern as `test_generation.py`'s
-`_FakeChatSync`.
+implements `chat_json` (T14.2.3's router call, and T14.2.6's memory-write call since 14-C1)
+-- same pattern as `test_generation.py`'s `_FakeChatSync`.
 
 Every test in this file imports a name (`DialogueTurnResult`, `compute_dialogue_metrics`,
 `evaluate_dialogues`, `judge_no_claims`, `looks_like_clarifying_question`) that does not exist
 before block 14-A2 -- they fail on the pre-14-A2 code with an ImportError, not just a wrong
 assertion. The `evaluate_dialogues` tests below additionally fail on the pre-14-B2 code (no
 `chat_json`/router call at all, so `_FakeChat` never needed one; `observed_intent` was only a
-chitchat/security binary) with an ``AttributeError`` or a wrong value.
+chitchat/security binary) with an ``AttributeError`` or a wrong value; the memory test fails
+on the pre-14-C1 code (``understand()`` took no ``summary``/``last_turn`` kwargs at all --
+`spy_understand` would record ``None`` for both on every turn, not the first turn's real
+``last_turn``) with a wrong value, not an exception (the kwargs have defaults).
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from collections.abc import Iterator
 
 import pytest
 
+import rag_app.assistant.core as assistant_core
 from rag_app.eval import gate
 from rag_app.eval.dataset import Dialogue, Turn
 from rag_app.eval.judge import parse_no_claims_verdict
@@ -238,14 +242,28 @@ def _chunk(chunk_uid: str) -> RetrievedChunk:
     )
 
 
-def test_evaluate_dialogues_has_no_memory_between_turns(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A follow-up turn is replayed STANDALONE (no prior-turn context passed to the router or
-    to retrieve) -- F14.2 persists through block 14-B2 (memory lands in 14-C1), proven here by
-    asserting every call to the fake `retrieve` only ever sees the CURRENT turn's own message,
-    never a prior one. `_FakeChat.chat_json` always returns the router's conservative
-    `fallback` (intent "security", the message unchanged), which is exactly today's real
-    behaviour for a follow-up with no memory to resolve it from."""
+def test_evaluate_dialogues_passes_memory_into_understand_but_not_into_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14.2.5/T14.2.6 (block 14-C1), supersedes the old (pre-14-C1)
+    ``test_evaluate_dialogues_has_no_memory_between_turns``, whose premise ("no prior-turn
+    context passed to the router") is no longer true: the SECOND turn's ``understand()`` call
+    now receives the FIRST turn's real memory (``last_turn`` always; ``summary`` stays
+    ``None`` here because ``_FakeChat.chat_json`` always returns the caller's ``fallback`` --
+    an empty ``ConversationSummary()`` -- which ``summarize_turn`` correctly treats as
+    "dropped", same as a real invalid/unreachable reply would be). Retrieval still uses each
+    turn's own raw ``message`` only (T14.2.7/14-C2, not this block) -- proven, as before, by
+    asserting every call to the fake `retrieve` only ever sees the CURRENT turn's own
+    message, never a prior one or the memory."""
     seen_queries: list[str] = []
+    understand_calls: list[tuple[str, str | None, str | None]] = []
+    real_understand = assistant_core.understand
+
+    def spy_understand(
+        chat: object, query: str, *, summary: str | None = None, last_turn: str | None = None
+    ) -> object:
+        understand_calls.append((query, summary, last_turn))
+        return real_understand(chat, query, summary=summary, last_turn=last_turn)  # type: ignore[arg-type]
 
     def fake_retrieve(
         _session: object, query: str, *, reranker: object, top_n: int | None = None, **_kw: object
@@ -255,6 +273,7 @@ def test_evaluate_dialogues_has_no_memory_between_turns(monkeypatch: pytest.Monk
 
     monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
     monkeypatch.setattr("rag_app.reranking.retrieve", fake_retrieve)
+    monkeypatch.setattr(assistant_core, "understand", spy_understand)
 
     dialogue = Dialogue(
         id="dlg-1",
@@ -282,6 +301,12 @@ def test_evaluate_dialogues_has_no_memory_between_turns(monkeypatch: pytest.Monk
     results = evaluate_dialogues(None, [dialogue], chat=chat, top_n=3)  # type: ignore[arg-type]
 
     assert seen_queries == ["How do I prevent SQL injection?", "What about OS commands?"]
+    assert understand_calls[0] == ("How do I prevent SQL injection?", None, None)
+    assert understand_calls[1] == (
+        "What about OS commands?",
+        None,  # dropped: _FakeChat.chat_json always returns the empty fallback summary
+        "User: How do I prevent SQL injection?\nAssistant: Use parameterized queries [1].",
+    )
     assert [r.observed_intent for r in results] == ["security", "security"]
     assert all(r.expected_doc == "docA" and r.retrieved_docs == ["docA"] for r in results)
 

@@ -7,8 +7,8 @@ Sections 1–3 are the **target design** from the planning phase (some tables �
 resets, login attempts, query logs — arrive in later phases; `sessions` arrived in 0006,
 `user_mfa`/`mfa_recovery_codes` arrived in 0007 "part 1", each with a narrower column set
 than the target design below — see section 5). What the migrations create **today** (head
-`0008_admin_dashboard`), including the database roles and their grants, is in
-[section 5](#5-as-implemented-migrations-0001-0008).
+`0009_conversation_summary`), including the database roles and their grants, is in
+[section 5](#5-as-implemented-migrations-0001-0009).
 
 ## 1. Authentication flow
 
@@ -126,6 +126,7 @@ users 1───∞ query_logs
 | id | uuid (PK) | |
 | user_id | uuid (FK→users) | |
 | title_encrypted | bytea, null | optional user-set title, encrypted with the per-user key; when null the title is derived on the fly from the first message |
+| summary_encrypted | bytea, null (0009, T14.2.4) | bounded, structured conversation memory (`rag_app.assistant.memory.ConversationSummary` — topics/entities/owasp_version/open_questions), encrypted the same way as `title_encrypted`; updated after every answered `/chat/stream` turn, read (with the last clean turn) into the router before the next one — see [TRD §6.3](TRD.md#63-conversation-memory-read--write-t1425t1426-block-14-c1) |
 | created_at | timestamptz | |
 
 ### messages
@@ -196,10 +197,10 @@ Deleting a user removes/renders-unrecoverable, at minimum:
 `messages`, `citations`, `query_logs` — **plus** any per-user cache entries and external trace records.
 Corpus tables (`documents`, `chunks`) are shared and not user-owned.
 
-## 5. As implemented (migrations 0001-0008)
+## 5. As implemented (migrations 0001-0009)
 
 Source of truth: `backend/src/rag_app/db/models.py` and `backend/migrations/versions/`. Head:
-**`0008_admin_dashboard`** (Phase 13, T13.0.1/T13.1.6/T13.3.2 — expand-only, see the
+**`0009_conversation_summary`** (block 14-C1, T14.2.4 — expand-only, see the
 [Definition of Done](DEFINITION_OF_DONE.md#phase-specific-norms), expand/contract).
 
 | Table | Columns (type; nullable = null) | Notes |
@@ -210,7 +211,7 @@ Source of truth: `backend/src/rag_app/db/models.py` and `backend/migrations/vers
 | `mfa_recovery_codes` (0007 "part 1") | `id` uuid PK · `user_id` uuid → `users` (cascade), indexed · `code_hash` varchar unique (SHA-256) · `used_at` timestamptz null · `created_at` | single-use; claimed atomically (`UPDATE ... WHERE used_at IS NULL`, X10) so two concurrent attempts with the same code can never both succeed |
 | `login_lockouts` (0007 "part 2", T12.4.2) | `email_hmac` varchar PK (`HMAC(LOCKOUT_HMAC_SECRET, email)` — **not** a `user_id` FK) · `failed_count` int default `0` · `locked_until` timestamptz null · `updated_at` | keyed by email, not the account, so an attempt against an address that is not even registered is throttled the same as a real one; the counter/back-off is one atomic `INSERT ... ON CONFLICT DO UPDATE` (X10, REC-05); deleted in the erasure request path while the email is still known (no `PURGE_STEPS` entry — X3 exemption), plus an age-based retention sweep (30 days, not currently locked) in the purger |
 | `user_keys` | `user_id` uuid PK → `users` (cascade) · `wrapped_key` bytea · `created_at` | the per-user Fernet key wrapped by `DATA_MASTER_KEY`; deleted in the erasure request (crypto-shred) |
-| `conversations` | `id` · `user_id` → `users` (cascade) · `title_encrypted` bytea null · `created_at` | |
+| `conversations` | `id` · `user_id` → `users` (cascade) · `title_encrypted` bytea null · **`summary_encrypted`** bytea null (0009, T14.2.4) · `created_at` | `summary_encrypted`: bounded structured memory (topics/entities/owasp_version/open_questions), encrypted like `title_encrypted`; no new `PURGE_STEPS` entry or grant (rides on the existing "conversations" step/0005 grants) |
 | `messages` | `id` · `conversation_id` → `conversations` (cascade) · `role` · `content_encrypted` bytea · `prompt_tokens`, `completion_tokens` int null · `created_at` | citations inside the encrypted JSON; failed/interrupted turns are stored as assistant error markers |
 | `email_verification_tokens` | `id` · `user_id` → `users` (cascade) · `token_hash` unique · `expires_at` · `used_at` null · `created_at` | only the hash is stored; consumed atomically (`UPDATE ... WHERE used_at IS NULL AND expires_at > now()`, X10, REC-06) |
 | `password_reset_tokens` (0007 "part 3", T12.4.6) | `id` uuid PK · `user_id` → `users` (cascade), indexed · `token_hash` varchar unique · `expires_at` (30 min) · `used_at` timestamptz null · `created_at` | only the hash is stored; consumed atomically, same shape as `email_verification_tokens` (X10, REC-06); success (`POST /auth/reset`) revokes every session of the account and clears any login lockout |
@@ -240,7 +241,9 @@ user has a non-default `role`; 0007's downgrade **refuses** while any MFA enrolm
 recovery code, login-lockout or password-reset-token row exists (leaf-first: reset tokens,
 "part 3", then lockout rows, "part 2", then MFA, "part 1"); 0008's downgrade **refuses**
 while any `admin_actions` or `defence_runs` row exists (losing the admin audit trail or the
-defence-lab history silently would be a real regression, not an inconvenience). None of
+defence-lab history silently would be a real regression, not an inconvenience); 0009's
+downgrade **refuses** while any conversation holds a non-null `summary_encrypted` (same
+"no rollback path once such data exists" rule). None of
 them is a rollback path once that data exists (roll images back
-instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback); 0006/0007/0008
-stay in place after a rollback).
+instead — [ADR phase 11, Rollback](adr/adr_phase11_stability.md#rollback); 0006/0007/0008/
+0009 stay in place after a rollback).

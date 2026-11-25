@@ -423,6 +423,53 @@ def test_answer_question_stream_chitchat_emits_classify_and_canned_reply_steps()
     assert after.get(build_prompt, 0.0) == before.get(build_prompt, 0.0)
 
 
+# --- T14.2.5 (block 14-C1): memory forwarded into understand() -----------------------------
+
+
+def test_answer_question_stream_forwards_summary_and_last_turn_into_understand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``api.conversations`` reads memory on its own session and passes it here as plain
+    ``summary``/``last_turn`` kwargs -- this test proves they reach ``understand()``
+    unchanged, without needing a real conversation/DB. Fails on the pre-14-C1 code with a
+    ``TypeError`` (``answer_question_stream`` took no such kwargs at all)."""
+    calls: list[tuple[str, str | None, str | None]] = []
+    real_understand = generation.understand
+
+    def spy(
+        chat: object,
+        query: str,
+        *,
+        summary: str | None = None,
+        last_turn: str | None = None,
+    ) -> object:
+        calls.append((query, summary, last_turn))
+        return real_understand(  # type: ignore[arg-type]
+            chat, query, summary=summary, last_turn=last_turn
+        )
+
+    monkeypatch.setattr(generation, "understand", spy)
+
+    list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "hi",
+            chat=_FakeChatSync(""),
+            summary='{"topics": ["sqli"]}',
+            last_turn="User: hello\nAssistant: hi there",
+        )
+    )
+
+    assert calls == [("hi", '{"topics": ["sqli"]}', "User: hello\nAssistant: hi there")]
+
+
+def test_answer_question_stream_defaults_memory_to_none() -> None:
+    """``POST /chat`` (``answer_question``) never passes memory at all (TF24, no
+    conversation); the stream path must still work with the defaults, same as before 14-C1."""
+    events = list(generation.answer_question_stream(None, "hi", chat=_FakeChatSync("")))  # type: ignore[arg-type]
+    assert any(isinstance(e, StreamResult) for e in events)
+
+
 # --- T13.12.5 (DEBT-062): StreamStep sub-step events (embed_query start/end) ----------------
 
 

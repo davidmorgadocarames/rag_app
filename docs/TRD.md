@@ -187,9 +187,10 @@ eval runner alike by ONE shared understanding step, `rag_app.assistant.core.unde
 
 **Self-reported scope boundaries (not asked for beyond what is listed, DA-13-J2-1 discipline):**
 
-- Memory (`summary`/`last_turn`, T14.2.5/14-C1) is accepted as an optional parameter
-  everywhere in this block but is always `None` from every 14-B2 call site — the router sees
-  only the current message, same F14.2 limitation as before, just with a real router call now.
+- Memory (`summary`/`last_turn`) is accepted as an optional parameter everywhere in THIS
+  block (14-B2) but is always `None` from every 14-B2 call site — the router sees only the
+  current message, same F14.2 limitation as before, just with a real router call now. **Wired
+  for real in block 14-C1 — see §6.3.**
 - Retrieval still uses the ORIGINAL message, never `standalone_query` (T14.2.7/14-C2) — the
   router already produces it, nothing downstream consumes it yet.
 - The retrieve/generate/groundedness-check code itself was NOT relocated into the `assistant`
@@ -218,6 +219,69 @@ eval runner alike by ONE shared understanding step, `rag_app.assistant.core.unde
   `build_router_messages`) — otherwise a message carrying a fake `<<<END MESSAGE>>>` could
   forge a closing tag (DA-14-B2 finding 4). Input-side mitigation, layered onto the existing
   output-side screen (`_looks_suspicious`), not a replacement for it.
+
+### 6.3 Conversation memory: read + write (T14.2.5/T14.2.6, block 14-C1)
+
+**Scope (DEC-059, user 2026-11-25 = A).** T14.2.1 literally asks for one shared core that
+also unifies retrieve/generate; 14-B2 shared only the UNDERSTAND step (§6.2's own
+self-reported boundary) for concrete, documented reasons (monkeypatch targets). Rather than
+block on that larger refactor, memory is wired directly into the TWO real call sites that
+have a conversation at all:
+
+1. **`/chat/stream`** (`generation.answer_question_stream`) — `api.conversations._load_memory`
+   reads the conversation's own `Conversation.summary_encrypted` (decrypted with the user's
+   per-user key — `rag_app.crypto`, the SAME Fernet scheme `title_encrypted` already uses,
+   no new primitive) and its last clean user+assistant turn, **before** the current turn's
+   own user message is persisted (`_start_turn` fetches `prior_messages` first). Both are
+   forwarded, unchanged, into `understand()` → `router.build_router_messages`, which already
+   wraps them as delimited, escaped untrusted data (§6.2, DA-14-B2 finding 4) exactly like the
+   user's own message — no new escaping mechanism.
+2. **The eval runner** (`eval.runner.evaluate_dialogues`) — the third entry point DEC-059
+   names: `summary`/`last_turn` are carried **in memory** across one replayed dialogue's own
+   turns (reset per dialogue; no DB, no encryption — a golden-set dialogue is not a real
+   account).
+
+`generation.answer_question` (`POST /chat`) stays memory-less by design — it genuinely has no
+conversation (TF24) — nothing to read or write; this is a documented boundary, not a gap.
+
+**Write** (`assistant.memory.summarize_turn`, T14.2.6): one bounded `chat_json` call against
+`ConversationSummary {topics, entities, owasp_version, open_questions}` (≤
+`MEMORY_SUMMARY_MAX_TOKENS` ≈ 300 tokens, `num_ctx=settings.num_ctx_answer` — same reused
+pattern as the router/chit-chat calls, §6.2's own "no new num_ctx setting" decision), merging
+the PREVIOUS summary + the last turn + the turn just answered. Runs **after** the final
+answer is already persisted (`_persist_message`), **before** the stream's own `done`/`error`
+event closes the turn (T14.2.6's own ordering requirement) — so a memory-write failure can
+never turn an already-successful answer into a failed stream.
+
+**Fail-safe/drop discipline (mirrors the router exactly).** `summarize_turn` returns `None`
+("dropped — leave the old summary exactly as it was") on EITHER of two failure classes, never
+raises:
+- a timeout/network/HTTP error reaching the LLM (not just an invalid reply) — caught the same
+  way `router.route` catches a chat-client exception;
+- `chat_json`'s own bounded retry (T14.1.2) exhausting itself on an invalid/schema-violating
+  reply — detected by **identity**: `summarize_turn` passes its own fresh, empty
+  `ConversationSummary()` as the `fallback`, and `_chat_json_with_retry` (`rag_app.llm`)
+  returns that exact object, never a new one, on failure — so `result is fallback` reliably
+  means "this was invalid", never confused with a genuinely empty but VALID reply (a
+  different object, same content — `test_summarize_turn_accepts_a_genuinely_empty_but_valid_
+  reply`). No prompt/response content is ever logged, only the call type and error class
+  (same discipline as every other LLM call in this app).
+
+**Isolation (authorization, T14.2.5).** `_load_memory` takes the already-ownership-checked
+`Conversation`/its own `prior_messages` as plain arguments — there is no user-id lookup
+inside it at all, so there is no code path by which it could read a different conversation's
+rows; `test_load_memory_never_crosses_conversations` and the DB-backed
+`test_stream_reads_this_conversations_own_memory_and_never_another_one`
+(`tests/test_memory_stream.py`) exercise two conversations of the SAME user and confirm
+neither's memory ever appears in the other's router call.
+
+**Purge (migration 0009, X3).** `conversations.summary_encrypted` needs no new
+`PURGE_STEPS` entry: it is plain content on the already-covered `conversations` table (no
+`user_id`/`*_hmac`-shaped name, no FK to users/conversations/messages), and the existing
+"conversations" purge step already `DELETE`s the whole row — the summary disappears with it,
+same as `title_encrypted` already does. No new grant (table-level grants from 0005 already
+cover the column). Downgrade refuses while any conversation holds a non-null summary (same
+"never a rollback path once such data exists" rule as 0008).
 
 ## 7. Cost & latency
 
@@ -623,7 +687,7 @@ catalogue analysis; this is the implementation summary.
   .../purge-now` / `.../retry`, `POST
   /admin/users/erase` (DEBT-002, last-admin guard, DEC-033/DEC-035), and `GET
   /admin/alerts` (T13.5.2, below; `feature_ids` per alert — T13.8.3). Every mutating call is audited in `admin_actions`
-  (migration 0008, [BACKEND_SCHEMA §5](BACKEND_SCHEMA.md#5-as-implemented-migrations-0001-0008)).
+  (migration 0008, [BACKEND_SCHEMA §5](BACKEND_SCHEMA.md#5-as-implemented-migrations-0001-0009)).
   `FeatureHealthOut.docs` (T13.8.6, 13-G2) passes the registry's own `docs` reference straight
   through, so the dashboard's feature drawer shows a docs/ADR pointer without a second,
   possibly-drifting lookup table.

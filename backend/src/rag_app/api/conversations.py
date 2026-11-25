@@ -62,6 +62,7 @@ from rag_app.api.schemas import (
     RenameRequest,
 )
 from rag_app.assistant.fast_path import match_fast_path
+from rag_app.assistant.memory import select_last_turn, summarize_turn
 from rag_app.authz import require_permission
 from rag_app.config import get_settings
 from rag_app.crypto import decrypt, encrypt, unwrap_key
@@ -76,7 +77,7 @@ from rag_app.generation import (
     StreamToken,
     answer_question_stream,
 )
-from rag_app.llm import Usage
+from rag_app.llm import Usage, make_chat_client
 from rag_app.reranking import get_shared_reranker
 from rag_app.usage_cap import (
     DAILY_CAP_CODE,
@@ -281,17 +282,58 @@ def _persist_error_marker(session: Session, conv: Conversation, key: bytes, code
         logger.warning("chat stream: error marker not saved (%s)", type(exc).__name__)
 
 
+def _decrypted_turns(key: bytes, messages: list[Message]) -> list[tuple[str, str, bool]]:
+    """``(role, text, error)`` for each message, in order, skipping any that fail to
+    decrypt — one damaged row must not break memory read, same "never crash on one bad row"
+    discipline as ``_title_for``/``list_conversations``."""
+    turns: list[tuple[str, str, bool]] = []
+    for m in messages:
+        try:
+            data = _decrypt_json(key, m.content_encrypted)
+        except Exception:  # noqa: BLE001 - one damaged message must not break memory read
+            continue
+        turns.append((m.role, data.get("text", ""), bool(data.get("error", False))))
+    return turns
+
+
+def _load_memory(
+    key: bytes, conv: Conversation, prior_messages: list[Message]
+) -> tuple[str | None, str | None]:
+    """T14.2.5 (memory read): the conversation's own summary + its last clean turn, from the
+    state strictly BEFORE the current turn — ``prior_messages`` must be fetched before
+    :func:`_start_turn` persists the new user message. Scoped to exactly ONE conversation by
+    construction: ``conv``/``prior_messages`` always come from the single, already
+    ownership-checked conversation this turn belongs to (``_get_owned_conversation`` for an
+    existing id, or a brand-new ``Conversation`` row) — there is no code path here that can
+    read another conversation's rows."""
+    summary: str | None = None
+    if conv.summary_encrypted is not None:
+        try:
+            summary = decrypt(key, conv.summary_encrypted)
+        except Exception as exc:  # noqa: BLE001 - a damaged/unreadable summary is just "none"
+            logger.warning(
+                "chat stream: conversation summary cannot be decrypted (%s)", type(exc).__name__
+            )
+    last_turn = select_last_turn(_decrypted_turns(key, prior_messages))
+    return summary, last_turn
+
+
 def _start_turn(
     session: Session, user_id: uuid.UUID, key: bytes, request: ChatStreamRequest
-) -> Conversation:
-    """Get or create the conversation and store the user message, in one transaction: a new
-    conversation never exists without its first message."""
+) -> tuple[Conversation, str | None, str | None]:
+    """Get or create the conversation, read its memory (T14.2.5 — BEFORE this turn's own
+    message exists), and store the user message, all in one transaction: a new conversation
+    never exists without its first message, and memory always reflects the state strictly
+    before the turn it is about to inform."""
     if request.conversation_id:
         conv = _get_owned_conversation(session, user_id, request.conversation_id)
+        prior_messages = _messages(session, conv.id)
     else:
         conv = Conversation(user_id=user_id)
         session.add(conv)
         session.flush()
+        prior_messages = []
+    summary, last_turn = _load_memory(key, conv, prior_messages)
     session.add(
         Message(
             conversation_id=conv.id,
@@ -300,7 +342,41 @@ def _start_turn(
         )
     )
     session.commit()
-    return conv
+    return conv, summary, last_turn
+
+
+def _update_conversation_summary(
+    session: Session,
+    conv: Conversation,
+    key: bytes,
+    *,
+    previous_summary: str | None,
+    last_turn: str | None,
+    question: str,
+    answer: str,
+) -> None:
+    """T14.2.6 (memory write): AFTER the final answer event (the assistant reply is already
+    persisted by the caller), BEFORE the stream's own ``done`` event. Best-effort by design:
+    ANY failure (an unreachable LLM, a damaged key, storage) is logged and otherwise
+    swallowed — memory is a quality feature, it must never turn an already-successful answer
+    into a failed stream. ``summarize_turn`` itself already turns an invalid/unreachable
+    update into ``None`` ("dropped"); the try/except here additionally covers the
+    encrypt/commit step."""
+    try:
+        chat = make_chat_client()
+        new_summary = summarize_turn(
+            chat,
+            previous_summary=previous_summary,
+            last_turn=last_turn,
+            question=question,
+            answer=answer,
+        )
+        if new_summary is not None:
+            conv.summary_encrypted = encrypt(key, new_summary)
+            session.commit()
+    except Exception as exc:  # noqa: BLE001 - memory is best-effort, see docstring
+        session.rollback()
+        logger.warning("chat stream: conversation summary not updated (%s)", type(exc).__name__)
 
 
 class _PipelineFailed:
@@ -313,12 +389,18 @@ class _PipelineFailed:
 _PIPELINE_END = object()
 
 
-def _pipeline_events(request: ChatStreamRequest) -> Generator[object | None, None, None]:
+def _pipeline_events(
+    request: ChatStreamRequest, *, summary: str | None, last_turn: str | None
+) -> Generator[object | None, None, None]:
     """The pipeline's events, produced on a worker thread with its OWN session (committed
     after every event, so no read transaction stays open while the model generates).
     Yields ``None`` whenever ``KEEPALIVE_SECONDS`` pass without an event (the caller sends a
     keep-alive). Re-raises the pipeline's exception here. Closing this generator (client gone)
-    tells the worker to stop at its next event."""
+    tells the worker to stop at its next event.
+
+    ``summary``/``last_turn`` (T14.2.5): the conversation's memory, already read by the
+    caller (``_load_memory``, on the OUTER session) before this worker thread's own session
+    even exists — forwarded unchanged into ``answer_question_stream``."""
     events: queue.Queue[object] = queue.Queue()
     cancel = threading.Event()
 
@@ -332,6 +414,8 @@ def _pipeline_events(request: ChatStreamRequest) -> Generator[object | None, Non
                     request.question,
                     version=request.version,
                     reranker=get_shared_reranker(),
+                    summary=summary,
+                    last_turn=last_turn,
                 ):
                     session.commit()  # ends the read transaction; a no-op when none is open
                     if cancel.is_set():
@@ -388,7 +472,7 @@ def _chat_events(
     # Own session: the SSE body outlives the request-scoped session (see factory above).
     with _stream_session_factory()() as session:
         try:
-            conv = _start_turn(session, user_id, key, request)
+            conv, memory_summary, memory_last_turn = _start_turn(session, user_id, key, request)
         except Exception as exc:  # noqa: BLE001 - storage down, or the conversation vanished
             session.rollback()
             logger.warning("chat stream: turn not stored (%s)", type(exc).__name__)
@@ -405,7 +489,7 @@ def _chat_events(
             answer: Answer | None = None
             usage = Usage()
             stage = "starting"
-            pipeline = _pipeline_events(request)
+            pipeline = _pipeline_events(request, summary=memory_summary, last_turn=memory_last_turn)
             try:
                 for event in pipeline:
                     if event is None:
@@ -462,6 +546,18 @@ def _chat_events(
                     replied = True
                 yield _error_event(conv_id, ERROR_STORAGE)
                 return
+            # T14.2.6 (memory write): AFTER the answer above is persisted, BEFORE the "done"
+            # event below closes the turn — best-effort, never breaks the stream (see
+            # _update_conversation_summary's own docstring).
+            _update_conversation_summary(
+                session,
+                conv,
+                key,
+                previous_summary=memory_summary,
+                last_turn=memory_last_turn,
+                question=request.question,
+                answer=answer.text,
+            )
             yield _sse(
                 {
                     "type": "done",

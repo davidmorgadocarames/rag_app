@@ -368,6 +368,86 @@ security path, per the Decision section above).
   screen and the conservative fallback, which is what actually guarantees a misrouted message
   never bypasses citation/groundedness.
 
+## Decision — conversation memory read/write (T14.2.5/T14.2.6, block 14-C1)
+
+**Scope (DEC-059, user 2026-11-25 09:00 = A).** 14-B2 shared only the UNDERSTAND step
+(above); unifying retrieve/generate/groundedness too, as T14.2.1's literal wording would
+imply, is a larger refactor than this project's own block-sizing rule allows in one step
+(≤3 rows per block). Memory is instead wired directly into the two entry points that genuinely
+have a conversation — `generation.answer_question_stream` (`/chat/stream`) and
+`eval.runner.evaluate_dialogues` (in-memory per replayed dialogue) — leaving
+`generation.answer_question` (`POST /chat`) memory-less by design (TF24: it has no
+conversation at all).
+
+- **Read** (migration 0009, `conversations.summary_encrypted`): `api.conversations
+  ._load_memory` decrypts the conversation's own summary and selects its last clean
+  user+assistant turn (`assistant.memory.select_last_turn` — skips an error/interrupted
+  marker, DA-G1-9/DA-G2-3) **before** the current turn's user message is persisted
+  (`_start_turn` fetches `prior_messages` first), then forwards both into `understand()`,
+  which already accepted them as of 14-B2.
+- **Write** (`assistant.memory.summarize_turn`): one bounded `chat_json` call against
+  `ConversationSummary {topics, entities, owasp_version, open_questions}` (≤ ~300 tokens),
+  merging the previous summary + last turn + the turn just answered, run **after** the
+  answer is persisted and **before** the stream's own `done`/`error` event (never a crash
+  risk for an already-successful turn). ANY failure — network/timeout, or `chat_json`'s own
+  bounded retry exhausting itself on an invalid reply (T14.1.2) — is a DROP (`None`): the
+  caller leaves the OLD summary untouched. Detected by identity against a dedicated,
+  freshly-built empty `ConversationSummary()` fallback (never confused with a genuinely
+  empty but valid reply — a different object, same content).
+- **Untrusted-data discipline, transitively.** Every piece of untrusted text the write call
+  sees (previous summary, last turn, the new question/answer) is escaped
+  (`assistant.fast_path.escape_delimiter_markers`) before being wrapped in this module's own
+  delimited blocks — the SAME reasoning as DA-14-B2 finding 4 applies here too: a malicious
+  turn must not be able to forge a fake closing tag and poison a FUTURE summary that is later
+  fed back to the router as untrusted data.
+- **Purge (X3).** No new `PURGE_STEPS` entry: `summary_encrypted` is plain content on the
+  already-covered `conversations` table (no user-linked column name, no FK) — the existing
+  "conversations" step already `DELETE`s the whole row leaf-first, same as `title_encrypted`
+  already does. No new grant (table-level grants from 0005 cover the column already).
+  Downgrade refuses while any conversation holds a non-null summary (0008's precedent).
+
+### Alternatives considered
+
+- **Refactor retrieve/generate/groundedness into `assistant.core` first, then wire memory
+  once, in one place.** Rejected for this block: it would re-trigger the exact
+  monkeypatch-target breakage 14-B2 already hit and reverted from (tests patch
+  `generation.hybrid_search`/`generation.embed_query`), and is a strictly bigger change than
+  T14.2.4-6's three rows ask for. DEC-059 explicitly accepted the narrower scope, flagging
+  the "wired three times" compounding risk for 14-C2 to budget for.
+- **Skip memory write for the chit-chat fast path** (a greeting carries no real security
+  content) to save one LLM call per trivial turn. Rejected: the schema's own
+  `open_questions` field is exactly as meaningful after a chit-chat turn that also contained
+  a genuine question buried in it (the router would have caught that and routed elsewhere,
+  but a fast-path match is, by construction, an EXACT short greeting/thanks/farewell with no
+  room for a buried question) — the extra call is cheap (one bounded ≤300-token structured
+  reply) and keeping the write path uniform across every answered turn is simpler to reason
+  about than a second special case.
+
+## Known limitations (self-reported, not just design) — 14-C1
+
+- **`POST /chat` stays memory-less.** Not an oversight: it has no conversation parameter at
+  all (TF24) — there is nothing to read memory FROM or write memory TO. Any future block that
+  wants memory on `POST /chat` would first need to give it a conversation concept, which is a
+  product decision, not a plumbing gap this block left open.
+- **Memory does not feed retrieval.** `understand()`'s `standalone_query` (now informed by
+  real memory) is still not consumed by `hybrid_search`/`retrieve` (T14.2.7/14-C2) — a
+  follow-up's retrieval quality is unaffected by this block; only the ROUTER's own
+  classification of the turn (and therefore `intent_accuracy`) can move.
+- **The summary is a running merge, not a verified fact store.** `summarize_turn`'s system
+  prompt asks the LLM to "merge" the previous summary with the new turn, but nothing
+  validates that the merge is faithful (no groundedness check on a summary, unlike an
+  answer) — a summary can drift or lose a detail over many turns; it is a soft aid to the
+  router's classification, never a source the final answer is checked against.
+- **`escape_delimiter_markers` is the same narrow, literal check 14-B2-fix already
+  documented** (only the exact `<<<`/`>>>` 3-character run) — the same bounded-risk reasoning
+  applies: a bypass here can at most make the router/memory see slightly misleading context,
+  never let an attacker's text escape into the system role or reach the corpus/citation path
+  directly.
+- **One extra bounded LLM call per answered turn** (the memory write) — a real, acknowledged
+  latency/cost cost on every turn that completes successfully, not just chit-chat ones (see
+  "Alternatives considered" above); not separately measured against a per-turn latency floor
+  in this block (14.5, Latency/cost/dashboard, is where a dedicated budget would be added).
+
 ## Rollback
 
 14-A1: no runtime behaviour changes (`eval/golden_set_v2.jsonl` and the new
@@ -391,3 +471,12 @@ same commit), and `escape_delimiter_markers` is a pure string transform. A plain
 of this block's commit(s) restores 14-B2's behaviour exactly (reopening the cap-exemption and
 delimiter-breakout holes this block closes); no migration, no new persisted data, no
 deployed-image step.
+14-C1: the FIRST block in Phase 14 with a schema change — migration 0009 adds
+`conversations.summary_encrypted` (expand-only, nullable, docs/DEFINITION_OF_DONE.md
+"Expand/contract"): an OLDER image keeps working unmodified against the new schema (it
+simply never reads/writes the column), and a `git revert` of this block's CODE commit(s)
+alone is safe at any time — the column being present-but-unused is not a behaviour change.
+Reverting the MIGRATION itself (`alembic downgrade -1`) is the separate, data-loss-aware step
+0009's own `downgrade()` already guards: it refuses while any conversation holds a non-null
+summary (same rule as 0008's `admin_actions`/`defence_runs`) — roll back images instead once
+real summaries exist, never the migration.

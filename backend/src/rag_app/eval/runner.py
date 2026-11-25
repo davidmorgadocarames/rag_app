@@ -82,10 +82,16 @@ def evaluate_dialogues(
     ``evaluate()`` above still does) -- not duplicated into a new module, see
     ``assistant/core.py``'s own scope note on why that part was not relocated.
 
-    Still standalone per turn (F14.2 persists one more block, T14.2.5/14-C1): memory
-    (``summary``/``last_turn``) is not wired in here, so the router sees only the turn's own
-    message, never a dialogue's earlier turns — same limitation the "before" baseline (14-A2)
-    already had, just with a real router call now instead of no router at all.
+    T14.2.5/T14.2.6 (block 14-C1): memory (``summary``/``last_turn``) is now wired in, the
+    THIRD entry point named by DEC-059's option A -- carried IN-MEMORY across one dialogue's
+    own turns (reset for every new ``dialogue``, never across dialogues: each golden-set
+    dialogue is its own, independent conversation; there is no DB/encryption here, a
+    dialogue is not a real account). ``rag_app.assistant.memory.summarize_turn`` updates it
+    after every turn exactly like the real stream path does, right down to the same
+    "dropped, not crashed" behaviour on an invalid/unreachable update (``summary_text`` then
+    simply stays whatever it already was). Retrieval below still uses the turn's own raw
+    ``message``, never the router's ``standalone_query`` (T14.2.7/14-C2 — not this block), so
+    ``follow_up_resolution`` is expected to stay unchanged by this wiring.
     ``observed_intent`` is the real 5-way ``RouterOutput.intent`` (or ``"chitchat"`` from the
     exact fast path, which never calls the router) instead of the old placeholder's
     chitchat/security binary; ``router_latency_s`` is the first real measurement for the
@@ -103,6 +109,7 @@ def evaluate_dialogues(
     """
     from rag_app.assistant.core import understand
     from rag_app.assistant.fast_path import generate_chitchat_reply
+    from rag_app.assistant.memory import format_last_turn, summarize_turn
     from rag_app.eval.judge import judge_correctness, judge_no_claims
     from rag_app.generation import Answer, answer_from_chunks
     from rag_app.reranking import get_shared_reranker, retrieve
@@ -115,9 +122,15 @@ def evaluate_dialogues(
     results: list[DialogueTurnResult] = []
     for dialogue in dialogues:
         is_noisy = dialogue.id.startswith("typo-")
+        # T14.2.5/T14.2.6: memory carried IN-MEMORY across this dialogue's own turns only --
+        # reset for every new dialogue (see this function's own docstring).
+        summary_text: str | None = None
+        last_turn_text: str | None = None
         for index, turn in enumerate(dialogue.turns):
             start = time.perf_counter()
-            decision = understand(chat, turn.message)
+            decision = understand(
+                chat, turn.message, summary=summary_text, last_turn=last_turn_text
+            )
 
             if decision.intent == "chitchat":
                 reply = generate_chitchat_reply(chat, turn.message, decision.language)
@@ -130,6 +143,17 @@ def evaluate_dialogues(
                 retrieved_docs = [_doc_slug(c.chunk_uid) for c in chunks]
                 answer = answer_from_chunks(chat, turn.message, chunks)
             latency_s = time.perf_counter() - start
+
+            new_summary = summarize_turn(
+                chat,
+                previous_summary=summary_text,
+                last_turn=last_turn_text,
+                question=turn.message,
+                answer=answer.text,
+            )
+            if new_summary is not None:
+                summary_text = new_summary
+            last_turn_text = format_last_turn(turn.message, answer.text)
 
             correct: bool | None = None
             if turn.answerable:

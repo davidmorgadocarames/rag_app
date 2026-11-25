@@ -539,6 +539,39 @@ def test_the_purger_removes_everything_leaf_first_in_batches(
 
 
 @pytest.mark.db
+def test_the_purger_removes_the_conversation_summary_too(
+    db_engine: Engine, purger_engine: Engine, master_key: str
+) -> None:
+    """T14.2.4 (block 14-C1): ``summary_encrypted`` needs no PURGE_STEP of its own (0009's
+    own docstring) -- the existing "conversations" step DELETEs the whole row. Explicit,
+    focused proof (the generic count-based assertion above already implies this, but this
+    names the actual column): a conversation WITH a non-null summary is, after the purger
+    runs, gone entirely -- not just its messages."""
+    from rag_app.crypto import encrypt, generate_user_key
+    from rag_app.purger import Purger
+
+    user_id, _ = _make_user(db_engine, conversations=1, messages=1)
+    with db_engine.begin() as conn:
+        conv_id = conn.execute(
+            text("SELECT id FROM conversations WHERE user_id = :u"), {"u": user_id}
+        ).scalar_one()
+        conn.execute(
+            text("UPDATE conversations SET summary_encrypted = :s WHERE id = :c"),
+            {"s": encrypt(generate_user_key(), '{"topics": ["sqli"]}'), "c": conv_id},
+        )
+    request_id = _request(db_engine, user_id)
+
+    result = Purger(purger_engine, batch_size=10, sleep=_no_sleep).run(only=request_id)
+
+    assert result.ok and result.done == 1
+    with db_engine.connect() as conn:
+        remaining = conn.execute(
+            text("SELECT count(*) FROM conversations WHERE id = :c"), {"c": conv_id}
+        ).scalar_one()
+    assert remaining == 0
+
+
+@pytest.mark.db
 def test_the_purger_deletes_a_live_session_row(
     db_engine: Engine, purger_engine: Engine, master_key: str
 ) -> None:
