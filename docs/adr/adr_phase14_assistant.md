@@ -962,38 +962,82 @@ generating a second, independent question would be. A short bilingual fallback
 rule on (§6.4b/§6.4c narrowed, did not eliminate, the "`ambiguous` with `clarification=None`"
 self-contradiction) — never surfaces an empty reply.
 
-### Eval table — measured on the final code (resume, commit `81c562a`)
+### Eval table — measured on the final code (resume, commit `81c562a`/`6bcbc96`), 7 runs
 
 The first verification attempt (on `cc8c597`, before the resume fix) was killed by the harness
 itself (system-wide low memory while the session sat idle) immediately after `gate.sh --fast`
 had passed; the orchestrator then ran `--only eval` twice on `cc8c597` directly and found a
-real, deterministic `noisy_recall` regression (1.000 → 0.750 both times) plus thinner-margin
-dips in `intent_accuracy`/`follow_up_resolution` on one of those two runs — see "Resume fix"
-above for the root cause and fix (commit `81c562a`). The table below is the 2 required
-`--only eval` runs on that FINAL code:
+real, deterministic `noisy_recall` regression (1.000 → 0.750 both times) — see "Resume fix"
+above for the root cause and fix (commit `81c562a`). **`noisy_recall` is the metric this block
+set out to fix, and it is now the most solid number in the whole table: 1.000 on EVERY one of
+the 7 `--only eval`/`--full` runs below, including a code revert, an Ollama restart, and 2
+full `gate.sh --full` attempts.** `intent_accuracy`/`follow_up_resolution`, by contrast, turned
+out to be noisier at the margin than the 2-run framing below first assumed — the full 7-run
+picture (not just the first 2) is the honest basis for this block's state:
 
-| Metric | 14-C4 (before) | Run 1 (`gate-20261125T194629Z-3275007.log`) | Run 2 (`gate-20261125T195226Z-3276875.log`) | Floor | Met (both)? | Enforced from this block? |
-|---|---|---|---|---|---|---|
-| intent_accuracy | 0.907 | 0.933 | 0.920 | ≥ 0.90 | **yes** | already (14-C4) |
-| follow_up_resolution | 0.900 | 1.000 | 1.000 | ≥ 0.85 | **yes** | already (14-C3) |
-| noisy_recall | 1.000 | 1.000 | 1.000 | ≥ 0.90 | **yes** | already (14-C2); regression found + fixed this block |
-| conversational_reply_rate | 1.000 | 0.944 | 0.889 | ≥ 1.00 | no (not 1.0 either run) | **left unenforced** — not 1.0 in both runs |
-| clarification_rate | (no code path before 14-D1) | 1.000 | 1.000 | not floored | — | — |
-| greeting_reply_p95_s | ~1.5–1.6s | 1.514s | 1.533s | ≤ 2.0s | yes | already |
-| router_p95_s | ~1.05s | 1.053s | 1.055s | ≤ 1.5s local | yes | already |
+| Run | intent_accuracy | noisy_recall | follow_up_resolution | Verdict | Log |
+|---|---|---|---|---|---|
+| 1 | 0.933 | 1.000 | 1.000 | ALL enforced floors PASS | `gate-20261125T194629Z-3275007.log` |
+| 2 | 0.920 | 1.000 | 1.000 | ALL enforced floors PASS | `gate-20261125T195226Z-3276875.log` |
+| `--full` #1 (eval step) | 0.893 | 1.000 | 0.900 | eval FAIL (intent) | `gate-20261125T195933Z-3279426.log` |
+| A (post-revert¹) | 0.907 | 1.000 | 0.700 | FAIL (follow-up) | `gate-20261125T202842Z-3338303.log` |
+| B | 0.920 | 1.000 | 0.800 | FAIL (follow-up) | `gate-20261125T203509Z-3339606.log` |
+| C (fresh Ollama²) | 0.893 | 1.000 | 0.900 | FAIL (intent) | `gate-20261125T204218Z-3341180.log` |
+| `--full` #2 (eval step) | 0.880 | 1.000 | 0.900 | eval FAIL (intent) | `gate-20261125T204938Z-3342634.log` |
+
+Floor: `intent_accuracy` ≥ 0.90, `follow_up_resolution` ≥ 0.85, `noisy_recall` ≥ 0.90 (all
+already enforced since 14-C4/14-C3/14-C2 respectively — this block changes none of them).
+¹Between runs A and the `--full` #1 result, a reworded few-shot was tried (to also fix a
+newly-observed `typo-hol-greeting` miss) and REVERTED after it caused a worse, reproducible
+regression on `typo-hell-midsentence`/`what the hell is sql injection` — see "Known
+limitations" below; run A is the FIRST measurement after reverting back to the original
+commit-`81c562a` wording, confirmed byte-identical via `git diff`. ²Ollama (`ollama serve`,
+up 6h45m/4.2 GB RSS at that point) was stopped and restarted fresh between run B and run C to
+rule out server-state drift as the cause — run C still failed (on a different metric), which
+disproves that hypothesis.
+
+**Per-turn forensics (all 7 runs' `eval/golden_set_v2_results.json` snapshots kept at
+`~/secrag-gate-logs/14-D1-*.json`): every single `intent_accuracy`/`follow_up_resolution` miss
+across all 7 runs belongs to an already-identified, PRE-EXISTING noise category** — none of
+them is `typo-injecion-what` (the item this block's fix targets, which stays correct in all 7):
+- `abstain-en-cisco`/`abstain-es-nginx` (security → off_topic) and `dlg-ambiguous-then-clarify`/
+  `dlg-abstention-then-recover` — the EXACT items 14-C3's own ADR section (§"Decision — 14-C3")
+  already named as "PRE-EXISTING items unrelated to this block's changes... consistent with
+  14-C2's own 'LLM run-to-run noise' finding" — present in the orchestrator's 2 pre-fix runs on
+  `cc8c597` too, so provably not caused by this block.
+- `dlg-followup-3-back-es`/`dlg-followup-3-back-es-2025` (a multi-turn-back `followup` labelled
+  `ambiguous`) — the same "boundary confusion between two intents whose DEFINITIONS are
+  genuinely close for a multi-turn-back reference" 14-C3's ADR already documents for siblings
+  of this exact dialogue family.
+- `typo-hol-greeting`/`typo-hell-greeting`/`dlg-typo-then-followup` turn 0 (a greeting typo —
+  "hol"/"hell" — labelled `off_topic` instead of `chitchat`) — a NEWLY-OBSERVED noise class, not
+  seen in the orchestrator's 2 pre-fix runs, but confirmed NOT deterministically caused by this
+  block's fix either: isolated, fresh-process repeated trials (5x) of the bare messages "hol"
+  and "hell" against the unmodified commit-`81c562a` code returned `chitchat` every time; it
+  only appears inside full 75-turn `--only eval`/`--full` runs, where upstream per-turn memory/
+  summarization calls (visibly non-deterministic in every run's log: `chat_json invalid
+  output... falling back`) feed slightly different accumulated state into later turns — the
+  same "not bit-for-bit deterministic run to run even at temperature 0" phenomenon 14-C2/14-C3's
+  ADR sections already self-report, now additionally visible on the chitchat/off_topic boundary.
+
+**Conclusion:** the fix in commit `81c562a` is verified correct and solid for its actual target
+(`noisy_recall`, 7/7 clean); it did not cause the `intent_accuracy`/`follow_up_resolution`
+flakiness, which is pre-existing, already-documented LLM margin noise that happened to surface
+more visibly during this block's unusually large number of verification runs (7, vs. 14-C3/
+14-C4's 2 each). **Per the brief's own fallback ("if a floor cannot be met after a real effort,
+STOP and report"): this report IS that stop** — see "Needs the user's decision" in the senior's
+handback for the options. No floor was lowered or silently un-enforced.
 
 v1 clean metrics (`retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`): **1.000
-on both runs** — unaffected by this block for `security`/`followup` turns (groundedness/
-citation logic untouched); `correct_abstention`/judge "no claims" now judges the
-conversational abstention text instead of the old fixed sentence (T14.3.5) and still measures
-1.000 on both runs — the stronger, more realistic version of the check passes cleanly.
+on every run that reached the `eval` step** — unaffected by this block for `security`/
+`followup` turns (groundedness/citation logic untouched); `correct_abstention`/judge "no
+claims" now judges the conversational abstention text instead of the old fixed sentence
+(T14.3.5) and still measures 1.000 throughout.
 
-`conversational_reply_rate` dropped on both these runs relative to 14-C4's own 1.000 (0.944,
-0.889) — plausibly ordinary run-to-run LLM variance on the chitchat/off-topic boundary (the
-same class of noise 14-C4's own ADR section already recorded for this metric), not attributed
-to a specific mechanism in this block; left unenforced per the orchestrator's brief ("enforce
-if 1.0 in both runs" — it is not), consistent with never lowering an already-enforced floor
-while also never enforcing a new one without 2 clean runs to back it.
+`conversational_reply_rate` (not floored by this block) ranged 0.833–1.000 across the 7 runs —
+the same chitchat/off_topic-boundary noise as above, not attributed to a specific mechanism;
+left unenforced, consistent with 14-C4's own precedent and the orchestrator's brief ("enforce
+only if 1.0 in both runs" — it was not).
 
 ### Known limitations (self-reported, not just design) — 14-D1
 
@@ -1015,20 +1059,42 @@ while also never enforcing a new one without 2 clean runs to back it.
   stated rule; narrowing that further is the router's own job (§6.4b/§6.4c), not this
   module's.
 - **`conversational_reply_rate` enforcement decision** (14-C4's own open item): **left
-  unenforced.** Measured 0.944 and 0.889 on the 2 final `--only eval` runs (down from 14-C4's
-  own 1.000) — not 1.0 in either run, so per the orchestrator's own stated rule ("enforce if
-  1.0 in both runs") it stays `enforce: false` in `eval/golden_set_v2_floors.json`. Not
-  attributed to a specific mechanism this block changed (chitchat's own branch/metric
-  computation is untouched) — most likely the same run-to-run LLM variance on the chitchat/
-  off-topic boundary 14-C4's ADR section already recorded.
-- **The noisy_recall / "ambiguous never retrieves" interaction (resume finding).** Making
-  `ambiguous` a dead-end for retrieval means ANY future router misclassification of a genuine,
-  answerable security question as `"ambiguous"` costs a real `noisy_recall`/`retrieval_recall`
-  point that the pre-14-D1 pipeline would have absorbed silently (it retrieved anyway, just
-  under the wrong label). This block narrowed one specific instance (a misspelling) with a
-  prompt few-shot; it does not structurally prevent a DIFFERENT false-positive `"ambiguous"`
-  from recurring with the same cost — a router-level reliability concern (router.py's own
-  module), not fully closed by this block.
+  unenforced.** Ranged 0.833–1.000 across 7 runs (down from 14-C4's own 1.000) — never 1.0
+  twice running, so per the orchestrator's own stated rule ("enforce if 1.0 in both runs") it
+  stays `enforce: false` in `eval/golden_set_v2_floors.json`. Not attributed to a specific
+  mechanism this block changed (chitchat's own branch/metric computation is untouched) — the
+  same chitchat/off_topic-boundary noise documented below.
+- **The noisy_recall / "ambiguous never retrieves" interaction (resume finding, CONFIRMED
+  across 7 runs, not just narrowed).** Making `ambiguous` a dead-end for retrieval means ANY
+  router misclassification of a genuine, answerable security question as `"ambiguous"` costs a
+  real `noisy_recall`/`retrieval_recall`/`intent_accuracy` point that the pre-14-D1 pipeline
+  would have absorbed silently (it retrieved anyway, just under the wrong label). This block
+  fixed the ONE specific instance it was asked to fix (a misspelling, `typo-injecion-what`,
+  solid 1.000 across all 7 verification runs) but discovered, while verifying it, that the
+  SAME structural exposure already existed for several OTHER boundaries this block never
+  touched: `security` questions about out-of-corpus vendor tools misclassified `off_topic`
+  (`abstain-en-cisco`/`abstain-es-nginx`, pre-existing per 14-C3's ADR), multi-turn-back
+  `followup` misclassified `ambiguous` (`dlg-followup-3-back-es`/`-es-2025`, pre-existing per
+  14-C3's ADR), and — newly observed this block, though NOT deterministically caused by it
+  (isolated fresh-process trials of the bare messages return the correct `chitchat` every
+  time; it only surfaces inside a full 75-turn run, alongside visible upstream
+  memory-summarization non-determinism) — a short greeting typo (`"hol"`/`"hell"`)
+  occasionally misclassified `off_topic` instead of `chitchat`. **This is a router-level
+  reliability concern spanning the WHOLE module, not something a single contrastive few-shot
+  can close** — see "Needs the user's decision" in the senior's handback for how to proceed.
+- **A reworded few-shot attempt was tried and reverted (self-reported, do not repeat without
+  re-testing).** To also fix the `typo-hol-greeting` miss, the fix's few-shot was reworded
+  twice: the first reword explicitly named the word "hell" as a chitchat example, which caused
+  a REAL, reproducible regression — the model started pattern-matching the literal substring
+  "hell" and misclassified `typo-hell-midsentence`/`"what the hell is sql injection"` (a real
+  security question using "hell" as an intensifier) as `chitchat`/`ambiguous`. A second,
+  more generic reword still left `"what the hell is sql injection"` misclassified `ambiguous`
+  (5/5 fresh-process trials). Both rewords were reverted; the shipped code is the ORIGINAL,
+  narrower wording from commit `81c562a` (confirmed solid for its own target across all 7
+  runs). **Lesson for whoever next touches `_ROUTER_SYSTEM`: a few-shot aimed at one specific
+  item can shift the decision boundary for UNRELATED items sharing a surface feature (a literal
+  word, a short/truncated shape) — always re-test the full golden set's noisy/greeting items
+  after any system-prompt change, not just the item the change targets.**
 
 ## Rollback
 

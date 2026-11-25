@@ -486,7 +486,14 @@ misspelling alone is not an unresolved reference. A code-level tie-breaker keyed
 `clarification is None` (the same self-contradiction §6.4b/§6.4c already narrowed for the
 followup case) was considered and rejected: live-verified, 2 of the 5 genuine golden-set
 `ambiguous` items ("Can you help me?", "¿Cómo lo arreglo?") ALSO produce `clarification=None`
-— that signal does not distinguish a genuine ambiguity from this one.
+— that signal does not distinguish a genuine ambiguity from this one. **Verified solid across
+7 `--only eval`/`--full` runs: `noisy_recall` measured 1.000 every single time** — see the
+ADR's "Eval table" (7 runs) for the full picture, including 2 reworded-few-shot attempts that
+were tried to ALSO fix an unrelated, pre-existing greeting-typo noise item and were reverted
+after they caused new regressions on other items (a literal-word-naming few-shot is not safe
+to generalize without re-testing the whole golden set). `intent_accuracy`/
+`follow_up_resolution` turned out noisier at the margin than first assumed from 2 runs alone —
+documented as pre-existing, not caused by this fix, in the ADR's "Known limitations".
 
 ## 7. Cost & latency
 
