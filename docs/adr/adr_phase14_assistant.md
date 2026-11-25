@@ -945,22 +945,32 @@ generating a second, independent question would be. A short bilingual fallback
 rule on (§6.4b/§6.4c narrowed, did not eliminate, the "`ambiguous` with `clarification=None`"
 self-contradiction) — never surfaces an empty reply.
 
-### Eval table (2 real `--only eval` runs, identical final code, same 75-turn fixture)
+### Eval table — NOT YET MEASURED on the final code (see status/blocks/14-D1.md)
+
+The required 2 real `--only eval` runs were not completed this block: the first attempt was
+killed by the harness itself (system-wide low memory while the session sat idle — not a
+command failure, not a code problem) immediately after `gate.sh --fast` had already passed on
+the final code, and the senior was instructed not to retry on its own. The table below
+therefore records the 14-C4 baseline and the floors only; `conversational_reply_rate`
+enforcement and a final confirmation that `intent_accuracy`/`follow_up_resolution` still clear
+their floors after the DA-14-C4-1 fix (expected — the fix only narrows a tie-breaker branch
+that never fired for any golden-set item before or after) are left for the next 2 real runs,
+to be completed before this block closes.
 
 | Metric | 14-C4 (before) | Run 1 | Run 2 | Floor | Met (both)? | Enforced from this block? |
 |---|---|---|---|---|---|---|
-| intent_accuracy | 0.907 | _(filled by the senior before closing — see status/blocks/14-D1.md)_ | | ≥ 0.90 | | already (14-C4) |
-| follow_up_resolution | 0.900 | | | ≥ 0.85 | | already (14-C3) |
-| noisy_recall | 1.000 | | | ≥ 0.90 | | already |
-| conversational_reply_rate | 1.000 | | | ≥ 1.00 | | see decision below |
-| clarification_rate | (no code path before 14-D1) | | | not floored | | — |
-| greeting_reply_p95_s | ~1.5–1.6s | | | ≤ 2.0s | | already |
-| router_p95_s | ~1.05s | | | ≤ 1.5s local | | already |
+| intent_accuracy | 0.907 | — | — | ≥ 0.90 | — | already (14-C4); re-confirm |
+| follow_up_resolution | 0.900 | — | — | ≥ 0.85 | — | already (14-C3); re-confirm |
+| noisy_recall | 1.000 | — | — | ≥ 0.90 | — | already |
+| conversational_reply_rate | 1.000 | — | — | ≥ 1.00 | — | pending these 2 runs |
+| clarification_rate | (no code path before 14-D1) | — | — | not floored | — | — |
+| greeting_reply_p95_s | ~1.5–1.6s | — | — | ≤ 2.0s | — | already |
+| router_p95_s | ~1.05s | — | — | ≤ 1.5s local | — | already |
 
 v1 clean metrics (`retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`):
-unaffected by this block for `security`/`followup` turns (groundedness/citation logic
+expected unaffected by this block for `security`/`followup` turns (groundedness/citation logic
 untouched); `correct_abstention`/judge "no claims" now judges the conversational abstention
-text instead of the old fixed sentence (T14.3.5) — see the measured value below.
+text instead of the old fixed sentence (T14.3.5) — not yet measured, see above.
 
 ### Known limitations (self-reported, not just design) — 14-D1
 
