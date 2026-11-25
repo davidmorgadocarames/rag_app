@@ -149,7 +149,7 @@ no clarification code path exists before 14.3, so this is 0 by construction, not
 the validated-judge mechanism), `greeting_reply_p95_s` (measurable today) and `router_p95_s`
 (always `None` — there is no router call to time yet).
 
-**Floors (PHASE_PLANNING §14.0) are recorded, not yet enforced.** §14.2's own Gate line reads
+**Floors (the Phase 14.0 plan) are recorded, not yet enforced.** §14.2's own Gate line reads
 "floors from 14.0", i.e. enforcement starts once the router/memory exist; `eval/golden_set_v2_floors.json`
 carries `enforce_now: false` for exactly that reason — the `eval` gate step prints every
 value-vs-floor comparison but only fails on it once a later block flips that flag. See the

@@ -95,7 +95,7 @@ time).
 
 ### Floor-enforcement decision
 
-`PHASE_PLANNING.md` §14.0 lists the floors next to "baseline on current code" with no explicit
+The Phase 14.0 plan lists the floors next to "baseline on current code" with no explicit
 enforcement date; §14.2's own Gate line reads **"floors from 14.0"**, read here as "14.0 records
 them, 14.2 (once the router/memory it measures exists) is where they start being enforced."
 `eval/golden_set_v2_floors.json` carries `enforce_now: false` accordingly — the `eval` gate step
