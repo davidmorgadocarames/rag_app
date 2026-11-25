@@ -990,4 +990,236 @@ def test_answer_question_stream_chitchat_still_emits_one_timing_record(
     assert payload["streaming"] is True
     assert payload["ttft_ms"] is None
     assert "classify_ms" in payload
-    assert "generate_ms" not in payload
+
+
+# --- T14.3.1/T14.3.3/T14.3.4 (block 14-D1): conversational ambiguous/off_topic/abstention ---
+# Every test below fails on pre-14-D1 code: `ambiguous`/`off_topic` fell through to the SAME
+# retrieve-and-answer path as `security` (no clarifying question/redirect branch existed),
+# and every abstention was the fixed English `_ABSTENTION_TEXT`, never this fake's own text.
+
+
+def test_answer_question_ambiguous_returns_the_clarifying_question_without_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_a: object, **_k: object) -> object:
+        raise AssertionError("ambiguous must never retrieve")
+
+    monkeypatch.setattr(generation, "hybrid_search", _boom)
+    router_output = RouterOutput(
+        intent="ambiguous",
+        language="en",
+        standalone_query="How do I fix this?",
+        clarification="What exactly would you like help fixing?",
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "unused")
+
+    answer = generation.answer_question(None, "How do I fix this?", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    assert answer.abstained is False
+    assert answer.text == "What exactly would you like help fixing?"
+    assert chat.calls == 0, "no extra LLM call -- the router's own clarification is reused"
+
+
+def test_answer_question_off_topic_returns_the_llm_redirect_without_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_a: object, **_k: object) -> object:
+        raise AssertionError("off_topic must never retrieve")
+
+    monkeypatch.setattr(generation, "hybrid_search", _boom)
+    router_output = RouterOutput(
+        intent="off_topic", language="en", standalone_query="what's the weather like today?"
+    )
+    chat = _FakeChatSyncWithRouterOutput(
+        router_output, "That's outside what I can help with -- ask me about security!"
+    )
+
+    answer = generation.answer_question(
+        None, "what's the weather like today?", chat=chat, use_rerank=False
+    )  # type: ignore[arg-type]
+
+    assert answer.abstained is False
+    assert answer.text == "That's outside what I can help with -- ask me about security!"
+    assert chat.calls == 1, "exactly one LLM call -- the redirect itself"
+
+
+def test_answer_question_stream_ambiguous_emits_responding_without_retrieval() -> None:
+    router_output = RouterOutput(
+        intent="ambiguous",
+        language="es",
+        standalone_query="¿Cómo lo arreglo?",
+        clarification="¿Qué exactamente te gustaría arreglar?",
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "unused")
+
+    events = list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "¿Cómo lo arreglo?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    result = events[-1]
+    assert isinstance(result, StreamResult)
+    assert result.answer.text == "¿Qué exactamente te gustaría arreglar?"
+    assert result.answer.abstained is False
+    tokens = "".join(e.text for e in events if isinstance(e, StreamToken))
+    assert tokens.strip() == "¿Qué exactamente te gustaría arreglar?"
+    assert chat.calls == 0
+
+
+def test_answer_question_stream_off_topic_emits_responding_without_retrieval() -> None:
+    router_output = RouterOutput(
+        intent="off_topic", language="en", standalone_query="can you write me a poem?"
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "I can only help with security topics.")
+
+    events = list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "can you write me a poem?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    result = events[-1]
+    assert isinstance(result, StreamResult)
+    assert result.answer.text == "I can only help with security topics."
+    assert result.answer.abstained is False
+    assert chat.calls == 1
+
+
+def test_answer_question_abstention_is_conversational_when_no_chunks_are_retrieved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14.3.4: the conversational abstention (LLM-phrased) replaces the literal
+    `_ABSTENTION_TEXT`. Fails on pre-14-D1 code: `answer.text` would be the fixed English
+    sentence, never this fake's own reply."""
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [])
+    chat = _FakeChatSync("I don't have a reliable source for that specific question.")
+
+    answer = generation.answer_question(
+        None, "How do I prevent SQL injection?", chat=chat, use_rerank=False
+    )  # type: ignore[arg-type]
+
+    assert answer.abstained is True
+    assert answer.text == "I don't have a reliable source for that specific question."
+    assert answer.text != generation._ABSTENTION_TEXT
+
+
+def test_answer_question_abstention_passes_the_detected_language_and_related_topics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PHASE_PLANNING.md 14.3's own wording: "related topics only if retrieval found them" --
+    a NOT_GROUNDED verdict (retrieval found something, just not enough to ground an answer)
+    passes the found chunks' headings through; the message's own language (detected by
+    `guess_language` on the router's conservative fallback) reaches the abstention call."""
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    chat = _FakeChatSync("Use parameterized queries [1].", verdict="NOT_GROUNDED")
+    captured: dict[str, object] = {}
+    real_generate_abstention_reply = generation.generate_abstention_reply
+
+    def spy(chat_: object, query: str, language: str, **kw: object) -> str:
+        captured["language"] = language
+        captured["related_topics"] = kw.get("related_topics")
+        return real_generate_abstention_reply(chat_, query, language, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation, "generate_abstention_reply", spy)
+
+    answer = generation.answer_question(
+        None, "¿Cómo prevengo la inyección SQL?", chat=chat, use_rerank=False
+    )  # type: ignore[arg-type]
+
+    assert answer.abstained is True
+    assert captured["language"] == "es"
+    assert captured["related_topics"] == ["h"]  # _chunk()'s own heading
+
+
+class _FakeChatStreamWithRouterAndAbstention:
+    """Combines a fixed ``chat_json`` router output, a ``chat_stream`` sequence (generate,
+    then groundedness) and a single ``chat()`` reply for the abstention call that follows a
+    NOT_GROUNDED verdict -- no existing fake in this file covers all three."""
+
+    def __init__(
+        self, router_output: RouterOutput, sequences: list[list[str]], abstention_reply: str
+    ) -> None:
+        self._router_output = router_output
+        self._sequences = sequences
+        self._abstention_reply = abstention_reply
+        self.stream_calls = 0
+        self.chat_calls = 0
+
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return self._router_output
+
+    def chat_stream(self, *_a: object, usage: Usage | None = None, **_kw: object) -> Iterator[str]:
+        seq = self._sequences[self.stream_calls]
+        self.stream_calls += 1
+        yield from seq
+        if usage is not None:
+            usage.add(Usage(prompt_tokens=10, completion_tokens=len(seq)))
+
+    def chat(self, *_a: object, **_kw: object) -> str:
+        self.chat_calls += 1
+        return self._abstention_reply
+
+
+def test_answer_question_stream_abstention_is_conversational_when_no_chunks_are_retrieved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [])
+    router_output = RouterOutput(
+        intent="security", language="en", standalone_query="How do I prevent SQL injection?"
+    )
+    chat = _FakeChatStreamWithRouterAndAbstention(
+        router_output, [], "I don't have a reliable source for that specific question."
+    )
+
+    events = list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "How do I prevent SQL injection?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    result = events[-1]
+    assert isinstance(result, StreamResult)
+    assert result.answer.abstained is True
+    assert result.answer.text == "I don't have a reliable source for that specific question."
+    assert result.answer.text != generation._ABSTENTION_TEXT
+    assert chat.chat_calls == 1
+
+
+def test_answer_question_stream_abstention_is_conversational_when_not_grounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    router_output = RouterOutput(
+        intent="security", language="en", standalone_query="How do I prevent SQL injection?"
+    )
+    chat = _FakeChatStreamWithRouterAndAbstention(
+        router_output,
+        [["Use parameterized queries ", "[1]."], ["NOT_GROUNDED"]],
+        "I don't have a reliable source for that specific question.",
+    )
+
+    events = list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "How do I prevent SQL injection?",
+            chat=chat,  # type: ignore[arg-type]
+            use_rerank=False,
+        )
+    )
+
+    result = events[-1]
+    assert isinstance(result, StreamResult)
+    assert result.answer.abstained is True
+    assert result.answer.text == "I don't have a reliable source for that specific question."
+    assert chat.chat_calls == 1

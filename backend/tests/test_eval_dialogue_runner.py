@@ -484,6 +484,110 @@ def test_evaluate_dialogues_retrieves_with_the_standalone_query_not_the_raw_mess
     assert seen_queries == ["How does the OS command injection ranking compare in OWASP Top 10?"]
 
 
+# --- T14.3.1/T14.3.3/T14.3.4 (block 14-D1): conversational ambiguous/off_topic/abstention ---
+# Every test below fails on pre-14-D1 code: `ambiguous`/`off_topic` fell through to the SAME
+# retrieve-and-answer path (no clarifying question/redirect branch existed in this runner).
+
+
+def test_evaluate_dialogues_ambiguous_asks_the_clarifying_question_without_retrieving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_retrieve(*_a: object, **_kw: object) -> list[RetrievedChunk]:
+        raise AssertionError("ambiguous must never retrieve")
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fail_retrieve)
+
+    router_output = RouterOutput(
+        intent="ambiguous",
+        language="en",
+        standalone_query="How do I fix this?",
+        clarification="What exactly would you like help fixing?",
+    )
+    dialogue = Dialogue(
+        id="dlg-ambiguous",
+        turns=(Turn(message="How do I fix this?", expected_intent="ambiguous", language="en"),),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "unused")
+
+    results = evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert len(results) == 1
+    assert results[0].observed_intent == "ambiguous"
+    assert results[0].reply_text == "What exactly would you like help fixing?"
+    assert results[0].abstained is False
+    assert results[0].retrieved_docs == []
+    assert chat.calls == 0, "no extra LLM call -- the router's own clarification is reused"
+
+
+def test_evaluate_dialogues_off_topic_gets_the_llm_redirect_without_retrieving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_retrieve(*_a: object, **_kw: object) -> list[RetrievedChunk]:
+        raise AssertionError("off_topic must never retrieve")
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fail_retrieve)
+
+    router_output = RouterOutput(
+        intent="off_topic", language="en", standalone_query="can you write me a poem?"
+    )
+    dialogue = Dialogue(
+        id="dlg-offtopic",
+        turns=(
+            Turn(message="can you write me a poem?", expected_intent="off_topic", language="en"),
+        ),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "I can only help with security topics.")
+
+    results = evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert len(results) == 1
+    assert results[0].observed_intent == "off_topic"
+    assert results[0].reply_text == "I can only help with security topics."
+    assert results[0].abstained is False
+    assert results[0].retrieved_docs == []
+    assert chat.calls == 1
+
+
+def test_evaluate_dialogues_abstention_is_conversational_in_the_detected_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14.3.4: `answer_from_chunks` now receives `language=decision.language` from this
+    runner too, the THIRD entry point. Fails on pre-14-D1 code: the reply would be the fixed
+    English `_ABSTENTION_TEXT`, never this fake's own (Spanish) text."""
+
+    def fake_retrieve(*_a: object, **_kw: object) -> list[RetrievedChunk]:
+        return []
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fake_retrieve)
+
+    router_output = RouterOutput(
+        intent="security",
+        language="es",
+        standalone_query="How do I prevent SQL injection?",
+    )
+    dialogue = Dialogue(
+        id="dlg-abstain-es",
+        turns=(
+            Turn(
+                message="¿Cómo prevengo la inyección SQL?",
+                expected_intent="security",
+                language="es",
+            ),
+        ),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "No tengo una fuente fiable para esa pregunta.")
+
+    results = evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert len(results) == 1
+    assert results[0].abstained is True
+    assert results[0].reply_text == "No tengo una fuente fiable para esa pregunta."
+    assert results[0].reply_text != generation._ABSTENTION_TEXT
+
+
 def test_evaluate_dialogues_still_generates_the_answer_from_the_raw_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

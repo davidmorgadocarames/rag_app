@@ -130,10 +130,13 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      "hello", "hola", "thanks") takes the **fast path** and skips the router only; a typo'd
      greeting ("hol"), a follow-up, an ambiguous or off-topic message all go through the **LLM
      router** instead, which classifies intent/language and rewrites an English standalone
-     query. Either way, a chit-chat-classified message gets a brief, honest, LLM-generated
-     reply (template fallback on failure) — no retrieval, no citations, no abstention. A
-     misclassified or adversarial router reply can never bypass retrieval/citation: any
-     failure degrades to the conservative "security" fallback carrying the user's raw message.
+     query. Every reply is in the user's own detected language (D14.1): a chit-chat-classified
+     message gets a brief, honest, LLM-generated reply (template fallback on failure) — no
+     retrieval, no citations, no abstention. An **ambiguous** message gets the router's own
+     clarifying question instead — asks, rather than guessing. An **off-topic** message gets
+     a polite, LLM-phrased redirect, never an uncited answer (TRD §6.5). A misclassified or
+     adversarial router reply can never bypass retrieval/citation: any failure degrades to the
+     conservative "security" fallback carrying the user's raw message.
    - **Remembers the conversation** (TRD §6.3, block 14-C1 — `/chat/stream` only; the one-shot
      `POST /chat` has no conversation at all, so it never reads or writes memory). Before the
      router runs, the server reads this conversation's own bounded summary (topics/entities/
@@ -142,8 +145,11 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      (one more small LLM call) **before** the `done`/`error` event below — best-effort: if that
      update fails or comes back invalid, the OLD summary is kept untouched and the turn is
      unaffected either way.
-   - Security (and, until 14.3 builds their own replies, follow-up/ambiguous/off-topic)
-     questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
+   - Security and follow-up questions run the grounded RAG pipeline: retrieve → rerank →
+     generate → groundedness check. An abstention from that pipeline (no matching source, or
+     an ungrounded answer) is now an LLM-phrased, honest reply in the user's own language —
+     never the same fixed English sentence for everyone — that may suggest rephrasing or a
+     related topic retrieval actually found, but never invents a fact (TRD §6.5).
    - Streams **Server-Sent Events** back. The **first** event is `conversation` with the
      `conversation_id` (the conversation and the user message are stored first, in one
      transaction); then `stage` (classifying/retrieving/reranking/generating/checking) and `token`

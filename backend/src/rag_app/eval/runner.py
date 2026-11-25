@@ -117,6 +117,13 @@ def evaluate_dialogues(
     fixed one layer down, in ``retrieval.hybrid_search``/``reranking.CrossEncoderReranker``
     themselves, so every caller of ``retrieve()`` gets that fix for free.
 
+    T14.3.1/T14.3.3/T14.3.4 (block 14-D1): the THIRD entry point for the conversational
+    replies -- ``ambiguous`` asks the router's own clarifying question
+    (``assistant.replies.clarifying_reply``), ``off_topic`` gets a polite redirect
+    (``assistant.replies.generate_offtopic_reply``), neither retrieves; ``answer_from_chunks``
+    now receives ``language=decision.language`` too, so a ``security``/``followup`` turn's
+    abstention is the LLM-phrased conversational one, same as the two live entry points.
+
     Uses ``make_chat_client()`` (TF21), unlike the v1 ``evaluate()`` above, which keeps its
     pre-existing hard-coded ``OllamaChat`` default unchanged (out of scope here — the v1 gate
     must stay green and untouched).
@@ -130,6 +137,7 @@ def evaluate_dialogues(
     from rag_app.assistant.core import named_owasp_version, retrieval_query, understand
     from rag_app.assistant.fast_path import generate_chitchat_reply
     from rag_app.assistant.memory import format_last_turn, summarize_turn
+    from rag_app.assistant.replies import clarifying_reply, generate_offtopic_reply
     from rag_app.eval.judge import judge_correctness, judge_no_claims
     from rag_app.generation import Answer, answer_from_chunks
     from rag_app.reranking import get_shared_reranker, retrieve
@@ -152,10 +160,22 @@ def evaluate_dialogues(
                 chat, turn.message, summary=summary_text, last_turn=last_turn_text
             )
 
+            # T14.3.1/T14.3.3/T14.3.4 (block 14-D1): the THIRD entry point for the
+            # chitchat/ambiguous/off_topic conversational replies -- same dispatch as
+            # `generation.answer_question`/`.answer_question_stream`. Only `security`/
+            # `followup` (and, as a conservative fallback, a router error) still retrieve.
             if decision.intent == "chitchat":
                 reply = generate_chitchat_reply(chat, turn.message, decision.language)
                 answer: Answer = Answer(text=reply, abstained=False, grounded=True)
                 retrieved_docs: list[str] = []
+            elif decision.intent == "ambiguous":
+                reply = clarifying_reply(decision.clarification, decision.language)
+                answer = Answer(text=reply, abstained=False, grounded=True)
+                retrieved_docs = []
+            elif decision.intent == "off_topic":
+                reply = generate_offtopic_reply(chat, turn.message, decision.language)
+                answer = Answer(text=reply, abstained=False, grounded=True)
+                retrieved_docs = []
             else:
                 search_query = retrieval_query(decision, turn.message)
                 # T14.2.9 (DEC-062): the THIRD entry point for the named-edition filter --
@@ -165,7 +185,7 @@ def evaluate_dialogues(
                     session, search_query, reranker=reranker, top_n=top_n, version=search_version
                 )
                 retrieved_docs = [_doc_slug(c.chunk_uid) for c in chunks]
-                answer = answer_from_chunks(chat, turn.message, chunks)
+                answer = answer_from_chunks(chat, turn.message, chunks, language=decision.language)
             latency_s = time.perf_counter() - start
 
             # DA-14-C1 finding 1 fix (14-C1-fix, HIGH): the same gap as /chat/stream's

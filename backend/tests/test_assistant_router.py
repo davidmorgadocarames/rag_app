@@ -211,26 +211,59 @@ def test_route_accepts_a_clean_ambiguous_reply_with_a_clarification() -> None:
 
 
 # --- _resolves_a_reference: the T14.2.9-fix (DEC-063) tie-breaker's own helper -------------
+# Corrected by 14-D1 (DA-14-C4-1): now takes the real `context` (summary/last_turn) as a
+# third argument and additionally requires the added word to appear IN it -- see the
+# function's own docstring for why "absent from query" alone was wrong (a plain translation
+# satisfies it every time, with no real grounding in context).
 
 
 def test_resolves_a_reference_detects_an_added_substantive_word() -> None:
     assert _resolves_a_reference(
         "Where does it rank in the 2021 OWASP Top 10?",
         "Where does SQL injection rank in the 2021 OWASP Top 10?",
+        context="SQL injection",
     )
 
 
 def test_resolves_a_reference_is_false_when_nothing_new_was_added() -> None:
     """A pure echo/translation (same content words, same or fewer) is NOT resolution --
-    stems the false-positive risk for a message the router genuinely could not resolve."""
-    assert not _resolves_a_reference("Is it safe?", "Is it safe?")
-    assert not _resolves_a_reference("How do I fix this?", "How do I fix this")  # punctuation only
+    stems the false-positive risk for a message the router genuinely could not resolve.
+    Context is irrelevant here: with no added word, condition (a) alone already fails."""
+    assert not _resolves_a_reference("Is it safe?", "Is it safe?", context="SQL injection")
+    assert not _resolves_a_reference(
+        "How do I fix this?", "How do I fix this", context="SQL injection"
+    )  # punctuation only
 
 
 def test_resolves_a_reference_ignores_digits_and_short_words() -> None:
     """Edition years (digits) and 1-2 letter words never count as "substantive" on their
     own -- only >=3-letter alphabetic tokens do."""
-    assert not _resolves_a_reference("What about 2021?", "What about 2025?")
+    assert not _resolves_a_reference("What about 2021?", "What about 2025?", context="2025")
+
+
+def test_resolves_a_reference_requires_the_added_word_to_appear_in_context() -> None:
+    """DA-14-C4-1 (HIGH): a genuine resolution's added word must come FROM the real context,
+    not merely be new relative to the raw query."""
+    assert _resolves_a_reference(
+        "What about the 2025 edition?",
+        "What rank does broken access control have in the 2025 OWASP Top 10?",
+        context='{"topics":["broken access control"]}',
+    )
+
+
+def test_resolves_a_reference_rejects_a_translation_only_addition_not_grounded_in_context() -> None:
+    """DA-14-C4-1 (HIGH), the exact regression: a Spanish message translated to English
+    shares almost no tokens with the original -- EVERY word in the translation would count
+    as "added" under the old (pre-14-D1) definition, even when the real context has nothing
+    to do with the message and nothing was actually resolved. Empirically verified before
+    this fix: ``_resolves_a_reference("¿Cómo lo arreglo?", "How do I fix this?")``
+    returned ``True`` with no context argument at all. With a real but UNRELATED context, the
+    added words ("how", "fix", "this") still do not appear in it, so this must stay False."""
+    assert not _resolves_a_reference(
+        "¿Cómo lo arreglo?",
+        "How do I fix this?",
+        context='{"topics":["SQL injection"]}',
+    )
 
 
 # --- route: T14.2.9-fix (DEC-063) ambiguous-vs-followup tie-breaker ------------------------
@@ -294,3 +327,58 @@ def test_route_leaves_ambiguous_alone_when_standalone_query_resolves_nothing() -
         last_turn="User: ...\nAssistant: ...",
     )
     assert out.intent == "ambiguous"
+
+
+# --- route: 14-D1 (DA-14-C4-1) -- the tie-breaker's context-grounding fix, in Spanish ------
+
+
+def test_route_overrides_ambiguous_to_followup_for_a_spanish_followup_grounded_in_context() -> None:
+    """A genuine Spanish follow-up: the resolved (English) standalone_query names a topic
+    ("SQL") that really is present in the real (Spanish) last turn -- condition (b) is
+    satisfied by GROUNDING, not merely by "the text differs" -- so the tie-breaker still
+    fires correctly after the 14-D1 fix."""
+    suspicious_label = RouterOutput(
+        intent="ambiguous",
+        language="es",
+        standalone_query="What rank does SQL injection have in the 2025 OWASP Top 10?",
+        clarification=None,
+    )
+    chat = _FakeChat(result=suspicious_label)
+    out = route(
+        chat,
+        "¿Y en la edición 2025?",
+        summary='{"topics":["inyección SQL"]}',
+        last_turn="Usuario: ¿Cómo prevengo la inyección SQL?\nAsistente: ...",
+    )
+    assert out.intent == "followup"
+    assert out.standalone_query == suspicious_label.standalone_query
+    assert out.clarification is None
+
+
+def test_route_leaves_a_genuinely_ambiguous_spanish_message_with_unrelated_context_alone() -> None:
+    """DA-14-C4-1's exact finding, reproduced at the ``route()`` level: a genuinely ambiguous
+    Spanish message (nothing in the REAL context resolves "lo arreglo") must stay
+    "ambiguous" even though condition (a) holds (context exists) and the model's own
+    standalone_query is a plain translation that "differs" from the raw message in every
+    token -- before 14-D1 this wrongly flipped to "followup" and discarded a real
+    clarification need; after the fix it does not, because the translation adds no word that
+    is also grounded in the (unrelated) context."""
+    result = RouterOutput(
+        intent="ambiguous",
+        language="es",
+        standalone_query="How do I fix this?",
+        clarification="¿Qué exactamente te gustaría arreglar?",
+    )
+    chat = _FakeChat(result=result)
+    out = route(
+        chat,
+        "¿Cómo lo arreglo?",
+        summary='{"topics":["SQL injection"]}',
+        # Deliberately avoids "how"/"fix"/"this" (the translation's own added words) so the
+        # test isolates the real finding -- a context that shares NO grounding with the
+        # translation must not flip the verdict -- from the tie-breaker's own documented
+        # crude-proxy limitation (a short common word accidentally shared by coincidence).
+        last_turn="Previous question: SQL injection prevention techniques",
+    )
+    assert out.intent == "ambiguous"
+    assert out.clarification == "¿Qué exactamente te gustaría arreglar?"

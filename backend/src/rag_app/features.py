@@ -1226,12 +1226,19 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         " standalone_query instead of the raw message -- a follow-up like 'where does it"
         " rank?' now retrieves the actual document, not just the right intent label; the"
         " streamed/returned answer still addresses the original message, in the user's own"
-        " language",
+        " language. T14.3.1/T14.3.3/T14.3.4 (block 14-D1): an 'ambiguous' message gets the"
+        " router's own clarifying question (no extra LLM call, asks instead of guessing); an"
+        " 'off_topic' message gets a polite, LLM-phrased redirect; neither retrieves. Every"
+        " abstention (no matching chunks, or an ungrounded answer) is now an LLM-phrased"
+        " conversational reply, in the user's own language, instead of a fixed English"
+        " sentence -- it may rephrase or point at a related topic retrieval actually found,"
+        " but never invents a claim about the original question.",
         key_files=(
             "backend/src/rag_app/assistant/core.py",
             "backend/src/rag_app/assistant/router.py",
             "backend/src/rag_app/assistant/fast_path.py",
             "backend/src/rag_app/assistant/memory.py",
+            "backend/src/rag_app/assistant/replies.py",
         ),
         e2e=("auth.spec.ts",),
         # auth.spec.ts registers a brand-new account to reach /chat (DA-HB-2).

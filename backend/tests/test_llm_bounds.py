@@ -249,12 +249,17 @@ def test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness() -
     T14.2.6 (block 14-C1): the memory-write call (``assistant.memory.summarize_turn``) runs
     right after generate/groundedness on the SAME turn (the live stream path) or the SAME
     dialogue turn (the eval runner) -- same reasoning, same pin.
+
+    T14.3.3/T14.3.4 (block 14-D1): the off-topic redirect and the conversational abstention
+    (``assistant.replies.generate_offtopic_reply``/``.generate_abstention_reply``) are on the
+    LIVE chat path too (and the eval runner), run back-to-back with generate/groundedness in
+    the SAME process -- both pin ``num_ctx_answer`` too, same reasoning.
     """
     from rag_app import agentic
-    from rag_app.assistant import fast_path, memory, router
+    from rag_app.assistant import fast_path, memory, replies, router
     from rag_app.eval import judge
 
-    for module in (agentic, judge, router, fast_path, memory):
+    for module in (agentic, judge, router, fast_path, memory, replies):
         calls = _llm_calls(Path(module.__file__))
         assert calls, f"{module.__name__}: expected at least one LLM call"
         attrs = [_num_ctx_attr_name(call) for call in calls]

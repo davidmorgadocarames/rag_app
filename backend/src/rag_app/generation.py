@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -23,6 +23,11 @@ from sqlalchemy.orm import Session
 from rag_app import timing
 from rag_app.assistant.core import named_owasp_version, retrieval_query, understand
 from rag_app.assistant.fast_path import generate_chitchat_reply
+from rag_app.assistant.replies import (
+    clarifying_reply,
+    generate_abstention_reply,
+    generate_offtopic_reply,
+)
 from rag_app.config import get_settings
 from rag_app.embeddings import OllamaEmbedder
 from rag_app.llm import ChatClient, Message, Usage, make_chat_client
@@ -34,6 +39,27 @@ if TYPE_CHECKING:
 
 INSUFFICIENT = "INSUFFICIENT_CONTEXT"
 _ABSTENTION_TEXT = "I don't have a reliable source for that in the corpus."
+
+
+def _conversational_abstention_text(
+    chat: ChatClient,
+    query: str,
+    language: str | None,
+    *,
+    related_topics: Sequence[str] = (),
+) -> str:
+    """T14.3.4 (block 14-D1): the LLM-phrased conversational abstention
+    (``assistant.replies.generate_abstention_reply``) replaces the literal
+    ``_ABSTENTION_TEXT`` for every caller that knows the detected ``language`` --
+    ``answer_question``/``answer_question_stream`` (``decision.language``) and
+    ``eval.runner.evaluate_dialogues``. ``language is None`` keeps the OLD, fixed English
+    sentence unchanged -- every caller WITHOUT a detected language (the CLI's own ``main()``,
+    ``eval.benchmark``'s v1 golden-set run, ``agentic.py``) is out of this block's scope (no
+    router/language detection runs for them) and must not regress."""
+    if language is None:
+        return _ABSTENTION_TEXT
+    return generate_abstention_reply(chat, query, language, related_topics=related_topics)
+
 
 _BRACKET_RE = re.compile(r"\[([^\]]*\d[^\]]*)\]")
 _DIGITS_RE = re.compile(r"\d+")
@@ -155,15 +181,31 @@ def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[Retrieve
         return parse_groundedness(raw)
 
 
-def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk]) -> Answer:
+def answer_from_chunks(
+    chat: ChatClient,
+    query: str,
+    chunks: list[RetrievedChunk],
+    *,
+    language: str | None = None,
+) -> Answer:
     """Generate a grounded, cited answer from already-retrieved chunks (or abstain).
 
     Also used by the eval runner and ``agentic.py`` (T11.3.1): outside a ``timing``
     recorder (only ``answer_question``/``answer_question_stream`` open one) the ``stage``/
     ``mark_first_token`` calls below are no-ops.
+
+    ``language`` (T14.3.4, block 14-D1): when given, every abstention below is the
+    LLM-phrased conversational abstention (``_conversational_abstention_text``) instead of
+    the literal ``_ABSTENTION_TEXT`` -- see that helper's own docstring for which callers
+    pass it and which deliberately do not (``language=None`` is the default specifically so
+    every existing caller that never detected a language keeps the old behaviour unchanged).
     """
     if not chunks:
-        return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
+        return Answer(
+            text=_conversational_abstention_text(chat, query, language),
+            abstained=True,
+            grounded=False,
+        )
 
     settings = get_settings()
     max_tokens = settings.max_tokens
@@ -194,12 +236,18 @@ def answer_from_chunks(chat: ChatClient, query: str, chunks: list[RetrievedChunk
         with timing.step("generating", "parse_answer"):
             answer = parse_answer(raw, chunks)
     if answer.abstained:
+        answer.text = _conversational_abstention_text(chat, query, language)
         return answer
 
     with timing.stage("groundedness"):
         answer.grounded = check_groundedness(chat, answer.text, chunks)
     if not answer.grounded:
-        return Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
+        topics = [c.heading for c in chunks[:3]]
+        return Answer(
+            text=_conversational_abstention_text(chat, query, language, related_topics=topics),
+            abstained=True,
+            grounded=False,
+        )
     return answer
 
 
@@ -221,9 +269,16 @@ def answer_question(
     running full RAG unconditionally. Before this block ``answer_question`` had NO chit-chat
     branch at all -- every ``POST /chat`` ran full RAG even for "hi" (closed here, F14.2-
     adjacent gap): a bare "hi" now gets the same LLM-generated small-talk reply the stream
-    does (P14-D1), never a RAG abstention. Non-chitchat intents (``followup``/``ambiguous``/
-    ``off_topic``, besides ``security``) fall through to the SAME retrieve-and-answer path as
-    before (T14.3/14-D1 has not built their dedicated replies yet) -- documented, not silent.
+    does (P14-D1), never a RAG abstention.
+
+    T14.3.1/T14.3.3/T14.3.4 (block 14-D1): ``ambiguous`` now asks the router's own clarifying
+    question (``assistant.replies.clarifying_reply``) instead of retrieving; ``off_topic`` now
+    gets a polite, LLM-phrased redirect (``assistant.replies.generate_offtopic_reply``)
+    instead of retrieving; only ``security``/``followup`` (and, as a conservative fallback, a
+    router error carrying the raw query as ``"security"``) still run the grounded
+    retrieve -> generate -> groundedness-check path, whose own abstention
+    (``answer_from_chunks``) is now the LLM-phrased conversational abstention too
+    (``language=decision.language``), replacing the literal English ``_ABSTENTION_TEXT``.
 
     T11.3.1: one JSON timing record per answer plus the same durations into the Prometheus
     histograms (T11.3.2, never on the API port).
@@ -237,7 +292,7 @@ def answer_question(
     -- the router's English ``standalone_query`` when present and safe, else the original
     ``query`` -- instead of always the original message. Generation (``answer_from_chunks``)
     still receives the ORIGINAL ``query``, so the reply still addresses what the user typed,
-    in their own language.
+    in their own language (D14.1).
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
@@ -248,6 +303,12 @@ def answer_question(
             decision = understand(chat, query)
         if decision.intent == "chitchat":
             reply = generate_chitchat_reply(chat, query, decision.language)
+            return Answer(text=reply, abstained=False, grounded=True)
+        if decision.intent == "ambiguous":
+            reply = clarifying_reply(decision.clarification, decision.language)
+            return Answer(text=reply, abstained=False, grounded=True)
+        if decision.intent == "off_topic":
+            reply = generate_offtopic_reply(chat, query, decision.language)
             return Answer(text=reply, abstained=False, grounded=True)
 
         search_query = retrieval_query(decision, query)
@@ -269,7 +330,7 @@ def answer_question(
         else:
             chunks = hybrid_search(session, search_query, top_k=top_n, version=search_version)
 
-        return answer_from_chunks(chat, query, chunks)
+        return answer_from_chunks(chat, query, chunks, language=decision.language)
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +614,16 @@ def answer_question_stream(
     T14.2.1/T14.2.2 (block 14-B2): the old inline ``classify_intent`` check is replaced by
     the shared understanding step (``rag_app.assistant.core.understand`` -- fast path, then
     the LLM router); a chit-chat reply is now LLM-generated (P14-D1) instead of a fixed
-    canned template. Everything from "retrieving" onward is UNCHANGED.
+    canned template.
+
+    T14.3.1/T14.3.3/T14.3.4 (block 14-D1): ``ambiguous``/``off_topic`` now get their own
+    conversational reply (a clarifying question / a polite redirect, see
+    ``assistant.replies``) instead of falling through to retrieval; every abstention from
+    this point on (no chunks, the model says ``INSUFFICIENT_CONTEXT``, or the groundedness
+    check fails) is the LLM-phrased conversational abstention
+    (``_conversational_abstention_text``, ``language=decision.language``) instead of the
+    literal English ``_ABSTENTION_TEXT``. Everything from "retrieving" onward is otherwise
+    UNCHANGED.
 
     DA-14-C1 finding 1 fix (14-C1-fix): the ``StreamResult``'s ``used_fast_path`` flag lets
     ``api.conversations._chat_events`` skip the memory-write call on the exact fast-path
@@ -604,6 +674,26 @@ def answer_question_stream(
                 used_fast_path=decision.used_fast_path,
             )
             return
+        if decision.intent in ("ambiguous", "off_topic"):
+            # T14.3.1/T14.3.3 (block 14-D1): a clarifying question (ambiguous) or a polite
+            # redirect (off_topic) -- never retrieval, never an uncited answer
+            # (PHASE_PLANNING.md 14.3). Reuses the SAME "responding"/"stream_canned_reply"
+            # stage/step pair the chit-chat branch above already emits -- no new mechanism.
+            yield StreamStage(stage="responding")
+            with timing.stage("responding"):
+                if decision.intent == "ambiguous":
+                    reply = clarifying_reply(decision.clarification, decision.language)
+                else:
+                    reply = generate_offtopic_reply(chat, query, decision.language)
+                with timing.step("responding", "stream_canned_reply"):
+                    for word in reply.split(" "):
+                        yield StreamToken(text=word + " ")
+            yield StreamResult(
+                answer=Answer(text=reply, abstained=False, grounded=True),
+                usage=usage,
+                used_fast_path=decision.used_fast_path,  # always False here (router-only)
+            )
+            return
 
         yield StreamStage(stage="retrieving")
         # T13.12.5 (DEBT-062): the embed call is pulled out of hybrid_search and made HERE,
@@ -638,7 +728,12 @@ def answer_question_stream(
 
         if not chunks:
             yield StreamResult(
-                answer=Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False), usage=usage
+                answer=Answer(
+                    text=_conversational_abstention_text(chat, query, decision.language),
+                    abstained=True,
+                    grounded=False,
+                ),
+                usage=usage,
             )
             return
 
@@ -664,6 +759,7 @@ def answer_question_stream(
             answer = parse_answer(raw, chunks)
         timing.record("generate", time.perf_counter() - generate_start)
         if answer.abstained:
+            answer.text = _conversational_abstention_text(chat, query, decision.language)
             yield StreamResult(answer=answer, usage=usage)
             return
 
@@ -671,7 +767,14 @@ def answer_question_stream(
         with timing.stage("groundedness"):
             answer.grounded = _check_groundedness_counted(chat, answer.text, chunks, usage)
         if not answer.grounded:
-            answer = Answer(text=_ABSTENTION_TEXT, abstained=True, grounded=False)
+            topics = [c.heading for c in chunks[:3]]
+            answer = Answer(
+                text=_conversational_abstention_text(
+                    chat, query, decision.language, related_topics=topics
+                ),
+                abstained=True,
+                grounded=False,
+            )
         yield StreamResult(answer=answer, usage=usage)
 
 

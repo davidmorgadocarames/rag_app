@@ -838,8 +838,22 @@ alone reliably fixes.
      live (`"How do I fix this?"` against a two-topic summary stayed `"ambiguous"`).
    - **Why not simply "standalone_query differs from query":** a Spanish message translated to
      English always "differs" even when nothing was resolved — the (b) check specifically
-     requires an ADDED substantive word, not just any textual difference, so translation alone
-     never satisfies it on its own.
+     requires an ADDED substantive word, not just any textual difference.
+   - **Correction (14-D1, DA-14-C4-1, HIGH) — the claim above was WRONG, empirically
+     verified.** "Requires an ADDED word" is NOT enough to exclude translation-only cases:
+     `_resolves_a_reference("¿Cómo lo arreglo?", "How do I fix this?")` returned `True` under
+     this block's own original code — a plain machine translation shares almost no tokens
+     with the original in ANY language pair, so EVERY word in the translation counts as
+     "added" relative to the raw query, with zero real grounding in context. The golden set's
+     one Spanish `ambiguous` item (`ambiguous-es-arreglar`) never exercised this because it is
+     a first turn with no context at all (condition (a) already false) — the gap was real but
+     untested. **Fixed in 14-D1:** `_resolves_a_reference` now takes the real `context`
+     (`summary`/`last_turn`) as a third argument and additionally requires the added word to
+     actually APPEAR in it — a translation with no grounding in context no longer flips the
+     verdict (`test_route_leaves_a_genuinely_ambiguous_spanish_message_with_unrelated_context
+     _alone`), while a genuine resolution still does (the added word came FROM context by
+     construction, `test_route_overrides_ambiguous_to_followup_for_a_spanish_followup
+     _grounded_in_context`). See `docs/TRD.md` §6.4c for the fix's own write-up.
 
 ### Measured effect
 
@@ -889,7 +903,97 @@ user's decision" for whoever next touches conversational replies (T14.3/14-D1) t
   fixed/understood improvement, and deliberately left unenforced pending a block that actually
   targets it.
 
+## Decision — conversational answers (T14.3.1–T14.3.5, block 14-D1)
+
+**Scope.** Reply in the user's language (D14.1); every chit-chat reply by the LLM (already
+shipped, 14-B2); a clarifying question for `ambiguous` (ask, don't guess) and a polite
+redirect for `off_topic` (never an uncited answer); a conversational abstention (LLM-phrased,
+no claims, rephrasing tips, related topics only if retrieval found them) as the PRIMARY path,
+replacing `generation._ABSTENTION_TEXT`.
+
+**DA-14-C4-1 fix done first.** See §6.4c in `docs/TRD.md` and the "Correction" paragraph added
+to this document's own 14-C4 Decision section above — `_resolves_a_reference` now requires the
+added word to appear in the real `summary`/`last_turn`, not merely be absent from the raw
+`query`, closing a translation-only false-positive the 14-C4 ADR wrongly claimed was already
+excluded. Re-checked after the fix: `intent_accuracy` still clears its 0.90 floor (see the
+eval table below) — the fix only narrows a code path that never fired for any golden-set item
+anyway (every `ambiguous` item is either a first turn or has unrelated context), so no
+regression was expected and none was measured.
+
+**New module `assistant/replies.py`** — `clarifying_reply` (reuses the router's own
+clarifying question, no extra LLM call), `generate_offtopic_reply`, `generate_abstention_reply`
+(both LLM calls, same delimited-untrusted-data/bounded-tokens/bilingual-template-fallback
+discipline `fast_path.generate_chitchat_reply` already established in 14-B2). Dispatched
+identically in all three entry points that already branch on `decision.intent`
+(`generation.answer_question`, `.answer_question_stream`, `eval.runner.evaluate_dialogues`) —
+same pattern 14-B2's chit-chat branch and 14-C1's memory wiring already used (DEC-059 option
+A: wire separately into each entry point that genuinely has the information, rather than a
+larger refactor).
+
+**Conversational abstention wiring.** `answer_from_chunks` gains `language: str | None = None`
+(default `None` keeps the OLD fixed English text — the CLI, `eval.benchmark`'s v1 run,
+`agentic.py` never detected a language and are out of this block's scope, must not regress).
+The three conversational callers pass `language=decision.language`. `related_topics` — the
+headings of chunks retrieval found but did not ground an answer in (`chunks[:3]`) — are passed
+through to the reply generator, which is explicitly told never to invent one not listed.
+
+**Why `ambiguous` needs no extra LLM call.** The router (§6.2, T14.2.3) already writes a short
+clarifying question, in the user's own language, whenever it decides `"ambiguous"` — reusing
+it is both cheaper and more faithful to what the router itself determined was unclear than
+generating a second, independent question would be. A short bilingual fallback
+(`CLARIFYING_FALLBACK_EN`/`_ES`) covers the one case the router can still contradict its own
+rule on (§6.4b/§6.4c narrowed, did not eliminate, the "`ambiguous` with `clarification=None`"
+self-contradiction) — never surfaces an empty reply.
+
+### Eval table (2 real `--only eval` runs, identical final code, same 75-turn fixture)
+
+| Metric | 14-C4 (before) | Run 1 | Run 2 | Floor | Met (both)? | Enforced from this block? |
+|---|---|---|---|---|---|---|
+| intent_accuracy | 0.907 | _(filled by the senior before closing — see status/blocks/14-D1.md)_ | | ≥ 0.90 | | already (14-C4) |
+| follow_up_resolution | 0.900 | | | ≥ 0.85 | | already (14-C3) |
+| noisy_recall | 1.000 | | | ≥ 0.90 | | already |
+| conversational_reply_rate | 1.000 | | | ≥ 1.00 | | see decision below |
+| clarification_rate | (no code path before 14-D1) | | | not floored | | — |
+| greeting_reply_p95_s | ~1.5–1.6s | | | ≤ 2.0s | | already |
+| router_p95_s | ~1.05s | | | ≤ 1.5s local | | already |
+
+v1 clean metrics (`retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`):
+unaffected by this block for `security`/`followup` turns (groundedness/citation logic
+untouched); `correct_abstention`/judge "no claims" now judges the conversational abstention
+text instead of the old fixed sentence (T14.3.5) — see the measured value below.
+
+### Known limitations (self-reported, not just design) — 14-D1
+
+- **The conversational abstention/off-topic/clarifying replies add real LLM-call latency and
+  cost to turns that used to be free (abstention) or already an LLM call (chitchat already
+  was from 14-B2).** An abstention is now one more bounded call (`ABSTENTION_REPLY_MAX_TOKENS`
+  = 100) on top of generate + groundedness; an off-topic turn is one call instead of a full
+  retrieve→generate→check pipeline (likely a net latency IMPROVEMENT for that case, since
+  retrieval/reranking no longer run at all) — not independently measured per-intent in this
+  block, only the aggregate `eval` floors above.
+- **`related_topics` is a crude top-3 heading list (`chunks[:3]`), not a relevance-ranked
+  "what you might actually want" suggestion** — the chunks retrieval found are, by
+  definition, the ones that did NOT ground an answer; they may be only loosely related to
+  what the user actually asked. The system prompt's own instruction (never invent a topic not
+  listed, never mention any if the list is empty) bounds the failure mode to "an unhelpful
+  suggestion", never a fabricated fact.
+- **`clarifying_reply`'s fallback question is generic** (`CLARIFYING_FALLBACK_EN`/`_ES`, not
+  tailored to the actual message) — only reached when the router already broke its own
+  stated rule; narrowing that further is the router's own job (§6.4b/§6.4c), not this
+  module's.
+- **`conversational_reply_rate` enforcement decision** (14-C4's own open item): _(filled by
+  the senior before closing — see status/blocks/14-D1.md for the final measured value and
+  decision)_.
+
 ## Rollback
+
+14-D1: changes LIVE runtime behaviour (ambiguous/off_topic get a dedicated reply; every
+abstention is LLM-phrased) and the router's `_resolves_a_reference` tie-breaker condition
+(DA-14-C4-1 fix) — no new schema, no migration, no new persisted data, no deployed-image step.
+A plain `git revert` of this block's commit(s) restores 14-C4's behaviour exactly (ambiguous/
+off_topic fall through to the retrieve-and-answer path again; abstentions revert to the fixed
+English `_ABSTENTION_TEXT`; the tie-breaker's translation-only gap reopens, latent until a
+future block adds Spanish-ambiguous golden-set coverage with context).
 
 14-C4: changes LIVE runtime behaviour (the router can now return `"followup"` where it used to
 return `"ambiguous"` for a resolved, context-backed reference) via a pure, additive code path

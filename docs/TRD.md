@@ -382,6 +382,97 @@ the intent LABEL, never `standalone_query`'s resolution quality, which `follow_u
 actually measures). See the ADR's "14-C4 decision" section for the live-diagnosis evidence,
 the full measured-effect table and the "Known limitations" section.
 
+### 6.4c Tie-breaker context-grounding fix (DA-14-C4-1, block 14-D1)
+
+**What changed.** §6.4b's own `_resolves_a_reference` condition (b) — "`standalone_query`
+names a substantive word absent from the raw `query`" — is corrected to ALSO require that
+word to appear in the real `context` (`summary`/`last_turn`, concatenated), which the
+function now takes as a third argument. §6.4b's ADR claimed a plain textual difference could
+not be satisfied by translation alone ("a Spanish message translated to English always
+'differs' ... translation alone never satisfies it on its own") — DA-14-C4.md's review proved
+this wrong, empirically: `_resolves_a_reference("¿Cómo lo arreglo?", "How do I fix this?")`
+returned `True` under the original (pre-14-D1) code, because a translation shares almost no
+tokens with the original message in ANY language pair, so "absent from query" is satisfied by
+translation alone every time, with zero real grounding in context.
+
+**Why this matters.** Not a live bypass today (§6.4b's own `route()` call never reaches a
+dedicated reply for `"ambiguous"` vs `"followup"` before this block — both fell through to the
+same retrieve-and-answer path) but it would have become a real, systematic Spanish-language UX
+regression the moment §6.5 below shipped a dedicated clarifying-question reply: a genuinely
+ambiguous Spanish message with ANY prior context, however unrelated, would always have been
+wrongly flipped to `"followup"` and silently answered instead of asked about.
+
+**Why it still works for a genuine resolution.** The added word in a REAL resolution comes
+FROM the context by construction (that is the whole point of pulling a topic out of the
+conversation's own summary/last turn to resolve a terse reference) — requiring it to also
+appear there costs nothing in the cases condition (b) was ever meant to catch, and closes
+exactly the translation-only gap. Verified both ways, in Spanish, at the `route()` level:
+`test_route_overrides_ambiguous_to_followup_for_a_spanish_followup_grounded_in_context` (a
+real follow-up still flips) and
+`test_route_leaves_a_genuinely_ambiguous_spanish_message_with_unrelated_context_alone` (a
+translation-only "resolution" with unrelated context no longer does).
+
+### 6.5 Conversational answers (T14.3.1–T14.3.5, block 14-D1)
+
+**What changed.** The THREE entry points that already call `understand()`/dispatch on
+`decision.intent` — `generation.answer_question`, `generation.answer_question_stream`,
+`eval.runner.evaluate_dialogues` — gain two more dedicated branches (`chitchat` already had
+one since 14-B2), and every abstention changes:
+
+- **`ambiguous`** (T14.3.3) now replies with the router's OWN clarifying question
+  (`assistant.replies.clarifying_reply`) instead of falling through to retrieval — asks,
+  rather than guessing what the user meant. No extra LLM call: the router
+  already writes a short clarifying question, in the user's own language, whenever it decides
+  `"ambiguous"` (`router._ROUTER_SYSTEM`'s rule, §6.2). A bilingual fallback question
+  (`CLARIFYING_FALLBACK_EN`/`_ES`) covers the one case the router can still contradict its own
+  rule on (an `"ambiguous"` verdict with `clarification=None` — §6.4b/§6.4c narrowed but did
+  not eliminate this).
+- **`off_topic`** (T14.3.3) now gets a polite, LLM-phrased redirect
+  (`assistant.replies.generate_offtopic_reply`) — never an uncited answer. Same
+  delimited-untrusted-data/bounded-tokens/template-fallback discipline as
+  `fast_path.generate_chitchat_reply` (§6.2): the message is wrapped in `<<<MESSAGE>>>...`
+  markers in the user turn, never the system prompt; ANY call failure degrades to a bilingual
+  template.
+- **Every abstention is now the conversational abstention** (T14.3.4,
+  `assistant.replies.generate_abstention_reply`), replacing the literal, fixed English
+  `generation._ABSTENTION_TEXT` as the PRIMARY path — at all three abstention points
+  (`answer_from_chunks`'s "no chunks" and "ungrounded" cases, and the equivalent inline
+  "no chunks" case in `answer_question_stream`). LLM-phrased, in the user's detected
+  language; may rephrase or apologise, and may point at `related_topics` — the HEADINGS of
+  chunks retrieval actually found but did not ground an answer in (`chunks[:3]`), passed
+  through, never invented by the reply generator itself; the system prompt explicitly
+  forbids stating any fact, number or recommendation that would answer the original
+  question. `answer_from_chunks` gains an optional `language: str | None = None` parameter
+  (default preserves the OLD, fixed English text for every caller that never detected a
+  language — the CLI's `main()`, `eval.benchmark`'s v1 golden-set run, `agentic.py` — out of
+  this block's scope, must not regress); the three conversational entry points now pass
+  `language=decision.language`.
+- **Reply language (T14.3.1, D14.1).** Every function above replies in
+  `Understanding.language` (the router's own detected language, or the fast path's exact
+  match) — never a fixed English default — closing the gap self-reported since 14-B2/14-C2
+  ("an explicit reply-language decision belongs to T14.3.1/14-D1", §6.4).
+
+**Security/groundedness unchanged.** `security`/`followup` (and, as a conservative fallback,
+a router error carrying the raw query as `"security"`) are the ONLY intents that still
+retrieve, generate and run the groundedness check — citations and the groundedness check
+themselves are byte-identical to before this block; `ambiguous`/`off_topic` never retrieve at
+all, so they can never produce an uncited claim.
+
+**Judge "no claims" on the conversational abstention (T14.3.5).** `eval.judge.judge_no_claims`
+(validated since 14-A2) is unchanged; it is applied to whatever text ends up in
+`DialogueTurnResult.reply_text` when `answer.abstained`, so it now judges the LLM-phrased
+conversational abstention instead of the old fixed sentence — a stronger, more realistic test
+of "no claims" than judging a hand-written string that can never accidentally drift into
+making one.
+
+**Expected effect on the golden-set v2 floors.** `conversational_reply_rate` (chit-chat
+classified as chit-chat) is unaffected in definition — this block does not touch `chitchat`'s
+own branch or the metric's own computation; see the ADR's "14-D1 decision" section for
+whether it is enforced from this block based on the measured runs. `clarification_rate`
+(ambiguous turns whose reply looks like a clarifying question,
+`metrics.looks_like_clarifying_question`) is expected to move toward 1.0 for the first time
+— no code path producing a real clarifying reply existed before this block.
+
 ## 7. Cost & latency
 
 - Q4 quantization; a single shared LLM; reranker on CPU.
