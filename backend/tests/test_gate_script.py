@@ -81,6 +81,20 @@ def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str
     )
 
 
+def _shell(repo: Path, script: str, **env: str) -> subprocess.CompletedProcess[str]:
+    """Runs a raw shell snippet (not a fixed argv) so a test can wrap `scripts/gate.sh` in a
+    manual `&`, `nohup … &` or `( … & )` the same way a human/agent would from a terminal --
+    the thing F24 is about. Uses the same scratch HOME/env isolation as _gate()."""
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=repo,
+        env=_gate_env(repo, **env),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def _gate_popen(repo: Path, *args: str, **env: str) -> subprocess.Popen[str]:
     # new_session=True (setsid): the process and anything it forks (e.g. the test-only
     # GATE_LOCK_TEST_SLEEP `sleep`) share ONE process group, so a test can release the lock
@@ -304,6 +318,77 @@ def test_only_security_headers_and_zap_baseline_are_unknown_in_a_repo_without_th
     proc = _gate(_make_repo(tmp_path), "--only", "security-headers,zap-baseline,not-a-real-step")
     assert proc.returncode == 2, proc.stdout
     assert "unknown step: not-a-real-step" in proc.stdout + proc.stderr
+
+
+# --- F24 guard: refuse a manual-background launch (DA-13-HI-2, 2026-11-25) -------------
+#
+# A shell backgrounds a command non-interactively (`cmd &`, `nohup cmd &`, `( cmd & )`) by
+# setting BOTH SIGINT and SIGQUIT to ignored for it -- and that ignored disposition is
+# preserved across every exec() the command (or anything it forks) does, which is what
+# broke test_db_tunnel.py's signal tests three times on 2026-11-25. These tests prove
+# gate.sh refuses to start in exactly those three launch styles, and keeps working for
+# every sanctioned launch (plain foreground, the --run-step re-entrant child, and the
+# documented escape hatch).
+
+
+@needs_tools
+def test_refuses_a_manual_background_launch_with_bare_amp(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    proc = _shell(repo, "bash scripts/gate.sh --only git-modes & wait $!")
+    assert proc.returncode == 1
+    out = proc.stdout + proc.stderr
+    assert "F24" in out
+    assert "GATE_BACKGROUND_OK=1" in out  # the documented escape hatch is named
+
+
+@needs_tools
+def test_refuses_a_nohup_background_launch(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    proc = _shell(repo, "nohup bash scripts/gate.sh --only git-modes & wait $!")
+    assert proc.returncode == 1
+    assert "F24" in proc.stdout + proc.stderr
+
+
+@needs_tools
+def test_refuses_a_parenthesised_background_subshell(tmp_path: Path) -> None:
+    """`( cmd & )` -- the subshell itself exits immediately (so its own return code says
+    nothing), but the backgrounded gate.sh inside it must still refuse to run."""
+    repo = _make_repo(tmp_path)
+    out_file = tmp_path / "paren.out"
+    _shell(
+        repo,
+        f"( bash scripts/gate.sh --only git-modes > '{out_file}' 2>&1 & ); sleep 1",
+    )
+    assert "F24" in out_file.read_text(encoding="utf-8")
+
+
+@needs_tools
+def test_a_plain_foreground_launch_is_never_refused(tmp_path: Path) -> None:
+    proc = _gate(_make_repo(tmp_path), "--only", "git-modes")
+    assert proc.returncode == 0, proc.stdout
+    assert "F24" not in proc.stdout + proc.stderr
+
+
+@needs_tools
+def test_the_run_step_reentrant_child_is_never_refused(tmp_path: Path) -> None:
+    """The pre-push hook, CI (`gate.sh --only …`) and every step's own `bash "$SELF"
+    --run-step <name>` child all run gate.sh as a plain foreground child of an
+    already-running (non-backgrounded) process -- never through a shell `&`. Exercised
+    directly via the re-entrant --run-step path."""
+    proc = _gate(_make_repo(tmp_path), "--run-step", "environment")
+    assert "F24" not in proc.stdout + proc.stderr
+
+
+@needs_tools
+def test_the_escape_hatch_env_var_allows_a_deliberate_background_launch(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    proc = _shell(
+        repo,
+        "bash scripts/gate.sh --only git-modes & wait $!",
+        GATE_BACKGROUND_OK="1",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "F24" not in proc.stdout + proc.stderr
 
 
 # --- global gate lock (T13.14.4, Paralelo-B) --------------------------------------------

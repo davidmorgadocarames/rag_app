@@ -32,6 +32,44 @@
 # under the git common dir (built with uv). GATE_VENV=<dir> overrides the choice.
 set -uo pipefail
 
+# --- F24 guard: refuse a manual-background launch (DA-13-HI-2, 2026-11-25) -------------
+# `cmd &`, `nohup cmd &` and `( cmd & )` in a non-interactive, non-job-control shell make
+# bash set BOTH SIGINT and SIGQUIT to ignored for that backgrounded command (POSIX
+# "asynchronous list" semantics) -- and once ignored, that disposition survives every
+# exec() this process or its children do (an exec() only resets signals that are *caught*
+# back to default; SIG_IGN is preserved), which is exactly what broke the
+# test_db_tunnel.py signal tests three times on 2026-11-25 (F24). A plain foreground
+# invocation (incl. this script's own `bash "$SELF" --run-step ...` re-entrant children,
+# the pre-push hook, CI's `gate.sh --only ...`, and the Bash-tool's own
+# run_in_background mechanism -- verified empirically: it does not set SIGINT to
+# ignored, only this environment's own baseline SIGQUIT-ignored quirk, which alone never
+# trips this check) never has SIGINT ignored, so checking SIGINT *and* SIGQUIT together
+# (not either alone) tells a real manual background apart from every sanctioned launch.
+# Read from /proc instead of `trap -p` so the check is independent of anything this
+# script traps later and survives even if bash's own trap bookkeeping doesn't surface an
+# inherited (pre-exec) ignore. Escape hatch for a deliberate, understood use:
+# GATE_BACKGROUND_OK=1 (named in the F24 failures.md note).
+check_not_backgrounded() {
+  [ -n "${GATE_BACKGROUND_OK:-}" ] && return 0
+  local sigign status_file="/proc/$$/status" hexval
+  [ -r "$status_file" ] || return 0   # no /proc (non-Linux) -- cannot check, don't block
+  sigign="$(awk '/^SigIgn:/{print $2}' "$status_file" 2>/dev/null)"
+  [ -n "$sigign" ] || return 0
+  hexval=$((16#$sigign)) 2>/dev/null || return 0
+  # SIGINT=2 -> bit 0x2, SIGQUIT=3 -> bit 0x4; manual backgrounding sets BOTH.
+  if [ $((hexval & 0x6)) -eq 6 ]; then
+    echo "FAIL (F24): scripts/gate.sh refuses to start — SIGINT and SIGQUIT are both" >&2
+    echo "  ignored, which means this shell launched it as a manual background job" >&2
+    echo "  (\`cmd &\`, \`nohup cmd &\`, or \`( cmd & )\`). That changes signal disposition" >&2
+    echo "  for every child process (incl. psql) and breaks test_db_tunnel.py's signal" >&2
+    echo "  tests (DA-13-HI-2). Run it in the foreground, via the pre-push hook, via CI," >&2
+    echo "  or via the sanctioned tool's own background-run mechanism instead." >&2
+    echo "  Deliberate override: GATE_BACKGROUND_OK=1 scripts/gate.sh ..." >&2
+    exit 1
+  fi
+}
+check_not_backgrounded
+
 export PATH="$HOME/.local/bin:$PATH"
 hash -r 2>/dev/null || true
 
