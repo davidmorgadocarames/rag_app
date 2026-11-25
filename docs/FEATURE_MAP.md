@@ -172,6 +172,21 @@
 - Remote-write mode: `read-only` (safe to run against a remote --base-url with no extra flag)
 - Docs: `docs/adr/adr_phase11_stability.md`
 
+### Assistant
+
+| id | name | phase | status | page | health/quality probe | e2e spec(s) | mode |
+|---|---|---|---|---|---|---|---|
+| `assistant-conversational-core` | Shared conversational core (fast path + LLM router) | 14-B2 | enabled | /chat | `rag_app.assistant.core` importable | `auth.spec.ts` | mutating |
+
+**`assistant-conversational-core`** -- Shared conversational core (fast path + LLM router)
+
+- Prerequisites: auth; a question not an exact greeting/thanks/farewell
+- User steps: send a message that is NOT an exact greeting (e.g. a misspelled 'hol', a follow-up, an off-topic question)
+- Observable result: the message is classified (chitchat/security/followup/ambiguous/off_topic) by the LLM router instead of the old binary classifier -- a security question still retrieves+cites as before; a misclassified/invalid router reply degrades to the same grounded security path (never bypasses retrieval/citation)
+- Key source files: `backend/src/rag_app/assistant/core.py`, `backend/src/rag_app/assistant/router.py`, `backend/src/rag_app/assistant/fast_path.py`
+- Remote-write mode: `mutating` (running its covering e2e spec(s) against a remote --base-url creates/changes real state -- needs --allow-remote-writes)
+- Docs: `docs/adr/adr_phase14_assistant.md`
+
 ### Quality
 
 | id | name | phase | status | page | health/quality probe | e2e spec(s) | mode |
@@ -449,7 +464,7 @@
 
 ## Coverage: features with no e2e spec
 
-**23 of 39** registry entries have no covering `frontend/e2e/*.spec.ts` file today (backend-only infrastructure, CI/offline quality checks, or an Azure-only property -- not necessarily a gap, but every one below falls back to its own health/quality probe instead of a Playwright run):
+**23 of 40** registry entries have no covering `frontend/e2e/*.spec.ts` file today (backend-only infrastructure, CI/offline quality checks, or an Azure-only property -- not necessarily a gap, but every one below falls back to its own health/quality probe instead of a Playwright run):
 
 - `stack-health-endpoint` -- Liveness endpoint (/health)
 - `stack-postgres` -- Postgres

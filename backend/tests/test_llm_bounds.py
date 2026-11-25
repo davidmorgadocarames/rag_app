@@ -18,6 +18,7 @@ import pytest
 
 import rag_app
 from rag_app import generation
+from rag_app.assistant.router import ROUTER_MAX_TOKENS
 from rag_app.config import Settings, get_settings
 from rag_app.generation import (
     GROUNDEDNESS_MAX_TOKENS,
@@ -158,7 +159,11 @@ def test_stream_path_bounds_generation_and_groundedness(monkeypatch: pytest.Monk
     )
     result = events[-1]
     assert isinstance(result, StreamResult) and not result.answer.abstained
+    # T14.2.1/T14.2.3 (block 14-B2): the shared understanding step's router call
+    # (``chat_json``, not a ``max_tokens``-bound exemption -- it has its own, ROUTER_MAX_TOKENS)
+    # now precedes generation/groundedness on every non-fast-path query.
     assert chat.bounds == [
+        ("chat_json", ROUTER_MAX_TOKENS),
         ("chat_stream", get_settings().max_tokens),
         ("chat_stream", GROUNDEDNESS_MAX_TOKENS),
     ]
@@ -196,7 +201,11 @@ def test_stream_path_passes_num_ctx_per_call_type(monkeypatch: pytest.MonkeyPatc
         )
     )
     settings = get_settings()
+    # T14.2.1/T14.2.3 (block 14-B2): the router call pins num_ctx_answer too (same reasoning
+    # as agentic.reformulate/eval.judge.judge_correctness -- see
+    # test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness below).
     assert chat.calls == [
+        ("chat_json", ROUTER_MAX_TOKENS, settings.num_ctx_answer, "router"),
         ("chat_stream", settings.max_tokens, settings.num_ctx_answer, "answer"),
         ("chat_stream", GROUNDEDNESS_MAX_TOKENS, settings.num_ctx_groundedness, "groundedness"),
     ]
@@ -230,11 +239,18 @@ def test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness() -
     generate -> groundedness -> judge (and the router's rewrite, when exercised) in the SAME
     process/keep-alive window, on every golden-set item, today. Both call sites now pin
     ``num_ctx_answer`` (== ``num_ctx_groundedness``, guarded above) so qwen is never reloaded
-    mid-run."""
+    mid-run.
+
+    T14.2.1-T14.2.3 (block 14-B2): the LLM router (``assistant.router.route``) and the
+    chit-chat reply (``assistant.fast_path.generate_chitchat_reply``) are on the LIVE chat
+    path itself (not just the eval gate) and run back-to-back with generate/groundedness in
+    the SAME process -- both pin ``num_ctx_answer`` too, same reasoning.
+    """
     from rag_app import agentic
+    from rag_app.assistant import fast_path, router
     from rag_app.eval import judge
 
-    for module in (agentic, judge):
+    for module in (agentic, judge, router, fast_path):
         calls = _llm_calls(Path(module.__file__))
         assert calls, f"{module.__name__}: expected at least one LLM call"
         attrs = [_num_ctx_attr_name(call) for call in calls]

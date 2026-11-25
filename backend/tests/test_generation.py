@@ -167,7 +167,14 @@ def test_token_stream_step_is_recorded_even_on_a_mid_stream_disconnect() -> None
 
 
 class _FakeChatSync:
-    """Non-streaming ``chat()``: first call answers, second call is the groundedness verdict."""
+    """Non-streaming ``chat()``: first call answers, second call is the groundedness verdict.
+
+    ``chat_json`` (T14.2.3's router call, block 14-B2): always returns the caller's
+    ``fallback`` -- same minimal fake as ``test_llm_bounds.py::_RecordingChat``. Every
+    security-path query in this file is plain English security text, so the router's
+    conservative fallback (intent "security", the raw query) IS the behaviour under test;
+    it never touches ``self.calls`` (a separate counter from the real `chat()` calls below).
+    """
 
     def __init__(self, answer_text: str, verdict: str = "GROUNDED") -> None:
         self._answer_text = answer_text
@@ -178,9 +185,17 @@ class _FakeChatSync:
         self.calls += 1
         return self._answer_text if self.calls == 1 else self._verdict
 
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return fallback
+
 
 class _FakeChatStreamSeq:
-    """Streaming ``chat_stream()``: one fixed delta sequence per call, in order."""
+    """Streaming ``chat_stream()``: one fixed delta sequence per call, in order.
+
+    ``chat_json``: see ``_FakeChatSync`` above -- same reasoning, same always-fallback fake.
+    """
 
     def __init__(self, sequences: list[list[str]]) -> None:
         self._sequences = sequences
@@ -192,6 +207,11 @@ class _FakeChatStreamSeq:
         yield from seq
         if usage is not None:
             usage.add(Usage(prompt_tokens=10, completion_tokens=len(seq)))
+
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return fallback
 
 
 def _timing_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -328,6 +348,7 @@ def test_answer_question_stream_emits_the_expected_atomic_steps(
     )
     chat = _FakeChatStreamSeq([["Use prepared statements ", "[1]."], ["GROUNDED"]])
     before = _step_counts()
+    classify_stage_before = _stage_sum("classify")
 
     list(
         generation.answer_question_stream(
@@ -339,7 +360,6 @@ def test_answer_question_stream_emits_the_expected_atomic_steps(
 
     after = _step_counts()
     for pair in (
-        ("classifying", "classify_intent"),
         ("generating", "build_prompt"),
         ("generating", "llm_first_token"),
         ("generating", "token_stream"),
@@ -349,20 +369,30 @@ def test_answer_question_stream_emits_the_expected_atomic_steps(
         ("checking", "parse_verdict"),
     ):
         assert after.get(pair, 0.0) > before.get(pair, 0.0), pair
+    # T14.2.1/T14.2.3 (block 14-B2): classify_intent's own step is gone from the live
+    # pipeline (replaced by the shared `understand()` -- fast path, then the LLM router);
+    # the coarse "classify" STAGE total is still recorded around that call.
+    assert _stage_sum("classify") > classify_stage_before
 
 
 def test_answer_question_stream_chitchat_emits_classify_and_canned_reply_steps() -> None:
-    """The chit-chat fast path never calls the LLM -- only classify_intent and
-    stream_canned_reply are observed, nothing from retrieving/reranking/generating/checking."""
+    """T14.2.1/T14.2.2 (block 14-B2): the fast path matches "hi" and skips the router --
+    only the coarse "classify"/"responding" stage totals and the "stream_canned_reply" step
+    are observed, nothing from retrieving/reranking/generating/checking. The reply is now
+    LLM-generated (``_FakeChatSync("")``'s empty ``chat()`` reply falls back to the safe
+    template, P14-D1), not a hard-coded canned string, but the step/stage NAMES recording the
+    word-by-word streaming are unchanged."""
     before = _step_counts()
+    classify_stage_before = _stage_sum("classify")
+    responding_stage_before = _stage_sum("responding")
 
     list(generation.answer_question_stream(None, "hi", chat=_FakeChatSync("")))  # type: ignore[arg-type]
 
     after = _step_counts()
-    classify = ("classifying", "classify_intent")
     canned = ("responding", "stream_canned_reply")
-    assert after.get(classify, 0.0) > before.get(classify, 0.0)
     assert after.get(canned, 0.0) > before.get(canned, 0.0)
+    assert _stage_sum("classify") > classify_stage_before
+    assert _stage_sum("responding") > responding_stage_before
     build_prompt = ("generating", "build_prompt")
     assert after.get(build_prompt, 0.0) == before.get(build_prompt, 0.0)
 

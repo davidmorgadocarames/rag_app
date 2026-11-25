@@ -155,6 +155,59 @@ carries `enforce_now: false` for exactly that reason — the `eval` gate step pr
 value-vs-floor comparison but only fails on it once a later block flips that flag. See the
 golden-set-v2 table in `docs/adr/adr_phase14_assistant.md` for the measured numbers.
 
+### 6.2 Understanding step: fast path + LLM router (T14.2.1–T14.2.3, block 14-B2)
+
+The 14-A2 placeholder above (`classify_intent`, a binary chit-chat/security regex) is now
+replaced on the LIVE pipeline (`generation.answer_question`/`answer_question_stream`) and the
+eval runner alike by ONE shared understanding step, `rag_app.assistant.core.understand`:
+
+1. **Regex fast path** (`rag_app.assistant.fast_path.match_fast_path`, T14.2.2): an EXACT
+   greeting/thanks/farewell (en/es — e.g. `"hi"`, `"hola"`, `"thanks"`) skips the LLM router
+   only; the reply is itself LLM-generated (`generate_chitchat_reply`, ≤ 80 tokens, P14-D1)
+   with a bilingual template fallback on any failure (timeout, HTTP error, empty reply) —
+   never a hard failure of the chat turn. A lone typo ("hol", "hell") is deliberately NOT an
+   exact match, so it reaches the router instead (the plan's own phrasing for this rule).
+2. **LLM router** (`rag_app.assistant.router.route`, T14.2.3): `chat_json` against
+   `RouterOutput {intent: chitchat|security|followup|ambiguous|off_topic, language, standalone_query,
+   clarification?}`. The user's message (and, from 14-C1, the conversation summary/last turn)
+   is passed as DELIMITED (`<<<MESSAGE>>> ... <<<END MESSAGE>>>`) data in the USER turn, never
+   concatenated into the system prompt — the same "untrusted data, never instructions"
+   discipline `generation.py` already applies to retrieved corpus chunks. ANY failure — a
+   timeout/network/HTTP error (not caught by `chat_json`'s own retry, which only covers
+   invalid JSON/schema violations, T14.1.2), or a structurally VALID but suspicious reply
+   (`standalone_query`/`clarification` echoing a `<<<`/`>>>` delimiter or a `system:`/
+   `assistant:` role prefix — a sign the model partially obeyed injected instructions) —
+   degrades to the SAME conservative fallback: intent `"security"` carrying the user's RAW,
+   unmodified message. A misrouted or adversarial message can therefore never do worse than
+   re-enter the existing, already-reviewed retrieve → generate → groundedness-check →
+   cite-or-abstain path; it can never bypass citation/groundedness.
+3. Non-chitchat intents (`followup`/`ambiguous`/`off_topic`, besides `security`) fall through
+   to the SAME retrieve-and-answer path as `security` today — their own dedicated replies
+   (a clarifying question, a polite redirect) are T14.3/14-D1, not built yet.
+
+**Self-reported scope boundaries (not asked for beyond what is listed, DA-13-J2-1 discipline):**
+
+- Memory (`summary`/`last_turn`, T14.2.5/14-C1) is accepted as an optional parameter
+  everywhere in this block but is always `None` from every 14-B2 call site — the router sees
+  only the current message, same F14.2 limitation as before, just with a real router call now.
+- Retrieval still uses the ORIGINAL message, never `standalone_query` (T14.2.7/14-C2) — the
+  router already produces it, nothing downstream consumes it yet.
+- The retrieve/generate/groundedness-check code itself was NOT relocated into the `assistant`
+  package: it stays in `generation.py`'s own functions (and the eval runner's own direct
+  calls), because several existing tests monkeypatch module-qualified names
+  (`generation.hybrid_search`/`generation.embed_query`) that only work when the calling code
+  is textually inside `generation.py`. Collapsing stream/non-stream/eval into one literal
+  generator end-to-end remains a larger refactor than T14.2.1-3's rows ask for.
+- No new Prometheus step metric was added for the understanding step itself (it would need a
+  `metrics.STEP_ALLOWLIST` entry, outside this block's named touches) — only the pre-existing
+  coarse `secrag_chat_stage_seconds{stage="classify"|"responding"}` total grows to include it;
+  per-step latency instrumentation is deferred to 14.5 (Latency, cost, dashboard).
+- The daily-answer-cap "chit-chat is free" exemption (`api.conversations._reserve_stream_answer`)
+  still uses the OLD `classify_intent` heuristic unchanged — since T14.2.2 even an exempted
+  turn now costs one small LLM call (previously a free canned reply), so this exemption is an
+  approximation ("probably cheap"), not a strict "no LLM call happened" guarantee; flagged for
+  the user's decision in the 14-B2 block report, not silently changed here.
+
 ## 7. Cost & latency
 
 - Q4 quantization; a single shared LLM; reranker on CPU.

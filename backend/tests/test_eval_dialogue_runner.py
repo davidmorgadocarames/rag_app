@@ -1,15 +1,19 @@
-"""Unit tests for the golden-set v2 runner + metrics (T14.0.4/T14.0.5, block 14-A2).
+"""Unit tests for the golden-set v2 runner + metrics (T14.0.4/T14.0.5, block 14-A2; updated
+for the real shared core/router in block 14-B2).
 
 No DB/LLM: `compute_dialogue_metrics` is pure aggregation (same style as `test_eval.py`'s
 `compute_metrics` tests), `looks_like_clarifying_question`/`parse_no_claims_verdict` are pure
-parsers, and the one `evaluate_dialogues` integration test monkeypatches `retrieve` +
-`get_shared_reranker` (never a live DB/Ollama) with a fake chat client, same pattern as
-`test_generation.py`'s `_FakeChatSync`.
+parsers, and the `evaluate_dialogues` integration tests monkeypatch `retrieve` +
+`get_shared_reranker` (never a live DB/Ollama) with a fake chat client that now also
+implements `chat_json` (T14.2.3's router call) -- same pattern as `test_generation.py`'s
+`_FakeChatSync`.
 
 Every test in this file imports a name (`DialogueTurnResult`, `compute_dialogue_metrics`,
 `evaluate_dialogues`, `judge_no_claims`, `looks_like_clarifying_question`) that does not exist
-before this block — they fail on the pre-14-A2 code with an ImportError, not just a wrong
-assertion.
+before block 14-A2 -- they fail on the pre-14-A2 code with an ImportError, not just a wrong
+assertion. The `evaluate_dialogues` tests below additionally fail on the pre-14-B2 code (no
+`chat_json`/router call at all, so `_FakeChat` never needed one; `observed_intent` was only a
+chitchat/security binary) with an ``AttributeError`` or a wrong value.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ def _turn(
     clarified: bool = False,
     abstention_no_claims: bool | None = None,
     latency_s: float = 0.1,
+    router_latency_s: float | None = None,
 ) -> DialogueTurnResult:
     return DialogueTurnResult(
         dialogue_id=dialogue_id,
@@ -64,6 +69,7 @@ def _turn(
         clarified=clarified,
         abstention_no_claims=abstention_no_claims,
         latency_s=latency_s,
+        router_latency_s=router_latency_s,
     )
 
 
@@ -71,7 +77,7 @@ def test_intent_accuracy_counts_exact_matches_only() -> None:
     results = [
         _turn(expected_intent="chitchat", observed_intent="chitchat"),
         _turn(expected_intent="security", observed_intent="security"),
-        # the placeholder core has no "followup" label -> always a miss today
+        # a real 5-way router miss (e.g. a follow-up it classified as plain security)
         _turn(expected_intent="followup", observed_intent="security"),
     ]
     m = compute_dialogue_metrics(results)
@@ -142,9 +148,24 @@ def test_greeting_reply_p95_is_measured_from_chitchat_turns_only() -> None:
     assert m.greeting_reply_p95_s == pytest.approx(1.5)
 
 
-def test_router_p95_is_always_none_before_the_router_exists() -> None:
-    m = compute_dialogue_metrics([_turn()])
+def test_router_p95_is_none_when_no_turn_carries_a_router_latency() -> None:
+    """Every turn's fast path matched (no router call happened to time) -- `None`, never a
+    fabricated 0."""
+    m = compute_dialogue_metrics([_turn(router_latency_s=None), _turn(router_latency_s=None)])
     assert m.router_p95_s is None
+
+
+def test_router_p95_is_measured_from_turns_with_a_router_latency_only() -> None:
+    """block 14-B2: the router now exists, so `router_latency_s` is populated for turns that
+    actually called it; a fast-path turn's `None` must be EXCLUDED, not treated as 0 (which
+    would silently drag the p95 down)."""
+    results = [
+        _turn(router_latency_s=0.2),
+        _turn(router_latency_s=0.8),
+        _turn(router_latency_s=None),  # fast path -- excluded, not a 0.0
+    ]
+    m = compute_dialogue_metrics(results)
+    assert m.router_p95_s == pytest.approx(0.8)
 
 
 # --- looks_like_clarifying_question: heuristic ---------------------------------------------
@@ -187,7 +208,11 @@ def test_parse_no_claims_verdict(raw: str, expected: bool) -> None:
 
 class _FakeChat:
     """First `chat()` call answers, second is the groundedness verdict (mirrors
-    `test_generation.py::_FakeChatSync`)."""
+    `test_generation.py::_FakeChatSync`). `chat_json` (T14.2.3's router call, block 14-B2)
+    always returns the caller's `fallback` -- same minimal fake as
+    `test_llm_bounds.py::_RecordingChat`, which is enough here: every non-fast-path message in
+    this file is plain English/Spanish security text, so the router's conservative
+    `fallback` (intent "security", the raw query) IS the behaviour under test."""
 
     def __init__(self, answer_text: str, verdict: str = "GROUNDED") -> None:
         self._answer_text = answer_text
@@ -201,6 +226,11 @@ class _FakeChat:
     def chat_stream(self, *_a: object, **_kw: object) -> Iterator[str]:
         raise NotImplementedError("evaluate_dialogues never streams")
 
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return fallback
+
 
 def _chunk(chunk_uid: str) -> RetrievedChunk:
     return RetrievedChunk(
@@ -209,9 +239,12 @@ def _chunk(chunk_uid: str) -> RetrievedChunk:
 
 
 def test_evaluate_dialogues_has_no_memory_between_turns(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A follow-up turn is replayed STANDALONE (no prior-turn context passed to retrieve) —
-    the placeholder core's defining limitation (F14.2), proven here by asserting every call to
-    the fake `retrieve` only ever sees the CURRENT turn's own message, never a prior one."""
+    """A follow-up turn is replayed STANDALONE (no prior-turn context passed to the router or
+    to retrieve) -- F14.2 persists through block 14-B2 (memory lands in 14-C1), proven here by
+    asserting every call to the fake `retrieve` only ever sees the CURRENT turn's own message,
+    never a prior one. `_FakeChat.chat_json` always returns the router's conservative
+    `fallback` (intent "security", the message unchanged), which is exactly today's real
+    behaviour for a follow-up with no memory to resolve it from."""
     seen_queries: list[str] = []
 
     def fake_retrieve(

@@ -72,18 +72,24 @@ def evaluate_dialogues(
     chat: ChatClient | None = None,
     top_n: int | None = None,
 ) -> list[DialogueTurnResult]:
-    """Replay golden-set v2 dialogues through TODAY's pipeline (T14.0.4, block 14-A2).
+    """Replay golden-set v2 dialogues through the REAL shared understanding step
+    (T14.2.1-T14.2.3, block 14-B2): each turn calls ``rag_app.assistant.core.understand`` --
+    the SAME function ``generation.answer_question``/``answer_question_stream`` now call too
+    (fast path, then the LLM router) -- closing TF19's "eval runner bypasses the real
+    pipeline" finding for the understanding step. The retrieve/generate/groundedness-check
+    part still calls the same shared primitives (``reranking.retrieve``,
+    ``generation.answer_from_chunks``) this runner already used before 14-B2 (and
+    ``evaluate()`` above still does) -- not duplicated into a new module, see
+    ``assistant/core.py``'s own scope note on why that part was not relocated.
 
-    **Placeholder core.** There is no shared conversational core and no LLM router/memory yet
-    (T14.2.1/T14.2.2, block 14-B2): each turn is replayed STANDALONE, through the SAME decision
-    point the live stream handler (``api/conversations.py`` ->
-    ``generation.answer_question_stream``) uses today — ``classify_intent`` (chit-chat canned
-    reply) or retrieve+answer — never a richer behaviour this block did not build. A dialogue's
-    earlier turns are NOT passed as context
-    (F14.2: the live stream handler only ever forwards ``request.question`` too). This under-builds
-    on purpose: it is the "before" measurement T14.0.5's floors are compared against, and several
-    floors are expected to be missed here precisely because the feature they measure (router,
-    memory) does not exist until later blocks (14-0 re-check scope note; see the ADR).
+    Still standalone per turn (F14.2 persists one more block, T14.2.5/14-C1): memory
+    (``summary``/``last_turn``) is not wired in here, so the router sees only the turn's own
+    message, never a dialogue's earlier turns — same limitation the "before" baseline (14-A2)
+    already had, just with a real router call now instead of no router at all.
+    ``observed_intent`` is the real 5-way ``RouterOutput.intent`` (or ``"chitchat"`` from the
+    exact fast path, which never calls the router) instead of the old placeholder's
+    chitchat/security binary; ``router_latency_s`` is the first real measurement for the
+    T14.0.5 "router p95" floor.
 
     Uses ``make_chat_client()`` (TF21), unlike the v1 ``evaluate()`` above, which keeps its
     pre-existing hard-coded ``OllamaChat`` default unchanged (out of scope here — the v1 gate
@@ -95,8 +101,10 @@ def evaluate_dialogues(
     would need a real per-turn flag if a future noisy item is added inside a multi-turn dialogue
     at a turn other than the first.
     """
+    from rag_app.assistant.core import understand
+    from rag_app.assistant.fast_path import generate_chitchat_reply
     from rag_app.eval.judge import judge_correctness, judge_no_claims
-    from rag_app.generation import _CHITCHAT_REPLY, answer_from_chunks, classify_intent
+    from rag_app.generation import Answer, answer_from_chunks
     from rag_app.reranking import get_shared_reranker, retrieve
 
     settings = get_settings()
@@ -109,34 +117,19 @@ def evaluate_dialogues(
         is_noisy = dialogue.id.startswith("typo-")
         for index, turn in enumerate(dialogue.turns):
             start = time.perf_counter()
-            observed_intent = (
-                "chitchat" if classify_intent(turn.message) == "chitchat" else "security"
-            )
+            decision = understand(chat, turn.message)
 
-            if observed_intent == "chitchat":
-                results.append(
-                    DialogueTurnResult(
-                        dialogue_id=dialogue.id,
-                        turn_index=index,
-                        expected_intent=turn.expected_intent,
-                        observed_intent="chitchat",
-                        is_noisy=is_noisy,
-                        retrieved_docs=[],
-                        expected_doc=turn.expected_doc,
-                        answerable=turn.answerable,
-                        abstained=False,
-                        reply_text=_CHITCHAT_REPLY,
-                        correct=None,
-                        clarified=False,
-                        abstention_no_claims=None,
-                        latency_s=time.perf_counter() - start,
-                    )
+            if decision.intent == "chitchat":
+                reply = generate_chitchat_reply(chat, turn.message, decision.language)
+                answer: Answer = Answer(text=reply, abstained=False, grounded=True)
+                retrieved_docs: list[str] = []
+            else:
+                chunks = retrieve(
+                    session, turn.message, reranker=reranker, top_n=top_n, version=None
                 )
-                continue
-
-            chunks = retrieve(session, turn.message, reranker=reranker, top_n=top_n)
-            retrieved_docs = [_doc_slug(c.chunk_uid) for c in chunks]
-            answer = answer_from_chunks(chat, turn.message, chunks)
+                retrieved_docs = [_doc_slug(c.chunk_uid) for c in chunks]
+                answer = answer_from_chunks(chat, turn.message, chunks)
+            latency_s = time.perf_counter() - start
 
             correct: bool | None = None
             if turn.answerable:
@@ -155,7 +148,7 @@ def evaluate_dialogues(
                     dialogue_id=dialogue.id,
                     turn_index=index,
                     expected_intent=turn.expected_intent,
-                    observed_intent="security",
+                    observed_intent=decision.intent,
                     is_noisy=is_noisy,
                     retrieved_docs=retrieved_docs,
                     expected_doc=turn.expected_doc,
@@ -165,7 +158,8 @@ def evaluate_dialogues(
                     correct=correct,
                     clarified=looks_like_clarifying_question(answer.text, bool(answer.citations)),
                     abstention_no_claims=abstention_no_claims,
-                    latency_s=time.perf_counter() - start,
+                    latency_s=latency_s,
+                    router_latency_s=decision.router_latency_s,
                 )
             )
     return results

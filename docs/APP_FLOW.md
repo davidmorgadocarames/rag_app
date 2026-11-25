@@ -122,11 +122,19 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      cap is reached the stream sends the `conversation` event and one `error` event
      (`daily_cap_reached`, "SecRAG has reached its daily answer limit … come back after
      midnight UTC") and stores nothing; the one-shot `POST /chat` answers **429** with
-     `Retry-After` (seconds to UTC midnight). A greeting (fast path, no LLM call) is never
-     counted or refused.
-   - **Classifies intent.** Small talk / greetings ("hello", "thanks", "who are you") take a **fast-path**:
-     an instant, honest, non-sourced reply — no retrieval, no citations, no abstention.
-   - Security questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
+     `Retry-After` (seconds to UTC midnight). An EXACT greeting/thanks/farewell (fast path) is
+     still exempt from the cap today (TRD §6.2 self-reports this as an approximation, not a
+     strict "no LLM call" guarantee, since block 14-B2).
+   - **Understands the message** (TRD §6.2): an EXACT greeting/thanks/farewell (en/es —
+     "hello", "hola", "thanks") takes the **fast path** and skips the router only; a typo'd
+     greeting ("hol"), a follow-up, an ambiguous or off-topic message all go through the **LLM
+     router** instead, which classifies intent/language and rewrites an English standalone
+     query. Either way, a chit-chat-classified message gets a brief, honest, LLM-generated
+     reply (template fallback on failure) — no retrieval, no citations, no abstention. A
+     misclassified or adversarial router reply can never bypass retrieval/citation: any
+     failure degrades to the conservative "security" fallback carrying the user's raw message.
+   - Security (and, until 14.3 builds their own replies, follow-up/ambiguous/off-topic)
+     questions run the grounded RAG pipeline: retrieve → rerank → generate → groundedness check.
    - Streams **Server-Sent Events** back. The **first** event is `conversation` with the
      `conversation_id` (the conversation and the user message are stored first, in one
      transaction); then `stage` (classifying/retrieving/reranking/generating/checking) and `token`

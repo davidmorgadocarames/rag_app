@@ -1,0 +1,75 @@
+"""Unit tests for the shared understanding step (T14.2.1, block 14-B2).
+
+No DB/live LLM: ``understand`` is exercised against a fake ``ChatClient``. Every test here
+fails on the pre-14-B2 code with an ``ImportError`` (``rag_app.assistant.core`` does not
+exist yet).
+"""
+
+from __future__ import annotations
+
+from rag_app.assistant.core import understand
+from rag_app.assistant.router import RouterOutput
+
+
+class _FakeChat:
+    """``chat_json`` records whether it was ever called (to prove the fast path skips the
+    router entirely, T14.2.2) and otherwise returns a canned result."""
+
+    def __init__(self, result: RouterOutput | None = None) -> None:
+        self._result = result
+        self.chat_json_calls = 0
+
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: RouterOutput, **_kw: object
+    ) -> RouterOutput:
+        self.chat_json_calls += 1
+        return self._result if self._result is not None else fallback
+
+    def chat(self, *_a: object, **_kw: object) -> str:
+        return "a reply"
+
+
+def test_exact_fast_path_match_skips_the_router_entirely() -> None:
+    chat = _FakeChat()
+    decision = understand(chat, "hola")  # type: ignore[arg-type]
+    assert decision.intent == "chitchat"
+    assert decision.language == "es"
+    assert decision.used_fast_path is True
+    assert decision.router_latency_s is None
+    assert chat.chat_json_calls == 0  # the router was never called
+
+
+def test_non_exact_message_calls_the_router_and_measures_its_latency() -> None:
+    result = RouterOutput(intent="followup", language="en", standalone_query="x")
+    chat = _FakeChat(result=result)
+    decision = understand(chat, "what about that?")  # type: ignore[arg-type]
+    assert decision.intent == "followup"
+    assert decision.used_fast_path is False
+    assert chat.chat_json_calls == 1
+    assert decision.router_latency_s is not None
+    assert decision.router_latency_s >= 0.0
+
+
+def test_a_typo_greeting_is_not_fast_pathed_but_reaches_the_router() -> None:
+    """PHASE_PLANNING.md 14.2: "a lone 'hol'/'hell' is not exact -> router"."""
+    result = RouterOutput(intent="chitchat", language="es", standalone_query="hello")
+    chat = _FakeChat(result=result)
+    decision = understand(chat, "hol")  # type: ignore[arg-type]
+    assert decision.used_fast_path is False
+    assert chat.chat_json_calls == 1
+    assert decision.intent == "chitchat"  # the router, not the fast path, decided this
+
+
+def test_router_failure_still_degrades_to_security_with_a_measured_latency() -> None:
+    """The router's own failure handling (route()) already returns the safe fallback without
+    raising -- understand() must not swallow that into a crash, and still times the call."""
+
+    class _RaisingChat:
+        def chat_json(self, *_a: object, **_kw: object) -> RouterOutput:
+            raise TimeoutError("boom")
+
+    decision = understand(_RaisingChat(), "how do I prevent SQL injection?")  # type: ignore[arg-type]
+    assert decision.intent == "security"
+    assert decision.standalone_query == "how do I prevent SQL injection?"
+    assert decision.used_fast_path is False
+    assert decision.router_latency_s is not None

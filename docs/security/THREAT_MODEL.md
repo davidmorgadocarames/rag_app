@@ -226,7 +226,7 @@ tracking IDs like `DEBT-020`, never a private file name — `private-names`).
 
 | ID | Entry | Status | Defence difficulty | Attack level | Phase | Test ID | Notes |
 |---|---|---|---|---|---|---|---|
-| LLM-01 | Prompt Injection | planned | high | medium | 15.4 | T15.4.1 | Today the user's question is the only free-text LLM input; retrieved chunks, the conversation summary and the router's inputs are not yet wrapped as explicitly untrusted data (closes in 14.2/15.4). |
+| LLM-01 | Prompt Injection | planned | high | medium | 15.4 | T15.4.1 | Retrieved chunks were already wrapped as DATA, never instructions (`generation.py`'s system prompt). Block 14-B2 (T14.2.3) closes the router's own inputs the same way: the user's message is passed as DELIMITED (`<<<MESSAGE>>>...`) data in the user turn, never the system prompt, and a reply that echoes a delimiter/role-prefix (a sign of partial compliance with injected instructions) is screened out and degrades to the conservative security fallback (`backend/tests/test_assistant_router.py`). Still planned: the conversation summary's own wrapping once memory is wired in (14-C1) and systematic, broader prompt-injection test coverage (15.4). |
 | LLM-02 | Sensitive Information Disclosure | planned | medium | medium | 15.4 | T15.4.2 | Canary token (leak detection) planned; logging already keeps PII/secrets out (`test_log_hygiene.py`). |
 | LLM-03 | Supply Chain | mitigated | medium | medium | 11a | backend/tests/test_devtools.py::test_the_repository_exceptions_file_is_valid | Same control as OWASP-A03 — model/dependency pinning + dependency audit. |
 | LLM-04 | Data and Model Poisoning | planned | high | low | 15.4 | T15.4.5 | Corpus hash manifest verified at index time. |

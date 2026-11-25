@@ -536,9 +536,22 @@ def _key_unwraps(wrapped_key: bytes) -> bool:
 
 def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None, bool]:
     """The daily-cap reservation of a stream turn, at request start (R6-1, DA-G3-1):
-    ``(blocking error code or None, counted)``. A chit-chat question gets the canned reply
-    with no LLM call, so it is neither counted nor refused. When the counter cannot be
-    written the turn is refused as a storage failure (fail closed: no uncounted LLM call)."""
+    ``(blocking error code or None, counted)``. A chit-chat question is exempt (neither
+    counted nor refused). When the counter cannot be written the turn is refused as a
+    storage failure (fail closed: no uncounted LLM call).
+
+    **Self-reported drift (T14.2.1/T14.2.2, block 14-B2):** this still uses the pre-14.2
+    ``classify_intent`` heuristic, unchanged, to decide the exemption -- NOT the live
+    pipeline's new understanding step (``rag_app.assistant.fast_path``/``.router``). Before
+    14.2 a chit-chat reply was a free, instant canned template; since T14.2.2 it is an
+    LLM-generated reply (small, but no longer free), so this exemption is now an
+    approximation ("probably cheap"), not a strict "no LLM call happened" guarantee. Needs
+    the user's decision (see the 14-B2 block report): keep this narrow heuristic as-is
+    (cheapest, current behaviour), switch it to ``assistant.fast_path.match_fast_path``
+    (matches ONLY the new, narrower exact fast path -- a typo'd/router-classified chit-chat
+    turn would then count against the cap like any router call), or track it as a dated
+    debt row for a later block.
+    """
     if classify_intent(question) == "chitchat":
         return None, False
     cap = get_settings().daily_answer_cap

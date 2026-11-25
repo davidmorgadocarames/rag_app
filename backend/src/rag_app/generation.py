@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING
 from sqlalchemy.orm import Session
 
 from rag_app import timing
+from rag_app.assistant.core import understand
+from rag_app.assistant.fast_path import generate_chitchat_reply
 from rag_app.config import get_settings
 from rag_app.embeddings import OllamaEmbedder
 from rag_app.llm import ChatClient, Message, Usage, make_chat_client
@@ -211,10 +213,19 @@ def answer_question(
     use_rerank: bool = True,
     version: str | None = None,
 ) -> Answer:
-    """Full RAG: retrieve -> generate -> groundedness check -> cited answer or abstention.
+    """Full RAG: understand -> retrieve -> generate -> groundedness check -> cited answer,
+    small-talk reply, or abstention.
 
-    T11.3.1: one JSON timing record per answer (classify is streaming-only — this path
-    never has a chit-chat fast path) plus the same durations into the Prometheus
+    T14.2.1/T14.2.2 (block 14-B2): now starts with the shared understanding step
+    (``rag_app.assistant.core.understand`` -- fast path, then the LLM router) instead of
+    running full RAG unconditionally. Before this block ``answer_question`` had NO chit-chat
+    branch at all -- every ``POST /chat`` ran full RAG even for "hi" (closed here, F14.2-
+    adjacent gap): a bare "hi" now gets the same LLM-generated small-talk reply the stream
+    does (P14-D1), never a RAG abstention. Non-chitchat intents (``followup``/``ambiguous``/
+    ``off_topic``, besides ``security``) fall through to the SAME retrieve-and-answer path as
+    before (T14.3/14-D1 has not built their dedicated replies yet) -- documented, not silent.
+
+    T11.3.1: one JSON timing record per answer plus the same durations into the Prometheus
     histograms (T11.3.2, never on the API port).
 
     ``reranker`` (T11.4.1): defaults to the ONE process-wide shared instance
@@ -227,6 +238,12 @@ def answer_question(
     chat = chat or make_chat_client()
 
     with timing.recorder(streaming=False, on_stage=observe_stage, on_step=observe_step):
+        with timing.stage("classify"):
+            decision = understand(chat, query)
+        if decision.intent == "chitchat":
+            reply = generate_chitchat_reply(chat, query, decision.language)
+            return Answer(text=reply, abstained=False, grounded=True)
+
         if use_rerank:
             from rag_app.reranking import get_shared_reranker, retrieve
 
@@ -244,10 +261,14 @@ def answer_question(
 
 
 # ---------------------------------------------------------------------------
-# Chit-chat fast-path: greetings/thanks/meta get an instant, honest, non-sourced
-# reply instead of running the full RAG pipeline (and abstaining). Security
-# questions always go through grounded retrieval — the classifier is conservative
-# and defaults to "security" whenever it is unsure.
+# Chit-chat classifier (pre-14.2): greetings/thanks/meta vs. security, with typo
+# tolerance. T14.2.1/T14.2.2 (block 14-B2) replaced this as the LIVE pipeline's
+# understanding step with ``rag_app.assistant.fast_path``/``.router`` (an EXACT
+# fast path + an LLM router) -- ``classify_intent`` stays here, unchanged and still
+# tested, ONLY for ``api.conversations._reserve_stream_answer``'s cheap "is this
+# free of charge" pre-check (documented self-reported drift there: since T14.2.2
+# every chit-chat reply is now LLM-generated, that exemption is no longer literally
+# free, just small).
 # ---------------------------------------------------------------------------
 
 _CHITCHAT_REPLY = (
@@ -497,6 +518,11 @@ def answer_question_stream(
     Mirrors ``answer_question`` but yields progress so the UI can show what is happening
     and stream the answer. ``answer_question`` itself is left untouched (eval gate).
 
+    T14.2.1/T14.2.2 (block 14-B2): the old inline ``classify_intent`` check is replaced by
+    the shared understanding step (``rag_app.assistant.core.understand`` -- fast path, then
+    the LLM router); a chit-chat reply is now LLM-generated (P14-D1) instead of a fixed
+    canned template. Everything from "retrieving" onward is UNCHANGED.
+
     T11.3.1: one JSON timing record per answer (classify, embed, hybrid search, rerank
     load/inference, time to first token, total) plus the same durations into the
     Prometheus histograms (T11.3.2, never on the API port). The ``with`` block spans every
@@ -513,15 +539,17 @@ def answer_question_stream(
 
     with timing.recorder(streaming=True, on_stage=observe_stage, on_step=observe_step):
         yield StreamStage(stage="classifying")
-        with timing.stage("classify"), timing.step("classifying", "classify_intent"):
-            intent = classify_intent(query)
-        if intent == "chitchat":
+        with timing.stage("classify"):
+            decision = understand(chat, query)
+        if decision.intent == "chitchat":
             yield StreamStage(stage="responding")
-            with timing.step("responding", "stream_canned_reply"):
-                for word in _CHITCHAT_REPLY.split(" "):
-                    yield StreamToken(text=word + " ")
+            with timing.stage("responding"):
+                reply = generate_chitchat_reply(chat, query, decision.language)
+                with timing.step("responding", "stream_canned_reply"):
+                    for word in reply.split(" "):
+                        yield StreamToken(text=word + " ")
             yield StreamResult(
-                answer=Answer(text=_CHITCHAT_REPLY, abstained=False, grounded=True), usage=usage
+                answer=Answer(text=reply, abstained=False, grounded=True), usage=usage
             )
             return
 

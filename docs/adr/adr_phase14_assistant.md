@@ -249,6 +249,67 @@ greeting) — not part of the gate (cost/determinism), reported for confidence o
   not self-correct; no retry-with-a-corrective-message strategy is implemented (none was asked
   for — the task's "bounded retry" + "safe fallback" are satisfied literally).
 
+## Decision — shared understanding step: fast path + LLM router (T14.2.1–T14.2.3, block 14-B2)
+
+**One shared understanding step** (`rag_app.assistant.core.understand`) replaces the 14-A2
+placeholder (`classify_intent`, binary chit-chat/security) on every call site that answers a
+message: `generation.answer_question` (`POST /chat` — which previously had NO chit-chat branch
+at all, running full RAG even for "hi"), `generation.answer_question_stream` (`/chat/stream`),
+and `eval.runner.evaluate_dialogues`. See `docs/TRD.md` §6.2 for the full design (regex fast
+path, LLM router schema, delimited untrusted-data handling, fallback semantics).
+
+**Scope interpretation (documented, not a blocking ambiguity).** The phase plan describes
+"one shared conversational core (understand → retrieve → answer)". This block builds the
+UNDERSTAND part as one genuinely shared implementation (there was none before — the 5-way
+router/fast-path decision literally did not exist). The RETRIEVE/GENERATE/CHECK part
+deliberately stays where it already lived (`generation.py`'s own functions, the eval runner's
+own direct `reranking.retrieve`/`generation.answer_from_chunks` calls) rather than being
+relocated into `rag_app.assistant` too: several pre-existing tests monkeypatch module-qualified
+names (`generation.hybrid_search`, `generation.embed_query`) that only intercept the real call
+when the calling code is textually inside `generation.py` — moving that code to a new module
+would silently stop those tests from testing anything (the patch would simply not apply, and
+the real function would run unmocked) rather than failing loudly. Collapsing stream/non-stream/
+eval into one single generator end-to-end is accordingly tracked as a follow-up (TF19's second
+half), not silently dropped.
+
+**Design note: the daily-answer-cap exemption is now an approximation, not fixed here.**
+`api.conversations._reserve_stream_answer` exempts a chit-chat turn from the global daily
+answer cap (R6-1) on the theory that it is a free, instant canned reply. Since T14.2.2 every
+chit-chat reply (fast path OR router-detected) is LLM-generated — small, but no longer free.
+This block leaves the exemption's mechanics unchanged (still keyed off the OLD `classify_intent`
+heuristic, not the new fast path/router) rather than silently changing a cost-cap policy
+decision; see the 14-B2 block report's "Needs the user's decision" for the options.
+
+## Known limitations (self-reported, not just design) — 14-B2
+
+- **Memory is plumbed but inert.** `understand`/`route` accept `summary`/`last_turn` parameters
+  (ready for 14-C1) but every 14-B2 call site always passes `None` — the router classifies a
+  follow-up on its own wording alone, same F14.2 shape as before, just with a real router call.
+- **Retrieval still uses the original message, never `standalone_query`.** The router already
+  produces an English, self-contained rewrite; nothing downstream reads it yet (T14.2.7/14-C2).
+- **`followup`/`ambiguous`/`off_topic` have no dedicated reply yet.** All three currently fall
+  through to the same retrieve-and-answer path as `security` (the pre-14.2 conservative
+  default) — a clarifying question, a polite off-topic redirect and a conversational
+  abstention are T14.3/14-D1, not built here. `clarification_rate`/some `conversational_reply_rate`
+  gaps in the eval table below are therefore still expected misses, same reasoning as 14-A2's
+  own baseline table, just narrower.
+- **No new fine-grained latency metric for the understanding step.** Adding one would need a
+  new `metrics.STEP_ALLOWLIST` entry (`metrics.py` is outside this block's named touches); the
+  pre-existing coarse `secrag_chat_stage_seconds{stage="classify"|"responding"}` total already
+  grows to include it. Deferred to 14.5 (Latency, cost, dashboard).
+- **The router's own num_ctx/call_type plumbing is exercised only against a local Ollama fake
+  in tests** — no live Azure OpenAI `chat_json` call exists yet (DEBT-036's existing note still
+  applies: the first live Azure `chat_json` call, whichever block makes it, must confirm API
+  version `2024-10-21` serves `strict: true` for the pinned deployment).
+- **The suspicious-output screen (`_looks_suspicious`) is a narrow, literal check** (delimiter
+  markers, a `role:` prefix) — a determined prompt-injection attempt that avoids those exact
+  literal patterns while still producing a structurally valid `RouterOutput` would not be
+  caught by this screen specifically; the defence-in-depth property that matters (a misrouted
+  message can only ever reach the existing, already-reviewed retrieve → generate →
+  groundedness-check → cite-or-abstain path, never bypass citation/groundedness) holds
+  regardless, because every non-chitchat intent — caught or not — runs through that same,
+  unmodified path.
+
 ## Rollback
 
 14-A1: no runtime behaviour changes (`eval/golden_set_v2.jsonl` and the new
@@ -261,3 +322,7 @@ implementations; no existing caller is touched (`chat`/`chat_stream` signatures 
 byte-identical, proven by the full pre-existing `test_llm.py`/`test_llm_bounds.py` suite staying
 green) and nothing in `generation.py`/the API routes calls `chat_json` yet — reverting this
 block's commit(s) is a plain revert with no migration, no deployed-image, and no API impact.
+14-B2: changes LIVE runtime behaviour (every chat turn now runs the fast path or the LLM router
+before anything else) — a plain `git revert` of this block's commit(s) restores the 14-B1 head's
+`classify_intent`-only behaviour exactly; no migration, no new persisted data, no deployed-image
+step (Ollama/Azure OpenAI are called the same way `chat`/`chat_stream` already were).

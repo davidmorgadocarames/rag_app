@@ -70,10 +70,11 @@ def test_every_registry_id_has_a_feature_doc() -> None:
 def test_coverage_numbers_match_what_the_report_quotes() -> None:
     """Pins the two numbers the Harness-B report quotes (N features, M without e2e) to the
     real registry, so a future registry change that silently shifts them is caught here
-    instead of only in a hand-typed report."""
+    instead of only in a hand-typed report. Block 14-B2 added "assistant-conversational-core"
+    (covered by auth.spec.ts, so `without_e2e` is unchanged)."""
     total = len(REGISTRY)
     without_e2e = len([entry for entry in REGISTRY if not FEATURE_DOCS[entry.id].e2e])
-    assert total == 39
+    assert total == 40
     assert without_e2e == 23
 
 

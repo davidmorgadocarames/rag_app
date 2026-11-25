@@ -64,14 +64,16 @@ def compute_metrics(results: list[ItemResult]) -> Metrics:
 
 @dataclass
 class DialogueTurnResult:
-    """One replayed turn of a golden-set v2 dialogue (T14.0.4, block 14-A2).
+    """One replayed turn of a golden-set v2 dialogue (T14.0.4, block 14-A2; ``observed_intent``
+    and ``router_latency_s`` updated for the real router/fast path in block 14-B2).
 
-    ``observed_intent`` is what TODAY's placeholder core actually decided for this turn
-    (``"chitchat"`` or ``"security"`` — ``rag_app.generation.classify_intent`` has no router yet,
-    T14.2.1), not a 5-way match of ``expected_intent``. A dialogue has no memory yet either: every
-    turn is replayed standalone, exactly as the live stream handler does today (only
-    ``request.question``, F14.2) — this is the "before" baseline the floors in T14.0.5 are
-    measured against, not a simulation of the future router.
+    ``observed_intent`` is what the pipeline actually decided for this turn --- before 14-B2
+    always ``"chitchat"``/``"security"`` (``rag_app.generation.classify_intent``, no router);
+    from 14-B2 the real 5-way ``rag_app.assistant.router.RouterOutput.intent`` (or
+    ``"chitchat"`` from the exact fast path, which never calls the router) --- a 5-way match of
+    ``expected_intent``. A dialogue still has no memory (14-C1): every turn is replayed
+    standalone, only its own message (F14.2) --- the router call itself exists now, but
+    ``summary``/``last_turn`` are always ``None``.
     """
 
     dialogue_id: str
@@ -87,7 +89,10 @@ class DialogueTurnResult:
     correct: bool | None  # judge verdict for answerable turns; None otherwise
     clarified: bool
     abstention_no_claims: bool | None  # judge verdict when abstained; None otherwise
-    latency_s: float  # wall time for this turn's classify+reply/retrieve+answer
+    latency_s: float  # wall time for this turn's understand+reply/retrieve+answer
+    # Wall time of the LLM router call ALONE (block 14-B2); ``None`` when the exact fast path
+    # matched (no router call happened to time) -- never 0.0 as a stand-in for "not measured".
+    router_latency_s: float | None = None
 
 
 @dataclass
@@ -96,8 +101,9 @@ class DialogueMetrics:
 
     Every ratio uses the same ``_ratio`` convention as :class:`Metrics`: an empty denominator
     defaults to 1.0 (no penalty for a category the fixture happens not to exercise) rather than
-    0/0. Latency fields are ``None`` when the feature they measure does not exist yet (no LLM
-    router before T14.2.1 — "router p95" has nothing to measure until then; see the ADR).
+    0/0. ``router_p95_s`` is ``None`` when no turn in the run ever reached the router (every
+    turn matched the exact fast path) rather than a fabricated 0; before block 14-B2 it was
+    always ``None`` (no router existed yet).
     """
 
     n_turns: int
@@ -154,11 +160,14 @@ def compute_dialogue_metrics(results: list[DialogueTurnResult]) -> DialogueMetri
     abstained = [r for r in results if r.abstained]
     no_claims_hits = sum(1 for r in abstained if r.abstention_no_claims)
 
-    # "Greeting reply" latency (floor: p95 <= 2s local) is measurable TODAY — it is the
-    # classify_intent + canned-reply path, the only conversational-style reply the placeholder
-    # core has. "Router p95" (floor: <=1.5s local / <=1s Azure) has no call to time until the
-    # LLM router exists (T14.2.1/14-B2) — always None here, not a fabricated 0.
+    # "Greeting reply" latency (floor: p95 <= 2s local): the whole turn's wall time whenever
+    # the observed intent is chit-chat (fast path OR router-detected) -- before 14-B2 this was
+    # always the instant canned-reply path; from 14-B2 it is a real (small) LLM call. "Router
+    # p95" (floor: <=1.5s local / <=1s Azure, block 14-B2 onward): ONLY the router call itself
+    # (``DialogueTurnResult.router_latency_s``, ``None`` when the exact fast path matched --
+    # excluded here, not counted as 0).
     greeting_latencies = [r.latency_s for r in results if r.observed_intent == "chitchat"]
+    router_latencies = [r.router_latency_s for r in results if r.router_latency_s is not None]
 
     return DialogueMetrics(
         n_turns=n_turns,
@@ -169,7 +178,7 @@ def compute_dialogue_metrics(results: list[DialogueTurnResult]) -> DialogueMetri
         conversational_reply_rate=_ratio(conversational_hits, len(chitchat_expected)),
         abstention_no_claims_rate=_ratio(no_claims_hits, len(abstained)),
         greeting_reply_p95_s=_p95(greeting_latencies),
-        router_p95_s=None,
+        router_p95_s=_p95(router_latencies),
     )
 
 

@@ -574,6 +574,21 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         health_probe=module_probe("rag_app.agentic", "answer_agentic"),
         docs="docs/adr/adr_phase11_stability.md",
     ),
+    FeatureEntry(
+        id="assistant-conversational-core",
+        name="Shared conversational core (fast path + LLM router)",
+        phase="14-B2",
+        status="enabled",
+        health_probe=module_probe("rag_app.assistant.core", "understand"),
+        # T13.5.1 DoD rule (this entry is NOT in the frozen `_DOD_GRANDFATHERED_IDS`, DEC-039):
+        # the understanding step's own timing is recorded under the pre-existing "classify"/
+        # "responding" stage labels (``generation.answer_question``/``answer_question_stream``'s
+        # own `timing.stage(...)` calls around `understand()`) rather than a new metric name --
+        # see `assistant/core.py`'s own self-reported limitation on why no new fine-grained
+        # step metric was added in this block.
+        metrics=("secrag_chat_stage_seconds",),
+        docs="docs/adr/adr_phase14_assistant.md",
+    ),
     # --- Quality ---------------------------------------------------------------------
     FeatureEntry(
         id="quality-eval-vs-baseline",
@@ -1191,6 +1206,24 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         steps="n/a",
         observable="module importable; not reachable through the product",
         key_files=("backend/src/rag_app/agentic.py",),
+    ),
+    "assistant-conversational-core": FeatureDoc(
+        page="/chat",
+        prerequisites="auth; a question not an exact greeting/thanks/farewell",
+        steps="send a message that is NOT an exact greeting (e.g. a misspelled 'hol', a"
+        " follow-up, an off-topic question)",
+        observable="the message is classified (chitchat/security/followup/ambiguous/"
+        "off_topic) by the LLM router instead of the old binary classifier -- a security"
+        " question still retrieves+cites as before; a misclassified/invalid router reply"
+        " degrades to the same grounded security path (never bypasses retrieval/citation)",
+        key_files=(
+            "backend/src/rag_app/assistant/core.py",
+            "backend/src/rag_app/assistant/router.py",
+            "backend/src/rag_app/assistant/fast_path.py",
+        ),
+        e2e=("auth.spec.ts",),
+        # auth.spec.ts registers a brand-new account to reach /chat (DA-HB-2).
+        mode="mutating",
     ),
     # --- Quality ---------------------------------------------------------------------------
     "quality-eval-vs-baseline": FeatureDoc(
