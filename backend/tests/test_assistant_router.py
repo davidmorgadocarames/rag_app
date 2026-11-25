@@ -18,6 +18,7 @@ from __future__ import annotations
 from rag_app.assistant.router import (
     ROUTER_MAX_TOKENS,
     RouterOutput,
+    _resolves_a_reference,
     build_router_messages,
     guess_language,
     route,
@@ -207,3 +208,89 @@ def test_route_accepts_a_clean_ambiguous_reply_with_a_clarification() -> None:
     chat = _FakeChat(result=result)
     out = route(chat, "tell me more")  # type: ignore[arg-type]
     assert out == result
+
+
+# --- _resolves_a_reference: the T14.2.9-fix (DEC-063) tie-breaker's own helper -------------
+
+
+def test_resolves_a_reference_detects_an_added_substantive_word() -> None:
+    assert _resolves_a_reference(
+        "Where does it rank in the 2021 OWASP Top 10?",
+        "Where does SQL injection rank in the 2021 OWASP Top 10?",
+    )
+
+
+def test_resolves_a_reference_is_false_when_nothing_new_was_added() -> None:
+    """A pure echo/translation (same content words, same or fewer) is NOT resolution --
+    stems the false-positive risk for a message the router genuinely could not resolve."""
+    assert not _resolves_a_reference("Is it safe?", "Is it safe?")
+    assert not _resolves_a_reference("How do I fix this?", "How do I fix this")  # punctuation only
+
+
+def test_resolves_a_reference_ignores_digits_and_short_words() -> None:
+    """Edition years (digits) and 1-2 letter words never count as "substantive" on their
+    own -- only >=3-letter alphabetic tokens do."""
+    assert not _resolves_a_reference("What about 2021?", "What about 2025?")
+
+
+# --- route: T14.2.9-fix (DEC-063) ambiguous-vs-followup tie-breaker ------------------------
+
+
+def test_route_overrides_ambiguous_to_followup_when_context_resolved_it() -> None:
+    """The real regression (DA-14-C3, live-verified): the model says "ambiguous" yet its OWN
+    standalone_query named the topic pulled from context -- a self-contradiction (an
+    "ambiguous" verdict with no real clarification need). The tie-breaker trusts the resolved
+    query over the label."""
+    suspicious_label = RouterOutput(
+        intent="ambiguous",
+        language="en",
+        standalone_query="Where does SQL injection rank in the 2021 OWASP Top 10?",
+        clarification=None,
+    )
+    chat = _FakeChat(result=suspicious_label)
+    out = route(
+        chat,
+        "Where does it rank in the 2021 OWASP Top 10?",
+        summary='{"topics":["SQL injection"]}',
+        last_turn="User: How do I prevent SQL injection?\nAssistant: ...",
+    )
+    assert out.intent == "followup"
+    assert out.standalone_query == suspicious_label.standalone_query
+    assert out.clarification is None
+
+
+def test_route_leaves_ambiguous_alone_without_any_context() -> None:
+    """Guard: every golden-set "ambiguous" item today is a first turn with no summary/last
+    turn at all -- the tie-breaker must never fire then, even if standalone_query happens to
+    differ from the raw message (e.g. a stray rewrite), because the router had nothing to
+    resolve anything FROM."""
+    result = RouterOutput(
+        intent="ambiguous",
+        language="en",
+        standalone_query="What security topic do you mean?",
+        clarification="What exactly would you like help fixing?",
+    )
+    chat = _FakeChat(result=result)
+    out = route(chat, "How do I fix this?")  # type: ignore[arg-type]
+    assert out.intent == "ambiguous"
+    assert out.clarification == "What exactly would you like help fixing?"
+
+
+def test_route_leaves_ambiguous_alone_when_standalone_query_resolves_nothing() -> None:
+    """Context WAS given, but the model's own standalone_query adds no new substantive word
+    (it could only echo/translate the vague message) -- genuinely unresolved, the tie-breaker
+    must not override it."""
+    result = RouterOutput(
+        intent="ambiguous",
+        language="en",
+        standalone_query="How do I fix this",
+        clarification="What exactly would you like help fixing?",
+    )
+    chat = _FakeChat(result=result)
+    out = route(
+        chat,
+        "How do I fix this?",
+        summary='{"topics":["SQL injection","OS command injection"]}',
+        last_turn="User: ...\nAssistant: ...",
+    )
+    assert out.intent == "ambiguous"

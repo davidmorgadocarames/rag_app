@@ -793,7 +793,112 @@ retrieval-time fix block). **Not a lowered floor** — recorded every run, never
   could in principle need this re-tuned the same way, by reproducing a failing case live
   against the real pipeline (as this block did) rather than guessing.
 
+## Decision — ambiguous-vs-followup tie-breaker (T14.2.9-fix, block 14-C4, DEC-063)
+
+**Scope.** DEC-063 option B (user 2026-11-25 18:50, per DA-14-C3's recommendation): fix the
+`intent_accuracy` regression 14-C3 left (0.873 → 0.840) without touching `follow_up_resolution`
+(≥ 0.85, already enforced) or lowering any floor; enforce `intent_accuracy` too, if ≥ 0.90 over
+2 real runs.
+
+**Re-diagnosis (live, against the real router, not only the aggregate).** Reconstructed the
+exact conversation state (summary + last turn) 14-C3's own 5 regressed turns reach by turn 3/4
+and called `understand()`/`route()` directly against it (real Ollama, no stub): both
+`dlg-followup-3-back` and `dlg-followup-3-back-es` turn 3 reproduce the mismatch every time —
+the router outputs `intent="ambiguous"` while its OWN `standalone_query` has already resolved
+the reference correctly from the summary (e.g. `'Where does it rank in the 2021 OWASP Top 10?'`
+→ `'Where does SQL injection rank in the 2021 OWASP Top 10?'`) — AND, in both live-reproduced
+cases, `clarification` is `null`, directly contradicting the router's own stated rule that an
+`"ambiguous"` verdict must carry a real clarifying question. 14-C3's two prompt-only attempts
+(a sharper definition, kept; one more few-shot, reverted) did not close this because the model's
+own self-contradiction (claims "ambiguous", behaves as if resolved) is not something more prose
+alone reliably fixes.
+
+**Fix.**
+
+1. **One more small, contrasting few-shot** in `assistant.router._ROUTER_SYSTEM`: an explicit
+   "genuinely ambiguous — no context at all" example, paired with a reminder that `"ambiguous"`
+   MUST carry a real `clarification`. Additive to 14-C3's existing 3 examples (kept unchanged).
+2. **A deterministic, code-level tie-breaker (`router._resolves_a_reference`)**, applied in
+   `route()` AFTER the existing suspicious-output screen, BEFORE returning: when the model says
+   `"ambiguous"` but (a) conversation context (`summary`/`last_turn`) actually existed to
+   consult, AND (b) `standalone_query` names at least one substantive (≥3-letter) word absent
+   from the raw `query` — direct, language-agnostic evidence it DID resolve the reference — the
+   verdict is corrected to `"followup"` (`clarification` reset to `None`), per the router's own
+   stated rule ("if you CAN write a resolved standalone_query … the intent is followup, never
+   ambiguous"). Trusts the resolved query over a self-contradicting label instead of trying to
+   out-prompt the contradiction.
+   - **Why both conditions are needed, not just "intent == ambiguous":** every golden-set
+     `ambiguous` item today is a FIRST turn with no prior summary/last-turn at all (condition
+     (a) is false) — live-verified with the final code (`test_route_leaves_ambiguous_alone_
+     without_any_context` + a direct 5x repeat of all 5 single-turn ambiguous fixtures against
+     the real router) that the tie-breaker never fires for them, regardless of how its
+     `standalone_query` happens to be worded. A message with context that genuinely cannot be
+     resolved (tried live: two topics in the summary, a message too vague to pick either) also
+     never satisfies (b) — the model can only echo/translate it, adding no new word — confirmed
+     live (`"How do I fix this?"` against a two-topic summary stayed `"ambiguous"`).
+   - **Why not simply "standalone_query differs from query":** a Spanish message translated to
+     English always "differs" even when nothing was resolved — the (b) check specifically
+     requires an ADDED substantive word, not just any textual difference, so translation alone
+     never satisfies it on its own.
+
+### Measured effect
+
+Real `--only eval` runs against the live dev corpus (same 322-chunk seed, same 75-turn golden
+set v2 fixture as 14-C3), identical code both times:
+
+| Metric | 14-C3 (before) | Run 1 (`gate-20261125T180052Z-3120649.log`) | Run 2 (`gate-20261125T180723Z-3121974.log`) | Floor | Met (both)? | Enforced from this block? |
+|---|---|---|---|---|---|---|
+| intent_accuracy | 0.840 | 0.907 | 0.907 | ≥ 0.90 | **yes** | **yes** |
+| follow_up_resolution | 0.900 | 0.900 | 0.900 | ≥ 0.85 | yes (unchanged) | yes (already, 14-C3) |
+| noisy_recall | 1.000 | 1.000 | 1.000 | ≥ 0.90 | yes (already) | yes (already) |
+| conversational_reply_rate | 0.944 | 1.000 | 1.000 | ≥ 1.00 | yes (both runs) | not this block (see below) |
+| greeting_reply_p95_s | ~1.53s | ~1.57s | ~1.56s | ≤ 2.0s | yes (already) | yes (already) |
+| router_p95_s | ~1.05s | ~1.05s | ~1.05s | ≤ 1.5s local | yes (already) | yes (already) |
+
+v1 golden set, BOTH runs: `retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`
+all **1.0** — unchanged, this block touches no retrieval/generation code.
+
+`intent_accuracy` 0.840 → 0.907, identical on both runs (same 5 previously-mislabeled turns
+re-checked individually: all 5 now observe `"followup"`, matching `expected_intent`) — clears
+the 0.90 floor with margin on both, so `enforce.intent_accuracy` flips to `true`.
+`conversational_reply_rate` also reached 1.000 on both of these same two runs (up from 14-C3's
+0.944) — plausibly the extra few-shot/prompt tweak also firming up the chitchat/off-topic
+boundary, or ordinary run-to-run LLM variance; **left unenforced** here regardless, since
+DEC-063's scope was `intent_accuracy` + `follow_up_resolution` only and two runs on one fixture
+is a thinner basis for a metric this block did not set out to fix — recorded in "Needs the
+user's decision" for whoever next touches conversational replies (T14.3/14-D1) to pick up.
+
+### Known limitations (self-reported, not just design) — 14-C4
+
+- **`_resolves_a_reference`'s "substantive word" test is a crude, language-agnostic proxy
+  (≥3-letter alphabetic token), not real semantic resolution.** It cannot tell a genuinely
+  resolved reference from the model simply inventing a plausible-sounding but WRONG entity not
+  actually in the real context (hallucinated resolution) — it only checks that the word is new
+  relative to the raw query, never that it is also correct. This mirrors 14-C3's own
+  `follow_up_resolution` metric covering genuine correctness instead (checked via
+  `retrieved_docs`, not by this tie-breaker); the tie-breaker's job is narrowly to stop a
+  self-contradicting `"ambiguous"` label from overriding a standalone_query that is in every
+  measured case already correct — not to independently verify that correctness itself.
+- **Still carries 14-C3's own run-to-run LLM variance.** The tie-breaker makes the ambiguous/
+  followup BOUNDARY deterministic given the model's own output, but the underlying router call
+  itself is not bit-for-bit reproducible (temperature, quantized model) — a future run could in
+  principle produce a `standalone_query` that fails condition (b) (e.g. staying a bare "it")
+  even for a resolvable reference, same class of noise 14-C2/14-C3 already self-report.
+- **`conversational_reply_rate` reaching 1.000 on both runs is NOT attributed to a specific
+  mechanism** (see "Measured effect" above) — recorded as an observation, not claimed as a
+  fixed/understood improvement, and deliberately left unenforced pending a block that actually
+  targets it.
+
 ## Rollback
+
+14-C4: changes LIVE runtime behaviour (the router can now return `"followup"` where it used to
+return `"ambiguous"` for a resolved, context-backed reference) via a pure, additive code path
+(`_resolves_a_reference`, called only after the existing suspicious-output screen) plus one
+more few-shot example in an existing prompt string — no new schema, no migration, no new
+persisted data, no deployed-image step. A plain `git revert` of this block's commit(s) restores
+14-C3's behaviour exactly (reopening the `intent_accuracy` regression this block fixes); if
+reverted, `eval/golden_set_v2_floors.json`'s `enforce.intent_accuracy` must also revert to
+`false` in the same revert or `gate.sh --full` will fail on the lower, 14-C3-era number.
 
 14-A1: no runtime behaviour changes (`eval/golden_set_v2.jsonl` and the new
 `Turn`/`Dialogue`/`load_dialogues` code were inert until this block). 14-A2: `evaluate_dialogues`/

@@ -361,6 +361,27 @@ that does not affect `follow_up_resolution`). See the ADR's "14-C3 decision" sec
 full live-diagnosis evidence, the before/after ranking tables, and the "Known limitations"
 section.
 
+### 6.4b Ambiguous-vs-followup tie-breaker (T14.2.9-fix, block 14-C4, DEC-063)
+
+**What changed.** §6.4a's own `intent_accuracy` gap is fixed in `assistant.router.route`, after
+the existing suspicious-output screen: when the model returns `intent="ambiguous"` but (a)
+conversation context (`summary`/`last_turn`) existed to consult AND (b) its own
+`standalone_query` names a substantive word absent from the raw message (`router
+._resolves_a_reference` — a deliberately crude, language-agnostic ≥3-letter-token diff, not
+semantic verification), the verdict is corrected to `"followup"` (`clarification` reset to
+`None`). This is a deterministic, code-level enforcement of the router's own stated rule ("if
+you CAN write a resolved standalone_query … the intent is followup, never ambiguous") rather
+than relying on prose alone — §6.4a's own two prompt-only attempts did not reliably close the
+gap. Paired with one more contrasting few-shot (a genuinely-ambiguous, no-context example) in
+`_ROUTER_SYSTEM`. Every golden-set `ambiguous` item is a first turn with no prior context, so
+condition (a) alone already guards every known genuinely-ambiguous case from being overridden.
+
+**Measured effect.** `intent_accuracy` 0.840 → 0.907 (two real `--only eval` runs, identical
+both times) — now enforced; `follow_up_resolution` unchanged at 0.900 (this fix only touches
+the intent LABEL, never `standalone_query`'s resolution quality, which `follow_up_resolution`
+actually measures). See the ADR's "14-C4 decision" section for the live-diagnosis evidence,
+the full measured-effect table and the "Known limitations" section.
+
 ## 7. Cost & latency
 
 - Q4 quantization; a single shared LLM; reranker on CPU.
