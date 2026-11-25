@@ -222,6 +222,10 @@ class OllamaChat:
         self.host = (host or settings.ollama_host).rstrip("/")
         self.model = model or settings.llm_model
         self.keep_alive = settings.ollama_keep_alive
+        # DEC-064: see config.py's own comment on `ollama_seed` -- always read from
+        # settings (no constructor override; a fixed seed is a correctness property, not
+        # a per-call choice).
+        self.seed = settings.ollama_seed
 
     def _options(
         self, temperature: float, max_tokens: int | None, num_ctx: int | None
@@ -231,6 +235,8 @@ class OllamaChat:
             options["num_predict"] = max_tokens
         if num_ctx is not None:
             options["num_ctx"] = num_ctx
+        if self.seed is not None:
+            options["seed"] = self.seed
         return options
 
     def chat(

@@ -155,6 +155,42 @@ def test_ollama_chat_never_warns_without_an_explicit_num_ctx(
     assert [r for r in caplog.records if r.name == "rag_app.llm"] == []
 
 
+# --- DEC-064 (eval-determinism): a fixed Ollama seed, always on ---------------------------
+
+
+def test_ollama_chat_sends_the_configured_seed_in_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default (`config.Settings.ollama_seed`, 42) is sent on every call -- this is
+    what fixes the golden-set eval's run-to-run non-determinism (DEC-064), and is harmless
+    in production since every caller already runs at temperature=0 (greedy)."""
+    captured: dict[str, Any] = {}
+    _patch_post(monkeypatch, captured)
+    client = OllamaChat(host="http://fake", model="m")
+    client.chat([{"role": "user", "content": "hi"}], max_tokens=16)
+    assert captured["options"]["seed"] == 42
+
+
+def test_ollama_chat_uses_the_configured_seed_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OLLAMA_SEED", "7")
+    captured: dict[str, Any] = {}
+    _patch_post(monkeypatch, captured)
+    client = OllamaChat(host="http://fake", model="m")
+    client.chat([{"role": "user", "content": "hi"}], max_tokens=16)
+    assert captured["options"]["seed"] == 7
+
+
+def test_ollama_chat_omits_seed_from_options_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(llm, "get_settings", lambda: Settings(ollama_seed=None))
+    captured: dict[str, Any] = {}
+    _patch_post(monkeypatch, captured)
+    client = OllamaChat(host="http://fake", model="m")
+    client.chat([{"role": "user", "content": "hi"}], max_tokens=16)
+    assert "seed" not in captured["options"]
+
+
 def test_azure_chat_accepts_and_ignores_num_ctx(monkeypatch: pytest.MonkeyPatch) -> None:
     """Azure OpenAI's context window is fixed by the deployment (T11.3.4)."""
     captured: dict[str, Any] = {}

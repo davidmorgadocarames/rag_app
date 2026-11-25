@@ -238,6 +238,69 @@ class _FakeChat:
         return fallback
 
 
+class _ReentrancyGuardChat(_FakeChat):
+    """DEC-064 (eval-determinism): ``evaluate_dialogues`` must issue one LLM call at a time
+    -- never two in flight on the SAME client -- so a run never depends on the Ollama
+    server's own concurrent-request batching (a documented source of run-to-run
+    non-determinism, see the ADR's "eval-determinism" section). Wraps every ``_FakeChat``
+    method with an in-flight flag that raises if re-entered before the previous call
+    returned; this fails loudly if a future refactor (e.g. threads/asyncio) ever makes two
+    calls overlap, even though today's plain ``for`` loop in ``runner.py`` never does."""
+
+    def __init__(self, answer_text: str, verdict: str = "GROUNDED") -> None:
+        super().__init__(answer_text, verdict)
+        self._in_flight = False
+
+    def _enter(self) -> None:
+        assert not self._in_flight, "evaluate_dialogues issued two overlapping LLM calls"
+        self._in_flight = True
+
+    def _exit(self) -> None:
+        self._in_flight = False
+
+    def chat(self, *a: object, **kw: object) -> str:
+        self._enter()
+        try:
+            return super().chat(*a, **kw)
+        finally:
+            self._exit()
+
+    def chat_json(self, *a: object, **kw: object) -> object:
+        self._enter()
+        try:
+            return super().chat_json(*a, **kw)
+        finally:
+            self._exit()
+
+
+def test_evaluate_dialogues_never_overlaps_two_llm_calls_on_the_same_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails on a hypothetical concurrent implementation; passes today because
+    ``evaluate_dialogues`` is a strictly sequential ``for`` loop (DEC-064's own fix doc)."""
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr(
+        "rag_app.reranking.retrieve",
+        lambda *_a, **_kw: [_chunk("docA::1")],
+    )
+    dialogue = Dialogue(
+        id="d1",
+        turns=(
+            Turn(
+                message="How do I prevent SQL injection?",
+                expected_intent="security",
+                language="en",
+            ),
+            Turn(message="Thanks!", expected_intent="chitchat", language="en"),
+            Turn(message="What about OS commands?", expected_intent="followup", language="en"),
+        ),
+    )
+    chat = _ReentrancyGuardChat("Use parameterized queries [1].")
+    results = evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+    assert len(results) == 3
+    assert chat._in_flight is False
+
+
 def _chunk(chunk_uid: str) -> RetrievedChunk:
     return RetrievedChunk(
         chunk_uid=chunk_uid, heading="h", text="t", version="2021", effective_date=None, score=1.0

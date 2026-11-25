@@ -161,6 +161,16 @@ class Settings(JobSettings):
     # Keep the model resident in VRAM between requests (avoids a cold ~5 GB reload
     # per idle window). Ollama accepts a duration ("30m") or -1 to keep forever.
     ollama_keep_alive: str = "30m"
+    # DEC-064 (block eval-determinism): a fixed seed sent as Ollama's own ``options.seed``
+    # on every call -- pins the server's internal RNG (tie-breaking among near-equal
+    # logits) so the SAME prompt/options produces the SAME output run to run. Always on,
+    # never only for the eval: every caller in this codebase already runs at
+    # ``temperature=0`` (greedy decoding, see ``ChatClient``'s own default), so a fixed
+    # seed changes nothing about WHAT gets generated for production traffic -- it only
+    # removes a source of non-determinism the gate's own golden-set replay was hitting
+    # (see the ADR's "eval-determinism" section). ``None`` disables it (omits the key
+    # entirely, Ollama's own pre-14-D1 behaviour) for anyone who needs to rule it out.
+    ollama_seed: int | None = 42
 
     # --- LLM provider selection ---
     # "ollama" (local/free, the dev default) or "azure_openai" (hosted, cloud path).
