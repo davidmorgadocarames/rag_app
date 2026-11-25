@@ -488,6 +488,7 @@ def _chat_events(
 
             answer: Answer | None = None
             usage = Usage()
+            used_fast_path = False
             stage = "starting"
             pipeline = _pipeline_events(request, summary=memory_summary, last_turn=memory_last_turn)
             try:
@@ -515,6 +516,7 @@ def _chat_events(
                     elif isinstance(event, StreamResult):
                         answer = event.answer
                         usage = event.usage
+                        used_fast_path = event.used_fast_path
                 if answer is None:
                     raise RuntimeError("the pipeline produced no answer")
             except Exception as exc:  # noqa: BLE001 - surface a clean error event, keep the stream valid
@@ -549,15 +551,26 @@ def _chat_events(
             # T14.2.6 (memory write): AFTER the answer above is persisted, BEFORE the "done"
             # event below closes the turn — best-effort, never breaks the stream (see
             # _update_conversation_summary's own docstring).
-            _update_conversation_summary(
-                session,
-                conv,
-                key,
-                previous_summary=memory_summary,
-                last_turn=memory_last_turn,
-                question=request.question,
-                answer=answer.text,
-            )
+            #
+            # DA-14-C1 finding 1 fix (14-C1-fix, HIGH): skipped entirely when this turn took
+            # the exact fast path (``used_fast_path``, the SAME ``match_fast_path`` decision
+            # ``_reserve_stream_answer`` above already used to exempt the turn from the daily
+            # cap). A bare greeting/thanks/farewell has no topic/entity/question content
+            # worth merging into the running summary, so nothing is lost; before this fix a
+            # cap-exempt turn cost TWO uncounted LLM calls (the chit-chat reply AND this
+            # write) instead of one. Every other answered turn (including router-classified
+            # chit-chat, which is NOT fast-path-exempt and is already counted against the
+            # cap) still writes memory exactly as before.
+            if not used_fast_path:
+                _update_conversation_summary(
+                    session,
+                    conv,
+                    key,
+                    previous_summary=memory_summary,
+                    last_turn=memory_last_turn,
+                    question=request.question,
+                    answer=answer.text,
+                )
             yield _sse(
                 {
                     "type": "done",

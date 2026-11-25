@@ -1219,7 +1219,9 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         " T14.2.5/T14.2.6 (block 14-C1): a follow-up in the SAME conversation (``/chat/"
         "stream`` only -- `POST /chat` has no conversation) now has the previous turn and a"
         " bounded structured summary available to the router, written back after every"
-        " answered turn (best-effort: a dropped/unreachable update never breaks the turn)",
+        " answered turn except an exact fast-path greeting/thanks/farewell (14-C1-fix: that"
+        " case is already exempt from the daily cap and must not cost a second LLM call;"
+        " best-effort otherwise: a dropped/unreachable update never breaks the turn)",
         key_files=(
             "backend/src/rag_app/assistant/core.py",
             "backend/src/rag_app/assistant/router.py",

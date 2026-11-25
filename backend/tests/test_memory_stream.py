@@ -316,3 +316,56 @@ def test_stream_never_fails_when_the_memory_write_call_is_unreachable(
     assert events[-1]["type"] == "done"
     conv_id = events[0]["conversation_id"]
     assert _summary_encrypted(db_engine, conv_id) is None
+
+
+# --- DA-14-C1 finding 1 fix (14-C1-fix): no second, uncounted LLM call on a fast-path turn --
+
+
+class _CountingChatClient:
+    """Every real LLM call across the whole turn, shared between the REAL pipeline
+    (``generation.make_chat_client``) and the memory write (``conversations.make_chat_client``)
+    -- the total is the true per-turn LLM-call count, not a per-module guess. Drives the REAL
+    ``answer_question_stream``/``understand()``/``generate_chitchat_reply`` (no ``_FakePipeline``
+    here), because the bug this fixes is specifically about how many real LLM calls one turn
+    costs."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, _messages: Any, **_kw: Any) -> str:
+        self.calls += 1
+        return "Hi there!"
+
+    def chat_stream(self, _messages: Any, **_kw: Any) -> Iterator[str]:
+        self.calls += 1
+        yield "Hi there!"
+
+    def chat_json(self, _messages: Any, _schema: Any, *, fallback: Any, **_kw: Any) -> Any:
+        self.calls += 1
+        return fallback
+
+
+@pytest.mark.db
+def test_stream_makes_exactly_one_llm_call_on_an_exact_fast_path_turn(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DA-14-C1 finding 1 (HIGH): an exact greeting matches ``match_fast_path``, which
+    already exempts the turn from the daily cap (14-B2-fix) -- it must not ALSO cost a
+    second, uncounted LLM call for the memory write. Fails on 9b6bb2e: the real
+    ``_update_conversation_summary`` call there is unconditional, so ``chat.calls`` is 2
+    (the chit-chat reply + ``summarize_turn``'s ``chat_json``) and the summary is written."""
+    from rag_app import generation
+    from rag_app.api import conversations
+
+    chat = _CountingChatClient()
+    monkeypatch.setattr(generation, "make_chat_client", lambda *_a, **_kw: chat)
+    monkeypatch.setattr(conversations, "make_chat_client", lambda *_a, **_kw: chat)
+    user = _make_user_with_key(db_engine)[0]
+
+    res = client.post("/chat/stream", json={"question": "hola"}, headers=_auth(db_engine, user))
+    events = _events(res)
+    assert events[-1]["type"] == "done"
+    conv_id = events[0]["conversation_id"]
+
+    assert chat.calls == 1  # the chit-chat reply only
+    assert _summary_encrypted(db_engine, conv_id) is None

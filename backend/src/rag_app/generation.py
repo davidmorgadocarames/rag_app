@@ -431,10 +431,21 @@ class StreamToken:
 
 @dataclass
 class StreamResult:
-    """The authoritative final answer plus token accounting."""
+    """The authoritative final answer plus token accounting.
+
+    ``used_fast_path`` (DA-14-C1 finding 1 fix): mirrors ``Understanding.used_fast_path`` --
+    True only when ``understand()`` matched the exact, anchored greeting/thanks/farewell
+    fast path (the SAME decision ``api.conversations._reserve_stream_answer``/
+    ``api.deps.reserve_daily_answer`` already use to exempt the turn from the daily cap).
+    The caller (``api.conversations._chat_events``) uses this to skip the memory-write call
+    too -- a cap-exempt turn must not cost a second, uncounted LLM call. Defaults to False
+    so every pre-existing test/fake pipeline that does not pass it keeps the old
+    ("always write memory") behaviour, which is correct for them: none of them are the
+    fast-path branch."""
 
     answer: Answer
     usage: Usage
+    used_fast_path: bool = False
 
 
 StreamEvent = StreamStage | StreamStep | StreamToken | StreamResult
@@ -532,6 +543,12 @@ def answer_question_stream(
     the LLM router); a chit-chat reply is now LLM-generated (P14-D1) instead of a fixed
     canned template. Everything from "retrieving" onward is UNCHANGED.
 
+    DA-14-C1 finding 1 fix (14-C1-fix): the ``StreamResult``'s ``used_fast_path`` flag lets
+    ``api.conversations._chat_events`` skip the memory-write call on the exact fast-path
+    chit-chat turn -- the same ``match_fast_path`` decision that already exempts the turn
+    from the daily cap, so a cap-exempt turn costs exactly one bounded LLM call (this reply),
+    never a second, uncounted one for ``summarize_turn``.
+
     T14.2.5 (block 14-C1): ``summary``/``last_turn`` -- the conversation's own memory, read
     by the caller (``api.conversations._load_memory``, scoped to ONE already-ownership-
     checked conversation) BEFORE this turn -- are forwarded unchanged into ``understand()``,
@@ -565,7 +582,9 @@ def answer_question_stream(
                     for word in reply.split(" "):
                         yield StreamToken(text=word + " ")
             yield StreamResult(
-                answer=Answer(text=reply, abstained=False, grounded=True), usage=usage
+                answer=Answer(text=reply, abstained=False, grounded=True),
+                usage=usage,
+                used_fast_path=decision.used_fast_path,
             )
             return
 

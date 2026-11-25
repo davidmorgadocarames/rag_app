@@ -415,13 +415,16 @@ conversation at all).
   T14.2.4-6's three rows ask for. DEC-059 explicitly accepted the narrower scope, flagging
   the "wired three times" compounding risk for 14-C2 to budget for.
 - **Skip memory write for the chit-chat fast path** (a greeting carries no real security
-  content) to save one LLM call per trivial turn. Rejected: the schema's own
-  `open_questions` field is exactly as meaningful after a chit-chat turn that also contained
-  a genuine question buried in it (the router would have caught that and routed elsewhere,
-  but a fast-path match is, by construction, an EXACT short greeting/thanks/farewell with no
-  room for a buried question) — the extra call is cheap (one bounded ≤300-token structured
-  reply) and keeping the write path uniform across every answered turn is simpler to reason
-  about than a second special case.
+  content) to save one LLM call per trivial turn. Originally rejected in this block in
+  favour of a uniform write path ("simpler to reason about than a second special case") —
+  **reversed in 14-C1-fix (DA-14-C1 finding 1, HIGH):** the DA review reframed this not as a
+  code-simplicity question but as a cost-control one, the same class DEC-050 was raised to
+  the user for: the fast path is ALREADY the one case this block's own daily-cap exemption
+  (14-B2-fix) singles out as free, so adding a second, uncounted LLM call on exactly that
+  case reopened a cost gap right next to the fix for a worse exploit of the same pattern.
+  The schema-meaningfulness argument above still holds (an exact fast-path match cannot
+  carry a buried real question), so skipping the write loses nothing — only the
+  "uniform is simpler" preference was outweighed, not refuted.
 
 ## Known limitations (self-reported, not just design) — 14-C1
 
@@ -444,9 +447,36 @@ conversation at all).
   never let an attacker's text escape into the system role or reach the corpus/citation path
   directly.
 - **One extra bounded LLM call per answered turn** (the memory write) — a real, acknowledged
-  latency/cost cost on every turn that completes successfully, not just chit-chat ones (see
-  "Alternatives considered" above); not separately measured against a per-turn latency floor
-  in this block (14.5, Latency/cost/dashboard, is where a dedicated budget would be added).
+  latency/cost cost on every turn that completes successfully; not separately measured
+  against a per-turn latency floor in this block (14.5, Latency/cost/dashboard, is where a
+  dedicated budget would be added). **Fixed for the fast-path case (14-C1-fix, DA-14-C1
+  finding 1, HIGH):** an exact, anchored greeting/thanks/farewell (`match_fast_path` —
+  the SAME decision `_reserve_stream_answer`/`reserve_daily_answer` use to exempt the turn
+  from the daily cap) now skips the memory write entirely, in both
+  `api.conversations._chat_events`/`_update_conversation_summary` and `eval.runner
+  .evaluate_dialogues` — a bare greeting has nothing worth summarizing, so this is free, not
+  a quality trade-off. Every other answered turn, including a turn the LLM ROUTER (not the
+  fast path) classifies as chit-chat, still writes memory and is still counted against the
+  cap — the fix narrows the skip to exactly the already cap-exempt case, nothing wider.
+- **Two-hop stored prompt injection via memory (DA-14-C1 finding 2, LOW, self-reported
+  explicitly here — DA-13-J2-1 discipline).** A malicious turn's text is summarized by
+  `summarize_turn` into the stored `summary`; `summarize_turn`'s own system prompt only
+  INSTRUCTS the model not to obey embedded instructions — nothing enforces that structurally
+  at the write step. On the NEXT turn, that (possibly poisoned) summary is fed back into the
+  router as `understand()`'s `summary` input. The mitigation already in place does not rely
+  on the write step being honest: every DOWNSTREAM read treats the summary as escaped,
+  delimited, untrusted data FOREVER, regardless of what ended up inside it —
+  `assistant.router.build_router_messages` escapes `summary`/`last_turn` via
+  `escape_delimiter_markers` before wrapping them in the router's own delimited block
+  (`router.py:109-113`), and the memory-WRITE prompt applies the identical escaping to every
+  untrusted field it reads, so even the ciphertext the next turn's read produces was already
+  pre-neutralised the first time
+  (`test_assistant_memory.py::test_build_memory_messages_escapes_a_literal_delimiter_marker_in_every_untrusted_field`).
+  This is a second-order case of the same bounded, literal-3-character-run risk the
+  `escape_delimiter_markers` bullet above already documents — not a new exploit surface, but
+  worth naming explicitly because "the summary becomes untrusted data again on the next
+  turn" is the whole argument for why the two-hop chain is safe, and was previously only
+  implicit in this list.
 
 ## Rollback
 

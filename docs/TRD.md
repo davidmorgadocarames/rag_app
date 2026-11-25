@@ -253,6 +253,15 @@ answer is already persisted (`_persist_message`), **before** the stream's own `d
 event closes the turn (T14.2.6's own ordering requirement) — so a memory-write failure can
 never turn an already-successful answer into a failed stream.
 
+**Skipped on an exact fast-path turn (14-C1-fix, DA-14-C1 finding 1).** Both call sites
+(`api.conversations._chat_events`/`eval.runner.evaluate_dialogues`) skip this call entirely
+when the turn took the exact, anchored greeting/thanks/farewell fast path — the same
+`match_fast_path` decision §6.2 already uses to exempt the turn from the daily answer cap.
+A bare greeting has nothing worth merging into the running summary, so a cap-exempt turn
+now costs exactly the one bounded LLM call its reply always did, never a second, uncounted
+one. Every other answered turn, including one the LLM router itself classifies as
+chit-chat, still writes memory.
+
 **Fail-safe/drop discipline (mirrors the router exactly).** `summarize_turn` returns `None`
 ("dropped — leave the old summary exactly as it was") on EITHER of two failure classes, never
 raises:

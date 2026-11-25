@@ -89,8 +89,12 @@ def evaluate_dialogues(
     dialogue is not a real account). ``rag_app.assistant.memory.summarize_turn`` updates it
     after every turn exactly like the real stream path does, right down to the same
     "dropped, not crashed" behaviour on an invalid/unreachable update (``summary_text`` then
-    simply stays whatever it already was). Retrieval below still uses the turn's own raw
-    ``message``, never the router's ``standalone_query`` (T14.2.7/14-C2 — not this block), so
+    simply stays whatever it already was) -- EXCEPT a fast-path chit-chat turn
+    (``decision.used_fast_path``), which skips the write entirely (DA-14-C1 finding 1 fix,
+    14-C1-fix): the identical "no second, uncounted LLM call on a cap-exempt turn" rule
+    ``api.conversations._update_conversation_summary`` now follows. Retrieval below still
+    uses the turn's own raw ``message``, never the router's ``standalone_query``
+    (T14.2.7/14-C2 — not this block), so
     ``follow_up_resolution`` is expected to stay unchanged by this wiring.
     ``observed_intent`` is the real 5-way ``RouterOutput.intent`` (or ``"chitchat"`` from the
     exact fast path, which never calls the router) instead of the old placeholder's
@@ -144,15 +148,23 @@ def evaluate_dialogues(
                 answer = answer_from_chunks(chat, turn.message, chunks)
             latency_s = time.perf_counter() - start
 
-            new_summary = summarize_turn(
-                chat,
-                previous_summary=summary_text,
-                last_turn=last_turn_text,
-                question=turn.message,
-                answer=answer.text,
-            )
-            if new_summary is not None:
-                summary_text = new_summary
+            # DA-14-C1 finding 1 fix (14-C1-fix, HIGH): the same gap as /chat/stream's
+            # ``_update_conversation_summary`` -- a fast-path chit-chat turn
+            # (``decision.used_fast_path``) has nothing worth summarizing and must not add a
+            # second, uncounted LLM call on top of the chit-chat reply. ``last_turn_text`` is
+            # still carried forward unconditionally: it reflects whatever the turn actually
+            # was (fast path or not), same as the real stream's DB-backed memory read always
+            # picks up the last stored turn regardless of how it was answered.
+            if not decision.used_fast_path:
+                new_summary = summarize_turn(
+                    chat,
+                    previous_summary=summary_text,
+                    last_turn=last_turn_text,
+                    question=turn.message,
+                    answer=answer.text,
+                )
+                if new_summary is not None:
+                    summary_text = new_summary
             last_turn_text = format_last_turn(turn.message, answer.text)
 
             correct: bool | None = None

@@ -331,6 +331,37 @@ def test_evaluate_dialogues_takes_the_chitchat_fast_path_without_retrieving(
     assert results[0].retrieved_docs == []
 
 
+def test_evaluate_dialogues_skips_the_memory_write_on_a_fast_path_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14-C1 finding 1 (HIGH), 14-C1-fix: this runner wires the identical pattern as
+    ``/chat/stream`` -- a fast-path chit-chat turn must not cost the extra bounded
+    ``summarize_turn`` call either. Fails on 9b6bb2e: ``summarize_turn`` there is called
+    unconditionally after every turn, so ``calls`` would be ``[{...}]``, not ``[]``."""
+
+    def fail_retrieve(*_a: object, **_kw: object) -> list[RetrievedChunk]:
+        raise AssertionError("chit-chat must never call retrieve")
+
+    calls: list[dict[str, object]] = []
+
+    def fake_summarize_turn(*_a: object, **kw: object) -> str:
+        calls.append(kw)
+        return '{"topics": ["should never be reached"]}'
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fail_retrieve)
+    monkeypatch.setattr("rag_app.assistant.memory.summarize_turn", fake_summarize_turn)
+
+    dialogue = Dialogue(
+        id="chat-1", turns=(Turn(message="Thanks!", expected_intent="chitchat", language="en"),)
+    )
+    results = evaluate_dialogues(None, [dialogue], chat=_FakeChat("unused"))  # type: ignore[arg-type]
+
+    assert len(results) == 1
+    assert results[0].observed_intent == "chitchat"
+    assert calls == []
+
+
 def test_evaluate_dialogues_noisy_flag_follows_the_typo_id_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
