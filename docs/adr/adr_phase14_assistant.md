@@ -1096,7 +1096,83 @@ only if 1.0 in both runs" — it was not).
   word, a short/truncated shape) — always re-test the full golden set's noisy/greeting items
   after any system-prompt change, not just the item the change targets.**
 
+### Eval-determinism fix and the real deterministic baseline (DEC-064, block eval-determinism)
+
+**This supersedes the 7-run "margin noise" framing above with a real answer: most (not all)
+of that flakiness was genuine LLM-serving non-determinism, now fixed — but fixing it reveals
+the deterministic result is BELOW the enforced floors, not a lucky-vs-unlucky coin flip.**
+
+**Root cause.** A minimal reproduction (same prompt/options, N=8 calls, real native Ollama)
+showed `OllamaChat.chat()` and `assistant.memory.summarize_turn()` are ALREADY
+byte-identical across repeats when called back-to-back with IDENTICAL input and no seed —
+isolated single-call determinism was never the problem (confirms the 7-run report's own
+"isolated trials are stable" finding, rather than contradicting it). Reading `eval/runner.py`/
+`eval/gate.py` confirmed there is no concurrency anywhere in the eval path. Cross-referencing
+the 7 runs' per-turn JSON separated two different phenomena the earlier framing had merged:
+3 items were wrong in **all 7/7 runs identically** (genuinely pre-existing, non-flipping
+noise), while a DIFFERENT set of items flipped between correct/incorrect run to run — every
+flipping item either depends on a `summary`/`last_turn` string built by an earlier
+`summarize_turn` call in the SAME run, or sits on a close router decision boundary — consistent
+with Ollama's own GPU-serving non-determinism (a documented class of issue, independent of
+client concurrency) that is invisible on an easy prompt but can flip a near-tied decision, and
+compounds across a multi-turn dialogue because an earlier turn's non-deterministic summary
+text changes what a LATER turn's router literally reads.
+
+**Fix (commit `60f5356`):** `config.Settings.ollama_seed` (default `42`) sent as
+`options.seed` on every `OllamaChat` call; `evaluate_dialogues` confirmed (by reading) already
+strictly sequential, with a new regression test guarding it; the gate's native Ollama server
+restarted with `OLLAMA_NUM_PARALLEL=1` for this block's measurement runs (a process-level
+setting, not a code change — outside this block's `touches`, see "Needs the user's decision"
+in the senior's handback for the runbook edit this needs to become persistent).
+
+**Measured (3 `gate.sh --only eval` runs on commit `60f5356`, same fixture, n=75):**
+
+| Run | intent_accuracy | noisy_recall | follow_up_resolution | conversational_reply_rate | Note |
+|---|---|---|---|---|---|
+| 1 (just after an Ollama restart) | 0.867 | 1.000 | 0.700 | 0.889 | `gate-20261125T230150Z-3484421.log` |
+| 2 | 0.867 | 1.000 | 0.800 | 0.833 | `gate-20261125T230955Z-3507623.log` |
+| 3 | 0.867 | 1.000 | 0.800 | 0.833 | `gate-20261125T231616Z-3509350.log` |
+
+**Runs 2 and 3 are BYTE-IDENTICAL** in every field of `eval/golden_set_v2_results.json`
+(intent, reply text, correctness, clarified, abstention-no-claims — everything) except the
+`latency_s`/`router_latency_s` timing fields themselves (confirmed with a full structural
+`diff`, 0 content differences). **This is full determinism, achieved** — the fix works. Run 1,
+taken immediately after restarting Ollama (to apply `OLLAMA_NUM_PARALLEL=1`), differs from
+runs 2/3 in exactly 2 items (`typo-hol-greeting`↔`dlg-followup-3-back` swap, same total miss
+count) — a cold-start artifact (GPU kernel/algorithm selection on the very first request after
+a fresh model load), not a flaw in the fix itself; in this project's real usage Ollama is a
+long-running native process started once per session, so this edge case is a one-off, not a
+per-gate-run risk.
+
+**The deterministic value itself (`intent_accuracy` 0.867, `follow_up_resolution` 0.800) is
+BELOW both enforced floors (≥ 0.90 / ≥ 0.85) — every single time, not sometimes.** Per-turn
+evidence (identical for runs 2 and 3; run 1 differs only in the 2 items named above), all 10
+`intent_accuracy` misses and both `follow_up_resolution` misses belong to the SAME
+already-documented categories 14-D1's own report above names (`abstain-en-cisco`/
+`abstain-es-nginx`, `dlg-ambiguous-then-clarify`, `dlg-abstention-then-recover`,
+`dlg-followup-3-back-2025`/`-es-2025`, greeting-typo `off_topic` misclassifications) — this
+block's fix did not introduce any new failure category, and did not regress `noisy_recall`
+(1.000, all 3 runs, confirming 14-D1's own fix is still solid). **What changed is the
+CONFIDENCE in the number: before this block, intent_accuracy's 7-run range (0.880–0.933)
+included 2 runs that cleared the 0.90 floor, which looked like "noise that might land on the
+right side of the floor by chance" (14-D1's own Option A reasoning). Now that the flipping is
+fixed, the deterministic value (0.867) is BELOW even the lowest historical run — this was
+never noise alone; some of those "lucky" high-side 7-run numbers were themselves
+non-deterministic excursions, and the true, reproducible baseline is lower than any of them.**
+
+This is the brief's own stop condition ("if floors still fail deterministically, STOP and
+report per-turn evidence") — no floor is lowered or un-enforced; this block does not attempt a
+router-prompt fix (out of DEC-064's scope, and 14-D1's own report already names this as a
+needed, separate router-reliability block). See "Needs the user's decision" in the senior's
+handback for how to proceed with 14-D1's closure given this.
+
 ## Rollback
+
+eval-determinism: `config.Settings.ollama_seed` is new, additive settings surface (default
+`42`, sent as `options.seed`) — no schema, no migration, no deployed-image step; reverting
+this block's commit restores the pre-DEC-064 behaviour (no seed sent) exactly, reopening the
+run-to-run flipping this block fixed. The new reentrancy-guard test is test-only. No runtime
+behaviour changes for any caller that was already deterministic.
 
 14-D1: changes LIVE runtime behaviour (ambiguous/off_topic get a dedicated reply; every
 abstention is LLM-phrased) and the router's `_resolves_a_reference` tie-breaker condition
