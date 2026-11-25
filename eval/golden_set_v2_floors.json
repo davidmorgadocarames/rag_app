@@ -1,0 +1,12 @@
+{
+  "_comment": "Golden set v2 floors (PHASE_PLANNING.md section 14.0 / P14-D4). Recorded by block 14-A2 (T14.0.5); enforcement starts at 14.2 per PHASE_PLANNING section 14.2's own Gate line ('floors from 14.0') -- enforce_now stays false until a later block flips it, once the LLM router/memory this measures actually exists.",
+  "intent_accuracy": 0.90,
+  "noisy_recall": 0.90,
+  "follow_up_resolution": 0.85,
+  "conversational_reply_rate": 1.00,
+  "greeting_reply_p95_s": 2.0,
+  "router_p95_s_local": 1.5,
+  "router_p95_s_azure": 1.0,
+  "enforced_from": "14.2 (router/memory land at 14-B2/14-C2); router_p95_s has no call to measure before then and is never checked by _check_v2 even if enforce_now flips to true",
+  "enforce_now": false
+}
