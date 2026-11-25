@@ -92,14 +92,21 @@ def evaluate_dialogues(
     simply stays whatever it already was) -- EXCEPT a fast-path chit-chat turn
     (``decision.used_fast_path``), which skips the write entirely (DA-14-C1 finding 1 fix,
     14-C1-fix): the identical "no second, uncounted LLM call on a cap-exempt turn" rule
-    ``api.conversations._update_conversation_summary`` now follows. Retrieval below still
-    uses the turn's own raw ``message``, never the router's ``standalone_query``
-    (T14.2.7/14-C2 — not this block), so
-    ``follow_up_resolution`` is expected to stay unchanged by this wiring.
+    ``api.conversations._update_conversation_summary`` now follows.
     ``observed_intent`` is the real 5-way ``RouterOutput.intent`` (or ``"chitchat"`` from the
     exact fast path, which never calls the router) instead of the old placeholder's
     chitchat/security binary; ``router_latency_s`` is the first real measurement for the
     T14.0.5 "router p95" floor.
+
+    T14.2.7 (block 14-C2): retrieval below searches with ``retrieval_query(decision,
+    turn.message)`` -- the router's English ``standalone_query`` when present and safe, else
+    the turn's raw ``message`` -- the THIRD entry point for this wiring (DEC-059 option A,
+    same pattern as memory). ``answer_from_chunks`` still receives the turn's own raw
+    ``message`` (generation is unchanged). This is the change expected to move
+    ``follow_up_resolution`` off its 0.500 baseline (14-B2-fix/14-C1): the metric is a pure
+    function of what ``retrieve()`` searched for, and a follow-up turn's raw message is
+    frequently a bare reference ("where does it rank?") that means nothing to hybrid search
+    on its own.
 
     Uses ``make_chat_client()`` (TF21), unlike the v1 ``evaluate()`` above, which keeps its
     pre-existing hard-coded ``OllamaChat`` default unchanged (out of scope here — the v1 gate
@@ -111,7 +118,7 @@ def evaluate_dialogues(
     would need a real per-turn flag if a future noisy item is added inside a multi-turn dialogue
     at a turn other than the first.
     """
-    from rag_app.assistant.core import understand
+    from rag_app.assistant.core import retrieval_query, understand
     from rag_app.assistant.fast_path import generate_chitchat_reply
     from rag_app.assistant.memory import format_last_turn, summarize_turn
     from rag_app.eval.judge import judge_correctness, judge_no_claims
@@ -141,8 +148,9 @@ def evaluate_dialogues(
                 answer: Answer = Answer(text=reply, abstained=False, grounded=True)
                 retrieved_docs: list[str] = []
             else:
+                search_query = retrieval_query(decision, turn.message)
                 chunks = retrieve(
-                    session, turn.message, reranker=reranker, top_n=top_n, version=None
+                    session, search_query, reranker=reranker, top_n=top_n, version=None
                 )
                 retrieved_docs = [_doc_slug(c.chunk_uid) for c in chunks]
                 answer = answer_from_chunks(chat, turn.message, chunks)

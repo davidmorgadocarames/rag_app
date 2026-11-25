@@ -19,13 +19,21 @@ of those tests' patch target (the code would still run, against a REAL, unpatche
 eval into one single generator end-to-end is a larger refactor than named by T14.2.1-3's rows;
 tracked as a follow-up, not silently dropped.
 
-Memory (``summary``/``last_turn``, block 14-C1) is accepted as an optional parameter but is
-always ``None`` from every 14-B2 call site. Retrieval still uses the ORIGINAL message, never
-``standalone_query`` (T14.2.7, block 14-C2) -- the router already produces it, nothing
-downstream consumes it yet. Conversational handling of ``followup``/``ambiguous``/``off_topic``
-(a clarifying question, a polite redirect -- T14.3/14-D1) is not built yet: those three intents
-fall through to the SAME retrieve-and-answer path as ``security`` today (the existing
-conservative default); only ``chitchat`` gets a different (LLM small-talk) reply in this block.
+Memory (``summary``/``last_turn``, block 14-C1) is accepted as an optional parameter and is
+read/written by the three entry points that have a conversation (DEC-059 option A).
+Conversational handling of ``followup``/``ambiguous``/``off_topic`` (a clarifying question, a
+polite redirect -- T14.3/14-D1) is not built yet: those three intents fall through to the SAME
+retrieve-and-answer path as ``security`` today (the existing conservative default); only
+``chitchat`` gets a different (LLM small-talk) reply in this block.
+
+**T14.2.7 (block 14-C2):** retrieval now searches with the router's English
+``standalone_query`` instead of the original (possibly non-English, possibly
+reference-only -- "what about that?") message -- see :func:`retrieval_query` below, used
+by all three entry points (``generation.answer_question``, ``generation.answer_question_stream``,
+``eval.runner.evaluate_dialogues``, DEC-059 option A, same pattern 14-C1 already used for
+memory). Generation itself still receives the ORIGINAL message, never the rewrite: the
+answer must address what the user actually typed, in the language they typed it in
+(D14.1) -- a concern T14.2.7 explicitly does not touch.
 """
 
 from __future__ import annotations
@@ -82,3 +90,22 @@ def understand(
         used_fast_path=False,
         router_latency_s=router_latency_s,
     )
+
+
+def retrieval_query(decision: Understanding, query: str) -> str:
+    """The query retrieval should search with (T14.2.7).
+
+    Uses the router's English ``standalone_query`` when it is present and safe -- a
+    genuine, non-empty rewrite -- so retrieval for a follow-up ("what about that?")
+    searches with the resolved, self-contained English question instead of a pronoun that
+    means nothing to hybrid search. Falls back to the original, raw ``query`` whenever
+    ``standalone_query`` is empty/blank (a defensive guard; no live caller actually produces
+    this today -- the exact fast path and the router's own ``_security_fallback`` both
+    already set ``standalone_query == query`` by construction, so this branch exists for
+    robustness, not because it is exercised in practice). Generation (the answer the user
+    reads) is UNCHANGED by this function -- callers keep passing the original ``query`` to
+    ``answer_from_chunks``/``_stream_answer_tokens`` so the reply still addresses what the
+    user actually typed, in their own language (D14.1).
+    """
+    candidate = decision.standalone_query.strip()
+    return candidate if candidate else query

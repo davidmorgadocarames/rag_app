@@ -13,6 +13,7 @@ from collections.abc import Iterator
 import pytest
 
 from rag_app import generation, reranking, timing
+from rag_app.assistant.router import RouterOutput
 from rag_app.generation import (
     INSUFFICIENT,
     StreamResult,
@@ -468,6 +469,228 @@ def test_answer_question_stream_defaults_memory_to_none() -> None:
     conversation); the stream path must still work with the defaults, same as before 14-C1."""
     events = list(generation.answer_question_stream(None, "hi", chat=_FakeChatSync("")))  # type: ignore[arg-type]
     assert any(isinstance(e, StreamResult) for e in events)
+
+
+# --- T14.2.7 (block 14-C2): retrieval searches with the router's standalone_query -----------
+
+
+class _FakeChatSyncWithRouterOutput:
+    """Like ``_FakeChatSync``, but ``chat_json`` returns a CALLER-SUPPLIED ``RouterOutput``
+    instead of always echoing ``fallback`` -- needed to prove retrieval sees a REWRITTEN
+    ``standalone_query``, which ``_FakeChatSync``'s always-fallback ``chat_json`` can never
+    exercise (its fallback's ``standalone_query`` is always the raw query, by the router's
+    own conservative-fallback construction)."""
+
+    def __init__(
+        self, router_output: RouterOutput, answer_text: str, verdict: str = "GROUNDED"
+    ) -> None:
+        self._router_output = router_output
+        self._answer_text = answer_text
+        self._verdict = verdict
+        self.calls = 0
+
+    def chat(self, *_a: object, **_kw: object) -> str:
+        self.calls += 1
+        return self._answer_text if self.calls == 1 else self._verdict
+
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return self._router_output
+
+
+class _FakeChatStreamSeqWithRouterOutput:
+    """Streaming twin of ``_FakeChatSyncWithRouterOutput`` above (mirrors
+    ``_FakeChatStreamSeq``'s own ``chat_stream`` shape)."""
+
+    def __init__(self, router_output: RouterOutput, sequences: list[list[str]]) -> None:
+        self._router_output = router_output
+        self._sequences = sequences
+        self.calls = 0
+
+    def chat_stream(self, *_a: object, usage: Usage | None = None, **_kw: object) -> Iterator[str]:
+        seq = self._sequences[self.calls]
+        self.calls += 1
+        yield from seq
+        if usage is not None:
+            usage.add(Usage(prompt_tokens=10, completion_tokens=len(seq)))
+
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return self._router_output
+
+
+def test_answer_question_retrieves_with_the_standalone_query_not_the_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14.2.7: a follow-up's raw message means nothing to hybrid search on its own --
+    retrieval must search with the router's resolved, self-contained English
+    ``standalone_query``. Fails on pre-14-C2 code: ``hybrid_search`` would be called with the
+    ORIGINAL message, never the rewrite."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="How does SQL injection rank in the OWASP Top 10 2021?",
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "It ranks #3 [1].")
+    seen_queries: list[str] = []
+
+    def fake_hybrid_search(_session: object, query: str, **_kw: object) -> list[object]:
+        seen_queries.append(query)
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+
+    generation.answer_question(None, "where does it rank?", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    assert seen_queries == ["How does SQL injection rank in the OWASP Top 10 2021?"]
+
+
+def test_answer_question_still_generates_with_the_original_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generation must still address what the user actually typed, in their own language
+    (D14.1) -- the ``standalone_query`` is for retrieval only (T14.2.7)."""
+    router_output = RouterOutput(
+        intent="followup", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "Queda en el puesto 3 [1].")
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    seen_generation_queries: list[str] = []
+    real_build_messages = generation.build_messages
+
+    def spy_build_messages(query: str, chunks: object) -> object:
+        seen_generation_queries.append(query)
+        return real_build_messages(query, chunks)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation, "build_messages", spy_build_messages)
+
+    generation.answer_question(None, "¿y eso, en qué puesto queda?", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    assert seen_generation_queries == ["¿y eso, en qué puesto queda?"]
+
+
+def test_answer_question_retrieval_falls_back_to_the_original_query_on_router_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The router's own conservative fallback (any failure -> security intent, raw query)
+    means retrieval still searches with the ORIGINAL message when the router is
+    unreachable -- T14.2.7 introduces no new, less-safe behaviour."""
+
+    class _RaisingRouterChat:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat_json(self, *_a: object, **_kw: object) -> object:
+            raise TimeoutError("boom")
+
+        def chat(self, *_a: object, **_kw: object) -> str:
+            self.calls += 1
+            return "Use prepared statements [1]." if self.calls == 1 else "GROUNDED"
+
+    chat = _RaisingRouterChat()
+    seen_queries: list[str] = []
+
+    def fake_hybrid_search(_session: object, query: str, **_kw: object) -> list[object]:
+        seen_queries.append(query)
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+
+    generation.answer_question(
+        None,
+        "how do I prevent SQL injection?",
+        chat=chat,
+        use_rerank=False,  # type: ignore[arg-type]
+    )
+
+    assert seen_queries == ["how do I prevent SQL injection?"]
+
+
+def test_answer_question_stream_retrieves_with_the_standalone_query_not_the_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming twin of
+    ``test_answer_question_retrieves_with_the_standalone_query_not_the_original`` -- the
+    embed call, the hybrid search and the rerank call must all search with the rewritten
+    English ``standalone_query``, not the original message."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="How does the OS command injection ranking compare?",
+    )
+    chat = _FakeChatStreamSeqWithRouterOutput(router_output, [["Use ", "[1]."], ["GROUNDED"]])
+    seen_queries: list[str] = []
+
+    monkeypatch.setattr(
+        generation,
+        "embed_query",
+        lambda _embedder, query: (seen_queries.append(("embed", query)) or [0.0]),
+    )
+
+    def fake_hybrid_search(_session: object, query: str, **_kw: object) -> list[object]:
+        seen_queries.append(("hybrid_search", query))
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+
+    def fake_rerank(_self: object, query: str, chunks: list[object], _top_n: int) -> list[object]:
+        seen_queries.append(("rerank", query))
+        return chunks
+
+    monkeypatch.setattr(reranking.CrossEncoderReranker, "rerank", fake_rerank)
+
+    list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "what about that one, which rank is it?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    expected = "How does the OS command injection ranking compare?"
+    assert seen_queries == [
+        ("embed", expected),
+        ("hybrid_search", expected),
+        ("rerank", expected),
+    ]
+
+
+def test_answer_question_stream_still_generates_with_the_original_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streamed reply must still address what the user actually typed, in their own
+    language (D14.1) -- T14.2.7 only changes what retrieval searches with."""
+    router_output = RouterOutput(
+        intent="followup", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
+    )
+    chat = _FakeChatStreamSeqWithRouterOutput(router_output, [["Use ", "[1]."], ["GROUNDED"]])
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    monkeypatch.setattr(
+        reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
+    )
+    seen_generation_queries: list[str] = []
+    real_stream_answer_tokens = generation._stream_answer_tokens
+
+    def spy_stream_answer_tokens(
+        chat_arg: object, query: str, chunks: object, usage: object
+    ) -> object:
+        seen_generation_queries.append(query)
+        return real_stream_answer_tokens(chat_arg, query, chunks, usage)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation, "_stream_answer_tokens", spy_stream_answer_tokens)
+
+    list(
+        generation.answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "¿y eso, en qué puesto queda?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    assert seen_generation_queries == ["¿y eso, en qué puesto queda?"]
 
 
 # --- T13.12.5 (DEBT-062): StreamStep sub-step events (embed_query start/end) ----------------

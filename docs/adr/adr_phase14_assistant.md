@@ -1,11 +1,13 @@
 # ADR phase 14 — Conversational assistant
 
 - **Status:** **In progress.** Created at block **14-A1** (golden set v2 schema + items);
-  extended at **14-A2** (runner + metrics, "before" baseline + floors) and **14-B1**
-  (`chat_json` structured output). The router/rewriting/memory, conversational-answer,
-  visible-plan, latency/cost/dashboard and Azure-migration decisions (blocks 14-B2, 14-C1/C2,
-  14-D1/D2/D3, 14.7/14.7-migration) are added as those blocks land. Do not read this file as a
-  complete phase-14 ADR until the "Docs + Azure promotion" block (14.6) closes it out.
+  extended at **14-A2** (runner + metrics, "before" baseline + floors), **14-B1** (`chat_json`
+  structured output), **14-B2**/**14-B2-fix** (shared understanding step), **14-C1**
+  (conversation memory read/write) and **14-C2** (retrieval with the standalone query +
+  per-metric floor enforcement). The conversational-answer, visible-plan, latency/cost/
+  dashboard and Azure-migration decisions (blocks 14-D1/D2/D3, 14.7/14.7-migration) are added
+  as those blocks land. Do not read this file as a complete phase-14 ADR until the "Docs +
+  Azure promotion" block (14.6) closes it out.
 - **Branch:** `phase-14-assistant`.
 - **Related:** `docs/TRD.md` §6.1 (golden set v2, same decision, shorter); `docs/PRD.md`
   (assistant behaviour, added at a later block); DEBT-006 (reranker truncation edge probe),
@@ -478,6 +480,128 @@ conversation at all).
   turn" is the whole argument for why the two-hop chain is safe, and was previously only
   implicit in this list.
 
+## Decision — retrieval with the standalone query + per-metric floor enforcement (T14.2.7/T14.2.8, block 14-C2)
+
+**What changed (T14.2.7).** `rag_app.assistant.core.retrieval_query(decision, query)` is a
+new pure function: the router's English `standalone_query` when it is a genuine, non-empty
+rewrite, else the original `query` unchanged. All three entry points that call `understand()`
+— `generation.answer_question`, `generation.answer_question_stream`,
+`eval.runner.evaluate_dialogues` (DEC-059 option A, the same "wire through all three entry
+points" pattern 14-C1 already used for memory) — now call `retrieve()`/`hybrid_search()`/
+`CrossEncoderReranker.rerank()` with that resolved query instead of the raw message.
+Generation (`answer_from_chunks`/`_stream_answer_tokens`) is deliberately UNCHANGED — it still
+receives the original `query`, so the reply still addresses what the user actually typed, in
+their own language (D14.1); see `docs/TRD.md` §6.4 for the full design.
+
+### Measured effect (real `--only eval`/`--full` run, 48-item/63-turn fixture, same fixture as 14-B2/14-C1)
+
+| Metric | 14-C1 (before) | 14-C2 (this block) | Floor | Met? | Enforced from this block? |
+|---|---|---|---|---|---|
+| intent_accuracy | 0.889 | 0.873 | ≥ 0.90 | no | no |
+| noisy_recall | 1.000 | 1.000 | ≥ 0.90 | **yes** | **yes** |
+| follow_up_resolution | 0.500 | 0.500 | ≥ 0.85 | no | no |
+| conversational_reply_rate | 0.9375 | 0.9375 | ≥ 1.00 | no | no |
+| greeting_reply_p95_s | ~1.71–1.94s | ~1.48s | ≤ 2.0s | **yes** | **yes** |
+| router_p95_s | ~1.15–1.34s | ~1.05s | ≤ 1.5s local | **yes** | **yes** (new check, see below) |
+
+(v1 golden set, unaffected: `retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`
+all 1.0, same as every earlier block — ≥ the Phase 4 baseline, the v1 `eval` gate path is
+untouched by this block.)
+
+**`intent_accuracy` (0.889 → 0.873, one turn) and `follow_up_resolution`/
+`conversational_reply_rate` (byte-identical) are explained, not a regression:**
+`intent_accuracy`/`conversational_reply_rate` depend on the ROUTER's classification and the
+CHIT-CHAT reply respectively — neither is touched by this block (T14.2.7 only changes what
+RETRIEVAL searches with); the one-turn drift in `intent_accuracy` is LLM run-to-run variance
+at the router call (same class of noise 14-C1's own table already called out for latency
+metrics), not a code change — rerunning the SAME code can move this number by ±1 turn either
+way. `follow_up_resolution` staying at EXACTLY 3/6 is the one number this block's own change
+COULD move — verified it is not silently broken by tracing the real pipeline by hand (not
+guessed from the aggregate number alone):
+
+```
+UNDERSTAND: 'Where does it rank in the 2021 OWASP Top 10?' (dlg-followup-3-back, turn 3,
+  3 turns back, after a chit-chat + off-topic distractor turn)
+  -> intent=ambiguous standalone='What rank does SQL injection have in the 2021 OWASP Top 10?'
+RETRIEVE CALLED WITH: 'What rank does SQL injection have in the 2021 OWASP Top 10?'
+```
+
+Retrieval genuinely now searches with the resolved, topic-correct English query (confirmed by
+instrumenting `understand()`/`retrieve()` directly against the real router, no DB needed for
+the trace) — T14.2.7's wiring works. The SAME 3 turns still miss their `expected_doc` for two
+different, narrower reasons, neither a wiring bug:
+
+1. **Near-duplicate corpus chunks differing only by OWASP edition year.** `dlg-followup-3-back`
+   (above) and `dlg-followup-doc-version` ("What about the 2025 edition?") both need retrieval
+   to distinguish a `top10-2021-a03-injection` chunk from a `top10-2025-a05-injection`/
+   `top10-2025-presentation-pdf` chunk — same topic (injection), different year. Even with a
+   well-resolved query naming the right topic, hybrid search/rerank (unchanged by this block)
+   sometimes still surfaces the wrong-edition chunk (`golden_set_v2_results.json`'s real
+   `retrieved_docs` for `dlg-followup-3-back`: `['top10-2025-a05-injection', ...]`, the WRONG
+   year) — a retrieval-precision limitation, not something an input-query rewrite alone fixes.
+2. **An under-specified router rewrite on a terse one-turn-back case.** For
+   `dlg-followup-doc-version`'s single prior turn, the router sometimes classifies the turn
+   `ambiguous` and writes a standalone_query like `"What about the 2025 edition of the OWASP Top
+   10?"` — grammatically resolved, but missing the TOPIC word ("injection") the previous turn
+   was about, because the router's own system prompt asks it to resolve a reference using the
+   last turn/summary but does not force every noun phrase from them into the rewrite. Retrieval
+   then (correctly, given that query) finds a generic Top-10-2025 overview chunk instead of the
+   injection-specific one.
+
+Both are real, narrower limitations of the ROUTER's rewrite quality and the CORPUS's
+near-duplicate chunks — not a regression from this block (the SAME 3/6 failed before T14.2.7
+existed, for the OLDER reason that retrieval used the raw, unresolved message at all) and not
+something `retrieval_query`/the wiring can fix by construction; closing them needs either a
+better router prompt (explicitly naming every entity resolved, not just paraphrasing) or
+corpus/retrieval changes (e.g. weighting the edition year more heavily) — out of this block's
+scope (T14.2.7 is "wire retrieval to the standalone query", not "fix router rewrite quality" or
+"fix retrieval precision on near-duplicate chunks").
+
+### Per-metric floor enforcement (T14.2.8)
+
+The Phase 14 plan's own §14.2 Gate line ("floors from 14.0") applies to every floor as of this
+block (router, memory AND retrieval all exist now) — read literally as "every floor is checked
+every run from now on", not "every floor must pass before any of them is enforced". 14-A2/
+14-B2/14-C1 all kept a single global `enforce_now: false` because, at each of those points,
+EVERY floor was still short. Now that `noisy_recall`/`greeting_reply_p95_s`/`router_p95_s` are
+genuinely met, `gate.py`'s `_check_v2` (and `eval/golden_set_v2_floors.json`) move to **one
+`enforce` flag per metric**: a metric only fails the gate once its OWN floor is both in force
+and actually met is false — `intent_accuracy`/`follow_up_resolution`/`conversational_reply_rate`
+stay `enforce: false` (recorded every run, never failing) until a later block (14.3/14-D1 for
+chit-chat/ambiguous handling; a router-prompt or corpus fix for the two narrower cases above)
+raises the real number — **not a lowered floor**, the same number (0.90/0.85/1.00) stays in
+the file, just not yet gating. `router_p95_s` is also a NEW check this block adds to
+`_check_v2` (compared against the floors file's own `router_p95_s_local` key, since this gate
+only ever runs against the local stack) — it existed as a measured field since 14-C1 but was
+never compared against a floor at all before (`_V2_LATENCY_KEYS` did not include it).
+
+### Alternatives considered
+
+- **Enforce every floor now regardless of measured state.** Rejected — explicitly ruled out by
+  the orchestrator's prompt ("do not lower a floor") and would fail `gate.sh --full` outright
+  on three metrics that a LATER block, not this one, is scoped to fix.
+- **Keep the single global `enforce_now` switch and simply leave it `false` again.** Rejected —
+  the orchestrator's prompt explicitly asks this block to "turn on floor enforcement for the
+  metrics the plan says apply now and are met"; a global switch cannot do that without ALSO
+  enforcing the three that are not met.
+
+## Known limitations (self-reported, not just design) — 14-C2
+
+- **Two narrower, explained gaps keep `follow_up_resolution` at 0.500** (see the measured-effect
+  section above): near-duplicate OWASP-edition-year chunks confusing retrieval precision, and
+  an occasional under-specified router rewrite on a terse one-turn-back follow-up. Neither is
+  fixed by this block; both are candidates for a future retrieval-precision or router-prompt
+  follow-up (not filed as a dated DEBT row here — out of scope to triage further within this
+  block's time budget; flagged for the orchestrator in the block report instead).
+- **`intent_accuracy`/`conversational_reply_rate` are untouched by this block** (T14.2.7 only
+  changes retrieval) — their gaps are the same ones 14-B2/14-C1 already self-reported
+  (chit-chat phrasing outside the fast-path lexicon; `followup`/`ambiguous`/`off_topic` having
+  no dedicated reply yet) and are T14.3/14-D1's scope, not this block's.
+- **LLM run-to-run variance.** `intent_accuracy` moved by exactly one turn (0.889 → 0.873)
+  between 14-C1's and this block's otherwise-identical-fixture runs with no retrieval-unrelated
+  code change to explain it — the same class of noise already documented for latency metrics;
+  a single re-run of the SAME code can move a ratio metric by ±1 turn.
+
 ## Rollback
 
 14-A1: no runtime behaviour changes (`eval/golden_set_v2.jsonl` and the new
@@ -510,3 +634,13 @@ Reverting the MIGRATION itself (`alembic downgrade -1`) is the separate, data-lo
 0009's own `downgrade()` already guards: it refuses while any conversation holds a non-null
 summary (same rule as 0008's `admin_actions`/`defence_runs`) — roll back images instead once
 real summaries exist, never the migration.
+14-C2: changes LIVE runtime behaviour (retrieval now searches with the router's
+`standalone_query`) and changes the `eval` gate's own pass/fail surface (per-metric floor
+enforcement) but no new persisted data, no migration, no deployed-image step. A plain `git
+revert` of this block's commit(s) restores 14-C1's behaviour exactly: retrieval reverts to
+always using the raw message, and `eval/golden_set_v2_floors.json`'s per-metric `enforce` map
+reverts to the single `enforce_now: false` 14-A2 introduced (every v2 floor recorded, none
+enforced) — `gate.sh --full` stays green either way, since no enforced floor regresses by
+reverting (they were already met before this block existed too, for unrelated reasons:
+`noisy_recall`/`greeting_reply_p95_s` predate Phase 14, `router_p95_s` is a 14-C1-era
+measurement this block only started comparing against its floor).

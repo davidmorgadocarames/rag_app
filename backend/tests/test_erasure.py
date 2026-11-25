@@ -572,6 +572,67 @@ def test_the_purger_removes_the_conversation_summary_too(
 
 
 @pytest.mark.db
+def test_the_summary_is_undecryptable_once_the_account_key_is_destroyed(
+    db_engine: Engine, master_key: str
+) -> None:
+    """T14.2.8 (block 14-C2): the "undecryptable" half of "purged/undecryptable" --
+    distinct from ``test_the_purger_removes_the_conversation_summary_too`` above (which
+    proves the row is PURGED) and from the generic ``keys == 0`` count in
+    ``test_delete_account_is_a_short_step_then_202_and_the_session_dies`` (which proves the
+    key is gone for the WHOLE account, not this column specifically). Here: encrypt a
+    summary with the account's REAL per-user key (round-trips BEFORE erasure, sanity check),
+    run the request path's SHORT step (key deletion -- before the purger ever physically
+    removes the row), then prove the ciphertext that is still sitting in the row cannot be
+    recovered any more -- crypto-shredding, not merely a pending delete."""
+    from rag_app.crypto import decrypt, encrypt, generate_user_key, wrap_key
+    from rag_app.db.models import Conversation, User, UserKey
+    from rag_app.security import hash_password
+
+    email = f"erasure-summary-{uuid.uuid4().hex[:10]}@example.test"
+    data_key = generate_user_key()
+    plaintext = (
+        '{"topics": ["sqli"], "entities": [], "owasp_version": "2021", "open_questions": []}'
+    )
+    summary_blob = encrypt(data_key, plaintext)
+    with Session(db_engine) as session:
+        user = User(email=email, password_hash=hash_password("correct horse battery"))
+        session.add(user)
+        session.flush()
+        session.add(UserKey(user_id=user.id, wrapped_key=wrap_key(data_key)))
+        conv = Conversation(user_id=user.id, summary_encrypted=summary_blob)
+        session.add(conv)
+        session.commit()
+        user_id = user.id
+        conv_id = conv.id
+
+    # Sanity: the summary round-trips with the real key BEFORE erasure.
+    assert decrypt(data_key, summary_blob) == plaintext
+
+    with Session(db_engine) as session:
+        assert erasure.request_erasure(session, user_id)
+
+    # The wrapped key row is gone -- nothing in the system can unwrap/retrieve `data_key`
+    # any more (it was never stored anywhere outside that now-deleted row).
+    with db_engine.connect() as conn:
+        remaining_keys, stored_blob = conn.execute(
+            text(
+                "SELECT (SELECT count(*) FROM user_keys WHERE user_id = :u),"
+                " (SELECT summary_encrypted FROM conversations WHERE id = :c)"
+            ),
+            {"u": user_id, "c": conv_id},
+        ).one()
+    assert remaining_keys == 0
+    # The ciphertext itself is untouched (still there until the purger's own DELETE runs --
+    # proven separately above) but is now permanently opaque: a key nobody still holds
+    # (modelled here by a freshly generated, unrelated key -- the same thing a backup
+    # restore or an attacker would be left with) cannot decrypt it.
+    assert stored_blob == summary_blob
+    forged_key = generate_user_key()
+    with pytest.raises(Exception):  # noqa: B017 - cryptography.fernet.InvalidToken
+        decrypt(forged_key, stored_blob)
+
+
+@pytest.mark.db
 def test_the_purger_deletes_a_live_session_row(
     db_engine: Engine, purger_engine: Engine, master_key: str
 ) -> None:

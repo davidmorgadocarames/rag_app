@@ -26,6 +26,8 @@ from collections.abc import Iterator
 import pytest
 
 import rag_app.assistant.core as assistant_core
+from rag_app import generation
+from rag_app.assistant.router import RouterOutput
 from rag_app.eval import gate
 from rag_app.eval.dataset import Dialogue, Turn
 from rag_app.eval.judge import parse_no_claims_verdict
@@ -251,10 +253,15 @@ def test_evaluate_dialogues_passes_memory_into_understand_but_not_into_retrieval
     now receives the FIRST turn's real memory (``last_turn`` always; ``summary`` stays
     ``None`` here because ``_FakeChat.chat_json`` always returns the caller's ``fallback`` --
     an empty ``ConversationSummary()`` -- which ``summarize_turn`` correctly treats as
-    "dropped", same as a real invalid/unreachable reply would be). Retrieval still uses each
-    turn's own raw ``message`` only (T14.2.7/14-C2, not this block) -- proven, as before, by
-    asserting every call to the fake `retrieve` only ever sees the CURRENT turn's own
-    message, never a prior one or the memory."""
+    "dropped", same as a real invalid/unreachable reply would be). Retrieval now searches
+    with ``retrieval_query(decision, message)`` (T14.2.7, block 14-C2) -- this fake's
+    ``chat_json`` always returns the caller's ``fallback``, whose ``standalone_query`` IS the
+    raw message by construction (``router._security_fallback``), so retrieval here still
+    sees exactly the raw message, same values as before -- proven, as before, by asserting
+    every call to the fake `retrieve` only ever sees the CURRENT turn's own message, never a
+    prior one or the memory. See
+    ``test_evaluate_dialogues_retrieves_with_the_standalone_query_not_the_raw_message`` below
+    for the case where the router DOES rewrite the query."""
     seen_queries: list[str] = []
     understand_calls: list[tuple[str, str | None, str | None]] = []
     real_understand = assistant_core.understand
@@ -403,50 +410,200 @@ def test_evaluate_dialogues_noisy_flag_follows_the_typo_id_prefix(
     assert results[1].is_noisy is False
 
 
-# --- gate._check_v2: floor-enforcement decision (recorded, not enforced today) -------------
+# --- T14.2.7 (block 14-C2): retrieval searches with the router's standalone_query ----------
 
 
-def test_check_v2_never_fails_when_enforce_now_is_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        gate,
-        "_load_json_any",
-        lambda _path: {"intent_accuracy": 0.90, "enforce_now": False},
+class _FakeChatWithRouterOutput:
+    """Like ``_FakeChat`` above, but ``chat_json`` returns a CALLER-SUPPLIED
+    ``RouterOutput`` instead of always echoing ``fallback`` -- needed to prove retrieval
+    actually sees a REWRITTEN ``standalone_query``, which the always-fallback ``_FakeChat``
+    can never exercise (its fallback's ``standalone_query`` is always the raw message, by
+    the router's own conservative-fallback construction)."""
+
+    def __init__(
+        self, router_output: RouterOutput, answer_text: str, verdict: str = "GROUNDED"
+    ) -> None:
+        self._router_output = router_output
+        self._answer_text = answer_text
+        self._verdict = verdict
+        self.calls = 0
+
+    def chat(self, *_a: object, **_kw: object) -> str:
+        self.calls += 1
+        return self._answer_text if self.calls == 1 else self._verdict
+
+    def chat_stream(self, *_a: object, **_kw: object) -> Iterator[str]:
+        raise NotImplementedError("evaluate_dialogues never streams")
+
+    def chat_json(
+        self, _messages: object, _schema: object, *, fallback: object, **_kw: object
+    ) -> object:
+        return self._router_output
+
+
+def test_evaluate_dialogues_retrieves_with_the_standalone_query_not_the_raw_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14.2.7: a follow-up's raw message ("What about OS commands, which rank is it?")
+    means little to hybrid search on its own -- retrieval must search with the router's
+    resolved, self-contained English ``standalone_query``. Fails on pre-14-C2 code:
+    ``retrieve`` would be called with the raw ``turn.message``, never the rewrite."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="How does the OS command injection ranking compare in OWASP Top 10?",
     )
-    metrics = DialogueMetrics(
+    seen_queries: list[str] = []
+
+    def fake_retrieve(
+        _session: object, query: str, *, reranker: object, top_n: int | None = None, **_kw: object
+    ) -> list[RetrievedChunk]:
+        seen_queries.append(query)
+        return [_chunk("docA::1")]
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fake_retrieve)
+
+    dialogue = Dialogue(
+        id="dlg-followup",
+        turns=(
+            Turn(
+                message="what about that one, which rank is it?",
+                expected_intent="followup",
+                language="en",
+                expected_doc="docA",
+                answerable=True,
+                ground_truth="truth",
+            ),
+        ),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "It ranks #5 [1].")
+
+    evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert seen_queries == ["How does the OS command injection ranking compare in OWASP Top 10?"]
+
+
+def test_evaluate_dialogues_still_generates_the_answer_from_the_raw_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generation must still address what the user actually typed (D14.1) -- the
+    ``standalone_query`` is for retrieval only (T14.2.7). Fails if a future change
+    accidentally feeds the rewritten English query into ``answer_from_chunks`` too."""
+    router_output = RouterOutput(
+        intent="followup", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
+    )
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", lambda *_a, **_kw: [_chunk("docA::1")])
+    seen_generation_queries: list[str] = []
+    real_build_messages = generation.build_messages
+
+    def spy_build_messages(query: str, chunks: object) -> object:
+        seen_generation_queries.append(query)
+        return real_build_messages(query, chunks)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation, "build_messages", spy_build_messages)
+
+    dialogue = Dialogue(
+        id="dlg-followup-es",
+        turns=(
+            Turn(
+                message="¿y eso, en qué puesto queda?",
+                expected_intent="followup",
+                language="es",
+                expected_doc="docA",
+                answerable=True,
+                ground_truth="truth",
+            ),
+        ),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "Queda en el puesto 5 [1].")
+
+    evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert seen_generation_queries == ["¿y eso, en qué puesto queda?"]
+
+
+# --- gate._check_v2: PER-METRIC floor enforcement (T14.2.8, block 14-C2) -------------------
+
+
+def _v2_metrics(*, intent_accuracy: float) -> DialogueMetrics:
+    return DialogueMetrics(
         n_turns=1,
-        intent_accuracy=0.10,  # far below the floor
+        intent_accuracy=intent_accuracy,
         noisy_recall=1.0,
         follow_up_resolution=1.0,
         clarification_rate=1.0,
         conversational_reply_rate=1.0,
         abstention_no_claims_rate=1.0,
         greeting_reply_p95_s=0.1,
-        router_p95_s=None,
+        router_p95_s=0.1,
     )
-    info, failures = gate._check_v2(metrics)
+
+
+def test_check_v2_never_fails_a_metric_whose_own_enforce_flag_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14.2.8 supersedes the old single global `enforce_now` boolean (14-A2) with a
+    per-metric `enforce` map -- a metric with `enforce.<key>: false` is recorded (printed as
+    "below floor") but can never fail the gate, independently of every other metric."""
+    monkeypatch.setattr(
+        gate,
+        "_load_json_any",
+        lambda _path: {"intent_accuracy": 0.90, "enforce": {"intent_accuracy": False}},
+    )
+    info, failures = gate._check_v2(_v2_metrics(intent_accuracy=0.10))  # far below the floor
     assert failures == []
     assert any("below floor" in line for line in info)
 
 
-def test_check_v2_fails_when_enforce_now_is_true(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Negative control for the test above: the same shortfall DOES fail once enforcement is
-    turned on, proving `enforce_now` genuinely gates the failure path, not just decorative."""
+def test_check_v2_fails_a_metric_whose_own_enforce_flag_is_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative control for the test above: the SAME shortfall DOES fail once THAT metric's
+    own `enforce` flag is turned on, proving the per-metric map genuinely gates the failure
+    path, not just decorative."""
     monkeypatch.setattr(
         gate,
         "_load_json_any",
-        lambda _path: {"intent_accuracy": 0.90, "enforce_now": True},
+        lambda _path: {"intent_accuracy": 0.90, "enforce": {"intent_accuracy": True}},
     )
-    metrics = DialogueMetrics(
-        n_turns=1,
-        intent_accuracy=0.10,
-        noisy_recall=1.0,
-        follow_up_resolution=1.0,
-        clarification_rate=1.0,
-        conversational_reply_rate=1.0,
-        abstention_no_claims_rate=1.0,
-        greeting_reply_p95_s=0.1,
-        router_p95_s=None,
-    )
-    _info, failures = gate._check_v2(metrics)
+    _info, failures = gate._check_v2(_v2_metrics(intent_accuracy=0.10))
     assert len(failures) == 1
     assert "intent_accuracy" in failures[0]
+
+
+def test_check_v2_enforcement_is_independent_per_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A metric NOT in the `enforce` map at all defaults to unenforced, even while a
+    DIFFERENT metric's floor IS enforced and genuinely met -- proves the per-metric map does
+    not accidentally couple metrics together (e.g. one global flag flipping everything)."""
+    monkeypatch.setattr(
+        gate,
+        "_load_json_any",
+        lambda _path: {
+            "intent_accuracy": 0.90,
+            "noisy_recall": 0.90,
+            "enforce": {"noisy_recall": True},  # intent_accuracy absent -> defaults to False
+        },
+    )
+    _info, failures = gate._check_v2(_v2_metrics(intent_accuracy=0.10))
+    assert failures == []  # noisy_recall (1.0) clears its own enforced floor; intent is unenforced
+
+
+def test_check_v2_checks_router_p95_s_against_its_own_local_floor_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """14-A2's floors file names the router floor `router_p95_s_local` (a separate key from
+    the metric field `router_p95_s`, since local/Azure have different floors) -- T14.2.8 wires
+    this check in now that a real router exists to measure (it was a no-op before, by
+    construction: 14-A2/14-B2/14-C1 never had a `router_p95_s` value to compare)."""
+    monkeypatch.setattr(
+        gate,
+        "_load_json_any",
+        lambda _path: {"router_p95_s_local": 1.5, "enforce": {"router_p95_s": True}},
+    )
+    metrics = _v2_metrics(intent_accuracy=1.0)
+    metrics.router_p95_s = 2.0  # above the 1.5s local floor
+    _info, failures = gate._check_v2(metrics)
+    assert len(failures) == 1
+    assert "router_p95_s" in failures[0]

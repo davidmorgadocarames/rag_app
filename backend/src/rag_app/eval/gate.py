@@ -8,10 +8,14 @@ hand without that flag, an unreachable stack is reported as SKIP (exit 0).
 ``eval/golden_set_v2.jsonl`` (dialogues) and records the "before" baseline + the plan's floors
 (``eval/golden_set_v2_baseline.json`` / ``eval/golden_set_v2_floors.json``, both git-tracked).
 **Per the Phase 14 plan, §14.2's own Gate ("floors from 14.0") the floors are enforced starting at
-14.2, once the router/memory they measure exists** — T14.0.5 establishes and records them, it
-does not yet gate on them (``golden_set_v2_floors.json``'s ``enforce_now: false``); this keeps
-the v1 eval gate's pass/fail behaviour above completely unaffected and green. See the ADR for the
-numbers and why several are expected to fall short of their floor on this "before" run.
+14.2, once the router/memory they measure exists.** T14.0.5/14-A2/14-C1 kept every floor
+record-only (``enforce_now: false``), since none of them were met yet. **T14.2.8 (block 14-C2)
+turns enforcement on PER METRIC** (``golden_set_v2_floors.json``'s ``enforce`` object), not with a
+single global switch any more: a metric fails the gate only once ITS OWN floor is both (a) in
+force per the plan (14.2 onward, which is every floor in this file) and (b) actually met by the
+measured numbers -- the plan is read as "apply floors now, enforce the ones that already pass;
+do not silently lower a floor just because another metric is still short." See the ADR's
+"14-C2 decision" section for which metrics that is, and why.
 """
 
 from __future__ import annotations
@@ -57,6 +61,11 @@ _V2_METRIC_KEYS = (
     "conversational_reply_rate",
 )
 _V2_LATENCY_KEYS = ("greeting_reply_p95_s",)
+# `router_p95_s` (the metric field, see metrics.py) is checked against the LOCAL floor's own
+# key name (`router_p95_s_local`) -- the floors file keeps local/Azure as two separate values
+# (P14-D3, the Azure subset is a later block's own eval run) but this gate only ever runs
+# against the local stack, so only the local floor applies here.
+_V2_ROUTER_LATENCY_FLOOR_KEY = "router_p95_s_local"
 
 
 def _stack_available() -> bool:
@@ -121,33 +130,42 @@ def _load_json_any(path: Path) -> dict[str, Any]:
 def _check_v2(metrics: DialogueMetrics) -> tuple[list[str], list[str]]:
     """Compare golden-set v2 metrics to the plan's floors (``golden_set_v2_floors.json``).
 
-    Returns ``(info_lines, failures)``. A floor only becomes a real FAIL when the floors file's
-    ``enforce_now`` is ``true`` — today it is ``false`` (floors apply from 14.2, the Phase 14 plan
-    §14.2 Gate: "floors from 14.0") — so this never fails the eval gate on this branch; every
-    comparison is still printed so the "before" gap is visible on every run, not just this one.
+    Returns ``(info_lines, failures)``. **T14.2.8 (block 14-C2): enforcement is PER METRIC**,
+    via the floors file's ``enforce`` object (``{"<metric>": true|false}``) — superseding
+    14-A2's single global ``enforce_now`` boolean (kept in the file only as a human-readable
+    note of when enforcement started, no longer read by this function). A metric's floor only
+    becomes a real FAIL when its OWN ``enforce.<metric>`` is ``true`` AND it is currently below
+    its floor; a metric with ``enforce.<metric>: false`` is still PRINTED (so every gap stays
+    visible every run) but can never fail the gate. This lets the plan's "floors apply from
+    14.2" stay literally true (every floor IS being checked, right now) while a floor this
+    block's own measured numbers do not yet meet is recorded, not silently lowered — see the
+    ADR's "14-C2 decision" for which floors that is this run.
     """
     floors = _load_json_any(V2_FLOORS_PATH)
-    enforce_now = bool(floors.get("enforce_now", False))
+    enforce_map: dict[str, Any] = floors.get("enforce", {})
     values = metrics.as_dict()
     info: list[str] = []
     failures: list[str] = []
 
-    def _compare(key: str, *, higher_is_better: bool) -> None:
+    def _compare(key: str, floor_key: str | None = None, *, higher_is_better: bool) -> None:
+        floor_key = floor_key or key
         value = values.get(key)
-        floor = floors.get(key)
+        floor = floors.get(floor_key)
         if value is None or floor is None:
             return
         met = float(value) >= float(floor) if higher_is_better else float(value) <= float(floor)
         sign = ">=" if higher_is_better else "<="
-        status = "OK" if met else "below floor"
+        enforced = bool(enforce_map.get(key, False))
+        status = "OK" if met else ("FAIL (enforced)" if enforced else "below floor (recorded)")
         info.append(f"  {key}: {value:.3f} (floor {sign} {float(floor):.3f}) {status}")
-        if enforce_now and not met:
+        if enforced and not met:
             failures.append(f"{key}={value:.3f} does not meet floor {sign} {float(floor):.3f}")
 
     for key in _V2_METRIC_KEYS:
         _compare(key, higher_is_better=True)
     for key in _V2_LATENCY_KEYS:
         _compare(key, higher_is_better=False)
+    _compare("router_p95_s", _V2_ROUTER_LATENCY_FLOOR_KEY, higher_is_better=False)
     return info, failures
 
 
@@ -215,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         encoding="utf-8",
     )
-    print("\ngolden set v2 metrics (before baseline, floors not yet enforced — see the ADR):")
+    print("\ngolden set v2 metrics (per-metric floor enforcement -- see the ADR):")
     for key, value in v2_metrics.as_dict().items():
         print(f"  {key}: {value}")
     v2_info, v2_failures = _check_v2(v2_metrics)

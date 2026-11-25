@@ -1221,7 +1221,12 @@ FEATURE_DOCS: dict[str, FeatureDoc] = {
         " bounded structured summary available to the router, written back after every"
         " answered turn except an exact fast-path greeting/thanks/farewell (14-C1-fix: that"
         " case is already exempt from the daily cap and must not cost a second LLM call;"
-        " best-effort otherwise: a dropped/unreachable update never breaks the turn)",
+        " best-effort otherwise: a dropped/unreachable update never breaks the turn)."
+        " T14.2.7 (block 14-C2): retrieval now searches with the router's resolved, English"
+        " standalone_query instead of the raw message -- a follow-up like 'where does it"
+        " rank?' now retrieves the actual document, not just the right intent label; the"
+        " streamed/returned answer still addresses the original message, in the user's own"
+        " language",
         key_files=(
             "backend/src/rag_app/assistant/core.py",
             "backend/src/rag_app/assistant/router.py",

@@ -7,7 +7,7 @@ exist yet).
 
 from __future__ import annotations
 
-from rag_app.assistant.core import understand
+from rag_app.assistant.core import Understanding, retrieval_query, understand
 from rag_app.assistant.router import RouterOutput
 
 
@@ -73,3 +73,55 @@ def test_router_failure_still_degrades_to_security_with_a_measured_latency() -> 
     assert decision.standalone_query == "how do I prevent SQL injection?"
     assert decision.used_fast_path is False
     assert decision.router_latency_s is not None
+
+
+# --- retrieval_query (T14.2.7, block 14-C2) -------------------------------------------------
+
+
+def _decision(standalone_query: str) -> Understanding:
+    return Understanding(
+        intent="followup",
+        language="en",
+        standalone_query=standalone_query,
+        clarification=None,
+        used_fast_path=False,
+        router_latency_s=0.1,
+    )
+
+
+def test_retrieval_query_uses_the_standalone_query_when_present() -> None:
+    """The whole point of T14.2.7: a follow-up's raw message often means nothing to hybrid
+    search on its own -- retrieval must search with the router's resolved, self-contained
+    English rewrite instead. Fails on pre-14-C2 code: the function does not exist."""
+    decision = _decision("How does SQL injection rank in the OWASP Top 10 2021?")
+    assert (
+        retrieval_query(decision, "where does it rank?")
+        == "How does SQL injection rank in the OWASP Top 10 2021?"
+    )
+
+
+def test_retrieval_query_falls_back_to_the_original_when_standalone_query_is_blank() -> None:
+    """Defensive guard (no live caller produces this today -- the router's own
+    ``_security_fallback``/the exact fast path both already set
+    ``standalone_query == query``): an empty rewrite must never make retrieval search with
+    nothing."""
+    assert retrieval_query(_decision(""), "original query") == "original query"
+
+
+def test_retrieval_query_falls_back_to_the_original_when_standalone_query_is_whitespace_only() -> (
+    None
+):
+    assert retrieval_query(_decision("   "), "original query") == "original query"
+
+
+def test_retrieval_query_matches_the_original_on_the_security_fallback_path() -> None:
+    """The security-fallback path (any router failure) already sets ``standalone_query ==
+    query`` by construction (``router._security_fallback``) -- ``retrieval_query`` must keep
+    that identity, not accidentally diverge from it."""
+    decision = understand(
+        _FakeChat(),  # chat_json raises nothing here; _FakeChat() with no result -> fallback
+        "how do I prevent SQL injection?",
+    )  # type: ignore[arg-type]
+    assert retrieval_query(decision, "how do I prevent SQL injection?") == (
+        "how do I prevent SQL injection?"
+    )

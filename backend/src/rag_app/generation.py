@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.orm import Session
 
 from rag_app import timing
-from rag_app.assistant.core import understand
+from rag_app.assistant.core import retrieval_query, understand
 from rag_app.assistant.fast_path import generate_chitchat_reply
 from rag_app.config import get_settings
 from rag_app.embeddings import OllamaEmbedder
@@ -232,6 +232,12 @@ def answer_question(
     (``reranking.get_shared_reranker()``) — never a fresh ``CrossEncoderReranker()`` per
     call, which reloaded the ~2.2 GB cross-encoder on every answer before this fix. Pass an
     explicit instance (e.g. a throwaway one in a test) to override it.
+
+    T14.2.7 (block 14-C2): retrieval below searches with ``retrieval_query(decision, query)``
+    -- the router's English ``standalone_query`` when present and safe, else the original
+    ``query`` -- instead of always the original message. Generation (``answer_from_chunks``)
+    still receives the ORIGINAL ``query``, so the reply still addresses what the user typed,
+    in their own language.
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
@@ -244,18 +250,19 @@ def answer_question(
             reply = generate_chitchat_reply(chat, query, decision.language)
             return Answer(text=reply, abstained=False, grounded=True)
 
+        search_query = retrieval_query(decision, query)
         if use_rerank:
             from rag_app.reranking import get_shared_reranker, retrieve
 
             chunks = retrieve(
                 session,
-                query,
+                search_query,
                 reranker=reranker or get_shared_reranker(),
                 top_n=top_n,
                 version=version,
             )
         else:
-            chunks = hybrid_search(session, query, top_k=top_n, version=version)
+            chunks = hybrid_search(session, search_query, top_k=top_n, version=version)
 
         return answer_from_chunks(chat, query, chunks)
 
@@ -552,9 +559,14 @@ def answer_question_stream(
     T14.2.5 (block 14-C1): ``summary``/``last_turn`` -- the conversation's own memory, read
     by the caller (``api.conversations._load_memory``, scoped to ONE already-ownership-
     checked conversation) BEFORE this turn -- are forwarded unchanged into ``understand()``,
-    which already accepted them as of 14-B2 (always ``None`` until this block). Retrieval
-    below still uses the ORIGINAL ``query``, never the router's own ``standalone_query``
-    (T14.2.7, block 14-C2 — not this block).
+    which already accepted them as of 14-B2 (always ``None`` until this block).
+
+    T14.2.7 (block 14-C2): retrieval (embed + hybrid search + rerank) below searches with
+    ``retrieval_query(decision, query)`` -- the router's English ``standalone_query`` when
+    present and safe, else the original ``query`` -- so a follow-up resolves to its real
+    subject instead of a bare pronoun. Generation (``_stream_answer_tokens``) still receives
+    the ORIGINAL ``query``, so the streamed reply still addresses what the user actually
+    typed, in their own language (D14.1, unchanged by this block).
 
     T11.3.1: one JSON timing record per answer (classify, embed, hybrid search, rerank
     load/inference, time to first token, total) plus the same durations into the
@@ -595,19 +607,24 @@ def answer_question_stream(
         # right around the actual Ollama call, not after the whole (fast) rest of
         # hybrid_search runs too -- a plain callback passed into hybrid_search could not do
         # this (only the generator's own `yield` can suspend it mid-call).
+        search_query = retrieval_query(decision, query)
         embedder = OllamaEmbedder()
         yield StreamStep(stage="retrieving", step="embed_query", phase="start")
-        query_vector = embed_query(embedder, query)
+        query_vector = embed_query(embedder, search_query)
         yield StreamStep(stage="retrieving", step="embed_query", phase="end")
         chunks = hybrid_search(
-            session, query, top_k=settings.top_k, version=version, query_vector=query_vector
+            session,
+            search_query,
+            top_k=settings.top_k,
+            version=version,
+            query_vector=query_vector,
         )
 
         if use_rerank and chunks:
             from rag_app.reranking import get_shared_reranker
 
             yield StreamStage(stage="reranking")
-            chunks = (reranker or get_shared_reranker()).rerank(query, chunks, top_n)
+            chunks = (reranker or get_shared_reranker()).rerank(search_query, chunks, top_n)
         else:
             chunks = chunks[:top_n]
 

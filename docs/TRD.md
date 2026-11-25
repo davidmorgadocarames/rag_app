@@ -149,11 +149,14 @@ no clarification code path exists before 14.3, so this is 0 by construction, not
 the validated-judge mechanism), `greeting_reply_p95_s` (measurable today) and `router_p95_s`
 (always `None` — there is no router call to time yet).
 
-**Floors (the Phase 14.0 plan) are recorded, not yet enforced.** §14.2's own Gate line reads
-"floors from 14.0", i.e. enforcement starts once the router/memory exist; `eval/golden_set_v2_floors.json`
-carries `enforce_now: false` for exactly that reason — the `eval` gate step prints every
-value-vs-floor comparison but only fails on it once a later block flips that flag. See the
-golden-set-v2 table in `docs/adr/adr_phase14_assistant.md` for the measured numbers.
+**Floors (the Phase 14.0 plan).** §14.2's own Gate line reads "floors from 14.0", i.e.
+enforcement starts once the router/memory/retrieval they measure exist. `eval
+/golden_set_v2_floors.json` recorded every floor without enforcing any of them (14-A2/14-B2/
+14-C1, `enforce_now: false`) while they were genuinely unmet; **block 14-C2 turns enforcement
+on PER METRIC** (`enforce.<metric>`, §6.4) once a given floor is actually cleared by the
+measured numbers — a floor this block's own numbers do not yet meet stays recorded, not
+silently lowered. See the golden-set-v2 table in `docs/adr/adr_phase14_assistant.md` for the
+measured numbers and which floors are enforced as of this block.
 
 ### 6.2 Understanding step: fast path + LLM router (T14.2.1–T14.2.3, block 14-B2)
 
@@ -191,8 +194,8 @@ eval runner alike by ONE shared understanding step, `rag_app.assistant.core.unde
   block (14-B2) but is always `None` from every 14-B2 call site — the router sees only the
   current message, same F14.2 limitation as before, just with a real router call now. **Wired
   for real in block 14-C1 — see §6.3.**
-- Retrieval still uses the ORIGINAL message, never `standalone_query` (T14.2.7/14-C2) — the
-  router already produces it, nothing downstream consumes it yet.
+- Retrieval used the ORIGINAL message, never `standalone_query`, until block 14-C2 wired it
+  in — see §6.4.
 - The retrieve/generate/groundedness-check code itself was NOT relocated into the `assistant`
   package: it stays in `generation.py`'s own functions (and the eval runner's own direct
   calls), because several existing tests monkeypatch module-qualified names
@@ -291,6 +294,43 @@ neither's memory ever appears in the other's router call.
 same as `title_encrypted` already does. No new grant (table-level grants from 0005 already
 cover the column). Downgrade refuses while any conversation holds a non-null summary (same
 "never a rollback path once such data exists" rule as 0008).
+
+### 6.4 Retrieval with the standalone query (T14.2.7, block 14-C2)
+
+**What changed.** The three entry points that call `understand()` — `generation
+.answer_question` (`POST /chat`), `generation.answer_question_stream` (`/chat/stream`) and
+`eval.runner.evaluate_dialogues` — now search with `rag_app.assistant.core.retrieval_query
+(decision, query)` instead of always the original message: the router's own English
+`standalone_query` when it is a genuine, non-empty rewrite, else the original `query`
+unchanged. This is the fix for the gap §6.2/§6.3 both self-reported ("retrieval still uses
+the original message, never `standalone_query`") — a follow-up like "Where does it rank?"
+means nothing to hybrid search on its own; the router already resolves it into a
+self-contained English question (e.g. "How does SQL injection rank in the OWASP Top 10
+2021?"), and now retrieval actually searches with that resolved query.
+
+**Generation is unchanged — still the original message.** `answer_from_chunks`/
+`_stream_answer_tokens` still receive the ORIGINAL `query`, never the rewrite: the reply must
+address what the user actually typed, in the language they typed it in (D14.1), which the
+English `standalone_query` would silently break if it reached generation too (an explicit
+reply-language decision belongs to T14.3.1/14-D1, not this block). Reranking is retrieval,
+not generation, so it also searches with the resolved query (`CrossEncoderReranker.rerank
+(search_query, chunks, top_n)`) — the same single-query convention `reranking.retrieve()`
+already used internally before this block existed.
+
+**Why this is a no-op on the security-fallback path, by construction, not by a special
+case.** `router._security_fallback` (any router failure: timeout, network error, invalid
+reply after retry, suspicious output) already sets `standalone_query = query` verbatim — the
+exact fast path does the same. `retrieval_query` therefore returns the untouched original
+message on every path that is not a genuine router rewrite; there is no second, separate
+"fallback" branch inside `retrieval_query` itself beyond a defensive guard against an empty
+string (no live caller produces one today).
+
+**Expected effect on the golden-set v2 floors.** `follow_up_resolution` (§6.1) is a pure
+function of what `retrieve()` searched for — this is the ONE metric this block's own change
+can move; `intent_accuracy`/`conversational_reply_rate` depend on the ROUTER's classification
+and the CHIT-CHAT reply respectively, neither of which this block touches, so they are not
+expected to move. See the ADR's "14-C2 decision" section for the measured before/after table
+and which floors are enforced from this block onward.
 
 ## 7. Cost & latency
 

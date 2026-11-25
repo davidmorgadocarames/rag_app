@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden set v2 floors (the Phase 14.0 plan, section 14.0 / P14-D4). Recorded by block 14-A2 (T14.0.5); enforcement starts at 14.2 per the Phase 14 plan's own section 14.2 Gate line ('floors from 14.0') -- enforce_now stays false until a later block flips it, once the LLM router/memory this measures actually exists.",
+  "_comment": "Golden set v2 floors (the Phase 14.0 plan, section 14.0 / P14-D4). Recorded by block 14-A2 (T14.0.5). T14.2.8 (block 14-C2) turns enforcement on PER METRIC (the `enforce` object below) instead of 14-A2's single global `enforce_now` switch: a metric is enforced once its floor is both in force (14.2 onward, i.e. every floor here) and actually met by the measured numbers; `enforce_now` is kept only as a human-readable note of when enforcement as a concept started, no longer read by gate.py.",
   "intent_accuracy": 0.90,
   "noisy_recall": 0.90,
   "follow_up_resolution": 0.85,
@@ -7,6 +7,15 @@
   "greeting_reply_p95_s": 2.0,
   "router_p95_s_local": 1.5,
   "router_p95_s_azure": 1.0,
-  "enforced_from": "14.2 (router/memory land at 14-B2/14-C2); router_p95_s has no call to measure before then and is never checked by _check_v2 even if enforce_now flips to true",
-  "enforce_now": false
+  "enforced_from": "14.2 (router/memory/retrieval land at 14-B2/14-C1/14-C2)",
+  "enforce_now": true,
+  "enforce": {
+    "noisy_recall": true,
+    "greeting_reply_p95_s": true,
+    "router_p95_s": true,
+    "intent_accuracy": false,
+    "follow_up_resolution": false,
+    "conversational_reply_rate": false
+  },
+  "_enforce_comment": "block 14-C2 (T14.2.8), measured on gate-20261125T102556Z-2507174.log (--only eval) and reconfirmed on the final --full run (see the ADR's '14-C2 decision' table): noisy_recall (1.000), greeting_reply_p95_s (~1.48s) and router_p95_s (~1.05s local) already clear their floor and are enforced from this block on. intent_accuracy (~0.873), follow_up_resolution (0.500) and conversational_reply_rate (0.9375) remain below their floor -- recorded, not enforced; see the ADR for why each gap is expected and which later block (14.3/14-D1) is expected to close it. Flipping any of these three to `true` without first raising the real number would fail `gate.sh --full` outright."
 }
