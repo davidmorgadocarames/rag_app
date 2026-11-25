@@ -170,6 +170,16 @@ class Settings(JobSettings):
     azure_openai_api_key: str = ""
     azure_openai_deployment: str = ""
     azure_openai_api_version: str = "2024-10-21"
+    # DEBT-036 (model migration): the current deployment (gpt-4.1-mini, non-reasoning chat
+    # family) sends "max_tokens" and a custom "temperature" to the Chat Completions API. A
+    # reasoning-tier target model (o-series, gpt-5 family) rejects both: it needs
+    # "max_completion_tokens" instead of "max_tokens", and errors if "temperature" is sent
+    # at all (no custom sampling temperature on reasoning models) -- so the field is a
+    # per-deployment switch, not a per-call one. Off by default: flipping it is exactly the
+    # "behind config" step 14.7-migration's code change prepares, with no behaviour change
+    # for today's gpt-4.1-mini deployment until the orchestrator sets it alongside a new
+    # AZURE_OPENAI_DEPLOYMENT. See docs/adr/adr_phase14_assistant.md's 14.7-migration section.
+    azure_openai_reasoning_model: bool = False
 
     # --- Ingestion / chunking ---
     chunk_size: int = 1200

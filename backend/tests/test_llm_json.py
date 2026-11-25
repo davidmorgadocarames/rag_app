@@ -358,6 +358,43 @@ def test_azure_chat_json_request_body_shape(monkeypatch: pytest.MonkeyPatch) -> 
     assert response_format["json_schema"]["schema"] == _strict_json_schema(_RouterOutput)
 
 
+def test_azure_chat_json_reasoning_model_sends_max_completion_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEBT-036 migration prep: a reasoning-tier target model (``Settings
+    .azure_openai_reasoning_model``) uses ``max_completion_tokens`` and no ``temperature``
+    on ``chat_json`` too -- ``_body``/``_json_body`` share the same switch ``chat``/
+    ``chat_stream`` use. The ``response_format``/``strict`` shape is unaffected."""
+    captured: list[dict[str, Any]] = []
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        captured.append(json)
+        return _FakeHttpResponse(_azure_payload('{"intent": "chitchat", "language": "en"}'))
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = AzureOpenAIChat(
+        endpoint="http://fake",
+        api_key="k",
+        deployment="d",
+        api_version="v",
+        reasoning_model=True,
+    )
+    client.chat_json(
+        [{"role": "user", "content": "hi"}],
+        _RouterOutput,
+        fallback=_FALLBACK,
+        max_tokens=64,
+        call_type="router",
+    )
+    assert len(captured) == 1
+    body = captured[0]
+    assert body["max_completion_tokens"] == 64
+    assert "max_tokens" not in body
+    assert "temperature" not in body
+    # strict-schema shape unaffected by the reasoning-model body switch
+    assert body["response_format"]["json_schema"]["strict"] is True
+
+
 def test_azure_chat_json_request_body_requires_the_optional_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

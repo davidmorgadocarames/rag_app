@@ -173,3 +173,86 @@ def test_azure_chat_accepts_and_ignores_num_ctx(monkeypatch: pytest.MonkeyPatch)
     )
     assert content == "ok"
     assert "num_ctx" not in captured  # never sent to Azure at all
+
+
+# --- DEBT-036 migration prep: reasoning-model request shape (max_completion_tokens, no
+# custom temperature) behind Settings.azure_openai_reasoning_model — off by default, so these
+# tests would fail against the pre-migration-prep code (no such body-shape switch existed). ---
+
+
+def test_azure_chat_non_reasoning_model_keeps_max_tokens_and_temperature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (today's gpt-4.1-mini, non-reasoning): no behaviour change."""
+    captured: dict[str, Any] = {}
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        captured.update(json)
+        return _FakeHttpResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = AzureOpenAIChat(endpoint="http://fake", api_key="k", deployment="d", api_version="v")
+    assert client.reasoning_model is False
+    client.chat([{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=16)
+    assert captured["temperature"] == 0.2
+    assert captured["max_tokens"] == 16
+    assert "max_completion_tokens" not in captured
+
+
+def test_azure_chat_reasoning_model_sends_max_completion_tokens_and_omits_temperature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reasoning-tier target model (o-series/gpt-5 family, DEBT-036) rejects both
+    ``max_tokens`` and a custom ``temperature``: Azure's Chat Completions API returns a 400
+    ("unsupported parameter") for either field on these deployments."""
+    captured: dict[str, Any] = {}
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        captured.update(json)
+        return _FakeHttpResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = AzureOpenAIChat(
+        endpoint="http://fake",
+        api_key="k",
+        deployment="d",
+        api_version="v",
+        reasoning_model=True,
+    )
+    assert client.reasoning_model is True
+    client.chat([{"role": "user", "content": "hi"}], temperature=0.2, max_tokens=16)
+    assert captured["max_completion_tokens"] == 16
+    assert "max_tokens" not in captured
+    assert "temperature" not in captured
+
+
+def test_azure_chat_reasoning_model_setting_defaults_the_constructor_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Settings.azure_openai_reasoning_model`` (not just the constructor kwarg) drives the
+    body shape when the client is built with no explicit override — the same
+    ``get_settings()`` fallback every other Azure client field already uses."""
+    captured: dict[str, Any] = {}
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        captured.update(json)
+        return _FakeHttpResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    monkeypatch.setattr(
+        llm,
+        "get_settings",
+        lambda: Settings(
+            llm_provider="azure_openai",
+            azure_openai_endpoint="http://fake",
+            azure_openai_api_key="k",
+            azure_openai_deployment="d",
+            azure_openai_reasoning_model=True,
+        ),
+    )
+    client = make_chat_client()
+    assert isinstance(client, AzureOpenAIChat)
+    assert client.reasoning_model is True
+    client.chat([{"role": "user", "content": "hi"}], max_tokens=16)
+    assert "max_completion_tokens" in captured
+    assert "temperature" not in captured
