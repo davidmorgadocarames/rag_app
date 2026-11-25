@@ -83,6 +83,15 @@ VENV="${GATE_VENV:-$MAIN_VENV}"   # final choice: resolve_venv
 PY="$VENV/bin/python"
 GATE_STATE="$MAIN_ROOT/.gate"
 ROLES_ENV="$GATE_STATE/roles.env"   # local role passwords (git-ignored, 0600; T11.0.13)
+# F31 (2026-11-25): one seed per alembic head under $GATE_STATE/seeds/<head>/{seed.dump,
+# seed.meta} -- $GATE_STATE is shared across every worktree (MAIN_ROOT), so a single
+# top-level seed.dump/seed.meta broke every branch whose alembic head differed from
+# whichever branch last ran --make-seed (14-C3 rebuilt it at 0009_conversation_summary,
+# failing eval/latency/e2e on every 0008 branch, main included). seed_dir_for_head()
+# below resolves the right directory; SEED/SEED_META (legacy top-level path, pre-F31) are
+# kept only as a read-only fallback for a tree whose head still matches them -- --make-seed
+# never writes there again.
+SEEDS_DIR="$GATE_STATE/seeds"
 SEED="$GATE_STATE/seed.dump"
 SEED_META="$GATE_STATE/seed.meta"
 CHUNKS="$MAIN_ROOT/data/chunks/chunks.jsonl"
@@ -1016,6 +1025,57 @@ db_alembic_head() {
   compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT version_num FROM alembic_version'
 }
 
+# seed_dir_for_head <head>: this alembic head's own seed directory (F31). Never shared
+# with any other head, so two branches/worktrees on different heads never collide.
+seed_dir_for_head() { echo "$SEEDS_DIR/$1"; }
+
+# resolve_seed_files <head>: sets SEED_FILE/SEED_META_FILE to whichever of (a) the
+# per-head directory (seed_dir_for_head) or (b) the legacy top-level SEED/SEED_META (only
+# when its own recorded alembic_head still matches, i.e. a tree that predates F31 whose
+# head happens to equal the legacy seed's) has a real seed for this head. Clears both and
+# returns 1 (SEED_ERROR already set, naming --make-seed) when neither does.
+SEED_FILE=""
+SEED_META_FILE=""
+resolve_seed_files() {
+  local head="$1" dir legacy_head
+  dir="$(seed_dir_for_head "$head")"
+  if [ -f "$dir/seed.dump" ] && [ -f "$dir/seed.meta" ]; then
+    SEED_FILE="$dir/seed.dump"
+    SEED_META_FILE="$dir/seed.meta"
+    return 0
+  fi
+  if [ -f "$SEED" ] && [ -f "$SEED_META" ]; then
+    legacy_head="$(sed -n 's/^alembic_head=//p' "$SEED_META" 2>/dev/null)"
+    if [ "$legacy_head" = "$head" ]; then
+      SEED_FILE="$SEED"
+      SEED_META_FILE="$SEED_META"
+      return 0
+    fi
+  fi
+  SEED_FILE=""
+  SEED_META_FILE=""
+  if [ -f "$SEED_META" ]; then
+    SEED_ERROR="no gate seed for alembic head $head (checked $dir/seed.dump; the legacy seed at $SEED is for head ${legacy_head:-?}) — run: scripts/gate.sh --make-seed"
+  else
+    SEED_ERROR="no gate seed for alembic head $head (checked $dir/seed.dump) — run: scripts/gate.sh --make-seed (needs Ollama)"
+  fi
+  return 1
+}
+
+# resolve_seed_files_cli <head>: test-only re-entrant entry point (like --run-step /
+# --build-venv below) so backend/tests/test_gate_script.py can exercise resolve_seed_files'
+# head-selection / legacy-fallback / mismatch-message logic directly, with plain files on
+# disk -- no Docker, no DB, no lock, no log file.
+resolve_seed_files_cli() {
+  if resolve_seed_files "$1"; then
+    echo "SEED_FILE=$SEED_FILE"
+    echo "SEED_META_FILE=$SEED_META_FILE"
+    return 0
+  fi
+  echo "SEED_ERROR=$SEED_ERROR"
+  return 1
+}
+
 # Local passwords of the database roles (git-ignored gate state, never printed). Created once;
 # the gate cluster is thrown away after every run, so they only need to be stable per clone.
 ensure_roles_env() {
@@ -1089,13 +1149,15 @@ stack_up() {
     return 1
   fi
   [ "$want_seed" = 1 ] || return 0
-  if [ ! -f "$SEED" ]; then
-    SEED_ERROR="no gate seed at $SEED — run: scripts/gate.sh --make-seed (needs Ollama)"
-    return 2
-  fi
-  # Staleness (DA-B-9): corpus, embedding model build and schema must match the seed.
-  local seeded_hash current_hash seeded_model current_model seeded_head current_head
-  seeded_hash="$(sed -n 's/^corpus_sha256=//p' "$SEED_META" 2>/dev/null)"
+  # F31: this tree's OWN current alembic head picks the seed directory -- never the
+  # single shared top-level file another branch/worktree may have just rebuilt.
+  local current_head
+  current_head="$(db_alembic_head)"
+  resolve_seed_files "$current_head" || return 2   # SEED_ERROR already set
+  # Staleness (DA-B-9): corpus and embedding model build must match the seed too (the
+  # alembic head match is already guaranteed by resolve_seed_files's directory choice).
+  local seeded_hash current_hash seeded_model current_model
+  seeded_hash="$(sed -n 's/^corpus_sha256=//p' "$SEED_META_FILE" 2>/dev/null)"
   if [ -f "$CHUNKS" ]; then
     current_hash="$(sha256sum "$CHUNKS" | cut -d' ' -f1)"
     if [ "$seeded_hash" != "$current_hash" ]; then
@@ -1103,7 +1165,7 @@ stack_up() {
       return 2
     fi
   fi
-  seeded_model="$(sed -n 's/^embed_model=//p' "$SEED_META" 2>/dev/null)"
+  seeded_model="$(sed -n 's/^embed_model=//p' "$SEED_META_FILE" 2>/dev/null)"
   if [ -z "$seeded_model" ]; then
     SEED_ERROR="the seed does not record its embedding model digest (older seed) — run: scripts/gate.sh --make-seed"
     return 2
@@ -1115,18 +1177,12 @@ stack_up() {
       return 2
     fi
   fi
-  seeded_head="$(sed -n 's/^alembic_head=//p' "$SEED_META" 2>/dev/null)"
-  current_head="$(db_alembic_head)"
-  if [ "$seeded_head" != "$current_head" ]; then
-    SEED_ERROR="migrations changed since the seed was made (seed at ${seeded_head:-?}, head ${current_head:-?}) — run: scripts/gate.sh --make-seed"
-    return 2
-  fi
   if ! compose exec -T db pg_restore -U "$GATE_DB_USER" -d "$GATE_DB_NAME" \
-         --data-only --disable-triggers --no-owner <"$SEED"; then
+         --data-only --disable-triggers --no-owner <"$SEED_FILE"; then
     SEED_ERROR="seed restore failed"
     return 2
   fi
-  echo "  seed restored: $(sed -n 's/^chunks=//p' "$SEED_META") chunks ($(sed -n 's/^created=//p' "$SEED_META"); $seeded_model; alembic $seeded_head)"
+  echo "  seed restored: $(sed -n 's/^chunks=//p' "$SEED_META_FILE") chunks ($(sed -n 's/^created=//p' "$SEED_META_FILE"); $seeded_model; alembic $current_head)"
 }
 
 make_seed() {
@@ -1149,22 +1205,26 @@ make_seed() {
   (cd backend && "$PY" -m rag_app.indexing --chunks "$CHUNKS") || { echo "  FAIL: indexing"; return 1; }
   [ "$(embed_model_digest)" = "$model" ] \
     || { echo "  FAIL: the embedding model changed while indexing — run --make-seed again"; return 1; }
-  mkdir -p "$GATE_STATE"
-  chmod 700 "$GATE_STATE"
-  compose exec -T db pg_dump -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -Fc --data-only \
-    -t documents -t chunks >"$SEED.tmp" || { echo "  FAIL: pg_dump"; rm -f "$SEED.tmp"; return 1; }
-  local chunks head
-  chunks="$(compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT count(*) FROM chunks')"
+  # F31: writes ONLY this tree's own current head's directory -- never the shared
+  # top-level legacy seed.dump/seed.meta another worktree/branch may be relying on.
+  local chunks head seed_dir
   head="$(db_alembic_head)"
-  mv -f "$SEED.tmp" "$SEED"
+  seed_dir="$(seed_dir_for_head "$head")"
+  mkdir -p "$seed_dir"
+  chmod 700 "$GATE_STATE" "$SEEDS_DIR" "$seed_dir" 2>/dev/null
+  compose exec -T db pg_dump -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -Fc --data-only \
+    -t documents -t chunks >"$seed_dir/seed.dump.tmp" \
+    || { echo "  FAIL: pg_dump"; rm -f "$seed_dir/seed.dump.tmp"; return 1; }
+  chunks="$(compose exec -T db psql -U "$GATE_DB_USER" -d "$GATE_DB_NAME" -tAc 'SELECT count(*) FROM chunks')"
+  mv -f "$seed_dir/seed.dump.tmp" "$seed_dir/seed.dump"
   {
     echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "corpus_sha256=$(sha256sum "$CHUNKS" | cut -d' ' -f1)"
     echo "embed_model=$model"
     echo "alembic_head=$head"
     echo "chunks=$chunks"
-  } >"$SEED_META"
-  echo "seed written: $SEED ($chunks chunks, $model, alembic $head) in $((SECONDS - t0))s"
+  } >"$seed_dir/seed.meta"
+  echo "seed written: $seed_dir/seed.dump ($chunks chunks, $model, alembic $head) in $((SECONDS - t0))s"
 }
 
 # --- global gate lock (T13.14.4, Paralelo-B problem #2) --------------------------------
@@ -1387,12 +1447,18 @@ main() {
 
 # --- gate log (C8c, T11c.E1) -------------------------------------------------------------
 
-# Re-entrant self-invocations (a step, the cached-venv builder) and purely informational
-# flags never open their own log file: their output already lands in the top-level run's
-# log (steps) or there is no run to record (--list/-h/--help).
+# Re-entrant self-invocations (a step, the cached-venv builder, the F31 seed-file
+# resolver) and purely informational flags never open their own log file: their output
+# already lands in the top-level run's log (steps) or there is no run to record
+# (--list/-h/--help).
 case "${1:-}" in
   --run-step | --build-venv | --list | -h | --help)
     main "$@"
+    exit $?
+    ;;
+  --resolve-seed-files)
+    shift
+    resolve_seed_files_cli "$1"
     exit $?
     ;;
 esac

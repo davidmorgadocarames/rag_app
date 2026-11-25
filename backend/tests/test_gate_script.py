@@ -81,6 +81,19 @@ def _gate(repo: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str
     )
 
 
+def _resolve_seed_files(repo: Path, head: str, **env: str) -> subprocess.CompletedProcess[str]:
+    """F31: exercises resolve_seed_files() via gate.sh's own --resolve-seed-files test-only
+    re-entrant entry point -- plain files on disk, no Docker/DB/lock/log needed."""
+    return subprocess.run(
+        ["bash", str(repo / "scripts" / "gate.sh"), "--resolve-seed-files", head],
+        cwd=repo,
+        env=_gate_env(repo, **env),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def _shell(repo: Path, script: str, **env: str) -> subprocess.CompletedProcess[str]:
     """Runs a raw shell snippet (not a fixed argv) so a test can wrap `scripts/gate.sh` in a
     manual `&`, `nohup … &` or `( … & )` the same way a human/agent would from a terminal --
@@ -389,6 +402,143 @@ def test_the_escape_hatch_env_var_allows_a_deliberate_background_launch(tmp_path
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "F24" not in proc.stdout + proc.stderr
+
+
+# --- F31: one gate seed per alembic head (2026-11-25) -----------------------------------
+#
+# $GATE_STATE (.gate/) is shared across every worktree of this repo (it lives under
+# MAIN_ROOT, not per-branch) -- a single top-level seed.dump/seed.meta broke eval/latency/e2e
+# on every branch whose alembic head differed from whichever branch last ran --make-seed
+# (14-C3 rebuilt it at 0009_conversation_summary; every 0008 branch, including main, failed).
+# These tests exercise resolve_seed_files() directly (no Docker/DB needed) via gate.sh's own
+# --resolve-seed-files test-only entry point.
+
+
+@needs_tools
+def test_no_seed_anywhere_names_make_seed(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    proc = _resolve_seed_files(repo, "0008_admin_dashboard")
+    assert proc.returncode == 1
+    assert "SEED_ERROR=no gate seed for alembic head 0008_admin_dashboard" in proc.stdout
+    assert "scripts/gate.sh --make-seed" in proc.stdout
+
+
+@needs_tools
+def test_the_per_head_directory_is_used_when_present(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    seed_dir = repo / ".gate" / "seeds" / "0009_conversation_summary"
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "seed.dump").write_bytes(b"dump")
+    (seed_dir / "seed.meta").write_text("alembic_head=0009_conversation_summary\n")
+    proc = _resolve_seed_files(repo, "0009_conversation_summary")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"SEED_FILE={seed_dir}/seed.dump" in proc.stdout
+    assert f"SEED_META_FILE={seed_dir}/seed.meta" in proc.stdout
+
+
+@needs_tools
+def test_a_different_heads_directory_is_never_picked(tmp_path: Path) -> None:
+    """Two branches on different heads, each with its own per-head directory, must never
+    see each other's seed."""
+    repo = _make_repo(tmp_path)
+    for head in ("0008_admin_dashboard", "0009_conversation_summary"):
+        d = repo / ".gate" / "seeds" / head
+        d.mkdir(parents=True)
+        (d / "seed.dump").write_bytes(f"dump-{head}".encode())
+        (d / "seed.meta").write_text(f"alembic_head={head}\n")
+    proc = _resolve_seed_files(repo, "0008_admin_dashboard")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "seeds/0008_admin_dashboard/seed.dump" in proc.stdout
+    assert "0009_conversation_summary" not in proc.stdout
+
+
+@needs_tools
+def test_the_legacy_top_level_seed_is_used_when_it_matches_the_head(tmp_path: Path) -> None:
+    """Backward compatibility (F31): a tree that predates the per-head layout still works
+    as long as the legacy seed's own recorded head matches what is being asked for."""
+    repo = _make_repo(tmp_path)
+    gate_dir = repo / ".gate"
+    gate_dir.mkdir()
+    (gate_dir / "seed.dump").write_bytes(b"legacy-dump")
+    (gate_dir / "seed.meta").write_text("alembic_head=0008_admin_dashboard\n")
+    proc = _resolve_seed_files(repo, "0008_admin_dashboard")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"SEED_FILE={gate_dir}/seed.dump" in proc.stdout
+    assert f"SEED_META_FILE={gate_dir}/seed.meta" in proc.stdout
+
+
+@needs_tools
+def test_the_legacy_seed_is_rejected_with_a_clear_message_when_its_head_differs(
+    tmp_path: Path,
+) -> None:
+    """The exact scenario this block fixes: some other branch/worktree rebuilt the shared
+    legacy seed at a different head (14-C3 at 0009 while this tree is at 0008) -- the error
+    must name both the requested head and the legacy seed's actual head, not silently use
+    the wrong data."""
+    repo = _make_repo(tmp_path)
+    gate_dir = repo / ".gate"
+    gate_dir.mkdir()
+    (gate_dir / "seed.dump").write_bytes(b"legacy-dump")
+    (gate_dir / "seed.meta").write_text("alembic_head=0009_conversation_summary\n")
+    proc = _resolve_seed_files(repo, "0008_admin_dashboard")
+    assert proc.returncode == 1
+    assert "SEED_ERROR=no gate seed for alembic head 0008_admin_dashboard" in proc.stdout
+    assert "the legacy seed at" in proc.stdout
+    assert "is for head 0009_conversation_summary" in proc.stdout
+    assert "scripts/gate.sh --make-seed" in proc.stdout
+
+
+@needs_tools
+def test_the_per_head_directory_wins_over_a_stale_legacy_seed_for_the_same_head(
+    tmp_path: Path,
+) -> None:
+    """If --make-seed has already written the modern per-head directory for this exact
+    head, it is used even though an old legacy top-level seed for the same head also still
+    exists on disk (--make-seed never deletes the legacy files, it only stops writing them)."""
+    repo = _make_repo(tmp_path)
+    gate_dir = repo / ".gate"
+    gate_dir.mkdir()
+    (gate_dir / "seed.dump").write_bytes(b"legacy-dump")
+    (gate_dir / "seed.meta").write_text("alembic_head=0008_admin_dashboard\n")
+    seed_dir = gate_dir / "seeds" / "0008_admin_dashboard"
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "seed.dump").write_bytes(b"modern-dump")
+    (seed_dir / "seed.meta").write_text("alembic_head=0008_admin_dashboard\n")
+    proc = _resolve_seed_files(repo, "0008_admin_dashboard")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"SEED_FILE={seed_dir}/seed.dump" in proc.stdout
+
+
+@needs_tools
+def test_a_per_head_directory_missing_its_meta_file_falls_through_to_legacy(
+    tmp_path: Path,
+) -> None:
+    """A half-written per-head directory (e.g. an interrupted --make-seed) must not be
+    treated as usable -- both files are required."""
+    repo = _make_repo(tmp_path)
+    seed_dir = repo / ".gate" / "seeds" / "0008_admin_dashboard"
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "seed.dump").write_bytes(b"half-written")
+    # no seed.meta written
+    gate_dir = repo / ".gate"
+    (gate_dir / "seed.dump").write_bytes(b"legacy-dump")
+    (gate_dir / "seed.meta").write_text("alembic_head=0008_admin_dashboard\n")
+    proc = _resolve_seed_files(repo, "0008_admin_dashboard")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"SEED_FILE={gate_dir}/seed.dump" in proc.stdout  # legacy, not the half-written dir
+
+
+@needs_tools
+def test_make_seed_only_ever_names_its_own_heads_directory(tmp_path: Path) -> None:
+    """Static check on the script text (cheap, no Docker): make_seed() must never write to
+    the shared legacy $SEED/$SEED_META constants directly -- only to seed_dir_for_head's own
+    per-head directory -- so running --make-seed on one branch can never clobber another
+    branch's/head's seed."""
+    text = GATE.read_text(encoding="utf-8")
+    make_seed_body = text.split("make_seed() {", 1)[1].split("\n}\n", 1)[0]
+    assert '>"$SEED.tmp"' not in make_seed_body
+    assert '>"$SEED_META"' not in make_seed_body
+    assert "seed_dir_for_head" in make_seed_body
 
 
 # --- global gate lock (T13.14.4, Paralelo-B) --------------------------------------------
