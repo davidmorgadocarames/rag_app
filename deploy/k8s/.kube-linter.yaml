@@ -1,0 +1,22 @@
+# kube-linter config for the `manifests` gate step (T16.1.7) + the CI `kind` job.
+#
+# A REPO-WIDE, dated, self-reported exception (not per-object): nothing under deploy/k8s/**
+# sets `readOnlyRootFilesystem: true` or `runAsNonRoot: true` on every container yet -- not
+# just backend/frontend (16-B's own "known boundaries"), but also the third-party service
+# images (mailpit, prometheus, valkey, seaweedfs, kube-state-metrics) and the `jobs`-image
+# Jobs that do not yet set a read-only root filesystem either. Both checks are excluded
+# PROJECT-WIDE here rather than per object because the real fix is one coordinated pass,
+# not object-by-object: T16.4.2 (block 16-E, Pod Security `restricted` on the app namespace)
+# needs a non-root backend/frontend image first (today's Dockerfiles have no non-root USER),
+# then both checks are re-enabled here in the SAME block. Re-check at 16-E: if any object
+# already complies by then, removing it from `exclude` would still let the others pass
+# object-by-object once their own containers are fixed -- these two lines are the only
+# thing to touch.
+#
+# Every OTHER exception stays a narrow, per-object `ignore-check.kube-linter.io/<check>`
+# annotation (see deploy/k8s/base/ollama/service.yaml's `dangling-service` exception) --
+# this file is deliberately the only project-wide, check-level exclude.
+checks:
+  exclude:
+    - run-as-non-root
+    - no-read-only-root-fs

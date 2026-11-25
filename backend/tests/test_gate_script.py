@@ -306,6 +306,62 @@ def test_only_security_headers_and_zap_baseline_are_unknown_in_a_repo_without_th
     assert "unknown step: not-a-real-step" in proc.stdout + proc.stderr
 
 
+# --- T16.1.7 `manifests` step + T16.1.8 `--k8s` mode ------------------------------------
+
+
+@needs_tools
+def test_manifests_is_a_fast_tier_step(tmp_path: Path) -> None:
+    """T16.1.7: `manifests` needs no stack (kustomize/kubeconform/kube-linter only), so it
+    must run in --fast (and therefore CI's cheap-checks job), not only --full/--only."""
+    proc = _gate(_make_repo(tmp_path), "--list")
+    assert proc.returncode == 0, proc.stdout
+    lines = {
+        line.split()[0]: line.split()[1] for line in proc.stdout.splitlines() if line.split()[:1]
+    }
+    assert lines.get("manifests") == "-", "manifests must be a stack-free (fast-tier) step"
+
+
+@needs_tools
+def test_k8s_steps_are_listed_but_never_part_of_fast_full_or_only(tmp_path: Path) -> None:
+    """T16.1.8: --k8s is its own mode with its own step table -- its steps must never leak
+    into --fast's step set (a repo without a real app has no scripts/gate.sh step functions
+    for rag_app internals, so this also doubles as a cheap, no-stack sanity check)."""
+    repo = _make_repo(tmp_path)
+    listed = _gate(repo, "--list")
+    assert listed.returncode == 0, listed.stdout
+    assert "k8s-chaos" in listed.stdout
+    assert "k8s-autoscale" in listed.stdout
+
+    fast = _gate(repo, "--fast")
+    assert "k8s-chaos" not in fast.stdout
+    assert "k8s-autoscale" not in fast.stdout
+
+
+@needs_tools
+def test_k8s_autoscale_and_policies_skip_with_a_reason_never_a_fake_pass(tmp_path: Path) -> None:
+    """T16.1.8: KEDA (16-D) and Kyverno (16-E) do not exist yet in this codebase -- both
+    steps must report an explicit SKIP naming the deferred block, never PASS."""
+    proc = _gate(_make_repo(tmp_path), "--k8s")
+    assert "k8s-autoscale" in proc.stdout
+    assert "SKIP (deferred to 16-D)" in proc.stdout
+    assert "k8s-policies" in proc.stdout
+    assert "SKIP (deferred to 16-E)" in proc.stdout
+    # SKIP is not a gate failure on its own (no other step should turn this FAIL in a repo
+    # with no real cluster other than via k8s-chaos's own explicit cluster-reachability check).
+    assert "GATE: FAIL" in proc.stdout  # k8s-chaos fails: no real k3d cluster in this test env
+    assert "k8s-chaos" in proc.stdout and "FAIL" in proc.stdout
+
+
+@needs_tools
+def test_k8s_chaos_fails_cleanly_without_a_reachable_cluster(tmp_path: Path) -> None:
+    """No k3d cluster is ever brought up by this test (T16.1.8: --k8s never manages cluster
+    lifecycle itself) -- k8s-chaos must FAIL with an actionable message, never hang or crash.
+    (``--only`` stays scoped to STEP_TABLE; ``--k8s`` is the one mode that runs k8s-chaos.)"""
+    proc = _gate(_make_repo(tmp_path), "--k8s")
+    assert "no k3d cluster reachable" in proc.stdout
+    assert proc.returncode != 0
+
+
 # --- global gate lock (T13.14.4, Paralelo-B) --------------------------------------------
 
 

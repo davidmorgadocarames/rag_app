@@ -31,6 +31,18 @@ are a human/agent checklist.
 
 ## Phase-specific norms
 
+- **Phase 16+ (k8s probes, T16.2.1)** — a Deployment's three probes are never the same path
+  doing the same check: **startup** is generous (covers a slow, cold, CPU-only model load)
+  and may be cheap (backend's own lifespan already blocks Uvicorn from serving at all until
+  the DB check + reranker warm-up succeed, so the startup probe hitting the liveness path is
+  still a real "did startup finish" signal); **readiness** checks the one real dependency
+  (backend: Postgres, via `GET /health/ready`; frontend: the backend, via `GET /api/health`,
+  its own existing BFF proxy) and pulls the pod out of the Service without restarting it on a
+  transient outage; **liveness** is **process only** (`GET /health` backend, `GET
+  /api/health/live` frontend) and must never call out to a dependency — a DB/backend outage
+  must never trigger a restart storm across every replica. Enforced structurally by
+  `backend/tests/test_api.py` (liveness never resolves a DB session; readiness fails closed
+  on a DB error) and the `deploy/k8s/base/*/deployment.yaml` probe wiring itself.
 - **Phase 4+ (evaluation)** — the **eval gate**: retrieval metrics (context recall/precision),
   generation metrics (faithfulness, answer relevance), and **correctness vs ground truth** meet
   their thresholds; results do not regress below `baseline_metrics.json`; the LLM-judge is
@@ -194,7 +206,8 @@ are a human/agent checklist.
 | `--full` | pre-push to `main` (promotion), before a PR is ready | fast + stack steps in the gate project: up → roles → migrate → seed → steps → `down -v`. A missing tool or an unreachable stack **fails** (never skips). A PASS on a clean tree publishes `secrag/gate-full` for the SHA (see above) |
 | `--only a,b` | closing a sub-phase, debugging, CI `cheap-checks` | just the named steps (the gate project is started only if one needs it). A missing tool **fails**, as in `--full` — a step that was asked for never passes without running |
 | `--make-seed` | once, and whenever the corpus (`data/chunks/chunks.jsonl`), the embedding model build (Ollama digest) or the migrations head changes | builds the git-ignored seed `.gate/seed.dump` (documents + chunks, embedded with Ollama) in the gate project; `seed.meta` records corpus hash, `embed_model` digest and `alembic_head`, and `eval` fails on any mismatch |
-| `--list` | — | step names, stack needs and budgets |
+| `--k8s` (T16.1.8) | local-only, after `deploy/k8s/**`/probe/scaling changes, before pushing them | `k8s-chaos`, `k8s-autoscale`, `k8s-policies`, `k8s-restart-check`, `k8s-eval` against an **already-running** k3d cluster (`scripts/k8s/cluster-up.sh`) — this mode never brings one up or tears one down itself. A step whose real prerequisite does not exist yet in this codebase (KEDA/16-D, Kyverno/16-E, no scripted app-image build+push step yet) is an explicit **SKIP with a named reason**, never a fake PASS. A PASS writes `.gate/k8s-pass` (exact SHA) — see "pre-push `--k8s` scoping" below |
+| `--list` | — | step names, stack needs and budgets (plus the separate `--k8s` step table) |
 
 Steps and time budgets (a step that exceeds its budget is killed and fails):
 
@@ -212,12 +225,75 @@ Steps and time budgets (a step that exceeds its budget is killed and fails):
 | `private-names` | - | 30 s | `backup-drill` | gate DB | 300 s |
 | `threat-catalogue` | - | 30 s | `erasure-scale` | gate DB | 600 s |
 | `registry` | - | 60 s | `security-suite` | gate DB | 180 s |
-| | | | `restart-check` | own throwaway projects | 900 s |
+| `manifests` | - | 90 s | `restart-check` | own throwaway projects | 900 s |
 | | | | `latency` | gate DB + seed + Ollama | 900 s |
 | | | | `e2e` | gate DB + seed + Ollama | 600 s |
 | | | | `security-headers` | gate DB | 300 s |
 | | | | `zap-baseline` | gate DB | 600 s |
 | | | | `email-e2e` | gate DB | 180 s |
+
+`--k8s`-only steps (T16.1.8, separate table — never part of `--fast`/`--full`/`--only`'s own count):
+
+| Step | Budget | Step | Budget |
+|---|---|---|---|
+| `k8s-chaos` | 300 s | `k8s-restart-check` | 10 s (SKIP today) |
+| `k8s-autoscale` | 10 s (SKIP today) | `k8s-eval` | 10 s (SKIP today) |
+| `k8s-policies` | 10 s (SKIP today) | | |
+
+`manifests` (T16.1.7, fast tier + CI's `cheap-checks` job): `kustomize build` of both overlays
+(`--load-restrictor LoadRestrictionsNone` — the roles Job's `configMapGenerator` reads
+`db/roles.sql` from outside `deploy/k8s/**` by design, DEC-051) + `kubeconform -strict
+-ignore-missing-schemas` + `kube-linter lint --config deploy/k8s/.kube-linter.yaml` (every
+finding fails except the two project-wide, dated exceptions that file documents — no image
+under `deploy/k8s/**` sets a non-root user or a read-only root filesystem yet, T16.4.2/16-E
+fixes both together) + the T16.1.2 "aks overlay carries no dev-only flag" assertion.
+Delegates to `scripts/k8s/smoke-16-1.sh` so a developer's shell and the gate see the
+identical result. CI's own `k8s-manifests-kind` job (not part of `cheap-checks`, not one of
+the 5 required status checks) goes further on a free GitHub-hosted runner: a real `kind`
+cluster, Kyverno installed (pinned chart), this repo's own image-signature `ClusterPolicy`
+(`deploy/k8s/policies/verify-image-signatures.yaml`, Audit mode, P16-D1/TF33) applied for
+real, and the local overlay rendered with the backend/frontend images substituted for a
+tiny always-pullable stub (`registry.k8s.io/pause`, probes/Secret references stripped for
+that substitution only) — proving the manifest SHAPE survives a real API server (a schema-
+valid, lint-clean manifest can still be rejected by real admission: wrong selector, a
+cross-reference to a Secret/ConfigMap key that does not exist) without needing CNPG/Sealed
+Secrets/Envoy Gateway or the real, torch-heavy application images (those stay `--k8s`'s own
+job, locally). The job's last step proves Kyverno is actually evaluating admission by
+creating a throwaway pod whose image matches the policy's own pattern: Audit mode admits it
+(never blocks) but both the admission response (`Warning:` naming the policy) and a real
+`PolicyReport` (`FAIL` count ≥ 1) must show it was evaluated — self-reported finding from
+building this: Kyverno 3.10.0/v1.20 removed admission of the legacy `kyverno.io/v1
+ClusterPolicy` type entirely (pinned to 3.9.2 instead; the CEL-based
+`policies.kyverno.io/ImageValidatingPolicy` replacement is real future work for 16-E, out of
+this row's scope), and `validationFailureAction: Audit` itself requires `mutateDigest:
+false` on the `verifyImages` rule or Kyverno's own policy-validating webhook rejects the
+policy before it is ever active.
+
+`--k8s` steps (T16.1.8): `k8s-chaos` is the one implemented check today — applies the local
+overlay via `scripts/k8s/deploy-local.sh` with short per-stage timeouts (`APPLY_FOUNDATION`,
+which includes Valkey, happens before CNPG/roles/migrate, so it is already applied by the
+time `deploy-local.sh` fail-closes on the still-placeholder jobs/backend/frontend images —
+expected, any OTHER exit code before `APPLY_FOUNDATION` is a real failure), then kills the
+Valkey pod and proves Kubernetes recreates it and the Service's Endpoints come back, without
+relying on KEDA/Kyverno/real app images. `k8s-autoscale` (KEDA `ScaledObject`s, TF37) and
+`k8s-policies` (Kyverno `ClusterPolicy`s, P16-D1) are an explicit, named SKIP until blocks
+16-D/16-E install their respective controller; `k8s-restart-check`/`k8s-eval` are an
+explicit, named SKIP today because no scripted backend/frontend/jobs image build+push step
+exists yet (self-reported boundary, 16-B-fix) — there is no real backend to exercise them
+against in-cluster. None of these ever manage the k3d cluster's own lifecycle (bring-up/
+tear-down stays the operator's explicit, separate step, for RAM reasons when a concurrent
+block's `--full` needs the same Docker Desktop budget).
+
+**Pre-push `--k8s` scoping (T16.1.8).** `.githooks/pre-push` additionally requires a
+*recorded* `scripts/gate.sh --k8s` PASS (`.gate/k8s-pass`, exact pushed SHA, same evidence
+shape as the `--full`/`secrag/gate-full` promotion evidence) whenever the pushed **diff**
+touches `deploy/k8s/**`, a probe implementation (`backend/src/rag_app/api/app.py`,
+`frontend/app/api/health/**`) or a scaling path (`backend/src/rag_app/rate_limit.py`) — never
+by branch name, so a push on an unrelated branch that happens to touch none of these paths is
+never blocked by this (the exact lesson from an earlier cross-branch scoping mistake with
+gitleaks). This never runs k3d inside the pre-push worktree itself (RAM/lock reasons above);
+it only checks the marker exists and names the exact SHA, failing the push with the command
+to run otherwise.
 
 `latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
 questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +

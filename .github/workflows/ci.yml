@@ -263,6 +263,126 @@ jobs:
           docker image inspect secrag-ollama:ci --format "{{.Size}} bytes"
           df -h /
 
+  # T16.1.7 (P16-D4): a real `kind` cluster on a free GitHub-hosted runner -- catches a
+  # regression kubeconform/kube-linter (the `manifests` gate step, cheap-checks below)
+  # cannot: a manifest that is schema-valid and lint-clean but a REAL API server still
+  # rejects (wrong label selector, a missing CRD, a cross-reference to a Secret/ConfigMap
+  # key that does not exist). Deliberately does NOT build or pull the real torch-heavy
+  # backend/frontend images (that stays local, scripts/gate.sh --k8s, 16-D/16-F) -- this job
+  # renders the REAL local overlay then substitutes a tiny, always-pullable stub image
+  # (registry.k8s.io/pause) for backend/frontend and drops the two app Secret
+  # references, so it never needs CNPG/Sealed Secrets/Envoy Gateway controllers either
+  # (those stay the real --k8s mode's job). Kyverno is installed and this repo's own
+  # (Audit-mode, T16.1.7) image-signature policy is applied and exercised for real.
+  k8s-manifests-kind:
+    name: k8s manifests (kind cluster, Kyverno Audit, stub images)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: kind + kubectl (pinned, checksum-verified; kubectl pin matches scripts/k8s/install-tools.sh)
+        env:
+          KIND_VERSION: "0.30.0"
+          KIND_SHA256: "517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889"
+          KUBECTL_VERSION: "1.37.2"
+          KUBECTL_SHA256: "c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4"
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors -o kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/v$KIND_VERSION/kind-linux-amd64"
+          echo "$KIND_SHA256  kind" | sha256sum -c -
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          curl -fsSL --retry 5 --retry-all-errors -o kubectl \
+            "https://dl.k8s.io/release/v$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+          echo "$KUBECTL_SHA256  kubectl" | sha256sum -c -
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          kind version
+          kubectl version --client
+      - name: kustomize (pinned, same as scripts/k8s/install-tools.sh)
+        env:
+          KUSTOMIZE_VERSION: "5.8.3"
+          KUSTOMIZE_SHA256: "cb9e31198d3f63b44848bd0afc4c8efc56e6cfef9c93a4a39a211940e6decd61"
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors -o kustomize.tar.gz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv$KUSTOMIZE_VERSION/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          echo "$KUSTOMIZE_SHA256  kustomize.tar.gz" | sha256sum -c -
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/kustomize
+      - name: kind cluster
+        run: kind create cluster --name secrag-ci --wait 120s
+      # Pinned to 3.9.2 (app v1.19.2), NOT the newer 3.10.0/v1.20.0: v1.20 removed admission
+      # (create/update) of the legacy kyverno.io/v1 ClusterPolicy type entirely -- confirmed
+      # locally (`helm install ... --version 3.10.0` then `kubectl apply` on this policy: the
+      # validating webhook itself rejects the create with "Kyverno v1.20 removed execution of
+      # legacy kyverno.io policy types"). The CEL-based policies.kyverno.io/ImageValidatingPolicy
+      # replacement is real future work (T16.4.4, block 16-E) -- out of this row's scope.
+      - name: Install Kyverno (pinned chart, legacy ClusterPolicy still supported)
+        run: |
+          helm repo add kyverno https://kyverno.github.io/kyverno/ --force-update
+          helm install kyverno kyverno/kyverno -n kyverno --create-namespace \
+            --version 3.9.2 --wait --timeout 180s
+      - name: Apply the signature policy (Audit mode, T16.1.7 -- real apply, proves the CRD/syntax)
+        run: kubectl apply -f deploy/k8s/policies/verify-image-signatures.yaml
+      - name: Render the local overlay with stub images (never the real backend/frontend build)
+        run: |
+          pip install --quiet --no-input pyyaml
+          kustomize build --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/local \
+            > /tmp/rendered.yaml
+          python3 - <<'PY'
+          import yaml
+          docs = [d for d in yaml.safe_load_all(open("/tmp/rendered.yaml")) if d]
+          keep = {"Namespace", "Deployment", "Service", "ConfigMap"}
+          out = []
+          for d in docs:
+              if d.get("kind") not in keep:
+                  continue
+              if d.get("kind") == "Deployment" and d["metadata"]["name"] in ("backend", "frontend"):
+                  spec = d["spec"]["template"]["spec"]
+                  for c in spec["containers"]:
+                      c["image"] = "registry.k8s.io/pause:3.10"
+                      c.pop("command", None)
+                      c.pop("envFrom", None)
+                      c["env"] = [e for e in c.get("env", []) if "valueFrom" not in e]
+                      # pause serves no HTTP at all (T16.2.1's real probes are unit-tested
+                      # on their own, backend/tests/test_api.py) -- drop them here only so
+                      # this stub smoke can prove the Deployment/Service/ConfigMap SHAPE
+                      # survives a real API server, never a claim that the probes ran.
+                      for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
+                          c.pop(probe, None)
+              out.append(d)
+          with open("/tmp/stub.yaml", "w") as f:
+              yaml.safe_dump_all(out, f)
+          PY
+      - name: Apply the stub manifests and check they come up for real (basic smoke)
+        run: |
+          kubectl apply -f /tmp/stub.yaml
+          kubectl -n secrag wait --for=condition=Available deployment/backend --timeout=120s
+          kubectl -n secrag wait --for=condition=Available deployment/frontend --timeout=120s
+          kubectl -n secrag get pods
+      # A pod whose image matches the policy's own imageReferences pattern but is not
+      # actually signed (no real ghcr.io/davidmorgadocarames/rag_app-* image is published
+      # before 15-P, so this one does not even exist) proves the policy is live WITHOUT
+      # proving it blocks anything -- Audit mode means exactly that: admitted with a
+      # warning, never rejected (verified locally first, kind + the same chart version:
+      # the pod IS created, `kubectl run`'s own exit code is 0, but the API response carries
+      # a `Warning:` line naming this policy, and Kyverno writes a real PolicyReport with
+      # FAIL=1 for it). A self-reported note for 16-E's real-Enforce rollout: confirm a
+      # VALIDLY signed image is still admitted once 15-P ships one, before flipping Enforce
+      # (see docs/adr/adr_phase16_kubernetes.md).
+      - name: Kyverno is actually evaluating admission (Audit warns, never blocks)
+        run: |
+          out="$(kubectl run signature-probe -n secrag \
+            --image=ghcr.io/davidmorgadocarames/rag_app-backend:test 2>&1)"
+          echo "$out"
+          echo "$out" | grep -q "verify-secrag-image-signatures" \
+            || { echo "::error::the policy never evaluated the matching image reference at all"; exit 1; }
+          for _ in $(seq 1 15); do
+            kubectl get polr -A --no-headers 2>/dev/null | grep -q secrag && break
+            sleep 2
+          done
+          kubectl get polr -A
+          # Columns: NAMESPACE NAME KIND NAME PASS FAIL WARN ERROR SKIP AGE -- FAIL is $6.
+          kubectl get polr -A --no-headers | awk '$6 != 0 { found=1 } END { exit !found }' \
+            || { echo "::error::no PolicyReport recorded a FAIL for the probe pod"; exit 1; }
+
   gitleaks:
     name: Secret scan
     runs-on: ubuntu-latest

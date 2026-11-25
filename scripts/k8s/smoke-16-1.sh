@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Static manifest tests for block 16-B (T16.1.1-T16.1.6). No cluster needed: kustomize build of
-# both overlays, kubeconform + kube-linter on each, and the T16.1.2 "aks has no dev-only flag"
+# Static manifest tests for Phase 16 (T16.1.1-T16.1.7). No cluster needed: kustomize build of
+# both overlays, kubeconform + kube-linter on each (kube-linter is now ENFORCED, T16.1.7 --
+# this is the gate's own `manifests` step, scripts/gate.sh step_manifests, so a developer's
+# shell and the gate see the identical result), and the T16.1.2 "aks has no dev-only flag"
 # Done-when. The real in-cluster smoke (local overlay actually comes up) is
 # scripts/k8s/smoke-16-1-cluster.sh, run separately against a live k3d cluster.
 #
@@ -9,7 +11,13 @@
 # --load-restrictor LoadRestrictionsNone is required: deploy/k8s/base/jobs's roles-scripts
 # configMapGenerator reads db/roles.sql + scripts/db/apply_roles.sh + scripts/db/scram_verifier.pl
 # from outside deploy/k8s/** BY DESIGN (DEC-051 -- the roles Job must package the repo's one real
-# roles.sql, never a duplicate). 16-C's future "manifests" gate step needs the same flag.
+# roles.sql, never a duplicate).
+#
+# kube-linter runs with deploy/k8s/.kube-linter.yaml (T16.1.7): a project-wide, dated exception
+# for the two checks (run-as-non-root, no-read-only-root-fs) that T16.4.2 (block 16-E, Pod
+# Security `restricted`) fixes together -- see that file's own header for the full rationale.
+# Every other finding is a real failure, including on a check this file does not yet know
+# about (a future kube-linter default-check addition shows up here, not silently).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,11 +55,13 @@ for overlay in local aks; do
     bad "kubeconform-$overlay" "$(cat "$tmp/$overlay.kubeconform")"
   fi
 
-  # kube-linter: informational for this block (the enforcing gate step is 16-C's); never fails
-  # this script, but the count is printed so a regression is visible.
-  lint_out="$(kube-linter lint "$out" 2>&1 || true)"
-  lint_n="$(grep -c '^.*: (object:' <<<"$lint_out" || true)"
-  echo "INFO kube-linter-$overlay: $lint_n finding(s) (see block report for the known/deferred list)"
+  # kube-linter: ENFORCED (T16.1.7) with the project's own config (exceptions documented in
+  # deploy/k8s/.kube-linter.yaml and, per-object, deploy/k8s/base/ollama/service.yaml).
+  if kube-linter lint --config "$REPO_ROOT/deploy/k8s/.kube-linter.yaml" "$out" >"$tmp/$overlay.kubelinter" 2>&1; then
+    ok "kube-linter-$overlay (0 findings)"
+  else
+    bad "kube-linter-$overlay" "$(cat "$tmp/$overlay.kubelinter")"
+  fi
 done
 
 # T16.1.2 Done-when: the aks overlay carries no dev-only flag.

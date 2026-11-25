@@ -44,6 +44,9 @@ pytestmark = pytest.mark.security
 PUBLIC_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
+        # T16.2.1: the k8s readiness probe hits this unauthenticated, same reasoning as
+        # /health itself -- a probe never carries a session.
+        ("GET", "/health/ready"),
         # T13.13.2 (DEBT-061): the wake ping -- unauthenticated by design (same reasoning as
         # /csp-report below: it must work before any session exists, from /login itself),
         # rate-limited through its own tight bucket (DEC-050, T13.J4-fix:

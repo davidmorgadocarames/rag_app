@@ -327,3 +327,110 @@ legitimately fail-closed (exit 6) on every real local run until that scripted bu
 above exists and produces a real `jobs` image — this is the CORRECT behaviour (refuse the
 backend rollout, not "usually" refuse), not a bug to silence; `smoke-16-1-cluster.sh`'s own
 comment header says so.
+
+### 16-C — `manifests` gate step, CI `kind` job, `--k8s` mode, probes (T16.1.7, T16.1.8, T16.2.1)
+
+**`manifests` gate step (T16.1.7).** Promotes `scripts/k8s/smoke-16-1.sh` (16-B's own static
+manifest smoke) from informational to the project's real gate step: `kustomize build` of both
+overlays + `kubeconform -strict -ignore-missing-schemas` + `kube-linter lint` + the T16.1.2
+"aks carries no dev-only flag" assertion. Stack-free (fast tier, also CI's `cheap-checks`
+job). kube-linter is now **enforced** (was informational in 16-B): two project-wide, dated
+exceptions in the new `deploy/k8s/.kube-linter.yaml` (`run-as-non-root`, `no-read-only-root-fs`
+— no image under `deploy/k8s/**` sets either yet, not just backend/frontend as 16-B's own
+"known boundaries" said, but every third-party service image and the `jobs`-image Jobs too;
+T16.4.2/16-E fixes both together, re-enable here in the same block), plus one narrow,
+per-object `ignore-check.kube-linter.io/dangling-service` annotation on `ollama-host`
+(selector-less by design, T16.0.4 — the one and only `dangling-service` finding this project
+ever expects). Two real `job-ttl-seconds-after-finished` findings fixed for real (not
+excepted): `purge-cronjob.yaml`/`audit-retention-cronjob.yaml` no longer set
+`ttlSecondsAfterFinished` at the Job-template level — a CronJob-owned Job's cleanup is the
+CronJob's own `successfulJobsHistoryLimit`/`failedJobsHistoryLimit`, never a per-Job TTL that
+can disagree with it. Result: 0 kube-linter findings on both overlays (down from 21, measured
+before this row's fixes).
+
+**CI `kind` job (T16.1.7, P16-D4).** `.github/workflows/ci.yml`'s `k8s-manifests-kind` — a
+real `kind` cluster on a free GitHub-hosted runner, never the real torch-heavy
+backend/frontend images (those stay local, `--k8s` mode). Renders the REAL local overlay,
+then filters it to the kinds a vanilla kind cluster understands without installing
+Envoy Gateway/Sealed Secrets/CNPG (`Namespace`/`Deployment`/`Service`/`ConfigMap` only —
+`SealedSecret`/`Cluster`/`Gateway`/`HTTPRoute`/Jobs/CronJobs stay `--k8s`'s own job, which
+installs the real controllers) and substitutes a tiny, always-pullable stub image
+(`registry.k8s.io/pause`) for backend/frontend, stripping their Secret references and probes
+(the real probes are unit-tested on their own, T16.2.1 below — this stub run proves the
+Deployment/Service/ConfigMap SHAPE survives a real API server, not that the probes ran).
+Installs Kyverno (pinned chart) and applies this repo's own image-signature `ClusterPolicy`
+(`deploy/k8s/policies/verify-image-signatures.yaml`, Audit mode, P16-D1/TF33 — "our images
+only": `imageReferences` scoped to `ghcr.io/davidmorgadocarames/rag_app-*`, third-party images
+stay digest-pinned instead). Not yet wired into `deploy/k8s/base`'s own kustomization —
+Kyverno itself is not installed locally until 16-E (T16.4.4); applied ad-hoc by this CI job
+for now, 16-E folds it in and flips `Audit` to `Enforce`.
+
+**Two real Kyverno findings, both self-reported and fixed (verified locally first, kind +
+the exact pinned chart, before ever touching CI):**
+1. Kyverno chart **3.10.0** (app v1.20.0) **removed admission (create/update) of the legacy
+   `kyverno.io/v1 ClusterPolicy` type entirely** — applying this exact policy against a fresh
+   3.10.0 install is rejected outright by Kyverno's own validating webhook ("Kyverno v1.20
+   removed execution of legacy kyverno.io policy types"). Pinned to **3.9.2** (app v1.19.2)
+   instead, which still accepts it. The CEL-based `policies.kyverno.io/ImageValidatingPolicy`
+   replacement is real, out-of-scope-for-this-row future work for 16-E to pick up when it
+   builds the real Enforce policy.
+2. `validationFailureAction: Audit` on a `verifyImages` rule **requires `mutateDigest: false`
+   explicitly** — the default (`true`) makes Kyverno's own policy-validating webhook reject the
+   policy itself ("mutateDigest must be set to false for 'Audit' failure action"), before it
+   is ever active. Fixed in the policy file, with the finding recorded in its own comment.
+
+**What Audit mode actually does, confirmed locally (not assumed):** a throwaway pod whose
+image matches the policy's pattern but is not signed (and does not even exist — no real
+`ghcr.io/davidmorgadocarames/rag_app-*` image is published before 15-P) is **admitted**
+(`kubectl run`'s own exit code is 0) with a `Warning:` in the API response naming the policy,
+and Kyverno writes a real `PolicyReport` with `FAIL >= 1` for it — this is the CI job's own
+"Kyverno is actually evaluating admission" proof, not a `PolicyReport` existing unconditionally
+(confirmed empty when no pod in the cluster matches the policy's `imageReferences` at all).
+**Self-reported note for 16-E's real Enforce rollout:** confirm a VALIDLY signed image is
+still admitted once 15-P ships one, before flipping `Enforce` — an untested assumption until
+then.
+
+**`--k8s` mode (T16.1.8).** A new, separate `gate.sh` mode and step table
+(`k8s-chaos`/`k8s-autoscale`/`k8s-policies`/`k8s-restart-check`/`k8s-eval`), never mixed into
+`--fast`/`--full`/`--only`'s own step count, and never managing the k3d cluster's own
+lifecycle (bring-up/tear-down stays the operator's explicit, separate step — RAM, when a
+concurrent block's `--full` needs the same Docker Desktop budget). Only `k8s-chaos` is
+implemented today: applies the local overlay via `deploy-local.sh` with short per-stage
+timeouts (`APPLY_FOUNDATION`, including Valkey, happens before CNPG/roles/migrate, so it is
+already applied by the time `deploy-local.sh` fail-closes on the still-placeholder
+jobs/backend/frontend images), then kills the Valkey pod and proves the Deployment recreates
+it and the Service's Endpoints come back. The other four are an **explicit, named SKIP**
+(never a fake PASS): `k8s-autoscale` (KEDA `ScaledObject`s, TF37, block 16-D),
+`k8s-policies` (Kyverno `ClusterPolicy`s, P16-D1, block 16-E), `k8s-restart-check`/`k8s-eval`
+(no scripted backend/frontend/jobs image build+push step exists yet — the same self-reported
+boundary 16-B-fix recorded; there is no real backend to exercise in-cluster yet). **Planning
+gap noticed, not fixed here:** the task rows for Resources/Rollouts/Chaos drills (16.2.2–
+16.2.4) do not appear to have an owning block in the current private block split — flagged
+for the orchestrator, not resolved by this senior agent (no private planning-file edits in
+this block's scope).
+
+**Pre-push `--k8s` scoping (T16.1.8).** `.githooks/pre-push` requires a recorded
+`gate.sh --k8s` PASS (`.gate/k8s-pass`, exact SHA — gate.sh writes it only on a real `--k8s`
+PASS) when the pushed **diff** touches `deploy/k8s/**`, a probe implementation
+(`backend/src/rag_app/api/app.py`, `frontend/app/api/health/**`) or a scaling path
+(`backend/src/rag_app/rate_limit.py`) — scoped by the diff, never the branch name (the exact
+lesson from an earlier gitleaks cross-branch scoping mistake, so a push on an unrelated branch
+is never blocked by this). Never runs k3d inside the pre-push worktree itself.
+
+**Probes (T16.2.1).** The three k8s probes stop sharing one endpoint. Backend: new
+`GET /health/ready` (checks Postgres via the existing `SessionDep`, 503 on failure) is
+readiness; the existing `GET /health` (already named "Liveness endpoint" in
+`rag_app.features.REGISTRY` since 11a) stays liveness, unchanged behaviour — every existing
+caller (`restart_check.sh`, `erasure_scale.py`, `negative_control.py`, the frontend's
+`/api/health` proxy) keeps working exactly as before. Startup stays on `/health` too: the
+backend's own `lifespan` already blocks Uvicorn from serving ANY request, including this
+probe, until the DB check + reranker warm-up both succeed, so hitting the cheap liveness path
+for startup is still a real "did startup finish" signal, not a weaker one — `failureThreshold`
+raised 30→60 (150s→300s) for a slower, real (not placeholder) image's cold model load.
+Frontend: the existing `GET /api/health` (already a real dependency check — it proxies the
+backend's own `/health`, used by Azure's CD health check) becomes the readiness/startup
+target unchanged; new `GET /api/health/live` (static `{"status":"ok"}`, no backend call) is
+liveness — a transient backend outage must never restart the frontend container.
+`backend/tests/test_api.py` proves both ends structurally: liveness never resolves a DB
+session even when the override is set up to crash if it tried; readiness fails closed (503)
+on a DB error, never a bare 500.

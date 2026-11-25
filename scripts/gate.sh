@@ -12,6 +12,13 @@
 #   scripts/gate.sh --make-seed       (re)build the gate seed dump from data/chunks with
 #                                     Ollama embeddings (corpus, embedding model or
 #                                     migrations changed)
+#   scripts/gate.sh --k8s             (T16.1.8) k8s-chaos/k8s-autoscale/k8s-policies/
+#                                     k8s-restart-check/k8s-eval against an ALREADY-RUNNING
+#                                     k3d cluster (scripts/k8s/cluster-up.sh) -- never brings
+#                                     one up or tears one down itself. A step whose real
+#                                     prerequisite does not exist yet (KEDA/16-D, Kyverno
+#                                     /16-E, no scripted app-image build+push yet) is an
+#                                     explicit SKIP with a reason, never a fake PASS.
 #   scripts/gate.sh --list            step names, modes and time budgets
 #
 # Gate log (C8c, T11c.E1): every real run's full output is also written to a file under
@@ -45,6 +52,10 @@ VENV="${GATE_VENV:-$MAIN_VENV}"   # final choice: resolve_venv
 PY="$VENV/bin/python"
 GATE_STATE="$MAIN_ROOT/.gate"
 ROLES_ENV="$GATE_STATE/roles.env"   # local role passwords (git-ignored, 0600; T11.0.13)
+# T16.1.8: the pre-push hook's own record of the last `--k8s` PASS (exact SHA, like the
+# `secrag/gate-full` promotion-evidence pattern) -- git-ignored, same directory as every
+# other gate-local state file above.
+K8S_PASS_MARKER="$GATE_STATE/k8s-pass"
 SEED="$GATE_STATE/seed.dump"
 SEED_META="$GATE_STATE/seed.meta"
 CHUNKS="$MAIN_ROOT/data/chunks/chunks.jsonl"
@@ -104,6 +115,7 @@ adr-links        - 30
 private-names    - 30
 threat-catalogue - 30
 registry         - 60
+manifests        - 90
 frontend         - 600
 dependency-audit - 240
 db-tests         db 300
@@ -126,6 +138,22 @@ step_names() { awk 'NF==3 {print $1}' <<<"$STEP_TABLE"; }
 step_field() { awk -v n="$1" -v f="$2" 'NF==3 && $1==n {print $f}' <<<"$STEP_TABLE"; }
 is_step() { [ -n "$(step_field "$1" 1)" ]; }
 
+# T16.1.8: `--k8s` mode steps. A SEPARATE table from STEP_TABLE above -- these need an
+# ALREADY-RUNNING k3d cluster (scripts/k8s/cluster-up.sh), never the compose gate stack, and
+# never bring one up or tear one down themselves (RAM: a concurrent --full elsewhere needs the
+# same Docker Desktop budget -- cluster lifecycle stays the operator's own, explicit step).
+# Never mixed into --fast/--full/--only's own counts.
+K8S_STEP_TABLE="
+k8s-chaos         300
+k8s-autoscale      10
+k8s-policies       10
+k8s-restart-check  10
+k8s-eval           10
+"
+k8s_step_names() { awk 'NF==2 {print $1}' <<<"$K8S_STEP_TABLE"; }
+k8s_step_budget() { awk -v n="$1" 'NF==2 && $1==n {print $2}' <<<"$K8S_STEP_TABLE"; }
+is_k8s_step() { [ -n "$(k8s_step_budget "$1")" ]; }
+
 compose() { docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" "$@"; }
 
 # Exported to every step (each runs in its own process).
@@ -145,6 +173,16 @@ missing_tool() {
   return 3
 }
 need_venv() { [ -x "$PY" ] || { echo "  FAIL: backend venv missing at $VENV"; return 1; }; }
+
+# deferred_to <block> <reason>: an EXPLICIT, PLANNED skip for a --k8s step whose real
+# prerequisite genuinely does not exist yet in THIS codebase (never a missing-tool situation
+# -- that is missing_tool above, which FAILs outside --fast). T16.1.8: "steps whose
+# prerequisites arrive in 16-D/16-E are explicit SKIP with a reason, not fake PASS" -- this is
+# that explicit reason, always visible in the gate's own output, never silently swallowed.
+deferred_to() {
+  echo "  SKIP (deferred to $1): $2"
+  return 3
+}
 
 # Every tracked shell script: *.sh, .githooks/*, and any file with a sh/bash shebang.
 tracked_scripts() {
@@ -278,6 +316,97 @@ step_threat-catalogue() { need_venv && "$PY" -m rag_app.devtools.threat_catalogu
 # DB happens to be reachable (the gate's own DATABASE_URL -- a stopped port in --fast, the
 # real gate DB once --full/--only has brought the stack up).
 step_registry() { need_venv && "$PY" -m rag_app.devtools.registry_check --root "$REPO_ROOT"; }
+
+# T16.1.7: kustomize build both overlays + kubeconform + kube-linter (deploy/k8s/.kube-linter.yaml
+# -- the project-wide exceptions, see that file's own header) + the T16.1.2 "aks has no dev-only
+# flag" assertion. No cluster needed (fast tier + CI's cheap-checks job). Delegates to
+# scripts/k8s/smoke-16-1.sh so the same check runs identically from a developer's shell.
+step_manifests() {
+  command -v kustomize >/dev/null \
+    || { missing_tool "kustomize (scripts/k8s/install-tools.sh kustomize)"; return; }
+  command -v kubeconform >/dev/null \
+    || { missing_tool "kubeconform (scripts/k8s/install-tools.sh kubeconform)"; return; }
+  command -v kube-linter >/dev/null \
+    || { missing_tool "kube-linter (scripts/k8s/install-tools.sh kube-linter)"; return; }
+  bash "$REPO_ROOT/scripts/k8s/smoke-16-1.sh"
+}
+
+# --- --k8s mode steps (T16.1.8) ----------------------------------------------------------
+# All of them assume an ALREADY-RUNNING k3d cluster (scripts/k8s/cluster-up.sh) and never
+# manage its lifecycle themselves.
+K8S_NS=secrag
+
+k8s_cluster_reachable() { kubectl get namespace >/dev/null 2>&1; }
+
+# k8s-chaos: the one real check here (what T16.2.4's chaos drills will later generalise,
+# PHASE_TASKS 16.2). Deploys the local overlay in the project's own enforced order
+# (scripts/k8s/deploy-local.sh, DA-16-B-1) with short stage timeouts -- APPLY_FOUNDATION
+# (Valkey, same category as every other in-cluster service) happens before CNPG/roles/
+# migrate, so it is already applied by the time deploy-local.sh fail-closes on the still-
+# placeholder jobs/backend/frontend images (expected, X1 convention; any OTHER exit code
+# before APPLY_FOUNDATION -- no cluster, controllers not ready -- is a real failure). Then
+# kills the Valkey pod and proves Kubernetes recreates it and the Service's Endpoints come
+# back, without relying on KEDA/Kyverno/real app images (none of which exist yet).
+step_k8s-chaos() {
+  command -v kubectl >/dev/null || { missing_tool "kubectl (scripts/k8s/install-tools.sh kubectl)"; return; }
+  k8s_cluster_reachable || { echo "  FAIL: no k3d cluster reachable -- run scripts/k8s/cluster-up.sh first"; return 1; }
+
+  echo "  applying the local overlay (deploy-local.sh, short stage timeouts)"
+  local deploy_rc=0
+  CONTROLLER_TIMEOUT=60s CNPG_TIMEOUT=20s ROLES_TIMEOUT=20s MIGRATE_TIMEOUT=20s ROLLOUT_TIMEOUT=20s \
+    "$REPO_ROOT/scripts/k8s/deploy-local.sh" || deploy_rc=$?
+  case "$deploy_rc" in
+    0 | 4 | 5 | 6 | 7)
+      echo "  deploy-local.sh exit $deploy_rc (APPLY_FOUNDATION reached -- see that script's own exit codes)" ;;
+    *)
+      echo "  FAIL: deploy-local.sh exited $deploy_rc before APPLY_FOUNDATION (no cluster / controllers not ready)"
+      return 1 ;;
+  esac
+
+  echo "  waiting for the Valkey Deployment to be Available"
+  kubectl -n "$K8S_NS" wait --for=condition=Available deployment/valkey --timeout=60s \
+    || { echo "  FAIL: valkey Deployment never became Available"; return 1; }
+
+  local old_uid new_uid elapsed=0
+  old_uid="$(kubectl -n "$K8S_NS" get pod -l app.kubernetes.io/name=valkey -o jsonpath='{.items[0].metadata.uid}')"
+  [ -n "$old_uid" ] || { echo "  FAIL: no valkey pod found before the kill"; return 1; }
+  echo "  killing the valkey pod (uid $old_uid)"
+  kubectl -n "$K8S_NS" delete pod -l app.kubernetes.io/name=valkey --wait=false >/dev/null
+
+  while [ "$elapsed" -lt 90 ]; do
+    new_uid="$(kubectl -n "$K8S_NS" get pod -l app.kubernetes.io/name=valkey -o jsonpath='{.items[0].metadata.uid}' 2>/dev/null || true)"
+    if [ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ] \
+      && [ "$(kubectl -n "$K8S_NS" get pod -l app.kubernetes.io/name=valkey -o jsonpath='{.items[0].status.phase}' 2>/dev/null)" = Running ]; then
+      break
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  [ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ] \
+    || { echo "  FAIL: no new valkey pod reached Running within 90s"; return 1; }
+  echo "  new valkey pod Running (uid $new_uid) after ${elapsed}s"
+
+  kubectl -n "$K8S_NS" wait --for=condition=Available deployment/valkey --timeout=60s \
+    || { echo "  FAIL: valkey Deployment did not return to Available after the kill"; return 1; }
+  local ep
+  ep="$(kubectl -n "$K8S_NS" get endpoints valkey -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)"
+  [ -n "$ep" ] || { echo "  FAIL: valkey Service has no ready endpoint after recovery"; return 1; }
+  echo "  valkey Service endpoint ready again ($ep) -- pod-kill recovery proven"
+}
+
+# T16.3's KEDA ScaledObjects (TF37) do not exist until block 16-D.
+step_k8s-autoscale() { deferred_to "16-D" "KEDA ScaledObjects not installed yet (TF37, T16.3.1)"; }
+
+# T16.4's Kyverno ClusterPolicies (P16-D1) do not exist until block 16-E.
+step_k8s-policies() { deferred_to "16-E" "Kyverno ClusterPolicies not installed yet (P16-D1, T16.4.4)"; }
+
+# No scripted backend/frontend/jobs image build+push step exists yet (self-reported boundary,
+# 16-B-fix) -- the images stay :placeholder (ErrImagePull), so there is no real backend to
+# exercise restart_check's register/verify/login/message flow against in-cluster.
+step_k8s-restart-check() { deferred_to "16-D/16-F" "no scripted backend/frontend/jobs image build+push step exists yet (16-B-fix self-reported boundary) -- restart_check needs a real running backend"; }
+
+# Same boundary as k8s-restart-check, plus eval also needs Ollama reachable from the cluster.
+step_k8s-eval() { deferred_to "16-D/16-F" "no scripted backend image build+push step exists yet -- eval needs a real running backend + Ollama reachable from the cluster"; }
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
@@ -1202,6 +1331,25 @@ fail=0
 
 run_step() {
   local name="$1" budget t0 rc status
+  if is_k8s_step "$name"; then
+    budget="$(k8s_step_budget "$name")"
+    echo ""
+    echo "== $name (budget ${budget}s) =="
+    t0=$SECONDS
+    timeout -k 10 "$budget" bash "$SELF" --run-step "$name"
+    rc=$?
+    local elapsed=$((SECONDS - t0))
+    case "$rc" in
+      0) status=PASS ;;
+      3) status=SKIP ;;
+      124 | 137) status=FAIL; echo "  FAIL: exceeded the ${budget}s budget" ;;
+      *) status=FAIL ;;
+    esac
+    [ "$status" = FAIL ] && fail=1
+    echo "  $status (${elapsed}s)"
+    RESULTS+=("$(printf '%-20s %-5s %5ss / %ss' "$name" "$status" "$elapsed" "$budget")")
+    return
+  fi
   budget="$(step_field "$name" 3)"
   echo ""
   echo "== $name (budget ${budget}s) =="
@@ -1230,7 +1378,7 @@ run_step() {
   RESULTS+=("$(printf '%-20s %-5s %5ss / %ss' "$name" "$status" "$elapsed" "$budget")")
 }
 
-usage() { sed -n '2,32p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,39p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local mode=fast only="" arg
@@ -1244,9 +1392,13 @@ main() {
       --only) shift; mode=only; only="$only,${1:-}" ;;
       --only=*) mode=only; only="$only,${arg#--only=}" ;;
       --make-seed) mode=seed ;;
+      --k8s) mode=k8s ;;
       --list)
         echo "step             stack budget(s)"
         awk 'NF==3' <<<"$STEP_TABLE"
+        echo ""
+        echo "--k8s step        budget(s)  (needs an already-running k3d cluster)"
+        awk 'NF==2' <<<"$K8S_STEP_TABLE"
         return 0 ;;
       -h | --help) usage; return 0 ;;
       *) echo "unknown argument: $arg" >&2; usage >&2; return 2 ;;
@@ -1270,9 +1422,10 @@ main() {
       for name in "${steps[@]}"; do
         is_step "$name" || { echo "unknown step: $name (see --list)" >&2; return 2; }
       done ;;
+    k8s) mapfile -t steps < <(k8s_step_names) ;;
   esac
   case "$mode" in
-    full | only) export GATE_MODE="$mode" ;;
+    full | only | k8s) export GATE_MODE="$mode" ;;
     *) export GATE_MODE=fast ;;
   esac
 
@@ -1343,6 +1496,12 @@ main() {
     echo "GATE: FAIL — see failures above (docs/DEFINITION_OF_DONE.md)"
   fi
   echo "============================================"
+  if [ "$mode" = k8s ] && [ "$fail" -eq 0 ]; then
+    mkdir -p "$GATE_STATE" 2>/dev/null
+    { printf 'sha=%s\n' "$GATE_START_SHA"; printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } \
+      >"$K8S_PASS_MARKER" 2>/dev/null \
+      && echo "k8s-pass marker recorded for $GATE_START_SHA ($K8S_PASS_MARKER) -- .githooks/pre-push reads this"
+  fi
   publish_gate_status "$mode" "$fail" "$total"
   return "$fail"
 }

@@ -1,6 +1,11 @@
 # Frontend Deployment (T16.1.1). No HPA (KEDA/T16.3 owns it, CPU-based for the frontend per
-# PHASE_PLANNING 16.3). Probes on the BFF's own /api/health route (frontend/app/api/health).
-# Image is a PLACEHOLDER, same convention as backend/deployment.yaml.
+# PHASE_PLANNING 16.3). Image is a PLACEHOLDER, same convention as backend/deployment.yaml.
+#
+# Probes (T16.2.1): startup and readiness both hit /api/health (the BFF's own proxy of the
+# backend's /health -- a real DEPENDENCY check, generous on startup for the same reason as
+# the backend's own startup probe: nothing meaningful can be served before the backend is
+# reachable at least once). Liveness hits /api/health/live (process only, no backend call --
+# never restart the frontend container just because the backend is transiently down).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -38,7 +43,7 @@ spec:
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /api/health
+              path: /api/health/live
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20

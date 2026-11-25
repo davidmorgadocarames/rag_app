@@ -1,0 +1,56 @@
+# Kyverno image-signature policy (T16.1.7, P16-D1, TF33) -- "our images only" half of the
+# signing story: GitHub's own keyless OIDC identity (Fulcio/Rekor via sigstore), scoped to
+# exactly this repo's GHCR images (ghcr.io/davidmorgadocarames/rag_app-*) -- third-party
+# images (Envoy Gateway, Sealed Secrets, CNPG, Mailpit, Prometheus, Valkey, SeaweedFS,
+# kube-state-metrics) are pinned by digest instead (TF33's own resolution) and are
+# deliberately OUT of this policy's imageReferences scope.
+#
+# validationFailureAction: Audit (T16.1.7) -- deliberately NOT Enforce yet: no image this
+# project builds is actually signed on `main` today (confirmed read-only, 16-0's own
+# pre-launch re-check: no cosign step exists anywhere in .github/workflows/; that lands at
+# Phase 15's promotion, 15-P). Enforcing now would reject every real deploy. T16.4.4 (block
+# 16-E) flips this to Enforce once 15-P's signing pipeline exists -- the policy SHAPE is
+# introduced now (CI's kind job applies and exercises it in Audit mode against a throwaway
+# cluster) so 16-E is a one-line flip, not new policy authoring under time pressure.
+#
+# Not yet wired into deploy/k8s/base's own kustomization: Kyverno itself is not installed
+# by scripts/k8s/cluster-up.sh until 16-E (T16.4.4) -- applying this policy against a cluster
+# with no Kyverno admission controller would simply have no effect, so it is applied
+# explicitly by the CI kind job (.github/workflows/ci.yml, "k8s manifests (kind cluster...)")
+# for now. 16-E adds a kyverno/ directory to the base and folds this file in.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-secrag-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify SecRAG image signatures (keyless GitHub Actions OIDC)
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/description: >-
+      Our own GHCR images (ghcr.io/davidmorgadocarames/rag_app-*) must carry a valid
+      keyless cosign signature from this repository's GitHub Actions OIDC identity.
+      Audit mode until 15-P's signing pipeline lands (T16.4.4 flips to Enforce).
+spec:
+  validationFailureAction: Audit
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-ghcr-image-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/davidmorgadocarames/rag_app-*"
+          # Kyverno requires this explicitly false under validationFailureAction: Audit
+          # (confirmed locally: applying this policy with the default `true` is itself
+          # REJECTED by Kyverno's own policy-validating webhook -- "mutateDigest must be
+          # set to false for 'Audit' failure action"). 16-E's Enforce flip can revisit
+          # pinning by digest once real signed images exist.
+          mutateDigest: false
+          attestors:
+            - entries:
+                - keyless:
+                    subject: "https://github.com/davidmorgadocarames/rag_app/.github/workflows/cd.yml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev

@@ -12,6 +12,11 @@ metadata:
   labels:
     app.kubernetes.io/name: ollama-host
     app.kubernetes.io/part-of: secrag
+  annotations:
+    # T16.1.7: a narrow, per-object kube-linter exception (not a check-wide exclude) --
+    # this Service is selector-less BY DESIGN (see the comment above), the one and only
+    # dangling-service finding this project ever expects to see.
+    ignore-check.kube-linter.io/dangling-service: "T16.0.4: selector-less by design, EndpointSlice managed by hand (see this file's header)"
 spec:
   ports:
     - name: http

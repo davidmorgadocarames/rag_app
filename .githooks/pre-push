@@ -15,21 +15,70 @@
 #
 # Test hook: SECRAG_PREPUSH_DRY_RUN=1 prints the plan (mode + SHAs) and exits 10 — never 0,
 # so a forgotten export blocks the push instead of skipping the gate (DA-B-11).
+#
+# T16.1.8: a push whose diff touches deploy/k8s/**, a k8s probe implementation or a scaling
+# path also needs a RECORDED `scripts/gate.sh --k8s` PASS for the exact pushed SHA
+# (.gate/k8s-pass, written by gate.sh itself on a real --k8s PASS -- same "exact SHA"
+# evidence shape as the --full/secrag-gate-full promotion evidence). This never runs k3d
+# itself inside the pre-push worktree (RAM/lock reasons, see gate.sh's own --k8s comment) --
+# it only checks that mark exists and matches, failing the push with an actionable message
+# if not. Scoped by the PUSHED DIFF, never the branch name, so a push on an unrelated branch
+# that happens to touch none of these paths is never blocked by this (K8S_TOUCH_PATTERNS
+# below is the one place both this check and its own test read from).
 set -euo pipefail
+
+K8S_TOUCH_PATTERNS=(
+  "^deploy/k8s/"
+  "^backend/src/rag_app/api/app\.py$"
+  "^frontend/app/api/health/"
+  "^backend/src/rag_app/rate_limit\.py$"
+)
+
+# k8s_touch_required <main_root> <old_sha> <new_sha>: 0 (required) if the diff between the two
+# refs touches K8S_TOUCH_PATTERNS, 1 (not required) otherwise. Falls back to the merge-base
+# with main, then to the single commit's own diff, when <old_sha> does not resolve (a new
+# branch's remote_sha is all-zero, or the remote is unknown to this clone yet).
+k8s_touch_required() {
+  local root="$1" old="$2" new="$3" files pattern
+  if [ -n "$old" ] && [ -n "${old//0/}" ] && git -C "$root" cat-file -e "$old" 2>/dev/null; then
+    files="$(git -C "$root" diff --name-only "$old" "$new" 2>/dev/null || true)"
+  else
+    local base
+    base="$(git -C "$root" merge-base main "$new" 2>/dev/null || true)"
+    if [ -n "$base" ]; then
+      files="$(git -C "$root" diff --name-only "$base" "$new" 2>/dev/null || true)"
+    else
+      files="$(git -C "$root" diff-tree --no-commit-id --name-only -r "$new" 2>/dev/null || true)"
+    fi
+  fi
+  for pattern in "${K8S_TOUCH_PATTERNS[@]}"; do
+    grep -Eq "$pattern" <<<"$files" && return 0
+  done
+  return 1
+}
+
+# k8s_pass_recorded <main_root> <sha>: a `.gate/k8s-pass` marker exists and names exactly
+# this SHA (gate.sh --k8s writes it only on a real PASS).
+k8s_pass_recorded() {
+  local root="$1" sha="$2" marker="$1/.gate/k8s-pass"
+  [ -f "$marker" ] || return 1
+  grep -qx "sha=$sha" "$marker"
+}
 
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 MAIN_ROOT="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
 mode="--fast"
 shas=()
-while read -r local_ref local_sha remote_ref _remote_sha; do
+declare -A remote_sha_of=()
+while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_ref:-}" ] || continue
   if [ -z "${local_sha//0/}" ]; then
     echo "[pre-push] $remote_ref: deletion — nothing to check"
     continue
   fi
   [ "$remote_ref" = "refs/heads/main" ] && mode="--full"
-  case " ${shas[*]:-} " in *" $local_sha "*) ;; *) shas+=("$local_sha") ;; esac
+  case " ${shas[*]:-} " in *" $local_sha "*) ;; *) shas+=("$local_sha"); remote_sha_of["$local_sha"]="$remote_sha" ;; esac
 done
 
 if [ "${#shas[@]}" -eq 0 ]; then
@@ -39,9 +88,27 @@ fi
 
 if [ "${SECRAG_PREPUSH_DRY_RUN:-0}" = 1 ]; then
   echo "[pre-push] plan: gate $mode on ${shas[*]}"
+  for sha in "${shas[@]}"; do
+    if k8s_touch_required "$MAIN_ROOT" "${remote_sha_of[$sha]:-}" "$sha"; then
+      echo "[pre-push] plan: $sha touches deploy/k8s scope — a recorded --k8s PASS will be required"
+    fi
+  done
   echo "[pre-push] SECRAG_PREPUSH_DRY_RUN=1: dry run only — push BLOCKED (unset it to push)" >&2
   exit 10
 fi
+
+for sha in "${shas[@]}"; do
+  if k8s_touch_required "$MAIN_ROOT" "${remote_sha_of[$sha]:-}" "$sha"; then
+    if k8s_pass_recorded "$MAIN_ROOT" "$sha"; then
+      echo "[pre-push] ${sha:0:12} touches deploy/k8s scope — recorded --k8s PASS found"
+    else
+      echo "[pre-push] ${sha:0:12} touches deploy/k8s/**, a probe or a scaling path (T16.1.8)," >&2
+      echo "[pre-push] but no matching .gate/k8s-pass PASS is recorded for this exact SHA." >&2
+      echo "[pre-push] Run: scripts/k8s/cluster-up.sh && scripts/gate.sh --k8s (then cluster-down.sh)" >&2
+      exit 1
+    fi
+  fi
+done
 
 WT=""
 cleanup() {

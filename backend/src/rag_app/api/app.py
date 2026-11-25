@@ -6,7 +6,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from sqlalchemy import text
 
 from rag_app import __version__, authz, csp_report, metrics, reranking, timing, wake, warmup
 from rag_app.api import admin, auth, conversations
@@ -153,6 +154,24 @@ def create_app() -> FastAPI:
     # mistagged) router fails the gate instead of going unnoticed.
     @app.get("/health", response_model=HealthResponse, tags=["stack"])
     def health() -> HealthResponse:
+        """Liveness: the process answers HTTP at all -- NEVER touches the DB/Ollama (T16.2.1,
+        k8s livenessProbe). A transient dependency outage must never trigger a container
+        restart storm; ``/health/ready`` below is the one that checks dependencies, and only
+        the k8s readinessProbe (never liveness) acts on it by pulling the pod out of the
+        Service. Unauthenticated, no rate limit, same as every other probe here (cheap,
+        process-only, meant to be hit every few seconds)."""
+        return HealthResponse(status="ok")
+
+    @app.get("/health/ready", response_model=HealthResponse, tags=["stack"])
+    def health_ready(session: SessionDep) -> HealthResponse:
+        """Readiness: the backend's one real dependency, Postgres, is reachable right now
+        (T16.2.1, k8s readinessProbe). A failure here pulls the pod out of the Service
+        (no new traffic routed to it) without restarting the process -- the process itself
+        may well be fine, only its DB connection is not, and a restart would not fix that."""
+        try:
+            session.execute(text("SELECT 1"))
+        except Exception as exc:  # noqa: BLE001 - any DB failure means "not ready", not a 500
+            raise HTTPException(status_code=503, detail="database unreachable") from exc
         return HealthResponse(status="ok")
 
     # Authenticated like /chat/stream: every answer costs an LLM call, so anonymous callers

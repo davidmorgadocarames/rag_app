@@ -21,6 +21,49 @@ def test_health() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_health_is_liveness_only_no_db_dependency() -> None:
+    """T16.2.1: /health (k8s livenessProbe) must answer even when the DB dependency
+    override is set up to fail -- it never touches a session at all. Fails on pre-T16.2.1
+    code that made /health itself check the DB (the exact regression this test guards)."""
+    app = create_app()
+
+    def _broken_session() -> Any:
+        raise AssertionError("liveness must never resolve a DB session")
+
+    app.dependency_overrides[get_session] = _broken_session
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_health_ready_ok() -> None:
+    """T16.2.1: /health/ready (k8s readinessProbe) is OK when the DB session can execute."""
+    app = create_app()
+    app.dependency_overrides[get_session] = lambda: SimpleNamespace(execute=lambda *a, **k: None)
+    client = TestClient(app)
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_health_ready_fails_closed_when_db_unreachable() -> None:
+    """T16.2.1: a DB failure makes /health/ready answer 503 (readiness fails, pod pulled
+    out of the Service), never a 200 and never an unhandled 500. The failure happens at
+    query time (``execute`` raising), matching a real "session built, connection refused"
+    shape -- never at dependency-resolution time, which FastAPI would turn into a bare 500
+    before this route's own try/except ever ran."""
+
+    def _execute(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("could not connect to server")
+
+    app = create_app()
+    app.dependency_overrides[get_session] = lambda: SimpleNamespace(execute=_execute)
+    client = TestClient(app)
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+
+
 def _stub_answerer() -> AnswerFn:
     def _answer(session: object, question: str, version: str | None) -> Answer:
         return Answer(

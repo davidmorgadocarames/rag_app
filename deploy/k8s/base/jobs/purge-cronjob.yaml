@@ -24,7 +24,9 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 0
-      ttlSecondsAfterFinished: 86400
+      # T16.1.7 (kube-linter job-ttl-seconds-after-finished): a CronJob-owned Job's cleanup
+      # is the CronJob's own successfulJobsHistoryLimit/failedJobsHistoryLimit above, never a
+      # per-Job ttlSecondsAfterFinished (the two can disagree on which finished Jobs survive).
       template:
         metadata:
           labels:
