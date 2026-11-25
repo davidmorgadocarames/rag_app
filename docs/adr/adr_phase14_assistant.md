@@ -225,12 +225,25 @@ greeting) — not part of the gate (cost/determinism), reported for confidence o
   `llm.chat_json` call sites because none exist.
   - Explore `test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness` once
     14-B2/14-C1 land.
-- **Azure's `strict: true` schema tightening (`_strict_json_schema`) only sets
-  `additionalProperties: false`.** OpenAI's strict mode also requires every property to be
-  listed in `required` (optional fields must be modelled as nullable, not merely absent from
-  `required`) — this is a constraint on how 14-B2/14-C1 author their Pydantic models, not
-  something `chat_json` enforces or can enforce generically; a schema that violates it would
-  fail at the real Azure API call, not locally (no live Azure call in this block to catch it).
+- **Fixed in block 14-B1-fix (DA-14-B1-1): Azure's `strict: true` schema tightening.**
+  `_strict_json_schema` now also sets `required` to the full list of a given object node's
+  `properties` keys, on every object node (top level, nested `properties`, `$defs`, and array
+  `items`) — not only `additionalProperties: false`. Azure/OpenAI's strict mode rejects a schema
+  where *any* property is missing from `required`; optionality must be expressed only via a
+  nullable type (Pydantic's own `anyOf: [..., {type: "null"}]` for `Optional[X] = None`), never
+  by omission from `required`. This limitation was first mis-framed as "a constraint on how
+  14-B2/14-C1 author their Pydantic models" — not quite right: a field with a default never
+  lands in Pydantic's own `required` regardless of its type annotation, so there was no
+  caller-side authoring fix available; the fix belongs in `_strict_json_schema` itself, which is
+  where it now lives. Runtime validation is unaffected — `model_validate` still accepts (and
+  produces) `null`/omitted for an `Optional` field; only the schema *advertised* to Azure
+  changed. `_strict_json_schema` operates on a deep copy of `model_json_schema()`'s result, never
+  mutating the dict Pydantic returns. **DEBT-036 note (unchanged by this fix):** no live Azure
+  call exists yet in this phase; the first real `chat_json` call against Azure (14-B2/14-C1) must
+  still confirm that API version `2024-10-21` (the pinned `azure_openai_api_version` default)
+  actually serves `response_format: {type: json_schema, strict: true}` for the `gpt-4.1-mini`
+  deployment — tie that confirmation to DEBT-036's existing "untested... request parameters"
+  language rather than opening a new row.
 - **Retry re-sends the exact same request.** A provider that is deterministically wrong for a
   given input (e.g. always drops a field) will exhaust both attempts and fall back every time,
   not self-correct; no retry-with-a-corrective-message strategy is implemented (none was asked

@@ -2,15 +2,20 @@
 providers, mocked -- no live Ollama/Azure OpenAI call (cost, per the orchestrator's
 prompt).
 
-Covers: Ollama's ``format`` field pinned to the Pydantic schema; Azure's
-``response_format: {type: json_schema, strict: true}`` with ``additionalProperties:
-false`` added (including nested ``$defs``); the shared validate/retry/fallback contract
-(one bounded retry, then the caller's safe fallback) for both invalid JSON and a schema
+Covers: Ollama's ``format`` field pinned to the plain, untightened Pydantic schema;
+Azure's ``response_format: {type: json_schema, strict: true}`` with
+``additionalProperties: false`` AND every property (including ``Optional`` ones with a
+default) listed in ``required`` on every object node -- top level, nested ``$defs`` and
+array ``items`` alike (DA-14-B1-1 fix: Azure's ``strict: true`` mode rejects a schema
+where any property is missing from ``required``; optionality is expressed only via a
+nullable type, not by omission); the shared validate/retry/fallback contract (one
+bounded retry, then the caller's safe fallback) for both invalid JSON and a schema
 violation; ``num_ctx``/``call_type`` plumbing identical to ``chat``/``chat_stream``.
 """
 
 from __future__ import annotations
 
+import enum
 import logging
 from typing import Any
 
@@ -37,6 +42,44 @@ class _WithNested(BaseModel):
     items: list[_Nested]
 
 
+class _Mood(str, enum.Enum):
+    """An enum field: its own ``$defs`` sub-schema has no ``properties`` key, so the
+    object-tightening branch must not touch it (and must not raise on it either)."""
+
+    HAPPY = "happy"
+    SAD = "sad"
+
+
+class _WithOptionalNestedListAndEnum(BaseModel):
+    """DA-14-B1-1 regression fixture: one required field, one ``Optional`` field *with
+    a default* (the case Pydantic never puts in its own ``required``), a nested model,
+    a list of nested models, and an enum -- every object node in the resulting schema
+    (top level, the nested ``$defs`` entry, and the list's ``items``) must end up with
+    ``required`` covering every one of its ``properties`` keys."""
+
+    name: str
+    note: str | None = None
+    mood: _Mood
+    nested: _Nested
+    items: list[_Nested]
+
+
+def _object_nodes(node: Any) -> list[dict[str, Any]]:
+    """Recursively collect every object sub-schema (``type == "object"`` with a
+    ``properties`` key) reachable from ``node`` -- top level, nested ``properties``,
+    ``$defs`` and array ``items`` alike."""
+    found: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        if node.get("type") == "object" and "properties" in node:
+            found.append(node)
+        for value in node.values():
+            found.extend(_object_nodes(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_object_nodes(item))
+    return found
+
+
 # --- _strict_json_schema (pure function, no mocking) -----------------------------------------
 
 
@@ -61,6 +104,71 @@ def test_strict_json_schema_does_not_mutate_pydantics_own_cache() -> None:
     first = _strict_json_schema(_RouterOutput)
     second = _strict_json_schema(_RouterOutput)
     assert first == second
+
+
+def test_strict_json_schema_does_not_mutate_the_callers_schema_dict() -> None:
+    """``_strict_json_schema`` must operate on a copy: mutating its returned dict (or
+    the dict returned by a prior call) must never leak into a fresh
+    ``model_json_schema()``/``_strict_json_schema()`` call on the same model."""
+    raw_before = _RouterOutput.model_json_schema()
+    tightened = _strict_json_schema(_RouterOutput)
+    tightened["additionalProperties"] = "mutated"
+    tightened["required"].append("mutated-field")
+    # the caller's own mutation of the returned dict must not affect either the raw
+    # Pydantic schema or a fresh call to _strict_json_schema.
+    assert _RouterOutput.model_json_schema() == raw_before
+    assert _strict_json_schema(_RouterOutput)["additionalProperties"] is False
+    assert _strict_json_schema(_RouterOutput)["required"] == ["intent", "language"]
+
+
+def test_strict_json_schema_required_covers_every_property_everywhere() -> None:
+    """DA-14-B1-1: Azure's ``strict: true`` mode rejects a schema where any property
+    (including an ``Optional`` one with a default) is missing from its object's
+    ``required`` array -- optionality must be expressed only via a nullable type.
+    Every object node reachable from the tightened schema (top level, the nested
+    ``$defs`` entry, and the list's ``items``) must list every one of its own
+    ``properties`` keys in ``required``, with ``additionalProperties: false``."""
+    schema = _strict_json_schema(_WithOptionalNestedListAndEnum)
+
+    object_nodes = _object_nodes(schema)
+    # top level + the one nested _Nested $defs entry (list items reference $defs by
+    # $ref, so they do not duplicate a separate "items" object node here) == 2.
+    assert len(object_nodes) == 2
+    for obj in object_nodes:
+        assert obj["additionalProperties"] is False
+        assert sorted(obj["required"]) == sorted(obj["properties"].keys())
+
+    # explicitly: the optional field (a default, never in Pydantic's own "required")
+    # is still listed in the top-level schema's "required".
+    assert "note" in schema["required"]
+    assert set(schema["required"]) == set(schema["properties"].keys())
+
+    # the enum's own $defs entry has no "properties" key, so it is correctly not an
+    # "object node" at all -- never touched, never raises.
+    mood_def = schema["$defs"]["_Mood"]
+    assert "properties" not in mood_def
+    assert "required" not in mood_def
+
+
+def test_strict_json_schema_optional_field_still_validates_as_null() -> None:
+    """The ``required``-array fix changes only the *schema advertised to Azure*, never
+    runtime validation: a model with an ``Optional`` field still validates a response
+    where that field is ``null`` (or omitted), via ``model_validate`` -- exactly how
+    ``_chat_json_with_retry`` consumes a provider's JSON reply."""
+    _strict_json_schema(_WithOptionalNestedListAndEnum)  # schema generation must not raise
+    data_with_null = {
+        "name": "a",
+        "note": None,
+        "mood": "happy",
+        "nested": {"topic": "t"},
+        "items": [{"topic": "t2"}],
+    }
+    result = _WithOptionalNestedListAndEnum.model_validate(data_with_null)
+    assert result.note is None
+
+    data_omitted = {k: v for k, v in data_with_null.items() if k != "note"}
+    result_omitted = _WithOptionalNestedListAndEnum.model_validate(data_omitted)
+    assert result_omitted.note is None
 
 
 # --- Fake HTTP plumbing (same pattern as test_llm.py) ----------------------------------------
@@ -161,6 +269,44 @@ def test_ollama_chat_json_falls_back_after_invalid_json_twice(
     assert any("falling back" in m for m in messages)
 
 
+def test_ollama_chat_json_sends_the_untightened_schema_even_with_an_optional_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14-B1-1 scope check: the ``required``-array fix is Azure-only.
+    ``OllamaChat.chat_json`` must keep sending the plain, untightened
+    ``schema.model_json_schema()`` as-is -- Ollama's ``format`` field has no
+    ``strict: true`` requirement, so a field with a default correctly stays absent
+    from ``required`` there."""
+    captured: list[dict[str, Any]] = []
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        captured.append(json)
+        return _FakeHttpResponse(
+            _ollama_payload(
+                '{"name": "a", "note": null, "mood": "happy",'
+                ' "nested": {"topic": "t"}, "items": []}'
+            )
+        )
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = OllamaChat(host="http://fake", model="m")
+    fallback = _WithOptionalNestedListAndEnum(
+        name="fb", mood=_Mood.SAD, nested=_Nested(topic="fb"), items=[]
+    )
+    client.chat_json(
+        [{"role": "user", "content": "hi"}],
+        _WithOptionalNestedListAndEnum,
+        fallback=fallback,
+        max_tokens=64,
+    )
+    assert len(captured) == 1
+    raw_schema = _WithOptionalNestedListAndEnum.model_json_schema()
+    assert captured[0]["format"] == raw_schema
+    # the untightened schema does NOT list "note" in its top-level "required" --
+    # confirms this request body is genuinely unaffected by the Azure-side fix.
+    assert "note" not in raw_schema["required"]
+
+
 def test_ollama_chat_json_falls_back_on_a_schema_violation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -210,6 +356,42 @@ def test_azure_chat_json_request_body_shape(monkeypatch: pytest.MonkeyPatch) -> 
     assert response_format["json_schema"]["strict"] is True
     assert response_format["json_schema"]["schema"]["additionalProperties"] is False
     assert response_format["json_schema"]["schema"] == _strict_json_schema(_RouterOutput)
+
+
+def test_azure_chat_json_request_body_requires_the_optional_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14-B1-1: the request body Azure actually receives must list the optional
+    field in ``required`` (Azure's ``strict: true`` would otherwise reject the
+    schema), and a response where that field is ``null`` must still validate --
+    without any fallback/retry."""
+    captured: list[dict[str, Any]] = []
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        captured.append(json)
+        return _FakeHttpResponse(
+            _azure_payload(
+                '{"name": "a", "note": null, "mood": "happy",'
+                ' "nested": {"topic": "t"}, "items": []}'
+            )
+        )
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = AzureOpenAIChat(endpoint="http://fake", api_key="k", deployment="d", api_version="v")
+    fallback = _WithOptionalNestedListAndEnum(
+        name="fb", mood=_Mood.SAD, nested=_Nested(topic="fb"), items=[]
+    )
+    result = client.chat_json(
+        [{"role": "user", "content": "hi"}],
+        _WithOptionalNestedListAndEnum,
+        fallback=fallback,
+        max_tokens=64,
+    )
+    assert len(captured) == 1  # no retry -- the null optional field validates first try
+    sent_schema = captured[0]["response_format"]["json_schema"]["schema"]
+    assert "note" in sent_schema["required"]
+    assert result.note is None
+    assert result != fallback
 
 
 def test_azure_chat_json_happy_path_returns_validated_model(

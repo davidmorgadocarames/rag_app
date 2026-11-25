@@ -16,6 +16,7 @@ router/summary reply degrades gracefully instead of breaking the chat flow.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections.abc import Callable, Iterator
@@ -135,15 +136,30 @@ class ChatClient(Protocol):
 
 
 def _strict_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
-    """``schema.model_json_schema()`` with ``additionalProperties: false`` set on every
-    object sub-schema (top level and any nested ``$defs``) -- required by Azure OpenAI's
-    ``strict: true`` structured-output mode, which Pydantic does not set on its own."""
-    raw = schema.model_json_schema()
+    """``schema.model_json_schema()`` tightened for Azure OpenAI's ``strict: true``
+    structured-output mode, on every object sub-schema (top level, nested ``properties``,
+    ``$defs`` and array ``items``):
+
+    - ``additionalProperties: false`` (Pydantic does not set this on its own).
+    - ``required`` listing **every** key in ``properties`` (DA-14-B1-1 fix). Azure's
+      strict mode rejects a schema where any property is missing from ``required`` --
+      optionality must instead be expressed via a nullable type, not by omission from
+      ``required``. Pydantic's own ``model_json_schema()`` only ever puts a field with no
+      default in ``required`` (e.g. ``Optional[str] = None`` is simply absent), so this
+      must be patched in here rather than on the caller's model. This changes nothing
+      about runtime validation: a field typed ``Optional[X] = None`` still accepts (and
+      ``model_validate`` still produces) a ``null``/missing value for it -- Azure just
+      requires the key to be *listed*, not that it always be non-null.
+
+    Operates on a deep copy, never the dict ``model_json_schema()`` returns -- that dict
+    must not be mutated in place (it may be a caller- or Pydantic-held reference)."""
+    raw = copy.deepcopy(schema.model_json_schema())
 
     def _tighten(node: Any) -> None:
         if isinstance(node, dict):
             if node.get("type") == "object" and "properties" in node:
-                node.setdefault("additionalProperties", False)
+                node["additionalProperties"] = False
+                node["required"] = list(node["properties"].keys())
             for value in node.values():
                 _tighten(value)
         elif isinstance(node, list):
