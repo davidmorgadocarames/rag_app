@@ -332,6 +332,35 @@ and the CHIT-CHAT reply respectively, neither of which this block touches, so th
 expected to move. See the ADR's "14-C2 decision" section for the measured before/after table
 and which floors are enforced from this block onward.
 
+### 6.4a Chunk dominance, named-edition filter, router few-shots (T14.2.9, block 14-C3)
+
+**What changed.** Three retrieval-time fixes, layered under `retrieval_query` (§6.4) rather
+than replacing it: (1) `retrieval._bm25_uids` now matches ANY of a query's terms (OR), not ALL
+of them (the previous `plainto_tsquery` AND semantics silently emptied BM25 for longer
+questions); (2) `retrieval.hybrid_search` fetches a wider raw candidate pool per list and caps
+how many of the final fused candidates one document may occupy
+(`diversify_candidates`) — stops a generic, multi-topic document (a slide-deck PDF, a full
+PDF's own front matter) from crowding out the one relevant document's chunk; (3)
+`reranking.CrossEncoderReranker.rerank` down-weights a chunk whose heading is a bare
+reference/citation list or presentation/front-matter breadcrumb (`is_low_value_heading`) AFTER
+the real cross-encoder score, so it stops out-ranking a lower-scored chunk that actually states
+the answer. A fourth change, `assistant.core.named_owasp_version`, scopes retrieval to the
+OWASP edition the RESOLVED query names (never the conversation summary directly, never when
+nothing names one) — wired into the same three `retrieval_query` call sites as §6.4, an
+explicit caller-supplied `version` always winning over the auto-detected one.
+
+**Why layered, not merged into `retrieval_query`.** `retrieval_query` answers "what text does
+retrieval search with"; `named_owasp_version` answers the orthogonal "which corpus version, if
+any, should that search be scoped to" — kept as two separate, independently testable pure
+functions rather than one that does both.
+
+**Measured effect.** `follow_up_resolution` 0.500 → 0.900 (two real `--only eval` runs on the
+final code, `n` raised from 6 to 10 follow-up turns) — now enforced. `intent_accuracy` stays
+below its floor (a narrower router ambiguous-vs-followup boundary confusion on terse follow-ups
+that does not affect `follow_up_resolution`). See the ADR's "14-C3 decision" section for the
+full live-diagnosis evidence, the before/after ranking tables, and the "Known limitations"
+section.
+
 ## 7. Cost & latency
 
 - Q4 quantization; a single shared LLM; reranker on CPU.
