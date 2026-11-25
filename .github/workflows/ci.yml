@@ -319,8 +319,29 @@ jobs:
           helm repo add kyverno https://kyverno.github.io/kyverno/ --force-update
           helm install kyverno kyverno/kyverno -n kyverno --create-namespace \
             --version 3.9.2 --wait --timeout 180s
+          # `--wait` only waits for the Deployments' own readiness, not for the admission
+          # webhook Services to be routable yet -- wait for real endpoints too (a real race
+          # seen on a GitHub-hosted runner, never locally).
+          for svc in kyverno-svc kyverno-svc-metrics kyverno-background-controller; do
+            kubectl -n kyverno get endpoints "$svc" >/dev/null 2>&1 || continue
+            for i in $(seq 1 15); do
+              [ -n "$(kubectl -n kyverno get endpoints "$svc" -o jsonpath='{.subsets[0].addresses}' 2>/dev/null)" ] && break
+              sleep 2
+            done
+          done
+      # `helm install --wait` only waits for the Kyverno Deployments' own readiness, not for
+      # the admission webhook's Service to be routable yet -- a real race seen on a
+      # GitHub-hosted runner (never locally): "dial tcp ...:443: connect: connection
+      # refused" on the very next `kubectl apply`. Retried instead of a longer sleep, since
+      # the real wait time varies by runner.
       - name: Apply the signature policy (Audit mode, T16.1.7 -- real apply, proves the CRD/syntax)
-        run: kubectl apply -f deploy/k8s/policies/verify-image-signatures.yaml
+        run: |
+          for i in $(seq 1 10); do
+            kubectl apply -f deploy/k8s/policies/verify-image-signatures.yaml && exit 0
+            echo "retrying (Kyverno's admission webhook may not be routable yet)..."
+            sleep 6
+          done
+          exit 1
       - name: Render the local overlay with stub images (never the real backend/frontend build)
         run: |
           pip install --quiet --no-input pyyaml
