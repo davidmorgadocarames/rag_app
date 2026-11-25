@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden set v2 floors (PHASE_PLANNING.md section 14.0 / P14-D4). Recorded by block 14-A2 (T14.0.5); enforcement starts at 14.2 per PHASE_PLANNING section 14.2's own Gate line ('floors from 14.0') -- enforce_now stays false until a later block flips it, once the LLM router/memory this measures actually exists.",
+  "_comment": "Golden set v2 floors (the Phase 14.0 plan, section 14.0 / P14-D4). Recorded by block 14-A2 (T14.0.5); enforcement starts at 14.2 per the Phase 14 plan's own section 14.2 Gate line ('floors from 14.0') -- enforce_now stays false until a later block flips it, once the LLM router/memory this measures actually exists.",
   "intent_accuracy": 0.90,
   "noisy_recall": 0.90,
   "follow_up_resolution": 0.85,

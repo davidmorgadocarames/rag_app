@@ -7,7 +7,7 @@ hand without that flag, an unreachable stack is reported as SKIP (exit 0).
 **Golden set v2 (T14.0.4/T14.0.5, block 14-A2):** this same step also replays
 ``eval/golden_set_v2.jsonl`` (dialogues) and records the "before" baseline + the plan's floors
 (``eval/golden_set_v2_baseline.json`` / ``eval/golden_set_v2_floors.json``, both git-tracked).
-**Per PHASE_PLANNING §14.2's own Gate ("floors from 14.0") the floors are enforced starting at
+**Per the Phase 14 plan, §14.2's own Gate ("floors from 14.0") the floors are enforced starting at
 14.2, once the router/memory they measure exists** — T14.0.5 establishes and records them, it
 does not yet gate on them (``golden_set_v2_floors.json``'s ``enforce_now: false``); this keeps
 the v1 eval gate's pass/fail behaviour above completely unaffected and green. See the ADR for the
@@ -122,7 +122,7 @@ def _check_v2(metrics: DialogueMetrics) -> tuple[list[str], list[str]]:
     """Compare golden-set v2 metrics to the plan's floors (``golden_set_v2_floors.json``).
 
     Returns ``(info_lines, failures)``. A floor only becomes a real FAIL when the floors file's
-    ``enforce_now`` is ``true`` — today it is ``false`` (floors apply from 14.2, PHASE_PLANNING
+    ``enforce_now`` is ``true`` — today it is ``false`` (floors apply from 14.2, the Phase 14 plan
     §14.2 Gate: "floors from 14.0") — so this never fails the eval gate on this branch; every
     comparison is still printed so the "before" gap is visible on every run, not just this one.
     """
