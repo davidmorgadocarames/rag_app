@@ -185,11 +185,16 @@ stage_controllers_ready() {
 
 # Every resource below has no correctness dependency on the CNPG/roles/migrate/apps stages --
 # applied together right after the controllers are confirmed ready.
+# PodDisruptionBudget added here T16.2.3 (self-reported gap found by this block's own node-drain
+# chaos drill: `deploy-local.sh` never applied the backend/frontend PDBs at all because this
+# regex predates them, which let a real `kubectl drain` evict the backend pod despite the
+# committed manifest declaring a PDB that should have blocked it -- the PDB existed in git but
+# was never actually live on a cluster deployed via this script).
 stage_foundation() {
   local files=()
   if [ "$DRY_RUN" -eq 0 ]; then
     mapfile -t files < <(awk -F: '
-      $2 ~ /^(ServiceAccount|ClusterRole|ClusterRoleBinding|ConfigMap|Service|SealedSecret|CronJob|Gateway|GatewayClass|HTTPRoute)$/ { print $1; next }
+      $2 ~ /^(ServiceAccount|ClusterRole|ClusterRoleBinding|ConfigMap|Service|SealedSecret|CronJob|Gateway|GatewayClass|HTTPRoute|PodDisruptionBudget)$/ { print $1; next }
       $2 == "Deployment" && $3 != "backend" && $3 != "frontend" { print $1 }
     ' "$render_dir/index.txt")
   fi

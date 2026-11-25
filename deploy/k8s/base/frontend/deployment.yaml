@@ -6,6 +6,20 @@
 # the backend's own startup probe: nothing meaningful can be served before the backend is
 # reachable at least once). Liveness hits /api/health/live (process only, no backend call --
 # never restart the frontend container just because the backend is transiently down).
+#
+# Rollout / zero-downtime (T16.2.3): the Gateway's HTTPRoute (base/gateway/httproute.yaml) routes
+# EVERY path, including the SSE chat stream, to this Service first (the Next.js BFF's
+# app/api/[...path] catch-all proxies to the backend server-side) -- so the frontend holds the
+# same long-lived SSE connection the backend does, and needs the identical grace-period treatment
+# (`maxUnavailable: 0`/`maxSurge: 1`, `preStop` sleep, `terminationGracePeriodSeconds: 310` = 10s
+# preStop + the Gateway's own 300s `POST /api/chat/stream` timeout). No uvicorn-style
+# `--timeout-graceful-shutdown` override is needed here: Next.js's standalone `server.js` (CMD
+# `node server.js`, frontend/Dockerfile, unchanged) already calls the underlying Node
+# `http.Server`'s own `close()` on SIGTERM, which stops accepting NEW connections but lets
+# in-flight ones (including a proxied SSE stream) finish naturally -- Node's default behaviour,
+# nothing to pin.
+# topologySpreadConstraints: same forward-looking, soft (`ScheduleAnyway`) spread as the backend's
+# own (see that file's comment) -- a no-op today at `replicas: 1`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,6 +30,11 @@ metadata:
     app.kubernetes.io/part-of: secrag
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: frontend
@@ -26,9 +45,21 @@ spec:
         app.kubernetes.io/part-of: secrag
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 310
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
       containers:
         - name: frontend
           image: secrag-registry:5050/secrag/frontend:placeholder
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
           ports:
             - name: http
               containerPort: 3000
@@ -53,12 +84,19 @@ spec:
               port: http
             failureThreshold: 20
             periodSeconds: 5
+          # T16.2.2, measured this block (throwaway docker network, no backend/Ollama reachable):
+          # idle VmRSS ~90 MiB (`/proc/1/status`), stable under a repeated-request loop. `requests`
+          # sit just above that floor; `limits` keep real headroom for concurrent SSR/BFF-proxy
+          # requests (a generic Next.js standalone server, not reranker-bound like the backend --
+          # no Azure-parity figure exists for the frontend Container App, which has no
+          # explicit cpu/mem override documented, i.e. the platform default).
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 192Mi
             limits:
-              memory: 768Mi
+              cpu: 500m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

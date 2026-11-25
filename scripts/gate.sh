@@ -144,7 +144,7 @@ is_step() { [ -n "$(step_field "$1" 1)" ]; }
 # same Docker Desktop budget -- cluster lifecycle stays the operator's own, explicit step).
 # Never mixed into --fast/--full/--only's own counts.
 K8S_STEP_TABLE="
-k8s-chaos         300
+k8s-chaos         600
 k8s-autoscale      10
 k8s-policies       10
 k8s-restart-check  10
@@ -338,15 +338,18 @@ K8S_NS=secrag
 
 k8s_cluster_reachable() { kubectl get namespace >/dev/null 2>&1; }
 
-# k8s-chaos: the one real check here (what T16.2.4's chaos drills will later generalise,
-# PHASE_TASKS 16.2). Deploys the local overlay in the project's own enforced order
+# k8s-chaos (T16.2.4 generalises the single T16.1.8 check into the full drill set PHASE_TASKS
+# 16.2 names). Deploys the local overlay in the project's own enforced order
 # (scripts/k8s/deploy-local.sh, DA-16-B-1) with short stage timeouts -- APPLY_FOUNDATION
-# (Valkey, same category as every other in-cluster service) happens before CNPG/roles/
-# migrate, so it is already applied by the time deploy-local.sh fail-closes on the still-
+# (Valkey, PDBs, same category as every other in-cluster service/policy) happens before CNPG/
+# roles/migrate, so it is already applied by the time deploy-local.sh fail-closes on the still-
 # placeholder jobs/backend/frontend images (expected, X1 convention; any OTHER exit code
-# before APPLY_FOUNDATION -- no cluster, controllers not ready -- is a real failure). Then
-# kills the Valkey pod and proves Kubernetes recreates it and the Service's Endpoints come
-# back, without relying on KEDA/Kyverno/real app images (none of which exist yet).
+# before APPLY_FOUNDATION -- no cluster, controllers not ready -- is a real failure). Real
+# drills that need no app image: Valkey pod-kill recovery, crash-loop back-off, CNPG failover
+# (marker row survives a primary deletion + promotion). Drills that need a real backend/
+# frontend image are an explicit, named SKIP (see the end of this function) -- never a fake
+# PASS; this block manually verified them once with hand-built local images instead (recorded
+# in status/blocks/16-C2.md, never scripted here).
 step_k8s-chaos() {
   command -v kubectl >/dev/null || { missing_tool "kubectl (scripts/k8s/install-tools.sh kubectl)"; return; }
   k8s_cluster_reachable || { echo "  FAIL: no k3d cluster reachable -- run scripts/k8s/cluster-up.sh first"; return 1; }
@@ -392,6 +395,98 @@ step_k8s-chaos() {
   ep="$(kubectl -n "$K8S_NS" get endpoints valkey -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)"
   [ -n "$ep" ] || { echo "  FAIL: valkey Service has no ready endpoint after recovery"; return 1; }
   echo "  valkey Service endpoint ready again ($ep) -- pod-kill recovery proven"
+
+  k8s_chaos_crash_loop_backoff || return 1
+  k8s_chaos_cnpg_failover || return 1
+
+  # T16.2.4: these three need a REAL running backend (no scripted image build+push pipeline
+  # exists yet, same boundary as k8s-restart-check/k8s-eval below) -- backend/frontend pod-kill
+  # continuity additionally needs >=2 LIVE backend replicas at this block's own MEASURED
+  # `requests.memory: 2Gi`, which this block confirmed live does NOT fit in the local k3d
+  # cluster's 8GB total memory budget (`0/3 nodes are available: Insufficient memory` scaling
+  # backend to replicas=2) -- a structural local-resource ceiling, not just a missing script.
+  # Manually verified once with hand-built local images pushed to the k3d registry (never
+  # scripted, per this block's instructions) instead: pod-kill recovery, the rolling-update
+  # manifest fields and the node-drain/PDB interaction all behaved correctly -- see
+  # status/blocks/16-C2.md and the ADR for that evidence. Never a fake PASS here.
+  echo "  SKIP (needs 16-D/16-F): backend/frontend pod-kill traffic-continuity -- no scripted image build+push pipeline, and >=2 live backend replicas do not fit the local 8GB k3d memory budget at this block's measured sizing (confirmed live)"
+  echo "  SKIP (needs 16-D/16-F): rolling update under k6 with zero failed requests -- same boundary (no scripted image pipeline)"
+  echo "  SKIP (needs 16-D/16-E/jobs-image): backup -> restore + replay_deletions -- needs the jobs image and Phase 15's GDPR erasure/replay_deletions integration against a restored cluster, beyond this block's time budget"
+}
+
+# T16.2.4: deploys a pod that always exits 1 (reusing the CNPG image already pulled onto every
+# node by the CNPG_HEALTHY check above -- no new image to pull) and waits for it to actually
+# reach CrashLoopBackOff with a growing restart count, never just "not Running".
+k8s_chaos_crash_loop_backoff() {
+  echo "  crash-loop-backoff drill: a pod that always exits 1"
+  local cnpg_image
+  cnpg_image="$(kubectl -n "$K8S_NS" get cluster secrag-pg -o jsonpath='{.spec.imageName}' 2>/dev/null)"
+  [ -n "$cnpg_image" ] || { echo "  FAIL: could not read the CNPG image to reuse for the crash-loop drill"; return 1; }
+  kubectl -n "$K8S_NS" delete pod chaos-crash-loop --ignore-not-found --wait=true >/dev/null 2>&1
+  kubectl -n "$K8S_NS" run chaos-crash-loop --image="$cnpg_image" --restart=Always \
+    --command -- sh -c "exit 1" >/dev/null
+
+  # Polled every 2s (not 5s): the "CrashLoopBackOff" waiting reason is only present DURING the
+  # backoff wait between two restart attempts, which a slower poll can straddle and miss even
+  # with a correctly climbing restartCount (observed live: restarts=4 already, reason read
+  # empty at every 5s sample) -- restartCount climbing is the real, reliable signal; the reason
+  # string is corroborating evidence, checked with a tighter poll so it is actually caught.
+  local elapsed=0 status="" restarts=0
+  while [ "$elapsed" -lt 90 ]; do
+    status="$(kubectl -n "$K8S_NS" get pod chaos-crash-loop -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)"
+    restarts="$(kubectl -n "$K8S_NS" get pod chaos-crash-loop -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)"
+    { [ "$status" = CrashLoopBackOff ] || [ "${restarts:-0}" -ge 3 ]; } && [ "${restarts:-0}" -ge 2 ] && break
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  kubectl -n "$K8S_NS" delete pod chaos-crash-loop --ignore-not-found --wait=false >/dev/null 2>&1
+  if [ "${restarts:-0}" -ge 2 ]; then
+    echo "  crash-loop-backoff drill PASS (last observed waiting-reason=$status, restarts=$restarts, ${elapsed}s)"
+  else
+    echo "  FAIL: crash-loop-backoff drill never reached >=2 restarts within 90s (status=$status restarts=$restarts)"
+    return 1
+  fi
+}
+
+# T16.2.4: writes a marker row through the CURRENT primary (local trust-authenticated `psql`
+# inside the pod, CNPG's own convention -- never the app's own credentials), deletes that
+# primary pod, waits for CNPG to promote the replica and for the cluster to report healthy
+# again, then reads the marker row back through the NEW primary -- proving both the failover
+# itself and that no data was lost.
+k8s_chaos_cnpg_failover() {
+  echo "  CNPG failover drill: marker row -> delete the primary -> expect promotion, no data lost"
+  local old_primary marker
+  old_primary="$(kubectl -n "$K8S_NS" get cluster secrag-pg -o jsonpath='{.status.currentPrimary}' 2>/dev/null)"
+  [ -n "$old_primary" ] || { echo "  FAIL: could not read CNPG's current primary"; return 1; }
+  marker="k8s-chaos-$(date +%s)"
+  kubectl -n "$K8S_NS" exec "$old_primary" -c postgres -- psql -U postgres -d rag -c \
+    "DROP TABLE IF EXISTS _chaos_marker; CREATE TABLE _chaos_marker(id serial primary key, note text); INSERT INTO _chaos_marker(note) VALUES ('$marker');" >/dev/null \
+    || { echo "  FAIL: could not write the CNPG failover marker row"; return 1; }
+
+  echo "  deleting the primary ($old_primary)"
+  kubectl -n "$K8S_NS" delete pod "$old_primary" --wait=false >/dev/null
+
+  local elapsed=0 new_primary=""
+  while [ "$elapsed" -lt 240 ]; do
+    new_primary="$(kubectl -n "$K8S_NS" get cluster secrag-pg -o jsonpath='{.status.currentPrimary}' 2>/dev/null || true)"
+    [ -n "$new_primary" ] && [ "$new_primary" != "$old_primary" ] && break
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  [ -n "$new_primary" ] && [ "$new_primary" != "$old_primary" ] \
+    || { echo "  FAIL: no new primary was promoted within 240s"; return 1; }
+  echo "  new primary: $new_primary (after ${elapsed}s)"
+
+  kubectl -n "$K8S_NS" wait --for=jsonpath='{.status.phase}'="Cluster in healthy state" cluster/secrag-pg --timeout=120s >/dev/null \
+    || { echo "  FAIL: CNPG cluster never returned to \"Cluster in healthy state\" after the failover"; return 1; }
+
+  local got
+  got="$(kubectl -n "$K8S_NS" exec "$new_primary" -c postgres -- psql -U postgres -d rag -t -A -c \
+    "SELECT note FROM _chaos_marker WHERE note = '$marker';" 2>/dev/null)"
+  kubectl -n "$K8S_NS" exec "$new_primary" -c postgres -- psql -U postgres -d rag -c "DROP TABLE IF EXISTS _chaos_marker;" >/dev/null 2>&1
+  [ "$got" = "$marker" ] \
+    || { echo "  FAIL: marker row '$marker' not found on the new primary after failover -- data loss"; return 1; }
+  echo "  CNPG failover PASS: $old_primary -> $new_primary, marker row survived, no data lost"
 }
 
 # T16.3's KEDA ScaledObjects (TF37) do not exist until block 16-D.

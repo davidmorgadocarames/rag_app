@@ -21,6 +21,25 @@
 # every backend pod CrashLoop. KNOWN BOUNDARY (self-reported, see the ADR): T16.4 (block 16-E,
 # Pod Security `restricted` on the app namespace) needs a non-root backend image; until then this
 # namespace cannot yet carry the `restricted` PSA label without breaking this Deployment.
+#
+# Rollout / zero-downtime (T16.2.3): `maxUnavailable: 0` + `maxSurge: 1` means a rolling update
+# always starts the NEW pod and waits for it to pass readiness before the OLD one is removed --
+# true even at `replicas: 1` (a surge pod, not an in-place replace). `preStop` sleeps 10s before
+# SIGTERM so the pod has already been removed from the Service's Endpoints (kube-proxy/EndpointSlice
+# propagation is not instantaneous) before the app itself starts shutting down -- otherwise a new
+# SSE connection could land on a pod that is already draining. `terminationGracePeriodSeconds: 310`
+# = the 10s preStop sleep + the Gateway's own 300s SSE request/backendRequest timeout
+# (base/gateway/httproute.yaml) for `POST /api/chat/stream`, so an in-flight stream is never cut by
+# the grace period itself; `--timeout-graceful-shutdown 300` (uvicorn, overridden via `command`
+# rather than editing backend/Dockerfile's CMD, which is outside this block's `touches`) makes
+# uvicorn's OWN shutdown wait that long for in-flight requests too -- without it uvicorn's default
+# graceful-shutdown window is far shorter than the k8s-level grace period, which would make the
+# manifest-level grace period cosmetic.
+# topologySpreadConstraints (soft/`ScheduleAnyway`, T16.2.3): spreads backend pods across nodes by
+# `kubernetes.io/hostname` once there is more than one replica/node -- a no-op today at
+# `replicas: 1` on k3d's 3 nodes, forward-looking for 16-D (KEDA raises `maxReplicaCount`) and for
+# AKS's multi-node pool; `ScheduleAnyway` (not the hard `DoNotSchedule`) so a replica never goes
+# Pending just because a single-node dev machine can't satisfy the spread.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,6 +50,11 @@ metadata:
     app.kubernetes.io/part-of: secrag
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: backend
@@ -41,9 +65,30 @@ spec:
         app.kubernetes.io/part-of: secrag
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 310
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: backend
       containers:
         - name: backend
           image: secrag-registry:5050/secrag/backend:placeholder
+          command:
+            - uvicorn
+            - rag_app.api.app:app
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+            - --timeout-graceful-shutdown
+            - "300"
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
           ports:
             - name: http
               containerPort: 8000
@@ -78,12 +123,26 @@ spec:
               port: http
             failureThreshold: 60
             periodSeconds: 5
+          # T16.2.2, measured this block (throwaway docker network/DB, never rag_ia_pgdata; built
+          # secrag/backend:16c2drill from this exact HEAD, no Ollama in the harness):
+          # idle VmRSS 1.92-2.0 GiB (/proc/1/status, trusted over docker stats' cgroup number per
+          # the phase-11 ADR finding), VmHWM 2.93 GiB after the reranker's load+quantize at
+          # startup; CPU ~105% (just over 1 vCPU) during a 50-worker/300-request /health/ready
+          # burst. Historical phase-11 ADR data (adr_phase11_stability.md, same reranker config,
+          # real concurrent /chat burst with Ollama) measured idle 2.02 GiB -> burst 2.32 GiB ->
+          # VmHWM peak 3.72 GiB -- reused here since this harness has no Ollama to reproduce a
+          # real chat burst. `limits.memory: 4Gi` and `limits.cpu: 2000m` match the already-
+          # adopted Azure Container App sizing for `secrag-backend` (cpu 2 / mem 4Gi, ADR
+          # decision 8: "1 vCPU/2 GiB is not viable") -- comfortably above
+          # both measured peaks above. `requests` sit just above the measured idle floor so the
+          # scheduler reserves what the pod actually uses, not more.
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
+              cpu: 500m
               memory: 2Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -1,0 +1,36 @@
+# PodDisruptionBudget (T16.2.3): `minAvailable: 1` blocks any VOLUNTARY disruption (node drain,
+# `kubectl delete pod` via the eviction API, etc.) of the backend's sole replica -- at
+# `replicas: 1` this means `disruptionsAllowed: 0` unconditionally (there is no safe way to evict
+# the only replica without a gap), which is the correct zero-downtime semantics today. KNOWN
+# BOUNDARY (self-reported, forward-looking for 16-D): once KEDA (T16.3.1, TF37) raises replicas
+# above 1, `minAvailable: 1` becomes progressively weaker (it would allow N-1 simultaneous
+# evictions) -- 16-D should revisit this as `minAvailable: 50%` or `maxUnavailable: 1` once
+# `replicas`/`maxReplicaCount` are no longer both 1. This PDB does NOT stop an involuntary
+# disruption (a crash, an OOMKill, a node failure) -- only the Kubernetes eviction API path
+# (`kubectl drain`, the descheduler, etc.), which is what a PDB can ever guarantee.
+#
+# kube-linter's `pdb-min-available` (minAvailable >= replicas) is exactly the boundary above,
+# self-reported rather than silently excepted project-wide (same narrow, per-object annotation
+# convention as base/ollama/service.yaml's `dangling-service`, deploy/k8s/.kube-linter.yaml
+# line 16-18) -- re-check at 16-D once replicas > 1.
+# `unhealthyPodEvictionPolicy: AlwaysAllow` (real fix, not excepted): the default
+# (`IfHealthyBudget`) can leave an already-unhealthy pod permanently blocking a drain even
+# though evicting it costs nothing (it is not serving traffic); `AlwaysAllow` lets an unhealthy
+# pod be evicted regardless of `disruptionsAllowed`, matching the k8s-chaos node-drain drill's
+# own expectation (drain blocks on the HEALTHY backend pod's PDB, never on a dead one).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend
+  namespace: secrag
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: secrag
+  annotations:
+    ignore-check.kube-linter.io/pdb-min-available: "replicas:1 forces minAvailable>=replicas by design (zero-downtime boundary, see comment above); re-check at 16-D (T16.3.1) once replicas > 1"
+spec:
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend

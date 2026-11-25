@@ -16,6 +16,17 @@
 # port-forward` + a spoofed Host header, which does not need a mapped port. Real interactive
 # browser access additionally needs `-p "<port>:80@loadbalancer"` added to cluster-up.sh (left
 # for a later block/developer need, not required by any T16.1 Done-when).
+#
+# OMP_NUM_THREADS / MKL_NUM_THREADS (T16.2.2, self-reported finding): the running app (unlike
+# rag_app.eval.latency's own measurement harness) never pinned torch's thread pool -- a k8s CPU
+# `limit` is a CFS quota, not a cpuset, so without this torch's intra-op thread pool sizes
+# itself from the node's FULL core count (via sched_getaffinity), not the pod's quota, which
+# throttles hard once more threads are runnable than the quota allows (confirmed by this
+# block's own burst measurement: ~105% CPU during a 50-worker /health/ready burst on an
+# unthrottled host -- a tighter quota without this pin would contend far worse). Pinned to "2"
+# to match the backend Deployment's own `resources.limits.cpu: 2000m` below (Azure parity --
+# `secrag-backend` is already provisioned at cpu 2 / mem 4Gi) and `rerank_concurrency`'s
+# existing design ("same 2 vCPUs", ADR phase11_stability decision 8/T11.5.1b).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -35,3 +46,5 @@ data:
   SMTP_HOST: "mailpit.secrag.svc.cluster.local"
   SMTP_PORT: "1025"
   PUBLIC_APP_URL: "http://secrag.localtest.me"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"

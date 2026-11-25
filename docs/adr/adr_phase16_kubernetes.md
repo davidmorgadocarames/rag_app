@@ -471,3 +471,131 @@ commits (the main risk this control targets) but does not stop a developer from
 hand-writing a false PASS for the SHA about to be pushed. Backstops: CI's `k8s-manifests-kind`
 job (independent of this marker, a real kind cluster) and 16-F's own exact-SHA `--k8s` run at
 the promotion SHA (DEC-16-C-1, adopted into 16-F's checklist).
+
+### 16-C2 — Resources from measurements, zero-downtime rollouts, chaos drills (T16.2.2-T16.2.4)
+
+**T16.2.2 — Resources from measurements.** Built fresh `backend`/`frontend`/`jobs` images
+from this exact HEAD (throwaway docker network + Postgres, never `rag_ia_pgdata`) and
+measured `/proc/1/status` VmRSS (trusted over `docker stats`' cgroup number, per the
+phase-11 ADR's own finding that the cgroup figure under-counts): backend idle **1.92-2.0
+GiB**, VmHWM **2.93 GiB** after the reranker's load+quantize at startup (no native Ollama in
+this throwaway harness, so a real concurrent `/chat` burst could not be reproduced here —
+reused phase-11's own historical concurrent-burst delta instead: idle 2.02 GiB → burst 2.32
+GiB → VmHWM peak 3.72 GiB, same reranker config, still the best evidence available for that
+specific number); CPU ~105% (just over 1 vCPU) during a 300-request/50-worker
+`/health/ready` burst. Frontend idle VmRSS ~90 MiB. `limits.memory: 4Gi` / `limits.cpu:
+2000m` for backend match the already-adopted Azure Container App sizing for
+`secrag-backend` (cpu 2 / mem 4Gi, ADR phase11 decision 8: "1 vCPU/2 GiB is not
+viable") and comfortably clear both measured peaks above; `requests` sit just above the
+measured idle floor. **Self-reported finding and fix:** the pre-block manifest's
+`limits.memory: 2Gi` was BELOW the measured idle floor (1.92-2.0 GiB) — a real deploy would
+have left essentially zero headroom before an OOMKill on the very first reranker load.
+**Second self-reported finding and fix:** the running app (unlike
+`rag_app.eval.latency`'s own measurement harness) never pinned torch's thread pool — a k8s
+CPU `limit` is a CFS quota, not a cpuset, so without `OMP_NUM_THREADS`/`MKL_NUM_THREADS` set
+to match `limits.cpu` (now in `backend-config`), torch sizes its intra-op thread pool from
+the node's full core count, not the pod's quota, and throttles hard under load once more
+threads are runnable than the quota allows.
+
+**T16.2.3 — Rollouts.** `backend`/`frontend` Deployments: `strategy.rollingUpdate.
+maxUnavailable: 0` / `maxSurge: 1` (a surge pod is always created and proven Ready before
+the old one is removed, true even at `replicas: 1`); `lifecycle.preStop` sleeps 10s (lets
+Service/EndpointSlice removal propagate before the app itself starts shutting down, so a new
+connection never races onto a pod that is already draining); `terminationGracePeriodSeconds:
+310` = the 10s preStop + the Gateway's own 300s `POST /api/chat/stream` request/
+backendRequest timeout (`base/gateway/httproute.yaml`), so an in-flight SSE stream is never
+cut by the grace period itself. The Gateway's `HTTPRoute` routes EVERY path (including the
+SSE stream) to the **frontend** Service first (the Next.js BFF proxies to the backend
+server-side) — found while implementing this row — so the frontend needs the identical
+grace-period treatment, not just the backend; Next.js's standalone `server.js` already calls
+Node's own `http.Server.close()` on SIGTERM, which lets in-flight connections finish
+naturally with no extra flag. Backend additionally overrides its container `command` to add
+uvicorn's own `--timeout-graceful-shutdown 300` (via the Deployment, not
+`backend/Dockerfile`'s CMD, which is outside this block's `touches`) — without it uvicorn's
+default graceful-shutdown window is far shorter than the k8s-level grace period, making the
+manifest-level grace period cosmetic. `topologySpreadConstraints` (soft, `ScheduleAnyway`,
+`kubernetes.io/hostname`) on both apps — a no-op today at `replicas: 1`, forward-looking for
+16-D's KEDA scale-up and for AKS's multi-node pool. New `PodDisruptionBudget`s
+(`minAvailable: 1`, `unhealthyPodEvictionPolicy: AlwaysAllow`) for both apps — at
+`replicas: 1` this correctly blocks ANY voluntary disruption (there is no safe way to evict
+the only replica without a gap); kube-linter's `pdb-min-available` check flags exactly this
+as an anti-pattern at scale, so it is a per-object, dated, self-reported exception (same
+convention as the `ollama-host` `dangling-service` exception) rather than silently
+suppressed, with an explicit re-check instruction for 16-D once `replicas > 1`. **Self-
+reported gap found by this block's own node-drain drill:** `scripts/k8s/deploy-local.sh`'s
+`stage_foundation()` applies every resource with no ordering dependency (Services,
+ConfigMaps, SealedSecrets, ...) but its `awk` filter predated `PodDisruptionBudget` — a real
+`deploy-local.sh` run never actually applied either PDB, so a real `kubectl drain` evicted
+the "protected" backend pod outright. Fixed by adding `PodDisruptionBudget` to the filter;
+re-verified live (see T16.2.4 below).
+
+**T16.2.4 — Chaos drills, extending `gate.sh`'s `k8s-chaos` step.** Real, scripted (never a
+fake PASS): **Valkey pod-kill** (T16.1.8, unchanged) — kill the pod, the Service's Endpoints
+recover. **Crash-loop back-off** (new) — a pod that always exits 1 (reusing the CNPG image
+already pulled onto every node, no new pull) reaches `restartCount >= 2` within 90s; the
+exact `CrashLoopBackOff` waiting-reason string is only present DURING the backoff wait
+between two restart attempts, which an earlier 5s poll interval could straddle and miss even
+with a correctly climbing restart count (observed live: `restarts=4`, reason read empty at
+every sample) — tightened to a 2s poll and made `restartCount >= 2` the primary pass signal,
+the reason string corroborating evidence only. **CNPG failover** (new) — write a marker row
+through the current primary's local trust-authenticated `psql` (CNPG's own convention),
+delete that primary pod, wait for CNPG to promote the replica and the cluster to report
+"Cluster in healthy state" again (observed live: ~180-235s under this block's own test load,
+well inside the step's 600s budget — the initial 150s timeout this drill shipped with was
+too tight and had to be widened to 240s after a live FAIL), then read the marker back
+through the NEW primary — proving both the failover and that no data was lost.
+
+**Explicit, named SKIPs (never scripted here) for the three drills that need a REAL running
+backend image:** backend/frontend pod-kill traffic-continuity, rolling update under k6 with
+zero failed requests, and backup → restore + `replay_deletions`. No scripted
+backend/frontend/jobs image build+push pipeline exists yet (same boundary as
+`k8s-restart-check`/`k8s-eval`, 16-B-fix). Per this block's own brief, hand-built the three
+images from this exact HEAD and pushed them to the k3d registry **by hand** (never
+scripted) to verify the design for real: backend/frontend came up Ready, single-replica
+pod-kill recovery worked (new pod Ready ~25s after the kill, including the preStop delay),
+and the node-drain/PDB interaction was proven correctly (`kubectl drain` blocked on the
+backend pod with "Cannot evict pod as it would violate the pod's disruption budget" until
+uncordoned). **Pod-kill traffic-CONTINUITY specifically (≥2 live backend replicas) was
+attempted and found to NOT fit the local k3d cluster's memory budget** at this block's own
+measured `requests.memory: 2Gi` — confirmed live (`0/3 nodes are available: Insufficient
+memory` scaling `backend` to `replicas: 2`), which is *why* `cluster-up.sh`'s per-node
+memory caps were raised from `2g`/`1g`/`1g` to `2g`/`3g`/`3g` (8GB total, matching the
+internal planning docs' own already-stated "Resource budget (local)" figure, never actually
+realised by 16-A's original k3d flags) — even after that raise, two live backend replicas
+(2Gi request each) plus CNPG×2/Valkey/SeaweedFS/Prometheus/Mailpit/Envoy Gateway/the CNPG
+operator/kube-state-metrics do not fit in 8GB simultaneously. Rolling-update-under-k6 was not
+attempted for the same reason (it needs the same ≥1-extra-replica headroom during the surge).
+Backup → restore + `replay_deletions` needs the `jobs` image plus Phase 15's GDPR
+erasure/`replay_deletions` integration against a RESTORED cluster — a materially larger,
+multi-cluster-recreate piece of work, explicitly deferred rather than attempted partially.
+
+**Major self-reported finding (T16.2.2/T16.2.4): the `backend-egress-ollama`
+NetworkPolicy IS enforced on this cluster, contrary to 16-A's own comment.** 16-A's
+`deploy/k8s/base/ollama/networkpolicy.yaml.tmpl` asserted "k3d's default CNI (flannel) does
+NOT enforce NetworkPolicy" and that the Ollama-only egress rule was therefore a harmless,
+unverified no-op. That claim is **false** on this cluster's actual k3s version
+(`v1.35.5+k3s1`, confirmed via `k3d version`) — proven live while bringing up the first real
+backend image for this block's drills: the pod went `CrashLoopBackOff` with
+`OperationalError: [Errno -3] Temporary failure in name resolution` trying to reach
+Postgres; a raw UDP probe to `kube-dns` timed out and a raw TCP probe to both
+`kube-dns:53` and `secrag-pg-rw:5432` came back "Connection refused" (an ACTIVE reject, not a
+route failure); `kubectl delete networkpolicy backend-egress-ollama` made both connect
+immediately — conclusive. The policy as originally written (ONLY `Ollama:11434` allowed)
+therefore silently broke the backend's own DNS and Postgres egress the instant a real image
+replaced the placeholder — never caught before because no real backend had ever run against
+it until this block built one. Fixed by broadening the SAME object (kept its name, to avoid
+disturbing the one existing reference in this ADR) to the backend's real egress set: DNS (to
+`kube-dns` in `kube-system`), Postgres (to `cnpg.io/cluster: secrag-pg` pods), Mailpit, and
+Prometheus, in addition to the original Ollama rule. T16.4 (block 16-E, the namespace-wide
+default-deny + every OTHER service's own egress rules + Pod Security `restricted`) still
+owns the complete, coordinated policy set — this only fixes the backend's own rule so it is
+CORRECT today, not a "no real enforcement yet, so it doesn't matter" placeholder; 16-E
+should re-read this finding before assuming NetworkPolicy is inert on this cluster.
+
+**Gate:** `k8s-chaos`'s step budget raised 300s → 600s (crash-loop + the widened-after-a-
+live-FAIL CNPG failover timeout need the room). `scripts/gate.sh --k8s` real run (fresh k3d,
+2g/3g/3g node memory, hand-built drill images for the backend/frontend Deployments only —
+never committed, the manifests stay `:placeholder`): **PASS, 268s** (Valkey pod-kill,
+crash-loop back-off, CNPG failover all real PASSes; the three image-dependent drills an
+explicit, named SKIP). `gate.sh --fast`/`--full` and CI results are in
+`status/blocks/16-C2.md`.

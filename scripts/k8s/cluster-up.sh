@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Bring up the local k3d cluster for Phase 16 (T16.0.3): 1 server + 2 agents, Traefik disabled
-# (Envoy Gateway takes over in T16.1.1), a local image registry, Docker memory limits per node,
+# (Envoy Gateway takes over in T16.1.1), a local image registry, Docker memory limits per node
+# (T16.2.2, 2026-11-25, self-reported fix: the original 2g server / 1g-per-agent split (16-A)
+# left only 1Gi allocatable per agent node -- too small to schedule even ONE backend pod at this
+# block's own MEASURED `requests.memory: 2Gi`, confirmed live: `0/3 nodes are available: 3
+# Insufficient memory` with the old caps. Raised to 2g/3g/3g = 8GB total, matching the
+# internal planning docs' own already-stated "Resource budget (local)" figure for Phase 16 --
+# that figure was never actually realised by 16-A's k3d flags until now),
 # the `secrag` namespace, the hand-managed Ollama Service/EndpointSlice/NetworkPolicy
 # (T16.0.4, reusing the T11.0.12 compose pattern for reaching the host's native Ollama), and
 # (T16.1.3/T16.1.4, 16-B living-graph deviation -- see status/blocks/16-B.md) three pinned Helm
@@ -43,7 +49,7 @@ else
     --k3s-arg '--disable=traefik@server:0' \
     --registry-create "$REGISTRY" \
     --servers-memory 2g \
-    --agents-memory 1g \
+    --agents-memory 3g \
     --wait --timeout 180s
 fi
 

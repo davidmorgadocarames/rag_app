@@ -1,14 +1,26 @@
-# Egress-to-Ollama allow rule (T16.0.4), templated like endpointslice.yaml.tmpl because the host
-# IP is resolved fresh by scripts/k8s/cluster-up.sh on every (re)creation. Restricts the
-# backend's egress (once the backend Deployment exists, T16.1.1, labelled
-# app.kubernetes.io/name: backend) to the host's Ollama port only — not a blanket "reach any
-# host IP" rule.
+# Backend egress allow-list (T16.0.4 added the Ollama rule only; T16.2.2/T16.2.4, 2026-11-25,
+# self-reported CORRECTION below broadened it to every destination the backend actually needs).
+# Templated like endpointslice.yaml.tmpl because the host IP is resolved fresh by
+# scripts/k8s/cluster-up.sh on every (re)creation.
 #
-# KNOWN BOUNDARY (self-reported, see docs/adr/adr_phase16_kubernetes.md "16-A" section): k3d's
-# default CNI (flannel, via k3s) does NOT enforce NetworkPolicy — this object is accepted by the
-# API server but has no effect on traffic until a NetworkPolicy-capable CNI (e.g. Calico) is
-# installed, T16.4.1's job (block 16-E). Applying it now is safe and documents the intended rule
-# ahead of time; it must be re-verified once a real CNI is in place.
+# CORRECTION (T16.2.2/T16.2.4, self-reported): the ORIGINAL comment here claimed "k3d's default
+# CNI (flannel, via k3s) does NOT enforce NetworkPolicy" and that this object was a no-op until
+# T16.4.1 installed a NetworkPolicy-capable CNI. That claim is FALSE on this cluster's actual k3s
+# version (v1.35.5+k3s1, confirmed via `k3d version`) -- k3s now enforces NetworkPolicy out of the
+# box. Proven live while building this block's chaos drills: the real backend image (not
+# :placeholder) went CrashLoopBackOff with `OperationalError: [Errno -3] Temporary failure in
+# name resolution` trying to reach Postgres; a raw UDP probe to kube-dns timed out and a raw TCP
+# probe to both kube-dns:53 and secrag-pg-rw:5432 came back "Connection refused" (an active
+# REJECT, not a route failure) -- `kubectl delete networkpolicy backend-egress-ollama` made both
+# connect immediately, conclusively proving enforcement. The policy as originally written (ONLY
+# Ollama:11434 allowed) therefore silently broke the backend's own DNS and Postgres egress the
+# moment a real image replaced the placeholder -- never caught before because no real backend had
+# ever run against this policy until this block built one. Broadened below to the backend's real
+# egress set (DNS, Postgres/CNPG, SMTP/Mailpit, Prometheus, plus the existing Ollama rule) rather
+# than reverted to "no effect assumed" -- T16.4 (block 16-E, Pod Security `restricted` + a
+# namespace-wide default-deny + the OTHER services' own egress rules) still owns the complete,
+# coordinated policy set; this fixes backend's own rule so it is correct TODAY, not a "no real
+# enforcement yet" placeholder.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -29,3 +41,40 @@ spec:
       ports:
         - protocol: TCP
           port: 11434
+    # DNS (CoreDNS/kube-dns in kube-system) -- without this the backend cannot resolve ANY
+    # in-cluster Service name, including Postgres (found live, see CORRECTION above).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Postgres (CNPG's secrag-pg-rw/-ro/-r Services route to these pods).
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: secrag-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Mailpit (local SMTP sink, T12.1.11) and Prometheus (admin dashboard's MetricsBackend, T13.1.3).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mailpit
+      ports:
+        - protocol: TCP
+          port: 1025
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
