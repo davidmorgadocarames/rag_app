@@ -206,7 +206,7 @@ are a human/agent checklist.
 | `--full` | pre-push to `main` (promotion), before a PR is ready | fast + stack steps in the gate project: up → roles → migrate → seed → steps → `down -v`. A missing tool or an unreachable stack **fails** (never skips). A PASS on a clean tree publishes `secrag/gate-full` for the SHA (see above) |
 | `--only a,b` | closing a sub-phase, debugging, CI `cheap-checks` | just the named steps (the gate project is started only if one needs it). A missing tool **fails**, as in `--full` — a step that was asked for never passes without running |
 | `--make-seed` | once, and whenever the corpus (`data/chunks/chunks.jsonl`), the embedding model build (Ollama digest) or the migrations head changes | builds the git-ignored seed `.gate/seed.dump` (documents + chunks, embedded with Ollama) in the gate project; `seed.meta` records corpus hash, `embed_model` digest and `alembic_head`, and `eval` fails on any mismatch |
-| `--k8s` (T16.1.8) | local-only, after `deploy/k8s/**`/probe/scaling changes, before pushing them | `k8s-chaos`, `k8s-autoscale`, `k8s-policies`, `k8s-restart-check`, `k8s-eval` against an **already-running** k3d cluster (`scripts/k8s/cluster-up.sh`) — this mode never brings one up or tears one down itself. A step whose real prerequisite does not exist yet in this codebase (KEDA/16-D, Kyverno/16-E, no scripted app-image build+push step yet) is an explicit **SKIP with a named reason**, never a fake PASS. A PASS writes `.gate/k8s-pass` (exact SHA) — see "pre-push `--k8s` scoping" below |
+| `--k8s` (T16.1.8) | local-only, after `deploy/k8s/**`/probe/scaling changes, before pushing them | `k8s-chaos`, `k8s-autoscale`, `k8s-policies`, `k8s-restart-check`, `k8s-eval` against an **already-running** k3d cluster (`scripts/k8s/cluster-up.sh`) — this mode never brings one up or tears one down itself. A step whose real prerequisite does not exist yet in this codebase (KEDA/16-D, Kyverno/16-E, no scripted app-image build+push step yet) is an explicit **SKIP with a named reason**, never a fake PASS. A PASS writes `.gate/k8s-pass` (exact SHA) — see "pre-push `--k8s` scoping" below. **`.gate/k8s-pass` is a self-attested, non-cryptographic local marker** (DA-16-C-2), the same trust model as every other git-ignored `.gate/` state file in this repo — nothing stops a developer from hand-writing a false PASS for the SHA they are about to push. The exact-SHA match (`scripts/gate.sh`, `.githooks/pre-push`) only prevents *stale* reuse across commits, not forgery. Accepted as a residual risk for this solo-dev workflow, backstopped by CI's own `k8s-manifests-kind` job (a real kind cluster + Kyverno Audit, independent of this marker) and by 16-F's exact-SHA `--k8s` run at the promotion SHA |
 | `--list` | — | step names, stack needs and budgets (plus the separate `--k8s` step table) |
 
 Steps and time budgets (a step that exceeds its budget is killed and fails):
@@ -293,7 +293,8 @@ by branch name, so a push on an unrelated branch that happens to touch none of t
 never blocked by this (the exact lesson from an earlier cross-branch scoping mistake with
 gitleaks). This never runs k3d inside the pre-push worktree itself (RAM/lock reasons above);
 it only checks the marker exists and names the exact SHA, failing the push with the command
-to run otherwise.
+to run otherwise. This is a presence/SHA check only, not a cryptographic one (DA-16-C-2,
+see the `--k8s` row above) — it catches a forgotten run, not a deliberately forged marker.
 
 `latency` (T11.3.5/T11.4.4/T11.6b.1, `rag_app.eval.latency`): runs the golden set (14
 questions) `N`=3 times through its own inlined per-call-site shape (`reranking.retrieve` +

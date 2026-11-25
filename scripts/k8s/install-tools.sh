@@ -13,6 +13,13 @@
 #   scripts/k8s/install-tools.sh                 # install everything missing
 #   scripts/k8s/install-tools.sh k3d kubectl      # only some tools
 #   scripts/k8s/install-tools.sh check            # report installed vs. pinned versions, no download
+#   scripts/k8s/install-tools.sh check k3d        # report installed vs. pinned for a subset only
+#
+# 16-C-fix (DA-16-C-1): CI's `cheap-checks` job (.github/workflows/ci.yml) calls
+#   `install-tools.sh kustomize kubeconform kubelinter` directly -- the SAME pins/checksums
+#   as below, one source of truth, no second pin table to drift. A subset install's trailing
+#   `check` only verifies the TOOLS THAT WERE ACTUALLY REQUESTED (not all nine) -- a bare CI
+#   runner has none of the other six installed by design, and that must never fail the step.
 #
 # Checksum provenance (recorded here, not just asserted): kubectl, k3d, helm, kustomize, k6,
 # kubeconform, cosign and kubeseal SHA-256s below were cross-checked against each project's own
@@ -208,7 +215,7 @@ install_kubeseal() {
   ln -sfn "$dir/kubeseal" "$BIN/kubeseal"
 }
 
-check() {
+check() { # check [tool ...] -- no args checks all nine; a subset checks only those
   local ok=0
   check_one() { # check_one <name> <want> <have>
     if [ "$2" = "$3" ]; then
@@ -218,21 +225,53 @@ check() {
       ok=1
     fi
   }
-  check_one k3d "$K3D_VERSION" "$(k3d version 2>/dev/null | awk '/^k3d version/ {print $3}' | tr -d v)"
-  check_one kubectl "$KUBECTL_VERSION" "$(kubectl version --client 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
-  check_one helm "$HELM_VERSION" "$(helm version --short 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
-  check_one kustomize "$KUSTOMIZE_VERSION" "$(kustomize version 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
-  check_one k6 "$K6_VERSION" "$(k6 version 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
-  check_one kubeconform "$KUBECONFORM_VERSION" "$(kubeconform -v 2>/dev/null | awk '{print $1}' | tr -d v)"
-  check_one kube-linter "$KUBELINTER_VERSION" "$(kube-linter version 2>/dev/null | tr -d v)"
-  check_one cosign "$COSIGN_VERSION" "$(cosign version 2>/dev/null | awk '/GitVersion/ {print $2}' | tr -d v)"
-  check_one kubeseal "$KUBESEAL_VERSION" "$(kubeseal --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)"
+  local names=("$@")
+  if [ ${#names[@]} -eq 0 ]; then
+    names=(k3d kubectl helm kustomize k6 kubeconform kube-linter cosign kubeseal)
+  fi
+  local n
+  for n in "${names[@]}"; do
+    case "$n" in
+      k3d)
+        check_one k3d "$K3D_VERSION" "$(k3d version 2>/dev/null | awk '/^k3d version/ {print $3}' | tr -d v)"
+        ;;
+      kubectl)
+        check_one kubectl "$KUBECTL_VERSION" "$(kubectl version --client 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
+        ;;
+      helm)
+        check_one helm "$HELM_VERSION" "$(helm version --short 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
+        ;;
+      kustomize)
+        check_one kustomize "$KUSTOMIZE_VERSION" "$(kustomize version 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
+        ;;
+      k6)
+        check_one k6 "$K6_VERSION" "$(k6 version 2>/dev/null | grep -o 'v[0-9.]*' | head -1 | tr -d v)"
+        ;;
+      kubeconform)
+        check_one kubeconform "$KUBECONFORM_VERSION" "$(kubeconform -v 2>/dev/null | awk '{print $1}' | tr -d v)"
+        ;;
+      kube-linter | kubelinter)
+        check_one kube-linter "$KUBELINTER_VERSION" "$(kube-linter version 2>/dev/null | tr -d v)"
+        ;;
+      cosign)
+        check_one cosign "$COSIGN_VERSION" "$(cosign version 2>/dev/null | awk '/GitVersion/ {print $2}' | tr -d v)"
+        ;;
+      kubeseal)
+        check_one kubeseal "$KUBESEAL_VERSION" "$(kubeseal --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)"
+        ;;
+      *)
+        echo "unknown tool: $n" >&2
+        ok=1
+        ;;
+    esac
+  done
   return "$ok"
 }
 
 main() {
   if [ "${1:-}" = "check" ]; then
-    check
+    shift
+    check "$@"
     return $?
   fi
   local tools=("$@")
@@ -254,7 +293,10 @@ main() {
       *) echo "unknown tool: $t" >&2; exit 1 ;;
     esac
   done
-  check
+  # Only verify the tools that were actually requested (a subset install, e.g. CI's
+  # cheap-checks job installing just kustomize/kubeconform/kubelinter, must never fail
+  # because the other six tools are not present -- they were never asked for).
+  check "${tools[@]}"
 }
 
 main "$@"

@@ -480,11 +480,25 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/shellcheck" --strip-components=1
           "$RUNNER_TEMP/shellcheck/shellcheck" --version | grep -qx "version: $SHELLCHECK_VERSION"
           echo "$RUNNER_TEMP/shellcheck" >> "$GITHUB_PATH"
+      # DA-16-C-1: the `manifests` gate step (kustomize build + kubeconform + kube-linter,
+      # scripts/k8s/smoke-16-1.sh) previously ran only in --fast/pre-push locally -- never in
+      # CI, so a push that skipped the hook shipped a kube-linter/manifest regression with no
+      # server-side signal. Reuses scripts/k8s/install-tools.sh directly (one source of truth
+      # for the pins/checksums -- NOT a second, hand-copied pin table) so this can never drift
+      # from the local toolchain; the installer's own `set -euo pipefail` + `sha256sum -c`
+      # already fails closed on any checksum mismatch.
+      - name: kustomize/kubeconform/kube-linter (scripts/k8s/install-tools.sh, pinned + checksum-verified)
+        run: |
+          bash scripts/k8s/install-tools.sh kustomize kubeconform kubelinter
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Tool versions
         run: |
           shellcheck --version | grep -x "version: 0.11.0"
           node --version && npm --version
-      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue,registry
+          kustomize version | grep -q "5.8.3"
+          kubeconform -v | grep -q "0.8.0"
+          kube-linter version | grep -q "0.8.3"
+      - name: gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue,registry,manifests
         env:
           GATE_VENV: ${{ github.workspace }}/backend/.venv
-        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue,registry
+        run: bash scripts/gate.sh --only git-modes,shellcheck,venv,dependency-audit,adr-links,private-names,threat-catalogue,registry,manifests

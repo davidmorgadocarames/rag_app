@@ -434,3 +434,40 @@ liveness — a transient backend outage must never restart the frontend containe
 `backend/tests/test_api.py` proves both ends structurally: liveness never resolves a DB
 session even when the override is set up to crash if it tried; readiness fails closed (503)
 on a DB error, never a bare 500.
+
+### 16-C-fix — wire `manifests` into CI, name `.gate/k8s-pass`'s trust model (DA-16-C-1, DA-16-C-2)
+
+**DA-16-C-1 (blocker, fixed).** 16-C's own `manifests` gate step claimed "fast tier + CI's
+`cheap-checks` job" but `cheap-checks`' `gate.sh --only ...` line never named `manifests`,
+and the job never installed kustomize/kubeconform/kube-linter at all — a push that skipped
+the pre-push hook (`core.hooksPath` unset, `--no-verify`, or any clone without the hook)
+shipped a kube-linter/manifest regression with **zero server-side signal**; the `kind` job
+doesn't run kubeconform/kube-linter either (it only proves manifests apply to a real API
+server, a different check). Fixed: `manifests` added to both the step's `name:` and the
+`run:` line of `cheap-checks`' `gate.sh --only ...` step; a new step installs
+kustomize/kubeconform/kube-linter by calling `scripts/k8s/install-tools.sh` **directly**
+(never a second, hand-copied pin table) — one source of truth for the pins/checksums,
+fail-closed on any mismatch via the installer's own `set -euo pipefail` + `sha256sum -c`.
+Confirmed the `k8s-manifests-kind` job is unaffected (single diff hunk, confined to
+`cheap-checks`; `backend/tests/test_ci_cheap_checks.py::test_k8s_manifests_kind_job_is_unaffected_by_the_cheap_checks_fix`).
+
+**Self-reported fix needed to make the reuse work:** `install-tools.sh`'s `check()` always
+verified all nine tools unconditionally, even for a partial install — on a bare CI runner
+that only ever asked for kustomize/kubeconform/kube-linter, the other six (k3d, kubectl,
+helm, k6, cosign, kubeseal) are never installed by design, and the old `check()` would still
+report them `KO` and fail the whole step. `check()` now takes an optional tool-name subset
+(`check kustomize kubeconform kubelinter`) and verifies only what was requested; the no-args
+default (full install, or a bare `install-tools.sh check`) is unchanged.
+`backend/tests/test_gate_script.py::test_install_tools_check_verifies_only_the_requested_subset`
+proves both the subset and the unchanged-default behaviour, with no network access (stub
+binary + the `check` subcommand, not a real download).
+
+**DA-16-C-2 (named, not fixed as a gap — accepted as documented residual risk).**
+`docs/DEFINITION_OF_DONE.md`'s `--k8s` row and its "Pre-push `--k8s` scoping" paragraph now
+state explicitly that `.gate/k8s-pass` is a **self-attested, non-cryptographic local
+marker** — the same trust model as every other git-ignored `.gate/` state file in this repo.
+The exact-SHA match (`scripts/gate.sh`, `.githooks/pre-push`) prevents *stale* reuse across
+commits (the main risk this control targets) but does not stop a developer from
+hand-writing a false PASS for the SHA about to be pushed. Backstops: CI's `k8s-manifests-kind`
+job (independent of this marker, a real kind cluster) and 16-F's own exact-SHA `--k8s` run at
+the promotion SHA (DEC-16-C-1, adopted into 16-F's checklist).

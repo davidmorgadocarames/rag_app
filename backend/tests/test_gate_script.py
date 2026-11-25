@@ -322,6 +322,47 @@ def test_manifests_is_a_fast_tier_step(tmp_path: Path) -> None:
 
 
 @needs_tools
+def test_install_tools_check_verifies_only_the_requested_subset(tmp_path: Path) -> None:
+    """DA-16-C-1 (16-C-fix): CI's `cheap-checks` job installs only
+    kustomize/kubeconform/kube-linter via `scripts/k8s/install-tools.sh` -- its trailing
+    `check()` must verify ONLY the tools that were actually requested. Before this fix,
+    `check()` always verified all nine tools unconditionally, so a bare runner (no k3d,
+    kubectl, helm, k6, cosign or kubeseal installed -- none of them were asked for) would
+    always fail the step with spurious KO lines for tools nobody requested."""
+    install_tools = REPO_ROOT / "scripts" / "k8s" / "install-tools.sh"
+    stub_bin = tmp_path / "stubbin"
+    stub_bin.mkdir()
+    stub = stub_bin / "kustomize"
+    stub.write_text("#!/usr/bin/env bash\necho 'Version: v5.8.3'\n", encoding="utf-8")
+    stub.chmod(0o755)
+    minimal_path = f"{stub_bin}:/usr/bin:/bin"
+
+    subset = subprocess.run(
+        ["bash", str(install_tools), "check", "kustomize"],
+        env={"PATH": minimal_path, "HOME": str(tmp_path / "home1")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert subset.returncode == 0, subset.stdout + subset.stderr
+    assert "OK  kustomize" in subset.stdout
+    assert "k3d" not in subset.stdout, "a tool that was never requested must never be checked"
+    assert "kubectl" not in subset.stdout
+
+    # Sanity: the no-subset (full) default behaviour is unchanged -- still checks all nine
+    # and still fails when they are missing.
+    full = subprocess.run(
+        ["bash", str(install_tools), "check"],
+        env={"PATH": minimal_path, "HOME": str(tmp_path / "home2")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert full.returncode != 0
+    assert "KO  k3d" in full.stdout
+
+
+@needs_tools
 def test_k8s_steps_are_listed_but_never_part_of_fast_full_or_only(tmp_path: Path) -> None:
     """T16.1.8: --k8s is its own mode with its own step table -- its steps must never leak
     into --fast's step set (a repo without a real app has no scripts/gate.sh step functions
