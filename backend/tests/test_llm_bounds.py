@@ -29,7 +29,10 @@ from rag_app.llm import Usage
 from rag_app.retrieval import RetrievedChunk
 
 _SRC = Path(rag_app.__file__).parent
-_LLM_METHODS = {"chat", "chat_stream"}
+# T14.1.1: chat_json is a third LLM-call method (router/summary callers from 14-B2/14-C1
+# onward) -- included here so a future real call site is caught by the same max_tokens
+# static check as chat/chat_stream, even though no call site exists yet in this block.
+_LLM_METHODS = {"chat", "chat_stream", "chat_json"}
 
 
 def _llm_calls(path: Path) -> list[ast.Call]:
@@ -100,6 +103,25 @@ class _RecordingChat:
         self.calls.append(("chat_stream", max_tokens, num_ctx, call_type))
         yield self._reply()
 
+    def chat_json(
+        self,
+        messages: Any,
+        schema: Any,
+        *,
+        fallback: Any,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
+    ) -> Any:
+        """T14.1.1: completes the ``ChatClient`` protocol so this fake stays structurally
+        valid now that ``chat_json`` is part of it. No caller in this test module uses
+        it (the router/summary call sites land in 14-B2/14-C1) -- it just records and
+        returns the fallback, same recording discipline as ``chat``/``chat_stream``."""
+        self.bounds.append(("chat_json", max_tokens))
+        self.calls.append(("chat_json", max_tokens, num_ctx, call_type))
+        return fallback
+
 
 def _chunk() -> RetrievedChunk:
     return RetrievedChunk(
@@ -114,7 +136,7 @@ def _chunk() -> RetrievedChunk:
 
 def test_chat_path_bounds_generation_and_groundedness() -> None:
     chat = _RecordingChat()
-    answer = answer_from_chunks(chat, "How do I prevent SQL injection?", [_chunk()])  # type: ignore[arg-type]
+    answer = answer_from_chunks(chat, "How do I prevent SQL injection?", [_chunk()])
     assert not answer.abstained
     assert chat.bounds == [
         ("chat", get_settings().max_tokens),
@@ -130,7 +152,7 @@ def test_stream_path_bounds_generation_and_groundedness(monkeypatch: pytest.Monk
         answer_question_stream(
             None,  # type: ignore[arg-type]
             "How do I prevent SQL injection?",
-            chat=chat,  # type: ignore[arg-type]
+            chat=chat,
             use_rerank=False,
         )
     )
@@ -153,7 +175,7 @@ def test_the_bounds_are_the_documented_values() -> None:
 
 def test_chat_path_passes_num_ctx_per_call_type() -> None:
     chat = _RecordingChat()
-    answer_from_chunks(chat, "How do I prevent SQL injection?", [_chunk()])  # type: ignore[arg-type]
+    answer_from_chunks(chat, "How do I prevent SQL injection?", [_chunk()])
     settings = get_settings()
     assert chat.calls == [
         ("chat", settings.max_tokens, settings.num_ctx_answer, "answer"),
@@ -169,7 +191,7 @@ def test_stream_path_passes_num_ctx_per_call_type(monkeypatch: pytest.MonkeyPatc
         answer_question_stream(
             None,  # type: ignore[arg-type]
             "How do I prevent SQL injection?",
-            chat=chat,  # type: ignore[arg-type]
+            chat=chat,
             use_rerank=False,
         )
     )
@@ -237,6 +259,6 @@ def test_agentic_reformulate_passes_num_ctx_answer_and_call_type_rewrite() -> No
     from rag_app.agentic import REWRITE_MAX_TOKENS, reformulate
 
     chat = _RecordingChat()
-    reformulate(chat, "sqli?")  # type: ignore[arg-type]
+    reformulate(chat, "sqli?")
     settings = get_settings()
     assert chat.calls == [("chat", REWRITE_MAX_TOKENS, settings.num_ctx_answer, "rewrite")]

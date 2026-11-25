@@ -1,11 +1,11 @@
 # ADR phase 14 — Conversational assistant
 
 - **Status:** **In progress.** Created at block **14-A1** (golden set v2 schema + items);
-  extended at **14-A2** (runner + metrics, "before" baseline + floors). The router/rewriting/
-  memory, conversational-answer, visible-plan, latency/cost/dashboard and Azure-migration
-  decisions (blocks 14-B1/B2, 14-C1/C2, 14-D1/D2/D3, 14.7/14.7-migration) are added as those
-  blocks land. Do not read this file as a complete phase-14 ADR until the "Docs + Azure
-  promotion" block (14.6) closes it out.
+  extended at **14-A2** (runner + metrics, "before" baseline + floors) and **14-B1**
+  (`chat_json` structured output). The router/rewriting/memory, conversational-answer,
+  visible-plan, latency/cost/dashboard and Azure-migration decisions (blocks 14-B2, 14-C1/C2,
+  14-D1/D2/D3, 14.7/14.7-migration) are added as those blocks land. Do not read this file as a
+  complete phase-14 ADR until the "Docs + Azure promotion" block (14.6) closes it out.
 - **Branch:** `phase-14-assistant`.
 - **Related:** `docs/TRD.md` §6.1 (golden set v2, same decision, shorter); `docs/PRD.md`
   (assistant behaviour, added at a later block); DEBT-006 (reranker truncation edge probe),
@@ -170,6 +170,72 @@ intent_accuracy/follow_up_resolution still look marginal once the router exists,
   this sample size, the table/log says so explicitly rather than reporting a single confident
   number from too few items.
 
+## Decision — `chat_json` structured output (T14.1.1/T14.1.2, block 14-B1)
+
+Both `OllamaChat` and `AzureOpenAIChat` (`backend/src/rag_app/llm.py`) gain a `chat_json(messages,
+schema, *, fallback, ...)` method with the same `max_tokens`/`num_ctx`/`call_type` shape as
+`chat`/`chat_stream`, so a future router (T14.2.3) or summary (T14.2.6) call site is a drop-in:
+
+- **Ollama**: the request's top-level `format` field is set to `schema.model_json_schema()`
+  (Ollama's own structured-output mechanism — a JSON-schema object, not the provider's `max_tokens`/
+  `num_ctx`/`options` shape, which is unchanged).
+- **Azure OpenAI**: `response_format: {"type": "json_schema", "json_schema": {"name":
+  schema.__name__, "schema": ..., "strict": true}}`. Azure's `strict: true` mode requires
+  `additionalProperties: false` on every object sub-schema (top level and any nested `$defs`),
+  which Pydantic's `model_json_schema()` does not set on its own — a small recursive helper
+  (`_strict_json_schema`) adds it without needing a second schema-authoring mechanism.
+- **Validate, one bounded retry, then the caller's `fallback`** (T14.1.2), shared by both
+  providers through one module-level `_chat_json_with_retry` helper so the retry/fallback policy
+  cannot drift between them: parse the reply as JSON, validate it against the Pydantic `schema`
+  (`model_validate`); on `JSONDecodeError`/`ValidationError`, retry once (two HTTP calls total,
+  never more); a second failure returns `fallback` (the caller's own safe default, e.g. a router
+  output that routes to today's "security" intent) rather than raising — a malformed router/
+  summary reply must never break the chat flow for the user. No prompt/response content is
+  logged on failure, only the call type, schema class name and error class (same PII discipline as
+  the rest of this module).
+- `num_ctx`/`call_type` on `chat_json` are accepted as a passthrough exactly like
+  `chat`/`chat_stream` (ignored by Azure, pinned explicitly for Ollama); this block does **not**
+  add `num_ctx_router`/`num_ctx_summary` constants to `config.py` — there is no real router/summary
+  call site yet to pin them from (T14.2.3/T14.2.6, blocks 14-B2/14-C1). Those blocks follow the
+  pattern `test_llm_bounds.py::test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_
+  groundedness` already enforces for the agentic rewrite and the eval judge: once the router/
+  summary calls can share the answer/groundedness Ollama process (same keep-alive window), they
+  must also pin `num_ctx_answer` to avoid a mid-request model reload (config.py's existing
+  `num_ctx_answer` comment already flags this as a "future conversation-summary call" risk).
+- `chat_json` is added to `test_llm_bounds.py`'s static `_LLM_METHODS` check (alongside
+  `chat`/`chat_stream`) so a real future call site missing `max_tokens` fails the same way the
+  existing calls already do — proactive, even though no such call site exists in this block.
+
+**Tests (mocked only, no live Azure OpenAI call — cost):** `backend/tests/test_llm_json.py` (new)
+covers `_strict_json_schema` (top-level and nested `$defs`), both providers' happy path, the
+request-body shape for Azure (`response_format`/`strict`/`additionalProperties`), the retry
+actually performing a second HTTP call (not a local no-op), invalid JSON and a schema violation
+both falling back after exactly two attempts, and Azure's `num_ctx` passthrough-and-ignore matching
+`chat`'s existing behaviour. A manual, uncommitted smoke against the local Ollama/qwen model
+confirmed the live request/response shape end-to-end (schema-valid JSON came back for a Spanish
+greeting) — not part of the gate (cost/determinism), reported for confidence only.
+
+## Known limitations (self-reported, not just design) — 14-B1
+
+- **No real router/summary call site yet.** `chat_json`'s `num_ctx`/`call_type` plumbing is
+  built and tested in isolation; whether the router (14-B2) and summary (14-C1) calls actually
+  need to pin `num_ctx_answer` to share Ollama's keep-alive window (as the agentic rewrite and
+  the eval judge already do) is a decision for those blocks, not verified here.
+  `test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness` does not yet cover
+  `llm.chat_json` call sites because none exist.
+  - Explore `test_router_and_judge_calls_now_pin_num_ctx_to_match_answer_groundedness` once
+    14-B2/14-C1 land.
+- **Azure's `strict: true` schema tightening (`_strict_json_schema`) only sets
+  `additionalProperties: false`.** OpenAI's strict mode also requires every property to be
+  listed in `required` (optional fields must be modelled as nullable, not merely absent from
+  `required`) — this is a constraint on how 14-B2/14-C1 author their Pydantic models, not
+  something `chat_json` enforces or can enforce generically; a schema that violates it would
+  fail at the real Azure API call, not locally (no live Azure call in this block to catch it).
+- **Retry re-sends the exact same request.** A provider that is deterministically wrong for a
+  given input (e.g. always drops a field) will exhaust both attempts and fall back every time,
+  not self-correct; no retry-with-a-corrective-message strategy is implemented (none was asked
+  for — the task's "bounded retry" + "safe fallback" are satisfied literally).
+
 ## Rollback
 
 14-A1: no runtime behaviour changes (`eval/golden_set_v2.jsonl` and the new
@@ -177,4 +243,8 @@ intent_accuracy/follow_up_resolution still look marginal once the router exists,
 `compute_dialogue_metrics`/`judge_no_claims` are new, additive functions reached only from the
 `eval` gate step's own extra code path and from tests — reverting this block's commit(s) is a
 plain revert with no migration, no deployed-image, and no API impact (the v1 `eval` gate path is
-untouched either way).
+untouched either way). 14-B1: `chat_json` is new, additive surface on both `ChatClient`
+implementations; no existing caller is touched (`chat`/`chat_stream` signatures and bodies are
+byte-identical, proven by the full pre-existing `test_llm.py`/`test_llm_bounds.py` suite staying
+green) and nothing in `generation.py`/the API routes calls `chat_json` yet — reverting this
+block's commit(s) is a plain revert with no migration, no deployed-image, and no API impact.

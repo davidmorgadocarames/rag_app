@@ -5,23 +5,36 @@ Two interchangeable providers implement the same ``ChatClient`` interface:
 cloud provider). ``make_chat_client`` picks one from ``LLM_PROVIDER``. The HTTP call is
 isolated from message building so callers/tests can construct prompts without a live
 server.
+
+``chat_json`` (T14.1.1/T14.1.2) is the structured-output variant both providers also
+implement: Ollama via its ``format`` field pinned to the Pydantic model's JSON schema,
+Azure OpenAI via ``response_format: {type: json_schema, strict: true}``. Both route
+through the shared ``_chat_json_with_retry`` helper -- parse, validate against the
+Pydantic model, one bounded retry, then the caller's safe ``fallback`` -- so a malformed
+router/summary reply degrades gracefully instead of breaking the chat flow.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from rag_app.config import Settings, get_settings
 
 _TIMEOUT_SECONDS = 180
 
 Message = dict[str, str]
+
+# T14.1.1: the Pydantic model type a ``chat_json`` caller validates its reply against
+# (router output, conversation summary, ...). Bound to ``BaseModel`` so both providers'
+# ``chat_json`` can call ``.model_json_schema()`` / ``.model_validate()`` generically.
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 # T11.3.4: an early warning for a prompt that may not fit the explicit `num_ctx` passed for
 # its call type (answer/groundedness, config.py). Ollama truncates a request that does not
@@ -107,6 +120,82 @@ class ChatClient(Protocol):
         num_ctx: int | None = None,
         call_type: str = "unknown",
     ) -> Iterator[str]: ...
+
+    def chat_json(
+        self,
+        messages: list[Message],
+        schema: type[SchemaT],
+        *,
+        fallback: SchemaT,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
+    ) -> SchemaT: ...
+
+
+def _strict_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    """``schema.model_json_schema()`` with ``additionalProperties: false`` set on every
+    object sub-schema (top level and any nested ``$defs``) -- required by Azure OpenAI's
+    ``strict: true`` structured-output mode, which Pydantic does not set on its own."""
+    raw = schema.model_json_schema()
+
+    def _tighten(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object" and "properties" in node:
+                node.setdefault("additionalProperties", False)
+            for value in node.values():
+                _tighten(value)
+        elif isinstance(node, list):
+            for item in node:
+                _tighten(item)
+
+    _tighten(raw)
+    return raw
+
+
+def _validate_json_content(content: str, schema: type[SchemaT]) -> SchemaT:
+    """Parse ``content`` as JSON and validate it against ``schema``; raises
+    ``json.JSONDecodeError``/``pydantic.ValidationError`` on failure (caught by
+    ``_chat_json_with_retry``)."""
+    data = json.loads(content)
+    return schema.model_validate(data)
+
+
+def _chat_json_with_retry(
+    perform_call: Callable[[], str],
+    schema: type[SchemaT],
+    fallback: SchemaT,
+    *,
+    call_type: str,
+) -> SchemaT:
+    """T14.1.2: validate the structured reply, one bounded retry, then ``fallback``.
+
+    Invalid JSON or a schema violation on the first attempt is retried once (two
+    attempts total); a second failure returns the caller's safe ``fallback`` rather
+    than raising -- a malformed router/summary reply must never break the chat flow.
+    No prompt/response content is logged (same discipline as the rest of this module),
+    only the call type, schema name and error class."""
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        content = perform_call()
+        try:
+            return _validate_json_content(content, schema)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            logger.warning(
+                "chat_json invalid output (attempt %d/%d): call_type=%s schema=%s error=%s",
+                attempt,
+                attempts,
+                call_type,
+                schema.__name__,
+                type(exc).__name__,
+            )
+    logger.warning(
+        "chat_json falling back to the caller's default: call_type=%s schema=%s",
+        call_type,
+        schema.__name__,
+    )
+    return fallback
 
 
 class OllamaChat:
@@ -207,6 +296,48 @@ class OllamaChat:
                         )
                     )
 
+    def chat_json(
+        self,
+        messages: list[Message],
+        schema: type[SchemaT],
+        *,
+        fallback: SchemaT,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
+    ) -> SchemaT:
+        """Structured-output chat call (T14.1.1): Ollama's ``format`` field pinned to
+        ``schema``'s JSON schema. ``num_ctx``/overflow-warning semantics match ``chat``
+        (future router/summary callers that share the answer/groundedness keep-alive
+        window must pin ``num_ctx`` the same way ``agentic.reformulate`` and
+        ``eval.judge.judge_correctness`` already do -- see ``test_llm_bounds.py``). See
+        module-level ``_chat_json_with_retry`` for the validate/retry/fallback contract
+        (T14.1.2)."""
+        _warn_if_may_overflow(messages, max_tokens=max_tokens, num_ctx=num_ctx, call_type=call_type)
+        json_schema = schema.model_json_schema()
+
+        def _call() -> str:
+            response = httpx.post(
+                f"{self.host}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "keep_alive": self.keep_alive,
+                    "format": json_schema,
+                    "options": self._options(temperature, max_tokens, num_ctx),
+                },
+                timeout=_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            content = response.json()["message"]["content"]
+            if not isinstance(content, str):
+                raise ValueError(f"unexpected chat response: {content!r}")
+            return content
+
+        return _chat_json_with_retry(_call, schema, fallback, call_type=call_type)
+
 
 def parse_azure_chat_response(data: dict[str, Any]) -> str:
     """Extract the assistant message content from an Azure OpenAI chat response."""
@@ -266,6 +397,24 @@ class AzureOpenAIChat:
             body["max_tokens"] = max_tokens
         if stream:
             body["stream_options"] = {"include_usage": True}
+        return body
+
+    def _json_body(
+        self,
+        messages: list[Message],
+        temperature: float,
+        max_tokens: int | None,
+        schema: type[BaseModel],
+    ) -> dict[str, Any]:
+        body = self._body(messages, temperature, max_tokens, stream=False)
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.__name__,
+                "schema": _strict_json_schema(schema),
+                "strict": True,
+            },
+        }
         return body
 
     def chat(
@@ -337,6 +486,37 @@ class AzureOpenAIChat:
                             completion_tokens=int(chunk_usage.get("completion_tokens", 0)),
                         )
                     )
+
+    def chat_json(
+        self,
+        messages: list[Message],
+        schema: type[SchemaT],
+        *,
+        fallback: SchemaT,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        num_ctx: int | None = None,
+        call_type: str = "unknown",
+    ) -> SchemaT:
+        """Structured-output chat call (T14.1.1): Azure OpenAI's
+        ``response_format: {type: json_schema, strict: true}``, with
+        ``additionalProperties: false`` added to every object sub-schema (see
+        ``_strict_json_schema`` -- Azure's strict mode requires it, Pydantic does not
+        set it). ``num_ctx``/``call_type`` accepted and unused for ``num_ctx`` -- see
+        ``chat``. See module-level ``_chat_json_with_retry`` for the validate/retry/
+        fallback contract (T14.1.2)."""
+
+        def _call() -> str:
+            response = httpx.post(
+                self._url(),
+                headers=self._headers(),
+                json=self._json_body(messages, temperature, max_tokens, schema),
+                timeout=_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return parse_azure_chat_response(response.json())
+
+        return _chat_json_with_retry(_call, schema, fallback, call_type=call_type)
 
 
 def make_chat_client(settings: Settings | None = None) -> ChatClient:
