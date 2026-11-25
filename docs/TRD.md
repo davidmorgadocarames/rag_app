@@ -473,6 +473,21 @@ whether it is enforced from this block based on the measured runs. `clarificatio
 `metrics.looks_like_clarifying_question`) is expected to move toward 1.0 for the first time
 — no code path producing a real clarifying reply existed before this block.
 
+**`noisy_recall` side effect, found and fixed in the resume (§6.2's `_ROUTER_SYSTEM`).**
+Making `ambiguous` never retrieve has a real cost: any noisy (misspelled) query the router
+mislabels `"ambiguous"` now scores a genuine `noisy_recall` miss, where before this block the
+retrieve-anyway `else` branch happened to still hit the expected doc despite the wrong label.
+Golden-set item `typo-injecion-what` ("What is injecion in security?", no prior context) is
+exactly this case — confirmed PRE-EXISTING at the `bf548f0` baseline too (same misclassification,
+replayed in a throwaway worktree), not something this block's dispatch code introduced; the
+dispatch change only made it visible in `noisy_recall` (1.0 → 0.75, deterministic across 2
+live eval runs). Fixed with one contrastive few-shot added to `router._ROUTER_SYSTEM`: a
+misspelling alone is not an unresolved reference. A code-level tie-breaker keyed on
+`clarification is None` (the same self-contradiction §6.4b/§6.4c already narrowed for the
+followup case) was considered and rejected: live-verified, 2 of the 5 genuine golden-set
+`ambiguous` items ("Can you help me?", "¿Cómo lo arreglo?") ALSO produce `clarification=None`
+— that signal does not distinguish a genuine ambiguity from this one.
+
 ## 7. Cost & latency
 
 - Q4 quantization; a single shared LLM; reranker on CPU.

@@ -920,6 +920,23 @@ eval table below) — the fix only narrows a code path that never fired for any 
 anyway (every `ambiguous` item is either a first turn or has unrelated context), so no
 regression was expected and none was measured.
 
+**Resume fix (noisy_recall regression, found by the orchestrator's verification, fixed by the
+resumed senior).** The orchestrator's first 2 `--only eval` runs on `cc8c597` both failed
+`noisy_recall` (1.000 → 0.750, deterministic). Root cause: golden-set item
+`typo-injecion-what` ("What is injecion in security?", no prior context) was ALREADY
+classified `"ambiguous"` by the live router at the `bf548f0` baseline too — confirmed by
+replaying the identical probe in a throwaway worktree at that commit (same result, 3×). Not a
+code regression in `router.py`: this block's own `_resolves_a_reference` tie-breaker change
+never touches a no-context, first-turn message. What changed the OUTCOME is T14.3.3's new
+dispatch — `ambiguous` never retrieves — so the pre-existing misclassification, which the OLD
+`else` branch used to retrieve through anyway (a lucky hit), now shows up as a genuine recall
+miss. Fixed with one contrastive few-shot added to `router._ROUTER_SYSTEM` (a misspelling
+alone is not an unresolved reference) rather than a code-level tie-breaker on
+`clarification is None`: live-verified, 2 of the golden set's 5 genuine `ambiguous` items
+("Can you help me?", "¿Cómo lo arreglo?") ALSO produce `clarification=None`, so that signal
+does not distinguish a genuine ambiguity from this one. See `docs/TRD.md` §6.5's own
+paragraph and `router.py`'s module docstring for the full write-up; commit `81c562a`.
+
 **New module `assistant/replies.py`** — `clarifying_reply` (reuses the router's own
 clarifying question, no extra LLM call), `generate_offtopic_reply`, `generate_abstention_reply`
 (both LLM calls, same delimited-untrusted-data/bounded-tokens/bilingual-template-fallback
@@ -945,32 +962,38 @@ generating a second, independent question would be. A short bilingual fallback
 rule on (§6.4b/§6.4c narrowed, did not eliminate, the "`ambiguous` with `clarification=None`"
 self-contradiction) — never surfaces an empty reply.
 
-### Eval table — NOT YET MEASURED on the final code (see status/blocks/14-D1.md)
+### Eval table — measured on the final code (resume, commit `81c562a`)
 
-The required 2 real `--only eval` runs were not completed this block: the first attempt was
-killed by the harness itself (system-wide low memory while the session sat idle — not a
-command failure, not a code problem) immediately after `gate.sh --fast` had already passed on
-the final code, and the senior was instructed not to retry on its own. The table below
-therefore records the 14-C4 baseline and the floors only; `conversational_reply_rate`
-enforcement and a final confirmation that `intent_accuracy`/`follow_up_resolution` still clear
-their floors after the DA-14-C4-1 fix (expected — the fix only narrows a tie-breaker branch
-that never fired for any golden-set item before or after) are left for the next 2 real runs,
-to be completed before this block closes.
+The first verification attempt (on `cc8c597`, before the resume fix) was killed by the harness
+itself (system-wide low memory while the session sat idle) immediately after `gate.sh --fast`
+had passed; the orchestrator then ran `--only eval` twice on `cc8c597` directly and found a
+real, deterministic `noisy_recall` regression (1.000 → 0.750 both times) plus thinner-margin
+dips in `intent_accuracy`/`follow_up_resolution` on one of those two runs — see "Resume fix"
+above for the root cause and fix (commit `81c562a`). The table below is the 2 required
+`--only eval` runs on that FINAL code:
 
-| Metric | 14-C4 (before) | Run 1 | Run 2 | Floor | Met (both)? | Enforced from this block? |
+| Metric | 14-C4 (before) | Run 1 (`gate-20261125T194629Z-3275007.log`) | Run 2 (`gate-20261125T195226Z-3276875.log`) | Floor | Met (both)? | Enforced from this block? |
 |---|---|---|---|---|---|---|
-| intent_accuracy | 0.907 | — | — | ≥ 0.90 | — | already (14-C4); re-confirm |
-| follow_up_resolution | 0.900 | — | — | ≥ 0.85 | — | already (14-C3); re-confirm |
-| noisy_recall | 1.000 | — | — | ≥ 0.90 | — | already |
-| conversational_reply_rate | 1.000 | — | — | ≥ 1.00 | — | pending these 2 runs |
-| clarification_rate | (no code path before 14-D1) | — | — | not floored | — | — |
-| greeting_reply_p95_s | ~1.5–1.6s | — | — | ≤ 2.0s | — | already |
-| router_p95_s | ~1.05s | — | — | ≤ 1.5s local | — | already |
+| intent_accuracy | 0.907 | 0.933 | 0.920 | ≥ 0.90 | **yes** | already (14-C4) |
+| follow_up_resolution | 0.900 | 1.000 | 1.000 | ≥ 0.85 | **yes** | already (14-C3) |
+| noisy_recall | 1.000 | 1.000 | 1.000 | ≥ 0.90 | **yes** | already (14-C2); regression found + fixed this block |
+| conversational_reply_rate | 1.000 | 0.944 | 0.889 | ≥ 1.00 | no (not 1.0 either run) | **left unenforced** — not 1.0 in both runs |
+| clarification_rate | (no code path before 14-D1) | 1.000 | 1.000 | not floored | — | — |
+| greeting_reply_p95_s | ~1.5–1.6s | 1.514s | 1.533s | ≤ 2.0s | yes | already |
+| router_p95_s | ~1.05s | 1.053s | 1.055s | ≤ 1.5s local | yes | already |
 
-v1 clean metrics (`retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`):
-expected unaffected by this block for `security`/`followup` turns (groundedness/citation logic
-untouched); `correct_abstention`/judge "no claims" now judges the conversational abstention
-text instead of the old fixed sentence (T14.3.5) — not yet measured, see above.
+v1 clean metrics (`retrieval_recall`/`faithfulness`/`correctness`/`correct_abstention`): **1.000
+on both runs** — unaffected by this block for `security`/`followup` turns (groundedness/
+citation logic untouched); `correct_abstention`/judge "no claims" now judges the
+conversational abstention text instead of the old fixed sentence (T14.3.5) and still measures
+1.000 on both runs — the stronger, more realistic version of the check passes cleanly.
+
+`conversational_reply_rate` dropped on both these runs relative to 14-C4's own 1.000 (0.944,
+0.889) — plausibly ordinary run-to-run LLM variance on the chitchat/off-topic boundary (the
+same class of noise 14-C4's own ADR section already recorded for this metric), not attributed
+to a specific mechanism in this block; left unenforced per the orchestrator's brief ("enforce
+if 1.0 in both runs" — it is not), consistent with never lowering an already-enforced floor
+while also never enforcing a new one without 2 clean runs to back it.
 
 ### Known limitations (self-reported, not just design) — 14-D1
 
@@ -991,9 +1014,21 @@ text instead of the old fixed sentence (T14.3.5) — not yet measured, see above
   tailored to the actual message) — only reached when the router already broke its own
   stated rule; narrowing that further is the router's own job (§6.4b/§6.4c), not this
   module's.
-- **`conversational_reply_rate` enforcement decision** (14-C4's own open item): _(filled by
-  the senior before closing — see status/blocks/14-D1.md for the final measured value and
-  decision)_.
+- **`conversational_reply_rate` enforcement decision** (14-C4's own open item): **left
+  unenforced.** Measured 0.944 and 0.889 on the 2 final `--only eval` runs (down from 14-C4's
+  own 1.000) — not 1.0 in either run, so per the orchestrator's own stated rule ("enforce if
+  1.0 in both runs") it stays `enforce: false` in `eval/golden_set_v2_floors.json`. Not
+  attributed to a specific mechanism this block changed (chitchat's own branch/metric
+  computation is untouched) — most likely the same run-to-run LLM variance on the chitchat/
+  off-topic boundary 14-C4's ADR section already recorded.
+- **The noisy_recall / "ambiguous never retrieves" interaction (resume finding).** Making
+  `ambiguous` a dead-end for retrieval means ANY future router misclassification of a genuine,
+  answerable security question as `"ambiguous"` costs a real `noisy_recall`/`retrieval_recall`
+  point that the pre-14-D1 pipeline would have absorbed silently (it retrieved anyway, just
+  under the wrong label). This block narrowed one specific instance (a misspelling) with a
+  prompt few-shot; it does not structurally prevent a DIFFERENT false-positive `"ambiguous"`
+  from recurring with the same cost — a router-level reliability concern (router.py's own
+  module), not fully closed by this block.
 
 ## Rollback
 
