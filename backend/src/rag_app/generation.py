@@ -264,11 +264,16 @@ def answer_question(
 # Chit-chat classifier (pre-14.2): greetings/thanks/meta vs. security, with typo
 # tolerance. T14.2.1/T14.2.2 (block 14-B2) replaced this as the LIVE pipeline's
 # understanding step with ``rag_app.assistant.fast_path``/``.router`` (an EXACT
-# fast path + an LLM router) -- ``classify_intent`` stays here, unchanged and still
-# tested, ONLY for ``api.conversations._reserve_stream_answer``'s cheap "is this
-# free of charge" pre-check (documented self-reported drift there: since T14.2.2
-# every chit-chat reply is now LLM-generated, that exemption is no longer literally
-# free, just small).
+# fast path + an LLM router).
+#
+# **14-B2-fix:** ``classify_intent`` is NO LONGER used by the daily-cap exemption
+# (``api.deps.reserve_daily_answer`` / ``api.conversations._reserve_stream_answer``) --
+# its unanchored, no-length-cap ``_META_RE`` branch let a long compound message smuggle
+# a real security question past the cap exemption for free (DA-14-B2 finding 2). Both
+# cap checks now key the exemption off ``assistant.fast_path.match_fast_path`` instead
+# (exact, anchored, cannot be smuggled). ``classify_intent`` has no remaining live call
+# site; it stays here, unchanged and still unit-tested, only as a standalone, documented
+# typo-tolerant classifier in case a future caller needs that specific behaviour again.
 # ---------------------------------------------------------------------------
 
 _CHITCHAT_REPLY = (

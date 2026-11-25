@@ -169,6 +169,26 @@ OLLAMA_WARMUP_TOTAL = Counter(
 # so this histogram can never grow a query-text/user-id/high-cardinality label by a future
 # careless call site. Every call site in retrieval.py/reranking.py/generation.py uses only a
 # literal pair from here, so the raise is a dev-time bug signal, never a real-traffic outcome.
+# DA-14-B2 finding 5 / 14-B2-fix: both entries below were flagged as possibly dead after
+# block 14-B2 replaced the live `classify_intent` step with the shared understanding step
+# (`rag_app.assistant.core.understand`). Checked (grep across backend/, frontend/, docs/)
+# before touching either, per this fix block's own LOW item:
+# - ("classifying", "classify_intent"): no backend call site observes this (stage, step)
+#   pair any more (`understand()` is only timed at the coarser "classify" STAGE level,
+#   T13.8.1's documented mapping choice) -- it IS dead on the backend side. KEPT anyway: the
+#   frontend's `LatencyPanel.STEP_LABELS["classify_intent"]` (an admin-UI label) and the
+#   `admin-dashboard.spec.ts` e2e fixture both still reference the literal string. Removing
+#   the allow-list entry would not break either (they are static/mocked, not read from this
+#   module), but a future admin-latency payload CAN still legitimately carry this pair if a
+#   later block re-adds fine-grained understanding-step timing (14.5, self-reported in the
+#   14-B2 ADR) -- keeping the slot reserved avoids re-litigating this exact grep later.
+# - ("responding", "stream_canned_reply"): NOT dead -- `generation.answer_question_stream`'s
+#   chit-chat branch still calls `timing.step("responding", "stream_canned_reply")` on every
+#   real chit-chat turn (the name predates P14-D1's "the reply is LLM-generated, not canned"
+#   change, so it is misleading, but it is live wiring, not a stale leftover). Renaming it
+#   would also require updating the frontend's `LatencyPanel.STEP_LABELS` entry and the
+#   `admin-dashboard.spec.ts`/`adminPipeline.test.ts` fixtures that assert on the literal
+#   string -- out of scope for this LOW item; tracked as a naming cleanup, not acted on here.
 STEP_ALLOWLIST: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("classifying", ("classify_intent",)),
     ("retrieving", ("embed_query", "vector_search", "bm25_search", "rrf_fusion", "load_chunks")),

@@ -14,6 +14,14 @@ suspicious-but-valid reply -- degrades to the SAME conservative fallback: intent
 text standing in for it). This means the router can never make the pipeline less safe than
 today: the worst a malicious or malformed message can do is fall through to the existing,
 already-reviewed security retrieve -> generate -> groundedness-check -> cite-or-abstain path.
+
+**14-B2-fix (DA-14-B2 finding 4):** a literal occurrence of our own delimiter marker
+(``<<<``/``>>>``) INSIDE the untrusted message/summary/last-turn is also neutralised, now,
+before wrapping (``build_router_messages`` -> ``escape_delimiter_markers``) -- otherwise a
+message carrying a fake ``<<<END MESSAGE>>>`` could forge a closing tag and make a less
+careful model treat trailing attacker text as outside the untrusted block. The fallback
+above still carries the ORIGINAL, unescaped query (never shown to an LLM), so this only
+affects what the router prompt itself sees.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from rag_app.assistant.fast_path import escape_delimiter_markers
 from rag_app.config import get_settings
 from rag_app.llm import ChatClient, Message
 
@@ -90,12 +99,18 @@ def build_router_messages(
     query: str, *, summary: str | None = None, last_turn: str | None = None
 ) -> list[Message]:
     """The router's own prompt: the untrusted message/summary/last turn, each in its own
-    delimited block (T14.2.3's "clearly delimited untrusted data")."""
-    parts = [_delimited("MESSAGE", query)]
+    delimited block (T14.2.3's "clearly delimited untrusted data").
+
+    DA-14-B2 finding 4 (14-B2-fix): each piece of untrusted text is run through
+    :func:`rag_app.assistant.fast_path.escape_delimiter_markers` BEFORE being wrapped --
+    otherwise a message already containing a literal ``<<<END MESSAGE>>>`` (or any other
+    label's marker) could forge a fake closing tag and make the model treat trailing
+    attacker text as outside the untrusted block."""
+    parts = [_delimited("MESSAGE", escape_delimiter_markers(query))]
     if last_turn:
-        parts.append(_delimited("LAST_TURN", last_turn))
+        parts.append(_delimited("LAST_TURN", escape_delimiter_markers(last_turn)))
     if summary:
-        parts.append(_delimited("CONVERSATION_SUMMARY", summary))
+        parts.append(_delimited("CONVERSATION_SUMMARY", escape_delimiter_markers(summary)))
     return [
         {"role": "system", "content": _ROUTER_SYSTEM},
         {"role": "user", "content": "\n\n".join(parts)},

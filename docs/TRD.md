@@ -202,11 +202,22 @@ eval runner alike by ONE shared understanding step, `rag_app.assistant.core.unde
   `metrics.STEP_ALLOWLIST` entry, outside this block's named touches) — only the pre-existing
   coarse `secrag_chat_stage_seconds{stage="classify"|"responding"}` total grows to include it;
   per-step latency instrumentation is deferred to 14.5 (Latency, cost, dashboard).
-- The daily-answer-cap "chit-chat is free" exemption (`api.conversations._reserve_stream_answer`)
-  still uses the OLD `classify_intent` heuristic unchanged — since T14.2.2 even an exempted
-  turn now costs one small LLM call (previously a free canned reply), so this exemption is an
-  approximation ("probably cheap"), not a strict "no LLM call happened" guarantee; flagged for
-  the user's decision in the 14-B2 block report, not silently changed here.
+- **(14-B2-fix)** The daily-answer-cap exemption (`api.deps.reserve_daily_answer`,
+  `api.conversations._reserve_stream_answer`, both endpoints now) is keyed ONLY off
+  `assistant.fast_path.match_fast_path` (exact, anchored) — NOT `classify_intent`, which had
+  no remaining live call site after this fix. `classify_intent`'s unanchored `_META_RE`
+  branch (no length cap) could be smuggled inside a long compound message to get a free
+  answer from the full retrieve → generate → groundedness path (DA-14-B2 finding 2); the
+  exact fast path cannot be smuggled the same way. Net effect: "chit-chat is (usually)
+  cheap, and a typo'd/router-detected chit-chat turn correctly counts against the cap" —
+  "chit-chat is free" stopped being literally true at T14.2.2 and this fix makes the
+  accounting match that everywhere, not just on the stream path.
+- **(14-B2-fix)** `assistant.fast_path.escape_delimiter_markers` neutralises a literal
+  `<<<`/`>>>` marker run already present inside untrusted text (message/summary/last turn)
+  before it is wrapped in a real delimited block (`_delimited_message`/
+  `build_router_messages`) — otherwise a message carrying a fake `<<<END MESSAGE>>>` could
+  forge a closing tag (DA-14-B2 finding 4). Input-side mitigation, layered onto the existing
+  output-side screen (`_looks_suspicious`), not a replacement for it.
 
 ## 7. Cost & latency
 

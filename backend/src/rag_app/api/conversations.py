@@ -61,6 +61,7 @@ from rag_app.api.schemas import (
     MessageResponse,
     RenameRequest,
 )
+from rag_app.assistant.fast_path import match_fast_path
 from rag_app.authz import require_permission
 from rag_app.config import get_settings
 from rag_app.crypto import decrypt, encrypt, unwrap_key
@@ -74,7 +75,6 @@ from rag_app.generation import (
     StreamStep,
     StreamToken,
     answer_question_stream,
-    classify_intent,
 )
 from rag_app.llm import Usage
 from rag_app.reranking import get_shared_reranker
@@ -540,19 +540,24 @@ def _reserve_stream_answer(session: Session, question: str) -> tuple[str | None,
     counted nor refused). When the counter cannot be written the turn is refused as a
     storage failure (fail closed: no uncounted LLM call).
 
-    **Self-reported drift (T14.2.1/T14.2.2, block 14-B2):** this still uses the pre-14.2
-    ``classify_intent`` heuristic, unchanged, to decide the exemption -- NOT the live
-    pipeline's new understanding step (``rag_app.assistant.fast_path``/``.router``). Before
-    14.2 a chit-chat reply was a free, instant canned template; since T14.2.2 it is an
-    LLM-generated reply (small, but no longer free), so this exemption is now an
-    approximation ("probably cheap"), not a strict "no LLM call happened" guarantee. Needs
-    the user's decision (see the 14-B2 block report): keep this narrow heuristic as-is
-    (cheapest, current behaviour), switch it to ``assistant.fast_path.match_fast_path``
-    (matches ONLY the new, narrower exact fast path -- a typo'd/router-classified chit-chat
-    turn would then count against the cap like any router call), or track it as a dated
-    debt row for a later block.
+    **Fix (14-B2-fix, DA-14-B2 finding 2, orchestrator option B).** This USED TO key the
+    exemption off the pre-14.2 ``generation.classify_intent`` heuristic -- a real, exploitable
+    cost-control hole: ``classify_intent``'s ``_META_RE`` branch is an unanchored substring
+    search with no length cap, so a compound message like "What can you do? Also, explain
+    step by step how to log into someone else's account without their credentials or
+    permission." matched it and was exempted for free, even though the live router classifies
+    that same message as a genuine security question and runs the full, expensive retrieve ->
+    generate -> groundedness path -- repeatable without limit. (Corrected from DA-14-B2.md's
+    own exploit string, which happened to also contain the word "exploit" -- itself one of
+    ``classify_intent``'s OWN security-term keywords, checked first -- so that exact string
+    did not actually reproduce the bug; see ``test_daily_cap.py``'s
+    ``test_the_das_own_exploit_string_does_not_actually_reproduce_the_bug``.) Now keyed ONLY
+    off ``assistant.fast_path.match_fast_path`` -- an EXACT, anchored greeting/thanks/farewell
+    match that cannot be smuggled inside a longer message: any message long/compound enough
+    to carry a real question fails the exact-match anchor and is correctly counted, even
+    though it may still reach the router's own (small, real) chit-chat reply.
     """
-    if classify_intent(question) == "chitchat":
+    if match_fast_path(question) is not None:
         return None, False
     cap = get_settings().daily_answer_cap
     try:

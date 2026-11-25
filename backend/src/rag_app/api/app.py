@@ -176,7 +176,7 @@ def create_app() -> FastAPI:
         # Global daily answer cap (R6-1): counted before the LLM call; 429 once reached. In
         # the body, so an unauthenticated, rate-limited or invalid call never uses one up.
         with metrics.track_in_flight():
-            reserve(session)
+            reserve(session, request.question)
             answer = answerer(session, request.question, request.version)
             return ChatResponse(
                 answer=answer.text,

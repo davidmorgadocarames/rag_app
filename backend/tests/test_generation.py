@@ -338,6 +338,32 @@ def test_answer_question_emits_the_expected_atomic_steps(
     assert steps_delta == pytest.approx(stage_delta, abs=0.02)
 
 
+def test_answer_question_chitchat_returns_an_llm_reply_without_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14-B2 finding 3 (14-B2-fix): ``answer_question`` (``POST /chat``, non-streaming)
+    gained the SAME chit-chat branch the stream path already has (T14.2.1) -- an exact
+    greeting gets a grounded, non-abstained reply with NO retrieval call at all, the
+    non-streaming mirror of
+    ``test_answer_question_stream_chitchat_emits_classify_and_canned_reply_steps``. Fails on
+    pre-14-B2 code: ``answer_question`` had no chit-chat branch at all, so "hi" would have
+    run full RAG straight into the deliberately-broken ``hybrid_search`` below."""
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise AssertionError("retrieval must never run for a chit-chat turn")
+
+    monkeypatch.setattr(generation, "hybrid_search", _boom)
+    chat = _FakeChatSync("")  # empty reply -> falls back to the safe bilingual template
+
+    answer = generation.answer_question(None, "hi", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    assert answer.abstained is False
+    assert answer.grounded is True
+    assert answer.text  # the non-empty template fallback (empty fake LLM reply)
+    assert answer.citations == []
+    assert chat.calls == 1, "only the chit-chat reply call should run (no groundedness verdict)"
+
+
 def test_answer_question_stream_emits_the_expected_atomic_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

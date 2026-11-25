@@ -123,8 +123,9 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      (`daily_cap_reached`, "SecRAG has reached its daily answer limit … come back after
      midnight UTC") and stores nothing; the one-shot `POST /chat` answers **429** with
      `Retry-After` (seconds to UTC midnight). An EXACT greeting/thanks/farewell (fast path) is
-     still exempt from the cap today (TRD §6.2 self-reports this as an approximation, not a
-     strict "no LLM call" guarantee, since block 14-B2).
+     exempt from the cap on BOTH endpoints (14-B2-fix, TRD §6.2) — a typo'd greeting or any
+     router-classified chit-chat turn still counts, since T14.2.2 even a chit-chat reply is a
+     small real LLM call, not a free canned one.
    - **Understands the message** (TRD §6.2): an EXACT greeting/thanks/farewell (en/es —
      "hello", "hola", "thanks") takes the **fast path** and skips the router only; a typo'd
      greeting ("hol"), a follow-up, an ambiguous or off-topic message all go through the **LLM

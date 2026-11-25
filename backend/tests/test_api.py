@@ -49,7 +49,7 @@ def test_chat_stubbed() -> None:
     # the fake user needs a .role, not a bare object() any more.
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
     # The daily cap needs the database: covered in test_daily_cap.
-    app.dependency_overrides[get_answer_reserver] = lambda: lambda _session: None
+    app.dependency_overrides[get_answer_reserver] = lambda: lambda _session, _question: None
     client = TestClient(app)
 
     response = client.post("/chat", json={"question": "How do I prevent SQL injection?"})
@@ -133,7 +133,7 @@ def test_chat_reuses_the_shared_reranker_across_requests(monkeypatch: pytest.Mon
     # T12.5.2: /chat now also checks a permission (always user:base for a real account) --
     # the fake user needs a .role, not a bare object() any more.
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(role="user")
-    app.dependency_overrides[get_answer_reserver] = lambda: lambda _session: None
+    app.dependency_overrides[get_answer_reserver] = lambda: lambda _session, _question: None
     client = TestClient(app)
 
     for _ in range(3):

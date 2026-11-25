@@ -10,6 +10,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from rag_app import metrics
+from rag_app.assistant.fast_path import match_fast_path
 from rag_app.client_ip import CLIENT_IP_HEADER, classify_client_ip_header
 from rag_app.config import get_settings
 from rag_app.db.session import make_session_factory
@@ -174,16 +175,36 @@ def rate_limit_account(action: str) -> Callable[..., None]:
     return _dependency
 
 
-ReserveFn = Callable[[Session], None]
+ReserveFn = Callable[[Session, str], None]
 
 
-def reserve_daily_answer(session: Session) -> None:
+def reserve_daily_answer(session: Session, question: str) -> None:
     """``/chat``: count the answer in ``usage_daily`` before the LLM is called (R6-1,
     DA-G3-1); 429 with ``Retry-After`` (seconds to the next UTC midnight) once the global
-    daily cap is reached. ``/chat`` has no chit-chat fast path, so every call counts.
+    daily cap is reached.
+
+    **Fix (14-B2-fix, DA-14-B2 findings 1+2, orchestrator option B).** Before this fix,
+    ``/chat`` had NO chit-chat exemption at all (stale docstring claimed "every call
+    counts", which was literally true then but silently became the ONLY entry point with
+    no exemption once T14.2.2 gave ``answer_question`` the same chit-chat branch
+    ``/chat/stream`` already had). The naive fix -- reusing ``generation.classify_intent``
+    like the stream path did -- would have REOPENED a cost-control hole: ``classify_intent``
+    is an unanchored substring/regex heuristic (``_META_RE`` has no length cap), so a long
+    compound message like "What can you do? Also: <a real question>" matches it and would
+    be exempted for free even though the real pipeline (the LLM router) classifies that same
+    message as a genuine security question and runs the full, expensive retrieve -> generate
+    -> groundedness path. Exempting is therefore keyed ONLY off
+    ``assistant.fast_path.match_fast_path`` -- an EXACT, anchored greeting/thanks/farewell
+    match that cannot be smuggled inside a longer message: any message long/compound enough
+    to carry a real question fails the exact-match anchor and is correctly counted, even
+    though it may still reach the router's own (small, real) chit-chat reply.
 
     Called from the handler body, not as a dependency: dependencies run before the request
-    body is validated, and an invalid request must not use up an answer."""
+    body is validated, and an invalid request must not use up an answer. Fails closed: a
+    counter write failure (``reserve_answer`` raising) propagates as an unhandled exception
+    -- never a free, uncounted answer."""
+    if match_fast_path(question) is not None:
+        return
     if not reserve_answer(session, get_settings().daily_answer_cap):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
