@@ -1,0 +1,11 @@
+{
+  "n_turns": 63,
+  "intent_accuracy": 0.5714285714285714,
+  "noisy_recall": 1.0,
+  "follow_up_resolution": 0.5,
+  "clarification_rate": 0.0,
+  "conversational_reply_rate": 0.5625,
+  "abstention_no_claims_rate": 1.0,
+  "greeting_reply_p95_s": 2.6300025638192892e-05,
+  "router_p95_s": null
+}

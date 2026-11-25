@@ -135,6 +135,26 @@ rewriting and memory (Phase 14.2–14.3) can be measured alongside retrieval and
   runner's migration to replay `Dialogue` objects, plus metrics (intent accuracy, noisy recall,
   follow-up resolution, clarification rate, conversational-reply check), is T14.0.4 (block 14-A2).
 
+**14-A2 (T14.0.4/T14.0.5) adds the runner, the metrics and the "before" baseline.**
+`rag_app.eval.runner.evaluate_dialogues` replays every dialogue turn through TODAY's
+placeholder core — `classify_intent` (chit-chat canned reply) or retrieve + `answer_from_chunks`
+— standalone per turn: **no memory is carried between turns yet** (the live stream handler has
+the same limitation, F14.2), so a follow-up like *"What about OS commands?"* is retrieved with no
+idea what "it" refers to. This is deliberate: it is the measurement the floors below are compared
+against BEFORE the router/memory land (T14.2.1, block 14-B2), not a simulation of them.
+`rag_app.eval.metrics.compute_dialogue_metrics` aggregates: `intent_accuracy`, `noisy_recall`
+(turns from a `typo-*` dialogue id), `follow_up_resolution`, `clarification_rate` (a heuristic —
+no clarification code path exists before 14.3, so this is 0 by construction, not hard-coded),
+`conversational_reply_rate`, `abstention_no_claims_rate` (`rag_app.eval.judge.judge_no_claims`,
+the validated-judge mechanism), `greeting_reply_p95_s` (measurable today) and `router_p95_s`
+(always `None` — there is no router call to time yet).
+
+**Floors (PHASE_PLANNING §14.0) are recorded, not yet enforced.** §14.2's own Gate line reads
+"floors from 14.0", i.e. enforcement starts once the router/memory exist; `eval/golden_set_v2_floors.json`
+carries `enforce_now: false` for exactly that reason — the `eval` gate step prints every
+value-vs-floor comparison but only fails on it once a later block flips that flag. See the
+golden-set-v2 table in `docs/adr/adr_phase14_assistant.md` for the measured numbers.
+
 ## 7. Cost & latency
 
 - Q4 quantization; a single shared LLM; reranker on CPU.
