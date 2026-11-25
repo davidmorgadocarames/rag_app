@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from rag_app.retrieval import RetrievedChunk, reciprocal_rank_fusion
+from rag_app.retrieval import (
+    RetrievedChunk,
+    diversify_candidates,
+    doc_slug,
+    reciprocal_rank_fusion,
+)
 
 
 def test_rrf_rewards_agreement_across_lists() -> None:
@@ -31,6 +36,56 @@ def test_rrf_k0_damping_is_monotonic() -> None:
     large_k0 = dict(reciprocal_rank_fusion([["x", "y"]], k0=1000))
     # a larger k0 flattens the gap between rank 1 and rank 2
     assert (small_k0["x"] - small_k0["y"]) > (large_k0["x"] - large_k0["y"])
+
+
+# --- doc_slug / diversify_candidates (T14.2.9, block 14-C3, DEC-062) -----------------------
+
+
+def test_doc_slug_strips_the_trailing_ordinal() -> None:
+    """Fails on pre-14-C3 code: the function does not exist."""
+    assert doc_slug("top10-2025-presentation-pdf::19") == "top10-2025-presentation-pdf"
+    assert doc_slug("cs-sql-injection-prevention::0") == "cs-sql-injection-prevention"
+
+
+def _fused(*uids: str) -> list[tuple[str, float]]:
+    """Descending scores matching list order, so re-sorting bugs would be visible."""
+    return [(uid, 1.0 - i * 0.01) for i, uid in enumerate(uids)]
+
+
+def test_diversify_candidates_caps_one_dominant_document() -> None:
+    """DEC-062's own failure: a single document (6 near-duplicate chunks) occupied the WHOLE
+    raw candidate pool, crowding out the one relevant chunk from a different document."""
+    fused = _fused(
+        "deck::0", "deck::1", "deck::2", "deck::3", "deck::4", "deck::5", "correct-doc::0"
+    )
+    # top_k == the non-dominant candidate count the cap should make room for (3): without
+    # capping, the first 4 entries (all "deck") would fill the whole pool and
+    # "correct-doc::0" would never be reached at all.
+    result = diversify_candidates(fused, top_k=3, max_per_document=2)
+    docs = [doc_slug(uid) for uid, _ in result]
+    assert docs.count("deck") == 2  # capped, not 3
+    assert "correct-doc::0" in [uid for uid, _ in result]  # room was made for it
+
+
+def test_diversify_candidates_preserves_score_order_within_the_cap() -> None:
+    fused = _fused("a::0", "b::0", "a::1", "c::0")
+    result = diversify_candidates(fused, top_k=4, max_per_document=2)
+    assert [uid for uid, _ in result] == ["a::0", "b::0", "a::1", "c::0"]
+
+
+def test_diversify_candidates_never_shrinks_the_pool_below_top_k() -> None:
+    """A single-document corpus (or every other document already capped/exhausted) must
+    still fill ``top_k`` by backfilling from the capped-out overflow, in its own order --
+    diversity must never cost RECALL by returning fewer candidates than fusion found."""
+    fused = _fused("only::0", "only::1", "only::2", "only::3", "only::4")
+    result = diversify_candidates(fused, top_k=4, max_per_document=2)
+    assert len(result) == 4
+    assert [uid for uid, _ in result] == ["only::0", "only::1", "only::2", "only::3"]
+
+
+def test_diversify_candidates_is_a_no_op_when_already_diverse() -> None:
+    fused = _fused("a::0", "b::0", "c::0", "d::0")
+    assert diversify_candidates(fused, top_k=4, max_per_document=2) == fused
 
 
 # --- DA-13-G1-2: direct unit test for hybrid_search's own atomic-step wiring --------------

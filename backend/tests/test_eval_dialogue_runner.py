@@ -524,6 +524,100 @@ def test_evaluate_dialogues_still_generates_the_answer_from_the_raw_message(
     assert seen_generation_queries == ["¿y eso, en qué puesto queda?"]
 
 
+# --- T14.2.9 (block 14-C3, DEC-062): named-edition version filter, third entry point -------
+
+
+def test_evaluate_dialogues_scopes_retrieval_to_a_named_owasp_edition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEC-062 option A, the THIRD entry point for the named-edition filter (same rule as
+    ``generation.answer_question``). Fails on pre-14-C3 code: ``version`` was hardcoded
+    ``None`` in ``evaluate_dialogues``."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="What rank does SQL injection have in the 2021 OWASP Top 10?",
+    )
+    seen_versions: list[str | None] = []
+
+    def fake_retrieve(
+        _session: object,
+        _query: str,
+        *,
+        reranker: object,
+        top_n: int | None = None,
+        version: str | None = None,
+        **_kw: object,
+    ) -> list[RetrievedChunk]:
+        seen_versions.append(version)
+        return [_chunk("docA::1")]
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fake_retrieve)
+
+    dialogue = Dialogue(
+        id="dlg-followup-version",
+        turns=(
+            Turn(
+                message="where does it rank?",
+                expected_intent="followup",
+                language="en",
+                expected_doc="docA",
+                answerable=True,
+                ground_truth="truth",
+            ),
+        ),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "It's A03 [1].")
+
+    evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert seen_versions == ["2021"]
+
+
+def test_evaluate_dialogues_never_scopes_retrieval_when_no_edition_is_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router_output = RouterOutput(
+        intent="security", language="en", standalone_query="How do I prevent SQL injection?"
+    )
+    seen_versions: list[str | None] = []
+
+    def fake_retrieve(
+        _session: object,
+        _query: str,
+        *,
+        reranker: object,
+        top_n: int | None = None,
+        version: str | None = None,
+        **_kw: object,
+    ) -> list[RetrievedChunk]:
+        seen_versions.append(version)
+        return [_chunk("docA::1")]
+
+    monkeypatch.setattr("rag_app.reranking.get_shared_reranker", lambda: object())
+    monkeypatch.setattr("rag_app.reranking.retrieve", fake_retrieve)
+
+    dialogue = Dialogue(
+        id="dlg-security",
+        turns=(
+            Turn(
+                message="how do I prevent SQL injection?",
+                expected_intent="security",
+                language="en",
+                expected_doc="docA",
+                answerable=True,
+                ground_truth="truth",
+            ),
+        ),
+    )
+    chat = _FakeChatWithRouterOutput(router_output, "Use prepared statements [1].")
+
+    evaluate_dialogues(None, [dialogue], chat=chat)  # type: ignore[arg-type]
+
+    assert seen_versions == [None]
+
+
 # --- gate._check_v2: PER-METRIC floor enforcement (T14.2.8, block 14-C2) -------------------
 
 

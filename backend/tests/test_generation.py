@@ -657,6 +657,128 @@ def test_answer_question_stream_retrieves_with_the_standalone_query_not_the_orig
     ]
 
 
+# --- T14.2.9 (block 14-C3, DEC-062): named-edition version filter ---------------------------
+
+
+def test_answer_question_scopes_retrieval_to_a_named_owasp_edition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEC-062 option A: when the resolved query names a corpus OWASP edition, retrieval is
+    scoped to it. Fails on pre-14-C3 code: ``version`` would always be ``None`` here (the
+    caller passed none explicitly)."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="What rank does SQL injection have in the 2021 OWASP Top 10?",
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "It's A03 [1].")
+    seen_versions: list[str | None] = []
+
+    def fake_hybrid_search(
+        _session: object, _query: str, *, version: str | None = None, **_kw: object
+    ) -> list[object]:
+        seen_versions.append(version)
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+
+    generation.answer_question(None, "where does it rank?", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    assert seen_versions == ["2021"]
+
+
+def test_answer_question_never_scopes_retrieval_when_no_edition_is_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEC-062's own wording: 'never when not named' -- a plain security question (no
+    edition mentioned anywhere) must retrieve across every corpus version."""
+    router_output = RouterOutput(
+        intent="security", language="en", standalone_query="How do I prevent SQL injection?"
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "Use prepared statements [1].")
+    seen_versions: list[str | None] = []
+
+    def fake_hybrid_search(
+        _session: object, _query: str, *, version: str | None = None, **_kw: object
+    ) -> list[object]:
+        seen_versions.append(version)
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+
+    generation.answer_question(None, "how do I prevent SQL injection?", chat=chat, use_rerank=False)  # type: ignore[arg-type]
+
+    assert seen_versions == [None]
+
+
+def test_answer_question_an_explicit_version_wins_over_the_named_edition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied ``version`` (e.g. the CLI's ``--version``) is an explicit, deliberate
+    choice -- it must never be silently overridden by the auto-detected named edition."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="What rank does SQL injection have in the 2021 OWASP Top 10?",
+    )
+    chat = _FakeChatSyncWithRouterOutput(router_output, "It's A03 [1].")
+    seen_versions: list[str | None] = []
+
+    def fake_hybrid_search(
+        _session: object, _query: str, *, version: str | None = None, **_kw: object
+    ) -> list[object]:
+        seen_versions.append(version)
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+
+    generation.answer_question(
+        None,
+        "where does it rank?",
+        chat=chat,
+        use_rerank=False,
+        version="2025",  # type: ignore[arg-type]
+    )
+
+    assert seen_versions == ["2025"]
+
+
+def test_answer_question_stream_scopes_retrieval_to_a_named_owasp_edition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming twin of ``test_answer_question_scopes_retrieval_to_a_named_owasp_edition``."""
+    router_output = RouterOutput(
+        intent="followup",
+        language="en",
+        standalone_query="What rank does injection have in the 2025 OWASP Top 10?",
+    )
+    chat = _FakeChatStreamSeqWithRouterOutput(router_output, [["Use ", "[1]."], ["GROUNDED"]])
+    seen_versions: list[str | None] = []
+
+    monkeypatch.setattr(generation, "embed_query", lambda _embedder, _query: [0.0])
+
+    def fake_hybrid_search(
+        _session: object, _query: str, *, version: str | None = None, **_kw: object
+    ) -> list[object]:
+        seen_versions.append(version)
+        return [_chunk()]
+
+    monkeypatch.setattr(generation, "hybrid_search", fake_hybrid_search)
+    monkeypatch.setattr(
+        reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
+    )
+
+    list(
+        generation.answer_question_stream(
+            None,
+            "what rank does it have now?",
+            chat=chat,  # type: ignore[arg-type]
+        )
+    )
+
+    assert seen_versions == ["2025"]
+
+
 def test_answer_question_stream_still_generates_with_the_original_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

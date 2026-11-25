@@ -7,7 +7,12 @@ exist yet).
 
 from __future__ import annotations
 
-from rag_app.assistant.core import Understanding, retrieval_query, understand
+from rag_app.assistant.core import (
+    Understanding,
+    named_owasp_version,
+    retrieval_query,
+    understand,
+)
 from rag_app.assistant.router import RouterOutput
 
 
@@ -125,3 +130,29 @@ def test_retrieval_query_matches_the_original_on_the_security_fallback_path() ->
     assert retrieval_query(decision, "how do I prevent SQL injection?") == (
         "how do I prevent SQL injection?"
     )
+
+
+# --- named_owasp_version (T14.2.9, block 14-C3, DEC-062) -----------------------------------
+
+
+def test_named_owasp_version_finds_a_known_corpus_edition() -> None:
+    """Fails on pre-14-C3 code: the function does not exist."""
+    assert named_owasp_version("What rank does SQL injection have in the 2021 OWASP Top 10?") == (
+        "2021"
+    )
+    assert named_owasp_version("What about the 2025 edition?") == "2025"
+    assert named_owasp_version("Injection was A1 in the 2017 Top 10") == "2017"
+
+
+def test_named_owasp_version_is_none_when_no_edition_is_named() -> None:
+    """DEC-062's own wording: 'never when not named' -- a plain security question, or one
+    naming a year that is not one of the corpus's three editions, must never trigger a
+    version filter."""
+    assert named_owasp_version("How do I prevent SQL injection?") is None
+    assert named_owasp_version("What happened in 2030?") is None  # not a corpus edition
+
+
+def test_named_owasp_version_ignores_a_year_elsewhere_in_the_text() -> None:
+    """A real false-positive guard: the regex is word-bounded, so a longer number containing
+    one of the edition digits (e.g. a CVE-style id) must not match."""
+    assert named_owasp_version("See CWE-12021 for details") is None

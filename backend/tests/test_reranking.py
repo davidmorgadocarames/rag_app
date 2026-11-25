@@ -6,14 +6,14 @@ import threading
 
 import pytest
 
-from rag_app.reranking import order_by_scores
+from rag_app.reranking import is_low_value_heading, order_by_scores
 from rag_app.retrieval import RetrievedChunk
 
 
-def _chunk(uid: str) -> RetrievedChunk:
+def _chunk(uid: str, heading: str = "") -> RetrievedChunk:
     return RetrievedChunk(
         chunk_uid=uid,
-        heading="",
+        heading=heading,
         text=f"text {uid}",
         version="2021",
         effective_date=None,
@@ -36,6 +36,58 @@ def test_order_by_scores_length_mismatch_raises() -> None:
 def test_order_by_scores_top_n_larger_than_input() -> None:
     ranked = order_by_scores([_chunk("a")], [0.3], top_n=10)
     assert len(ranked) == 1
+
+
+# --- is_low_value_heading (T14.2.9, block 14-C3, DEC-062) ----------------------------------
+
+
+def test_is_low_value_heading_matches_reference_and_boilerplate_sections() -> None:
+    """Fails on pre-14-C3 code: the function does not exist. Real headings from the live
+    corpus (confirmed via ``docker exec ... psql`` against the dev DB) -- see this block's
+    report/ADR for the full evidence."""
+    assert is_low_value_heading("A03:2021 – Injection > References")
+    assert is_low_value_heading("A05:2025 Injection > List of Mapped CWEs")
+    assert is_low_value_heading("Agenda")
+    assert is_low_value_heading("Agenda > A05:2025 Injection")
+    assert is_low_value_heading("FW > Welcome to the OWASP Top 10 - 2017!")
+
+
+def test_is_low_value_heading_does_not_match_substantive_sections() -> None:
+    assert not is_low_value_heading("A03:2021 – Injection > Overview")
+    assert not is_low_value_heading("A05:2025 Injection > Background.")
+    assert not is_low_value_heading("A03:2021 – Injection > How to Prevent")
+
+
+class _FakePredictModel:
+    """Returns a HIGHER raw score for the low-value candidate than the substantive one --
+    reproduces the live cross-encoder behaviour DEC-062 diagnosed (a bare reference list
+    outscoring the chunk that actually states the answer)."""
+
+    def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
+        return [0.8 if "References" in text else 0.5 for _, text in pairs]
+
+
+def test_rerank_down_weights_a_low_value_chunk_below_a_substantive_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end through ``CrossEncoderReranker.rerank`` (not just the heading predicate):
+    on the RAW cross-encoder score, the References chunk would win (0.8 > 0.5) -- the
+    penalty must flip the final order. Fails on pre-14-C3 code (no down-weighting at all)."""
+    import rag_app.reranking as reranking
+
+    monkeypatch.setattr(reranking, "load_cross_encoder", lambda *_a, **_k: _FakePredictModel())
+    reranker = reranking.CrossEncoderReranker(
+        model_name="BAAI/bge-reranker-v2-m3",
+        revision="953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+        quantize=False,
+    )
+    reference_chunk = _chunk("ref", heading="A03:2021 – Injection > References")
+    reference_chunk.text = "- [OWASP References link list]"
+    overview_chunk = _chunk("overview", heading="A03:2021 – Injection > Overview")
+    overview_chunk.text = "Injection slides down to the third position."
+
+    ranked = reranker.rerank("q", [reference_chunk, overview_chunk], top_n=2)
+    assert [c.chunk_uid for c in ranked] == ["overview", "ref"]
 
 
 # --- pinned revision + offline loading (DA-B-7, PHASE_TASKS row 37d) ---------------------

@@ -32,6 +32,38 @@ if TYPE_CHECKING:
 # module must stay importable (and this constant usable) without constructing Settings.
 RERANKER_MAX_LENGTH = 512
 
+# T14.2.9 (block 14-C3, DEC-062): a chunk that is a bare reference/citation list, a table of
+# risk statistics, or a presentation/front-matter breadcrumb carries little of the actual
+# prose a question is answered from, yet the cross-encoder's own raw score sometimes ranks it
+# ABOVE the chunk that states the real answer -- confirmed live (``docker exec ... psql`` +
+# a direct ``CrossEncoderReranker`` call against the dev corpus, see the ADR's "14-C3
+# decision" section): for "what rank does X have", a ``> References`` chunk (bare citation
+# links) outscored the SAME document's ``> Overview`` chunk (the one stating the actual
+# rank). Headings are corpus content, not a hardcoded per-document rule -- any document
+# whose own heading breadcrumb ends in one of these sections is treated the same way.
+_LOW_VALUE_HEADING_RE = re.compile(
+    r"\b(references?|list of mapped cwes?|acknowledg\w*|table of contents|agenda"
+    r"|release notes|foreword|welcome to|risk factor|industry ranked survey)\b",
+    re.IGNORECASE,
+)
+
+# Multiplies a low-value chunk's cross-encoder score before the final sort (not before --
+# the raw score is still what proves the chunk is even topically relevant at all; this only
+# stops it from crowding out a more substantive chunk that scored lower but carries the
+# actual answer). 0.05, not a gentler 0.4: a live v1-golden-set regression check (0.4 still
+# let a lucky `> References` chunk edge out a second `> How to Prevent` chunk for the final
+# slot in one real query, producing a bare "[1]" answer whose groundedness verdict then
+# turned out to be sensitive to that one slot -- 0.05 was the value that reliably lets any
+# competitive substantive chunk win instead, confirmed against all 3 live regression cases
+# (see the ADR's "14-C3 decision" section) without ever fully excluding a low-value chunk
+# that is genuinely the ONLY candidate left (it can still win if nothing else is better).
+_LOW_VALUE_SCORE_PENALTY = 0.05
+
+
+def is_low_value_heading(heading: str) -> bool:
+    """True for a reference-list / boilerplate / presentation-breadcrumb heading (T14.2.9)."""
+    return bool(_LOW_VALUE_HEADING_RE.search(heading))
+
 
 class _QuantizedCrossEncoder:
     """A ``predict(pairs) -> list[float]`` adapter around a raw, dynamically int8-quantized
@@ -265,7 +297,17 @@ class CrossEncoderReranker:
             finally:
                 semaphore.release()
             with timing.step("reranking", "order_by_scores"):
-                return order_by_scores(candidates, [float(score) for score in scores], top_n)
+                # T14.2.9 (DEC-062): down-weight a reference-list/boilerplate chunk's score
+                # AFTER the real cross-encoder call (it still had to be topically relevant
+                # enough to reach this candidate pool at all) so it stops crowding out a
+                # lower-raw-scored chunk that actually carries the answer -- see this
+                # module's own ``is_low_value_heading`` docstring for the live evidence.
+                adjusted = [
+                    float(score)
+                    * (_LOW_VALUE_SCORE_PENALTY if is_low_value_heading(c.heading) else 1.0)
+                    for c, score in zip(candidates, scores, strict=True)
+                ]
+                return order_by_scores(candidates, adjusted, top_n)
 
     def warm_up(self) -> None:
         """Load the model and run one dummy ``predict`` (T11.4.1), so no real request ever

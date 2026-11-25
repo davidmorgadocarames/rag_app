@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.orm import Session
 
 from rag_app import timing
-from rag_app.assistant.core import retrieval_query, understand
+from rag_app.assistant.core import named_owasp_version, retrieval_query, understand
 from rag_app.assistant.fast_path import generate_chitchat_reply
 from rag_app.config import get_settings
 from rag_app.embeddings import OllamaEmbedder
@@ -251,6 +251,11 @@ def answer_question(
             return Answer(text=reply, abstained=False, grounded=True)
 
         search_query = retrieval_query(decision, query)
+        # T14.2.9 (DEC-062): an explicit caller-supplied `version` always wins; otherwise
+        # scope retrieval to the OWASP edition the resolved query itself names (never
+        # inferred when nothing in it names one -- see `named_owasp_version`'s own
+        # docstring).
+        search_version = version if version is not None else named_owasp_version(search_query)
         if use_rerank:
             from rag_app.reranking import get_shared_reranker, retrieve
 
@@ -259,10 +264,10 @@ def answer_question(
                 search_query,
                 reranker=reranker or get_shared_reranker(),
                 top_n=top_n,
-                version=version,
+                version=search_version,
             )
         else:
-            chunks = hybrid_search(session, search_query, top_k=top_n, version=version)
+            chunks = hybrid_search(session, search_query, top_k=top_n, version=search_version)
 
         return answer_from_chunks(chat, query, chunks)
 
@@ -608,6 +613,9 @@ def answer_question_stream(
         # hybrid_search runs too -- a plain callback passed into hybrid_search could not do
         # this (only the generator's own `yield` can suspend it mid-call).
         search_query = retrieval_query(decision, query)
+        # T14.2.9 (DEC-062): see `answer_question`'s identical comment -- an explicit
+        # caller-supplied `version` always wins over the auto-detected named edition.
+        search_version = version if version is not None else named_owasp_version(search_query)
         embedder = OllamaEmbedder()
         yield StreamStep(stage="retrieving", step="embed_query", phase="start")
         query_vector = embed_query(embedder, search_query)
@@ -616,7 +624,7 @@ def answer_question_stream(
             session,
             search_query,
             top_k=settings.top_k,
-            version=version,
+            version=search_version,
             query_vector=query_vector,
         )
 

@@ -108,6 +108,15 @@ def evaluate_dialogues(
     frequently a bare reference ("where does it rank?") that means nothing to hybrid search
     on its own.
 
+    T14.2.9 (block 14-C3, DEC-062): ``retrieve()`` below also passes
+    ``named_owasp_version(search_query)`` -- the OWASP edition the resolved search query
+    itself names, or ``None`` -- as ``version``, scoping retrieval to that edition exactly
+    when the user (or the router's own resolved rewrite) named one, never otherwise. Fixes
+    the edition-confused misses DEC-062 diagnosed; the chunk-dominance misses (a generic,
+    multi-topic document crowding out the correct one even within the SAME edition) are
+    fixed one layer down, in ``retrieval.hybrid_search``/``reranking.CrossEncoderReranker``
+    themselves, so every caller of ``retrieve()`` gets that fix for free.
+
     Uses ``make_chat_client()`` (TF21), unlike the v1 ``evaluate()`` above, which keeps its
     pre-existing hard-coded ``OllamaChat`` default unchanged (out of scope here — the v1 gate
     must stay green and untouched).
@@ -118,7 +127,7 @@ def evaluate_dialogues(
     would need a real per-turn flag if a future noisy item is added inside a multi-turn dialogue
     at a turn other than the first.
     """
-    from rag_app.assistant.core import retrieval_query, understand
+    from rag_app.assistant.core import named_owasp_version, retrieval_query, understand
     from rag_app.assistant.fast_path import generate_chitchat_reply
     from rag_app.assistant.memory import format_last_turn, summarize_turn
     from rag_app.eval.judge import judge_correctness, judge_no_claims
@@ -149,8 +158,11 @@ def evaluate_dialogues(
                 retrieved_docs: list[str] = []
             else:
                 search_query = retrieval_query(decision, turn.message)
+                # T14.2.9 (DEC-062): the THIRD entry point for the named-edition filter --
+                # same rule as `generation.answer_question`'s identical comment.
+                search_version = named_owasp_version(search_query)
                 chunks = retrieve(
-                    session, search_query, reranker=reranker, top_n=top_n, version=None
+                    session, search_query, reranker=reranker, top_n=top_n, version=search_version
                 )
                 retrieved_docs = [_doc_slug(c.chunk_uid) for c in chunks]
                 answer = answer_from_chunks(chat, turn.message, chunks)

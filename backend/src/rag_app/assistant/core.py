@@ -38,6 +38,7 @@ answer must address what the user actually typed, in the language they typed it 
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -109,3 +110,27 @@ def retrieval_query(decision: Understanding, query: str) -> str:
     """
     candidate = decision.standalone_query.strip()
     return candidate if candidate else query
+
+
+# T14.2.9 (block 14-C3, DEC-062): the corpus's only three OWASP Top 10 editions -- not a
+# generic "any 4-digit number" match, so an unrelated year mentioned in a question never
+# triggers a filter that would wrongly exclude every corpus document.
+_KNOWN_OWASP_EDITIONS = ("2017", "2021", "2025")
+_OWASP_EDITION_RE = re.compile(r"\b(2017|2021|2025)\b")
+
+
+def named_owasp_version(text: str) -> str | None:
+    """The OWASP Top 10 edition explicitly named in ``text``, or ``None`` (T14.2.9, DEC-062
+    option A's "owasp_version ... as a filter or boost when the user named an edition (never
+    when not named)"). Deliberately reads the RESOLVED retrieval text (what
+    :func:`retrieval_query` actually returns -- the router's own ``standalone_query`` when
+    present, else the raw message), never the conversation summary's own
+    ``ConversationSummary.owasp_version`` field directly: the router already folds
+    summary/last-turn context into its rewrite (e.g. a terse "What about the 2025 edition?"
+    follow-up resolves into a standalone_query that itself names "2025"), so checking the
+    resolved text is both simpler AND safer than also consulting the summary -- a topic
+    change several turns after an edition was once named can never leak a stale version into
+    an unrelated query this way, because nothing in the CURRENT search text repeats it.
+    """
+    match = _OWASP_EDITION_RE.search(text)
+    return match.group(1) if match else None
