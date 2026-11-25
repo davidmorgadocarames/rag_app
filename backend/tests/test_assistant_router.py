@@ -382,3 +382,35 @@ def test_route_leaves_a_genuinely_ambiguous_spanish_message_with_unrelated_conte
     )
     assert out.intent == "ambiguous"
     assert out.clarification == "¿Qué exactamente te gustaría arreglar?"
+
+
+# --- 14-D1 resume fix: noisy (misspelled) self-contained queries are not "ambiguous" --------
+
+
+def test_router_system_prompt_distinguishes_a_typo_from_a_genuine_ambiguity() -> None:
+    """14-D1 (resume, noisy_recall regression): the real router (temperature 0.0, live-
+    verified against ``~/.local/bin/ollama serve``) classified 'What is injecion in security?'
+    (golden-set item ``typo-injecion-what``, no prior context) as ``"ambiguous"`` with
+    ``clarification=None`` both before AND at ``cc8c597`` -- a PRE-EXISTING router limitation,
+    not something 14-D1's code introduced (confirmed by replaying the same probe against the
+    ``bf548f0`` baseline in a throwaway worktree: identical result). What 14-D1's NEW
+    ``ambiguous`` dispatch (T14.3.3, ``generation.py``/``eval/runner.py``) changed is the
+    COST of that pre-existing misclassification: before 14-D1 the ``else`` branch still
+    retrieved despite the wrong label (a lucky recall hit); after 14-D1 ``ambiguous`` never
+    retrieves, so the same old misclassification now shows up as a genuine
+    ``noisy_recall`` miss (1.0 -> 0.75 on the golden-set v2 replay, deterministic across 2
+    orchestrator runs). The fix is a system-prompt contrastive few-shot (a misspelling alone
+    is not an unresolved reference) rather than a code-level tie-breaker, because
+    ``clarification is None`` is NOT a reliable signal on its own: 2 of the 5 genuine
+    ``ambiguous`` golden-set items ("Can you help me?", "¿Cómo lo arreglo?") ALSO produce
+    ``clarification=None`` live, so treating "ambiguous + no clarification" as "fall back to
+    security" would have reclassified genuinely ambiguous messages too. This unit test only
+    guards the fix's own text against accidental deletion/rewording -- the real regression
+    test is the golden-set eval replay (``scripts/gate.sh --only eval``'s enforced
+    ``noisy_recall >= 0.90`` floor), run twice on the final code per the block's own
+    convention for a system-prompt/model-level fix (same as 14-C3/14-C4's "live-verified"
+    fixes, which are likewise not unit-testable through a fake ``ChatClient``)."""
+    from rag_app.assistant.router import _ROUTER_SYSTEM
+
+    assert "misspelled but SELF-CONTAINED" in _ROUTER_SYSTEM
+    assert "a spelling/grammar slip is NOT the same as an unresolved reference" in _ROUTER_SYSTEM
