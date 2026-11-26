@@ -814,6 +814,12 @@ step_e2e() {
   # plus its own negative control.
   # not-found.spec.ts (T13.10.3/DEBT-057): the custom 404 page -- real HTTP 404 status, single
   # "Back to login" link, no path echo, /api/... negative control, phone width, no extra env.
+  # plan-panel.spec.ts (T14.4.1-3, block 14-D2): the chat UI's visible-plan panel, through a
+  # real registered user + one real chat turn -- no extra env needed (same `registerAndReach
+  # Chat` helper auth.spec.ts already uses). Added to this explicit list because this step
+  # never runs the whole `e2e/` directory -- a spec not named here simply never executes in
+  # `gate.sh --full`/CI (found running this block's own first `--full` attempt: the spec was
+  # committed and in `touches`, but never appeared in the 29-test run until added here).
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
   # verification email through the gate's own Mailpit (e2e_ensure_mailpit, above).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
@@ -825,7 +831,7 @@ step_e2e() {
     E2E_WAKEUP_EMAIL="$E2E_WAKEUP_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
       e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/wakeup-slow.spec.ts e2e/wakeup-pipeline.spec.ts \
-      e2e/not-found.spec.ts)
+      e2e/not-found.spec.ts e2e/plan-panel.spec.ts)
 }
 
 # T12.4.9: register -> Mailpit API -> open the link -> verified, and the same shape for

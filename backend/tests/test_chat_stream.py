@@ -184,12 +184,18 @@ def test_the_stream_emits_embed_query_step_events_around_the_real_retrieving_sta
 ) -> None:
     """T13.12.5 (DEBT-062): through the REAL ``/chat/stream`` SSE wire format -- the chat
     wake banner (frontend) parses exactly this shape. Exactly one start/end pair, both
-    typed ``"step"`` with ``stage``/``step``/``phase`` fields, sitting between the
-    "retrieving" and "reranking" stage events -- unlike the other tests in this file, this
-    one needs a REAL (non-raising) embed AND a real (non-raising) LLM call, so the chat
-    client is faked too (this file's own ``OLLAMA_HOST=CLOSED_PORT`` would otherwise fail
-    the "generating" stage for real, like ``test_an_llm_failure_ends_with_an_error_event``
-    deliberately does)."""
+    typed ``"step"`` with ``stage``/``step``/``phase``/``detail`` fields, sitting between
+    the "retrieving" and "reranking" stage events -- unlike the other tests in this file,
+    this one needs a REAL (non-raising) embed AND a real (non-raising) LLM call, so the
+    chat client is faked too (this file's own ``OLLAMA_HOST=CLOSED_PORT`` would otherwise
+    fail the "generating" stage for real, like ``test_an_llm_failure_ends_with_an_error_
+    event`` deliberately does).
+
+    T14.4.1 (block 14-D2): the real stream now ALSO emits four plan-panel steps
+    (``understood``/``searching``/``found_sources``/``writing_answer``) -- this test
+    narrows its own filter to ``embed_query`` specifically, its original and only target
+    (the new steps' own wire shape is covered by
+    ``backend/tests/test_assistant_plan_events.py``)."""
     from rag_app import generation, reranking
 
     class _TwoCallChat:
@@ -219,18 +225,32 @@ def test_the_stream_emits_embed_query_step_events_around_the_real_retrieving_sta
     events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
     assert events[-1]["type"] == "done"
 
-    steps = [e for e in events if e["type"] == "step"]
+    steps = [e for e in events if e["type"] == "step" and e["step"] == "embed_query"]
     assert steps == [
-        {"type": "step", "stage": "retrieving", "step": "embed_query", "phase": "start"},
-        {"type": "step", "stage": "retrieving", "step": "embed_query", "phase": "end"},
+        {
+            "type": "step",
+            "stage": "retrieving",
+            "step": "embed_query",
+            "phase": "start",
+            "detail": None,
+        },
+        {
+            "type": "step",
+            "stage": "retrieving",
+            "step": "embed_query",
+            "phase": "end",
+            "detail": None,
+        },
     ]
     # Built from "type" first, never a truthy-coalesce over "stage"/"phase" -- a "step"
     # event's own "stage" ("retrieving") is itself truthy, so `stage or phase` would have
-    # silently picked that instead of the phase (found running this for real).
+    # silently picked that instead of the phase (found running this for real). Filtered to
+    # stage events + embed_query steps ONLY, ignoring the new interleaved "searching"/
+    # "found_sources"/"writing_answer" steps (T14.4.1), which this test is not about.
     kinds = [
         ("stage", e["stage"]) if e["type"] == "stage" else ("step", e["phase"])
         for e in events
-        if e["type"] in ("stage", "step")
+        if e["type"] == "stage" or (e["type"] == "step" and e["step"] == "embed_query")
     ]
     retrieving_idx = kinds.index(("stage", "retrieving"))
     reranking_idx = kinds.index(("stage", "reranking"))
