@@ -1016,6 +1016,35 @@ resolve_ollama_host() {
 
 ollama_reachable() { curl -4 -fsS -m 5 -o /dev/null "${OLLAMA_HOST%/}/api/tags" 2>/dev/null; }
 
+# DEC-066 change 6 (F24-into-14): the deterministic eval (DEC-064, seed 42) is only
+# byte-reproducible when the native `ollama serve` runs with OLLAMA_NUM_PARALLEL=1 --
+# concurrent requests otherwise race inside Ollama's own runner. tools/ops/resume.sh
+# already exports it before starting the server; this is a safety net for anyone who
+# started `ollama serve` another way. Informational only (never fails the gate): a
+# remote/other Ollama (GATE_OLLAMA_HOST pointing elsewhere) has no local process to
+# inspect, and that is a legitimate, un-checkable setup, not a problem to report.
+check_ollama_num_parallel() {
+  local pid val
+  # Test-only override (same convention as GATE_LOCK_TEST_SLEEP): lets a test point at its
+  # own throwaway process deterministically instead of racing the real pgrep against
+  # whatever "ollama serve" may already be running on the host. The real code path never
+  # sets this.
+  if [ -n "${GATE_OLLAMA_PID_FOR_TEST:-}" ]; then
+    pid="$GATE_OLLAMA_PID_FOR_TEST"
+  else
+    pid="$(pgrep -f '[o]llama serve' 2>/dev/null | head -1)" || true
+  fi
+  [ -n "$pid" ] || return 0   # no native server here -- nothing to warn about
+  [ -r "/proc/$pid/environ" ] || return 0
+  val="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^OLLAMA_NUM_PARALLEL=//p' | tail -1)"
+  if [ "$val" != "1" ]; then
+    echo "WARNING: the native 'ollama serve' (pid $pid) was started without" >&2
+    echo "  OLLAMA_NUM_PARALLEL=1 (current value: '${val:-unset}') -- the dialogue eval" >&2
+    echo "  (DEC-064 seed 42) is NOT guaranteed reproducible under concurrent requests." >&2
+    echo "  Restart it with: OLLAMA_NUM_PARALLEL=1 ~/.local/bin/ollama serve" >&2
+  fi
+}
+
 # "<model> <digest>" of the embedding model Ollama serves now (DA-B-9); empty on error.
 embed_model_digest() {
   (cd "$REPO_ROOT/backend" && "$PY" -m rag_app.devtools.ollama_digest --host "$OLLAMA_HOST" 2>/dev/null)
@@ -1375,6 +1404,7 @@ main() {
   esac
 
   echo "gate: mode=$mode, tree=$REPO_ROOT${REPO_ROOT:+ @ $(git rev-parse --short HEAD 2>/dev/null)}"
+  check_ollama_num_parallel
   # The commit a --full PASS may vouch for: fixed now, re-checked before publishing.
   GATE_START_SHA="$(git rev-parse HEAD 2>/dev/null)"
   GATE_START_DIRTY=1

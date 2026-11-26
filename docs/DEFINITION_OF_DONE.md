@@ -400,7 +400,11 @@ the gate checks the resolved configuration (`rag_app.devtools.gate_compose`): pr
 ports (5432, 8000, 3000, 11434). Every native step gets the gate's `DATABASE_URL` and
 `OLLAMA_HOST` exported (in `--fast` the URL points at the stopped gate port, so nothing can
 reach the development database). `OLLAMA_HOST` = `GATE_OLLAMA_HOST`, else `OLLAMA_HOST`,
-else the main tree's `.env`, else `http://127.0.0.1:11434` (native `ollama serve`).
+else the main tree's `.env`, else `http://127.0.0.1:11434` (native `ollama serve`). Start
+the native server with `OLLAMA_NUM_PARALLEL=1 ollama serve`: the dialogue `eval` step's
+determinism (DEC-064, seed 42) only holds when Ollama is not also serving concurrent
+requests from another process. The gate warns (never fails) at start-up if it finds the
+native server running without it (DEC-066 change 6, F24-into-14).
 Teardown is `docker compose -p secrag-gate down -v` — it only removes that project.
 
 **Test DB harness** (`backend/tests/db_harness.py`, marker `db`). `TEST_DATABASE_URL` is a

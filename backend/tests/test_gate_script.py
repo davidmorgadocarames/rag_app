@@ -404,6 +404,73 @@ def test_the_escape_hatch_env_var_allows_a_deliberate_background_launch(tmp_path
     assert "F24" not in proc.stdout + proc.stderr
 
 
+# --- Ollama reproducibility warning (DEC-066 change 6, F24-into-14) --------------------
+#
+# The dialogue eval (DEC-064) is only byte-reproducible when the native `ollama serve` runs
+# with OLLAMA_NUM_PARALLEL=1. gate.sh now warns (never fails) when it detects the native
+# server lacks it. GATE_OLLAMA_PID_FOR_TEST is a test-only override (see gate.sh) so these
+# tests never race the real pgrep against whatever "ollama serve" may already be running on
+# the host machine.
+
+
+@needs_tools
+def test_warns_when_the_native_server_lacks_num_parallel_one(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    env_without = {k: v for k, v in os.environ.items() if k != "OLLAMA_NUM_PARALLEL"}
+    fake = subprocess.Popen(["sleep", "30"], env=env_without)
+    try:
+        proc = _gate(repo, "--only", "git-modes", GATE_OLLAMA_PID_FOR_TEST=str(fake.pid))
+    finally:
+        fake.terminate()
+        fake.wait(timeout=10)
+    out = proc.stdout + proc.stderr
+    assert "WARNING" in out
+    assert "OLLAMA_NUM_PARALLEL=1" in out
+    assert str(fake.pid) in out
+
+
+@needs_tools
+def test_warns_when_the_native_server_has_a_different_value(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    # A real, separate throwaway process with its OWN environ (os.getpid() above is the
+    # pytest process itself, whose environ is fixed at its own startup -- a subprocess.run
+    # env= override only affects a NEW child, never retroactively changes another already-
+    # running process's /proc/<pid>/environ).
+    fake = subprocess.Popen(["sleep", "30"], env={**os.environ, "OLLAMA_NUM_PARALLEL": "4"})
+    try:
+        proc = _gate(repo, "--only", "git-modes", GATE_OLLAMA_PID_FOR_TEST=str(fake.pid))
+    finally:
+        fake.terminate()
+        fake.wait(timeout=10)
+    out = proc.stdout + proc.stderr
+    assert "WARNING" in out
+    assert "'4'" in out
+
+
+@needs_tools
+def test_no_warning_when_the_native_server_has_num_parallel_one(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    fake = subprocess.Popen(["sleep", "30"], env={**os.environ, "OLLAMA_NUM_PARALLEL": "1"})
+    try:
+        proc = _gate(repo, "--only", "git-modes", GATE_OLLAMA_PID_FOR_TEST=str(fake.pid))
+    finally:
+        fake.terminate()
+        fake.wait(timeout=10)
+    out = proc.stdout + proc.stderr
+    assert "WARNING" not in out
+
+
+@needs_tools
+def test_no_warning_and_no_crash_when_no_server_is_found(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    # A PID that (almost certainly) does not exist -- simulates "no native server running"
+    # deterministically, without depending on whether a real ollama happens to be up.
+    proc = _gate(repo, "--only", "git-modes", GATE_OLLAMA_PID_FOR_TEST="999999999")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "WARNING" not in out
+
+
 # --- F31: one gate seed per alembic head (2026-11-25) -----------------------------------
 #
 # $GATE_STATE (.gate/) is shared across every worktree of this repo (it lives under
