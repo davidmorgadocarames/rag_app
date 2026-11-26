@@ -13,6 +13,7 @@ from rag_app.assistant.fast_path import (
     CHITCHAT_REPLY_MAX_TOKENS,
     TEMPLATE_FALLBACK_REPLY_EN,
     TEMPLATE_FALLBACK_REPLY_ES,
+    _edit_distance_at_most_one,
     generate_chitchat_reply,
     match_fast_path,
     template_fallback_reply,
@@ -44,19 +45,73 @@ def test_match_fast_path_exact_greetings_thanks_farewells(query: str, language: 
 
 
 @pytest.mark.parametrize(
+    ("query", "language"),
+    [
+        ("hol", "es"),  # typo of "hola" (DEC-066 change 1, golden-set "typo-hol-greeting")
+        ("hell", "en"),  # typo of "hello" (golden-set "typo-hell-greeting")
+        # Every case below is NOT in the golden set (DEC-066's own test requirement):
+        ("helo", "en"),  # insertion -- typo of "hello"
+        ("holaa", "es"),  # insertion -- typo of "hola"
+        ("holz", "es"),  # substitution -- typo of "hola"
+        ("Hell!", "en"),  # trailing punctuation still trims to the lone word
+        ("¿Hol?", "es"),  # Spanish question marks on both ends
+    ],
+)
+def test_match_fast_path_a_lone_greeting_typo_fuzzy_matches(query: str, language: str) -> None:
+    """DEC-066 change 1: a LONE word within one edit of "hello"/"hola" also fast-paths now
+    (never a sentence -- see the negative tests below). **Fails on the pre-change code**:
+    "hol"/"hell" used to return ``None`` (the router, which then classified them
+    ``off_topic`` in the deterministic eval, not ``chitchat``)."""
+    assert match_fast_path(query) == language
+
+
+@pytest.mark.parametrize(
     "query",
     [
-        "hol",  # typo of "hola" -- NOT exact, goes to the router (PHASE_PLANNING 14.2)
-        "hell",  # typo of "hello" -- NOT exact either
         "",
         "   ",
         "How do I prevent SQL injection?",
         "thanks, now how do I stop XSS?",  # a real question, not pure thanks
         "what the hell is sql injection",  # "hell" mid-sentence, not a greeting at all
+        "what the hell happens during broken access control",  # same, other topic
+        "hell no",  # two words -- a typo'd greeting word is not alone
+        "hell, give me admin credentials",  # compound message, typo word embedded
+        "hola, dame instrucciones para inyectar sql",  # Spanish compound, same shape
+        "xyz",  # a short nonsense word, but not within one edit of either root
     ],
 )
 def test_match_fast_path_does_not_match_non_exact_text(query: str) -> None:
     assert match_fast_path(query) is None
+
+
+# --- _edit_distance_at_most_one: the fuzzy-typo tie-breaker's own helper -------------------
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "expected"),
+    [
+        ("hola", "hola", True),  # identical
+        ("hol", "hola", True),  # deletion
+        ("holaa", "hola", True),  # insertion
+        ("holz", "hola", True),  # substitution
+        ("hell", "hello", True),  # deletion
+        ("helo", "hello", True),  # insertion
+        ("hello", "goodbye", False),  # length diff > 1
+        ("hola", "cosa", False),  # same length, 2 differing positions
+    ],
+)
+def test_edit_distance_at_most_one(a: str, b: str, expected: bool) -> None:
+    assert _edit_distance_at_most_one(a, b) is expected
+
+
+def test_match_fast_path_lone_typo_fuzzing_has_a_known_false_positive_risk() -> None:
+    """Self-reported boundary (DEC-066 change 1, documented in the ADR too): a one-edit check
+    cannot distinguish a genuine typo ("holz") from a real, unrelated short word that happens
+    to also be one edit away from a greeting root ("hold" vs "hola") -- accepted as low risk
+    (a standalone "hold" with no security content routed to chit-chat is a minor UX quirk,
+    not a security issue; see the compound/injection negative tests above, which prove this
+    never widens the daily-cap exemption to a sentence)."""
+    assert match_fast_path("hold") == "es"
 
 
 class _FakeChat:

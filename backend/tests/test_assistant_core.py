@@ -55,14 +55,30 @@ def test_non_exact_message_calls_the_router_and_measures_its_latency() -> None:
     assert decision.router_latency_s >= 0.0
 
 
-def test_a_typo_greeting_is_not_fast_pathed_but_reaches_the_router() -> None:
-    """PHASE_PLANNING.md 14.2: "a lone 'hol'/'hell' is not exact -> router"."""
-    result = RouterOutput(intent="chitchat", language="es", standalone_query="hello")
-    chat = _FakeChat(result=result)
+def test_a_lone_greeting_typo_is_now_fast_pathed_too() -> None:
+    """router-reliability (DEC-066 change 1), supersedes the old PHASE_PLANNING.md 14.2
+    wording ("a lone 'hol'/'hell' is not exact -> router"): a lone greeting-typo word now
+    skips the router entirely too (``assistant.fast_path.match_fast_path``'s own fuzzy
+    match) -- this fixed the golden-set's deterministic ``off_topic`` misses for exactly
+    these two words."""
+    chat = _FakeChat()
     decision = understand(chat, "hol")  # type: ignore[arg-type]
+    assert decision.used_fast_path is True
+    assert chat.chat_json_calls == 0  # the router was never called
+    assert decision.intent == "chitchat"
+    assert decision.language == "es"
+
+
+def test_a_typo_word_inside_a_sentence_still_reaches_the_router() -> None:
+    """The lone-word scope of change 1 does not widen to a sentence -- a security question
+    with a typo'd greeting word embedded still goes through the real router, same as before.
+    Not in the golden set (DEC-066's own test requirement)."""
+    result = RouterOutput(intent="security", language="en", standalone_query="x")
+    chat = _FakeChat(result=result)
+    decision = understand(chat, "hell, how do I stop XSS?")  # type: ignore[arg-type]
     assert decision.used_fast_path is False
     assert chat.chat_json_calls == 1
-    assert decision.intent == "chitchat"  # the router, not the fast path, decided this
+    assert decision.intent == "security"
 
 
 def test_router_failure_still_degrades_to_security_with_a_measured_latency() -> None:

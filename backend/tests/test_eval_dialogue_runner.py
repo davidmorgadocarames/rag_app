@@ -330,10 +330,17 @@ def test_evaluate_dialogues_passes_memory_into_understand_but_not_into_retrieval
     real_understand = assistant_core.understand
 
     def spy_understand(
-        chat: object, query: str, *, summary: str | None = None, last_turn: str | None = None
+        chat: object,
+        query: str,
+        *,
+        summary: str | None = None,
+        last_turn: str | None = None,
+        previous_intent: str | None = None,
     ) -> object:
         understand_calls.append((query, summary, last_turn))
-        return real_understand(chat, query, summary=summary, last_turn=last_turn)  # type: ignore[arg-type]
+        return real_understand(  # type: ignore[arg-type]
+            chat, query, summary=summary, last_turn=last_turn, previous_intent=previous_intent
+        )
 
     def fake_retrieve(
         _session: object, query: str, *, reranker: object, top_n: int | None = None, **_kw: object

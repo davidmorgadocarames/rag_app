@@ -154,11 +154,20 @@ def evaluate_dialogues(
         # reset for every new dialogue (see this function's own docstring).
         summary_text: str | None = None
         last_turn_text: str | None = None
+        # router-reliability (DEC-066 change 4): the PREVIOUS turn's own observed intent,
+        # reset per dialogue same as the memory above -- see `router.route`'s own docstring
+        # for why this is tracked explicitly here rather than guessed from `last_turn` text.
+        previous_intent: str | None = None
         for index, turn in enumerate(dialogue.turns):
             start = time.perf_counter()
             decision = understand(
-                chat, turn.message, summary=summary_text, last_turn=last_turn_text
+                chat,
+                turn.message,
+                summary=summary_text,
+                last_turn=last_turn_text,
+                previous_intent=previous_intent,
             )
+            previous_intent = decision.intent
 
             # T14.3.1/T14.3.3/T14.3.4 (block 14-D1): the THIRD entry point for the
             # chitchat/ambiguous/off_topic conversational replies -- same dispatch as

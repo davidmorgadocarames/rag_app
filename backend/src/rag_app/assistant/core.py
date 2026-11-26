@@ -67,9 +67,14 @@ def understand(
     *,
     summary: str | None = None,
     last_turn: str | None = None,
+    previous_intent: str | None = None,
 ) -> Understanding:
-    """Fast path first (T14.2.2, EXACT greeting/thanks/farewell only); otherwise the LLM
-    router (T14.2.3)."""
+    """Fast path first (T14.2.2, EXACT greeting/thanks/farewell only, now also a LONE
+    greeting-typo word -- router-reliability DEC-066 change 1); otherwise the LLM router
+    (T14.2.3). ``previous_intent`` (DEC-066 change 4): the PREVIOUS turn's own
+    ``Understanding.intent``, forwarded unchanged to :func:`rag_app.assistant.router.route` --
+    see that function's own docstring for why this is a caller-tracked flag, never guessed
+    from ``last_turn`` text."""
     fast_language = match_fast_path(query)
     if fast_language is not None:
         return Understanding(
@@ -81,7 +86,9 @@ def understand(
             router_latency_s=None,
         )
     start = time.perf_counter()
-    router_out = route(chat, query, summary=summary, last_turn=last_turn)
+    router_out = route(
+        chat, query, summary=summary, last_turn=last_turn, previous_intent=previous_intent
+    )
     router_latency_s = time.perf_counter() - start
     return Understanding(
         intent=router_out.intent,
