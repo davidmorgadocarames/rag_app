@@ -62,7 +62,7 @@ from rag_app.api.schemas import (
     RenameRequest,
 )
 from rag_app.assistant.fast_path import match_fast_path
-from rag_app.assistant.memory import select_last_turn, summarize_turn
+from rag_app.assistant.memory import previous_intent_from_summary, select_last_turn, summarize_turn
 from rag_app.authz import require_permission
 from rag_app.config import get_settings
 from rag_app.crypto import decrypt, encrypt, unwrap_key
@@ -298,14 +298,20 @@ def _decrypted_turns(key: bytes, messages: list[Message]) -> list[tuple[str, str
 
 def _load_memory(
     key: bytes, conv: Conversation, prior_messages: list[Message]
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """T14.2.5 (memory read): the conversation's own summary + its last clean turn, from the
     state strictly BEFORE the current turn — ``prior_messages`` must be fetched before
     :func:`_start_turn` persists the new user message. Scoped to exactly ONE conversation by
     construction: ``conv``/``prior_messages`` always come from the single, already
     ownership-checked conversation this turn belongs to (``_get_owned_conversation`` for an
     existing id, or a brand-new ``Conversation`` row) — there is no code path here that can
-    read another conversation's rows."""
+    read another conversation's rows.
+
+    ``previous_intent`` (DA-router-reliability-1, F24-into-14): read from the SAME decrypted
+    ``summary`` (``assistant.memory.previous_intent_from_summary``) — never a separate
+    database read, since it is piggybacked onto the already-stored
+    ``ConversationSummary.last_intent`` field (no new column; see that function's own
+    docstring for the self-reported staleness boundary)."""
     summary: str | None = None
     if conv.summary_encrypted is not None:
         try:
@@ -315,12 +321,13 @@ def _load_memory(
                 "chat stream: conversation summary cannot be decrypted (%s)", type(exc).__name__
             )
     last_turn = select_last_turn(_decrypted_turns(key, prior_messages))
-    return summary, last_turn
+    previous_intent = previous_intent_from_summary(summary)
+    return summary, last_turn, previous_intent
 
 
 def _start_turn(
     session: Session, user_id: uuid.UUID, key: bytes, request: ChatStreamRequest
-) -> tuple[Conversation, str | None, str | None]:
+) -> tuple[Conversation, str | None, str | None, str | None]:
     """Get or create the conversation, read its memory (T14.2.5 — BEFORE this turn's own
     message exists), and store the user message, all in one transaction: a new conversation
     never exists without its first message, and memory always reflects the state strictly
@@ -333,7 +340,7 @@ def _start_turn(
         session.add(conv)
         session.flush()
         prior_messages = []
-    summary, last_turn = _load_memory(key, conv, prior_messages)
+    summary, last_turn, previous_intent = _load_memory(key, conv, prior_messages)
     session.add(
         Message(
             conversation_id=conv.id,
@@ -342,7 +349,7 @@ def _start_turn(
         )
     )
     session.commit()
-    return conv, summary, last_turn
+    return conv, summary, last_turn, previous_intent
 
 
 def _update_conversation_summary(
@@ -354,6 +361,7 @@ def _update_conversation_summary(
     last_turn: str | None,
     question: str,
     answer: str,
+    observed_intent: str | None = None,
 ) -> None:
     """T14.2.6 (memory write): AFTER the final answer event (the assistant reply is already
     persisted by the caller), BEFORE the stream's own ``done`` event. Best-effort by design:
@@ -361,7 +369,14 @@ def _update_conversation_summary(
     swallowed — memory is a quality feature, it must never turn an already-successful answer
     into a failed stream. ``summarize_turn`` itself already turns an invalid/unreachable
     update into ``None`` ("dropped"); the try/except here additionally covers the
-    encrypt/commit step."""
+    encrypt/commit step.
+
+    ``observed_intent`` (DA-router-reliability-1): THIS turn's own ``decision.intent``
+    (from the pipeline's final ``StreamResult``), written onto the new summary's
+    ``last_intent`` so the NEXT turn's :func:`_load_memory` can read it back as
+    ``previous_intent``. Only reaches this far when the caller did not skip this call for
+    an exact fast-path turn (see ``generation.answer_question_stream``'s own self-reported
+    staleness note for that narrow case)."""
     try:
         chat = make_chat_client()
         new_summary = summarize_turn(
@@ -370,6 +385,7 @@ def _update_conversation_summary(
             last_turn=last_turn,
             question=question,
             answer=answer,
+            observed_intent=observed_intent,
         )
         if new_summary is not None:
             conv.summary_encrypted = encrypt(key, new_summary)
@@ -390,7 +406,11 @@ _PIPELINE_END = object()
 
 
 def _pipeline_events(
-    request: ChatStreamRequest, *, summary: str | None, last_turn: str | None
+    request: ChatStreamRequest,
+    *,
+    summary: str | None,
+    last_turn: str | None,
+    previous_intent: str | None = None,
 ) -> Generator[object | None, None, None]:
     """The pipeline's events, produced on a worker thread with its OWN session (committed
     after every event, so no read transaction stays open while the model generates).
@@ -398,9 +418,10 @@ def _pipeline_events(
     keep-alive). Re-raises the pipeline's exception here. Closing this generator (client gone)
     tells the worker to stop at its next event.
 
-    ``summary``/``last_turn`` (T14.2.5): the conversation's memory, already read by the
-    caller (``_load_memory``, on the OUTER session) before this worker thread's own session
-    even exists — forwarded unchanged into ``answer_question_stream``."""
+    ``summary``/``last_turn``/``previous_intent`` (T14.2.5, DA-router-reliability-1): the
+    conversation's memory, already read by the caller (``_load_memory``, on the OUTER
+    session) before this worker thread's own session even exists — forwarded unchanged into
+    ``answer_question_stream``."""
     events: queue.Queue[object] = queue.Queue()
     cancel = threading.Event()
 
@@ -416,6 +437,7 @@ def _pipeline_events(
                     reranker=get_shared_reranker(),
                     summary=summary,
                     last_turn=last_turn,
+                    previous_intent=previous_intent,
                 ):
                     session.commit()  # ends the read transaction; a no-op when none is open
                     if cancel.is_set():
@@ -472,7 +494,9 @@ def _chat_events(
     # Own session: the SSE body outlives the request-scoped session (see factory above).
     with _stream_session_factory()() as session:
         try:
-            conv, memory_summary, memory_last_turn = _start_turn(session, user_id, key, request)
+            conv, memory_summary, memory_last_turn, memory_previous_intent = _start_turn(
+                session, user_id, key, request
+            )
         except Exception as exc:  # noqa: BLE001 - storage down, or the conversation vanished
             session.rollback()
             logger.warning("chat stream: turn not stored (%s)", type(exc).__name__)
@@ -489,8 +513,14 @@ def _chat_events(
             answer: Answer | None = None
             usage = Usage()
             used_fast_path = False
+            observed_intent: str | None = None
             stage = "starting"
-            pipeline = _pipeline_events(request, summary=memory_summary, last_turn=memory_last_turn)
+            pipeline = _pipeline_events(
+                request,
+                summary=memory_summary,
+                last_turn=memory_last_turn,
+                previous_intent=memory_previous_intent,
+            )
             try:
                 for event in pipeline:
                     if event is None:
@@ -517,6 +547,7 @@ def _chat_events(
                         answer = event.answer
                         usage = event.usage
                         used_fast_path = event.used_fast_path
+                        observed_intent = event.intent or None
                 if answer is None:
                     raise RuntimeError("the pipeline produced no answer")
             except Exception as exc:  # noqa: BLE001 - surface a clean error event, keep the stream valid
@@ -570,6 +601,7 @@ def _chat_events(
                     last_turn=memory_last_turn,
                     question=request.question,
                     answer=answer.text,
+                    observed_intent=observed_intent,
                 )
             yield _sse(
                 {

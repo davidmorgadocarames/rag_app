@@ -132,11 +132,19 @@ def _summary_encrypted(engine: Engine, conv_id: str) -> bytes | None:
 
 class _FakePipeline:
     """Stands in for ``answer_question_stream`` (same shape as ``test_daily_cap.py``'s own):
-    records the ``summary``/``last_turn`` kwargs it was called with."""
+    records the ``summary``/``last_turn``/``previous_intent`` kwargs it was called with.
 
-    def __init__(self, *, answer_text: str = "Use prepared statements [1].") -> None:
+    ``intent`` (DA-router-reliability-1, F24-into-14): the ``StreamResult``'s own ``intent``
+    field this fake yields -- defaults to ``"security"`` (a realistic, non-empty value;
+    ``""`` would round-trip as ``None`` via ``api.conversations``'s own ``event.intent or
+    None``, same as every pre-existing fake that never set it)."""
+
+    def __init__(
+        self, *, answer_text: str = "Use prepared statements [1].", intent: str = "security"
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self._answer_text = answer_text
+        self._intent = intent
 
     def __call__(
         self,
@@ -145,14 +153,17 @@ class _FakePipeline:
         *,
         summary: str | None = None,
         last_turn: str | None = None,
+        previous_intent: str | None = None,
         **_kw: Any,
     ) -> Iterator[Any]:
         from rag_app.generation import Answer, StreamResult, StreamStage
         from rag_app.llm import Usage
 
-        self.calls.append({"summary": summary, "last_turn": last_turn})
+        self.calls.append(
+            {"summary": summary, "last_turn": last_turn, "previous_intent": previous_intent}
+        )
         yield StreamStage("generating")
-        yield StreamResult(Answer(text=self._answer_text), usage=Usage(10, 5))
+        yield StreamResult(Answer(text=self._answer_text), usage=Usage(10, 5), intent=self._intent)
 
 
 # --- T14.2.5: memory read is scoped to exactly ONE conversation -----------------------------
@@ -234,7 +245,83 @@ def test_stream_has_no_memory_for_a_brand_new_conversation(
     res = client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
 
     assert _events(res)[-1]["type"] == "done"
-    assert pipeline.calls == [{"summary": None, "last_turn": None}]
+    assert pipeline.calls == [{"summary": None, "last_turn": None, "previous_intent": None}]
+
+
+# --- DA-router-reliability-1 (F24-into-14): previous_intent through the real endpoint -------
+
+
+@pytest.mark.db
+def test_stream_passes_the_previous_intent_from_the_stored_summary_into_the_pipeline(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``last_intent``, piggybacked onto the stored ``ConversationSummary`` (no new database
+    column -- see ``assistant.memory.ConversationSummary``'s own docstring), reaches
+    ``answer_question_stream`` as ``previous_intent`` on the NEXT turn. Fails on pre-this-
+    change code: ``answer_question_stream`` took no such kwarg at all."""
+    from rag_app.api import conversations
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
+    monkeypatch.setattr(conversations, "summarize_turn", lambda *_a, **_k: None)
+    user, key = _make_user_with_key(db_engine)
+    conv_id = _make_conversation_with_turn(
+        db_engine,
+        user,
+        key,
+        question="How do I fix this?",
+        answer="What exactly would you like help fixing?",
+        summary='{"topics": [], "last_intent": "ambiguous"}',
+    )
+
+    res = client.post(
+        "/chat/stream",
+        json={"question": "I mean SQL injection in my app", "conversation_id": conv_id},
+        headers=_auth(db_engine, user),
+    )
+    assert _events(res)[-1]["type"] == "done"
+
+    assert pipeline.calls == [
+        {
+            "summary": '{"topics": [], "last_intent": "ambiguous"}',
+            "last_turn": "User: How do I fix this?\nAssistant: What exactly would you like "
+            "help fixing?",
+            "previous_intent": "ambiguous",
+        }
+    ]
+
+
+@pytest.mark.db
+def test_stream_persists_the_observed_intent_for_the_next_turns_memory_read(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The turn's own observed intent (the real ``StreamResult.intent``, here ``"security"``,
+    ``_FakePipeline``'s default) is written onto the new summary's ``last_intent`` -- round-
+    tripping through storage the same way ``test_stream_writes_the_updated_summary_before_
+    the_done_event`` already proves for ``topics``. Fails on pre-this-change code:
+    ``_update_conversation_summary``/``summarize_turn`` took no ``observed_intent`` kwarg."""
+    from rag_app.api import conversations
+
+    pipeline = _FakePipeline(intent="security")
+    monkeypatch.setattr(conversations, "answer_question_stream", pipeline)
+    seen_kwargs: dict[str, Any] = {}
+
+    def spy_summarize_turn(*_a: Any, **kwargs: Any) -> str:
+        seen_kwargs.update(kwargs)
+        return '{"topics": ["sql injection"], "last_intent": "security"}'
+
+    monkeypatch.setattr(conversations, "summarize_turn", spy_summarize_turn)
+    user, key = _make_user_with_key(db_engine)
+
+    res = client.post("/chat/stream", json={"question": QUESTION}, headers=_auth(db_engine, user))
+    events = _events(res)
+    assert events[-1]["type"] == "done"
+    conv_id = events[0]["conversation_id"]
+
+    assert seen_kwargs["observed_intent"] == "security"
+    blob = _summary_encrypted(db_engine, conv_id)
+    assert blob is not None
+    assert decrypt(key, blob) == '{"topics": ["sql injection"], "last_intent": "security"}'
 
 
 # --- T14.2.6: memory write happens after the answer, before "done" --------------------------

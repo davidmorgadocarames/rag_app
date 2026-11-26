@@ -1285,6 +1285,73 @@ zero-regression prompt that 14-D1's own report already warned is a real risk ("t
 few-shot attempts, both reverted after causing new regressions elsewhere" — the same
 whack-a-mole this block avoids repeating). Tracked as a known, accepted trade-off, not hidden.
 
+## Decision — F24/F31 merge + DA-router-reliability follow-ups (block F24-into-14)
+
+Merged `f24-check` (F24: `scripts/gate.sh` refuses a manual-background launch; F31: one
+gate seed per alembic head) into `phase-14-assistant` — clean, no conflicts (`fa135d8` x
+`bf548f0`), confirmed by an independent `git merge-tree` before this block started.
+`check_ollama_num_parallel()` closes DEC-066 change 6's second half: at gate start, reads
+`/proc/<pid>/environ` of the native `ollama serve` process (`pgrep -f`) and prints a
+WARNING (never fails) when `OLLAMA_NUM_PARALLEL=1` is missing -- the dialogue eval's
+determinism (DEC-064) depends on it. A test-only `GATE_OLLAMA_PID_FOR_TEST` override (same
+convention as the pre-existing `GATE_LOCK_TEST_SLEEP`) lets the 4 new tests point at a
+throwaway process deterministically instead of racing the real `pgrep` against whatever
+server may already be running on the host.
+
+**DA-router-reliability-2** (devil's-advocate finding 2 on the router-reliability block):
+a raw model `"followup"` verdict with NO context (no `summary`, no `last_turn`) is never
+trusted -- it falls through to `"ambiguous"` instead, letting the existing security-term
+tie-breaker (change 3) still classify it correctly. The DA proved, by querying the golden
+set directly, that zero turns ever expect `"followup"` on a context-free first turn, so
+this guard is provably safe against the whole golden set. Fixes the 2 regressions change 2
+introduced (`es-bac-rank-2021`, `dlg-followup-doc-version`, both turn 0) with no new
+regressions (confirmed on 2 byte-identical `--only eval` runs below).
+
+**DA-router-reliability-1** (devil's-advocate finding 1): `previous_intent` now reaches the
+LIVE `/chat/stream` path, not just the deterministic eval. `assistant.memory
+.ConversationSummary` gains a new `last_intent: str | None = None` field, piggybacked onto
+the ALREADY-persisted, already-encrypted `summary_encrypted` JSON blob -- **no new database
+column, no migration 0010** (every summary written before this change simply lacks the key,
+which Pydantic reads as the default `None`, never a parse error). `summarize_turn()` gains
+an `observed_intent` parameter that OVERWRITES whatever the LLM itself produced for that
+field -- the field is never asked for in the memory prompt, by design: this is a plain
+code-set/code-read value, not something a model should be trusted to report about itself.
+`api.conversations._load_memory` reads it back via the new
+`assistant.memory.previous_intent_from_summary` helper (same "never crash on bad stored
+data" discipline as `router._memory_subject`) and threads it through
+`_pipeline_events`/`answer_question_stream`/`understand()`/`route()`; the turn's own
+observed intent travels back out via a new `StreamResult.intent` field (set at all 5 of
+`answer_question_stream`'s yield sites) and is written back by
+`_update_conversation_summary` -> `summarize_turn(observed_intent=...)`. `answer_question`
+(`POST /chat`) also gained the `previous_intent` parameter, forwarded into `understand()`,
+for signature symmetry with `answer_question_stream` -- `POST /chat` remains genuinely
+stateless by design (TF24/DEC-059: no conversation at all, the same existing scope boundary
+that already excludes `summary`/`last_turn` from that function), so no live caller supplies
+a real value there today; this is parity, not a new capability.
+
+### Known limitations (self-reported, not just design) -- F24-into-14
+
+- **`last_intent` staleness across a fast-pathed turn.** The write only happens when
+  `_update_conversation_summary` runs, which (14-C1-fix) is deliberately SKIPPED on an
+  exact fast-path chit-chat turn (a bare greeting/thanks/farewell). A fast-pathed turn
+  sandwiched between an `"ambiguous"` turn and the user's reply to it leaves `last_intent`
+  one turn stale (still `"ambiguous"` from before the fast-pathed turn, not updated to
+  `"chitchat"`). This never produces an unsafe result -- change 4's tie-breaker only ever
+  moves an intent TOWARDS `"security"` (`assistant.router`'s own security framing: ANY
+  failure/ambiguity degrades to the conservative fallback, never away from it) -- only a
+  label/retrieval-target mismatch in this narrow, rare case (a user saying "thanks" or "hi"
+  literally between a clarifying question and their answer to it). Unlike `eval.runner
+  .evaluate_dialogues`'s own `previous_intent` tracking (a plain in-memory variable,
+  unconditionally updated every turn, never stale), the live path's fidelity is bounded by
+  the SAME optimization that already accepts similar staleness for `topics`/`entities`.
+- **`GATE_OLLAMA_PID_FOR_TEST`'s production path (plain `pgrep -f`) is exercised manually,
+  not by an automated test** that avoids depending on the host's real Ollama process (doing
+  so deterministically would need spawning a process whose own command line literally
+  contains the substring `ollama serve`, adding meaningful complexity for a thin wrapper
+  around 2 already-tested primitives, `pgrep`/`/proc/<pid>/environ` parsing). Manually
+  confirmed working against the real native Ollama server during this block (found its PID,
+  read its real `OLLAMA_NUM_PARALLEL=1` from `/proc/<pid>/environ` directly).
+
 ## Rollback
 
 router-reliability: changes LIVE runtime behaviour (the router prompt text and 3 new
@@ -1370,3 +1437,16 @@ block's commit(s) restores 14-C2's behaviour exactly (BM25 back to AND-only, no 
 no low-value penalty, no version filter, no few-shots, the original 6-follow-up-turn fixture) —
 `gate.sh --full` stays green either way as long as `enforce` was not flipped on a floor this
 revert would then fail; if it was, flip it back to `false` in the SAME revert commit.
+F24-into-14: no new schema, no migration, no deployed-image step. `scripts/gate.sh`'s
+`check_ollama_num_parallel` is additive and informational only (never fails). The
+router-reliability-2 guard changes LIVE runtime behaviour (a context-free raw `"followup"`
+now becomes `"ambiguous"` instead) — reverting it reopens the 2 regressions it fixes (same
+`enforce.intent_accuracy`/`enforce.follow_up_resolution` floor-regression risk as the
+router-reliability block above, since both floors are measured with it in place).
+`previous_intent`'s live wiring (`ConversationSummary.last_intent`, `StreamResult.intent`,
+the new `previous_intent`/`observed_intent` parameters) is additive and defaulted
+everywhere — every pre-existing caller that does not pass the new kwargs keeps its old
+behaviour unchanged, and a summary written before this change simply has no `last_intent`
+key (read back as `None`). A plain `git revert` of this block's commit(s) restores the
+router-reliability head's behaviour exactly; no data migration of any kind is needed either
+way (`last_intent` is just a JSON key inside an already-opaque encrypted blob).

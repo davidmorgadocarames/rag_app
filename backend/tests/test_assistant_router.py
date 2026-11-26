@@ -461,9 +461,12 @@ def test_names_a_security_term_detects_english_and_spanish_terms() -> None:
 
 
 def test_route_overrides_ambiguous_to_security_when_the_message_names_a_security_term() -> None:
-    """DEC-066 change 3, not in the golden set: a complete question that already names its
-    own security subject is never 'ambiguous', even with no conversation context at all
-    (unlike change 5 below, this tie-breaker needs no memory)."""
+    """DEC-066 change 3, not in the golden set (DA-router-reliability-3, F24-into-14: the
+    previous wording here was the EXACT verbatim text of ``dlg-abstention-then-recover``
+    turn 1 -- replaced with an equivalent paraphrase that is not a golden-set item): a
+    complete question that already names its own security subject is never 'ambiguous',
+    even with no conversation context at all (unlike change 5 below, this tie-breaker
+    needs no memory)."""
     result = RouterOutput(
         intent="ambiguous",
         language="en",
@@ -471,10 +474,13 @@ def test_route_overrides_ambiguous_to_security_when_the_message_names_a_security
         clarification="What kind of attack are you asking about?",
     )
     chat = _FakeChat(result=result)
-    out = route(chat, "OK, instead -- how do I prevent injection attacks in general?")  # type: ignore[arg-type]
+    out = route(chat, "Never mind that one -- what about preventing injection attacks generally?")  # type: ignore[arg-type]
     assert out.intent == "security"
     assert out.clarification is None
-    assert out.standalone_query == "OK, instead -- how do I prevent injection attacks in general?"
+    assert (
+        out.standalone_query == "Never mind that one -- what about preventing injection "
+        "attacks generally?"
+    )
 
 
 def test_route_overrides_ambiguous_to_security_for_a_spanish_self_contained_question() -> None:

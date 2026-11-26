@@ -260,6 +260,7 @@ def answer_question(
     top_n: int | None = None,
     use_rerank: bool = True,
     version: str | None = None,
+    previous_intent: str | None = None,
 ) -> Answer:
     """Full RAG: understand -> retrieve -> generate -> groundedness check -> cited answer,
     small-talk reply, or abstention.
@@ -293,6 +294,14 @@ def answer_question(
     ``query`` -- instead of always the original message. Generation (``answer_from_chunks``)
     still receives the ORIGINAL ``query``, so the reply still addresses what the user typed,
     in their own language (D14.1).
+
+    ``previous_intent`` (DA-router-reliability-1, F24-into-14): forwarded unchanged into
+    ``understand()``, same parameter ``answer_question_stream`` below also carries --
+    ``None`` by default. ``POST /chat`` (``api.deps.get_answerer``) remains stateless by
+    design (TF24/DEC-059: no conversation at all here, same scope boundary that already
+    excludes ``summary``/``last_turn`` from this function), so no live caller supplies a
+    real value today; the parameter exists for symmetry with ``understand()``'s own
+    signature, not as a new capability for this entry point.
     """
     settings = get_settings()
     top_n = top_n or settings.rerank_top_n
@@ -300,7 +309,7 @@ def answer_question(
 
     with timing.recorder(streaming=False, on_stage=observe_stage, on_step=observe_step):
         with timing.stage("classify"):
-            decision = understand(chat, query)
+            decision = understand(chat, query, previous_intent=previous_intent)
         if decision.intent == "chitchat":
             reply = generate_chitchat_reply(chat, query, decision.language)
             return Answer(text=reply, abstained=False, grounded=True)
@@ -514,11 +523,19 @@ class StreamResult:
     too -- a cap-exempt turn must not cost a second, uncounted LLM call. Defaults to False
     so every pre-existing test/fake pipeline that does not pass it keeps the old
     ("always write memory") behaviour, which is correct for them: none of them are the
-    fast-path branch."""
+    fast-path branch.
+
+    ``intent`` (DA-router-reliability-1, F24-into-14): the turn's own
+    ``Understanding.intent`` -- the caller (``api.conversations._chat_events``) persists it
+    as the NEXT turn's ``previous_intent`` (``assistant.memory.ConversationSummary
+    .last_intent``). Defaults to ``""`` for the same backward-compatibility reason as
+    ``used_fast_path`` above (every pre-existing test/fake pipeline that builds a
+    ``StreamResult`` directly, without this field)."""
 
     answer: Answer
     usage: Usage
     used_fast_path: bool = False
+    intent: str = ""
 
 
 StreamEvent = StreamStage | StreamStep | StreamToken | StreamResult
@@ -603,6 +620,7 @@ def answer_question_stream(
     version: str | None = None,
     summary: str | None = None,
     last_turn: str | None = None,
+    previous_intent: str | None = None,
 ) -> Iterator[StreamEvent]:
     """Streaming RAG: emit stage/token events, then a final grounded (or abstained) result.
 
@@ -636,6 +654,21 @@ def answer_question_stream(
     checked conversation) BEFORE this turn -- are forwarded unchanged into ``understand()``,
     which already accepted them as of 14-B2 (always ``None`` until this block).
 
+    ``previous_intent`` (DA-router-reliability-1, F24-into-14): the PREVIOUS turn's own
+    ``Understanding.intent``, read by the caller from the SAME stored summary
+    (``assistant.memory.previous_intent_from_summary``, piggybacked onto
+    ``ConversationSummary.last_intent`` -- no new database column) and forwarded unchanged
+    into ``understand()``/``route()``. Every ``StreamResult`` below now also carries
+    ``intent=decision.intent`` so the caller can persist THIS turn's own intent as the
+    NEXT turn's ``previous_intent`` in turn. **Self-reported boundary:** the write only
+    happens when ``_update_conversation_summary`` runs, which (14-C1-fix) is skipped on an
+    exact fast-path chit-chat turn -- so a fast-pathed turn sandwiched between an
+    ``ambiguous`` turn and the user's reply to it leaves ``last_intent`` one turn stale
+    (still ``"ambiguous"`` from before the fast-pathed turn). This never produces an unsafe
+    result (change 4's tie-breaker only ever moves an intent TOWARDS ``security``, see
+    ``assistant.router``'s own security framing), only a label/retrieval-target mismatch in
+    this narrow, rare case.
+
     T14.2.7 (block 14-C2): retrieval (embed + hybrid search + rerank) below searches with
     ``retrieval_query(decision, query)`` -- the router's English ``standalone_query`` when
     present and safe, else the original ``query`` -- so a follow-up resolves to its real
@@ -660,7 +693,9 @@ def answer_question_stream(
     with timing.recorder(streaming=True, on_stage=observe_stage, on_step=observe_step):
         yield StreamStage(stage="classifying")
         with timing.stage("classify"):
-            decision = understand(chat, query, summary=summary, last_turn=last_turn)
+            decision = understand(
+                chat, query, summary=summary, last_turn=last_turn, previous_intent=previous_intent
+            )
         if decision.intent == "chitchat":
             yield StreamStage(stage="responding")
             with timing.stage("responding"):
@@ -672,6 +707,7 @@ def answer_question_stream(
                 answer=Answer(text=reply, abstained=False, grounded=True),
                 usage=usage,
                 used_fast_path=decision.used_fast_path,
+                intent=decision.intent,
             )
             return
         if decision.intent in ("ambiguous", "off_topic"):
@@ -692,6 +728,7 @@ def answer_question_stream(
                 answer=Answer(text=reply, abstained=False, grounded=True),
                 usage=usage,
                 used_fast_path=decision.used_fast_path,  # always False here (router-only)
+                intent=decision.intent,
             )
             return
 
@@ -734,6 +771,7 @@ def answer_question_stream(
                     grounded=False,
                 ),
                 usage=usage,
+                intent=decision.intent,
             )
             return
 
@@ -760,7 +798,7 @@ def answer_question_stream(
         timing.record("generate", time.perf_counter() - generate_start)
         if answer.abstained:
             answer.text = _conversational_abstention_text(chat, query, decision.language)
-            yield StreamResult(answer=answer, usage=usage)
+            yield StreamResult(answer=answer, usage=usage, intent=decision.intent)
             return
 
         yield StreamStage(stage="checking")
@@ -775,7 +813,7 @@ def answer_question_stream(
                 abstained=True,
                 grounded=False,
             )
-        yield StreamResult(answer=answer, usage=usage)
+        yield StreamResult(answer=answer, usage=usage, intent=decision.intent)
 
 
 def _check_groundedness_counted(

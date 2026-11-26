@@ -64,12 +64,22 @@ MEMORY_SUMMARY_MAX_TOKENS = 300
 class ConversationSummary(BaseModel):
     """T14.2.6's schema: ``{topics, entities, owasp_version, open_questions}``. Every field
     has a default so an empty/fresh summary (the fallback on a dropped update) is always a
-    valid instance -- never a sentinel ``None`` the caller has to special-case."""
+    valid instance -- never a sentinel ``None`` the caller has to special-case.
+
+    ``last_intent`` (DA-router-reliability-1, F24-into-14): the PREVIOUS turn's own
+    ``Understanding.intent``, piggybacked onto this already-persisted, already-encrypted
+    JSON blob rather than a new database column (no migration needed: a field with a
+    default is simply absent -- never a parse error -- on every summary written before
+    this change). NEVER set by the LLM itself (the memory prompt below does not ask for
+    it, on purpose: this is a plain code-set/code-read value, not something a model should
+    be trusted to report about itself) -- only :func:`summarize_turn`'s caller sets it, via
+    the new ``observed_intent`` parameter."""
 
     topics: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
     owasp_version: str | None = None
     open_questions: list[str] = Field(default_factory=list)
+    last_intent: str | None = None
 
 
 _MEMORY_SYSTEM = (
@@ -118,6 +128,7 @@ def summarize_turn(
     last_turn: str | None,
     question: str,
     answer: str,
+    observed_intent: str | None = None,
 ) -> str | None:
     """T14.2.6: an updated :class:`ConversationSummary`, serialized (``model_dump_json``), or
     ``None`` when the update must be DROPPED (the caller must then leave the old summary
@@ -128,7 +139,14 @@ def summarize_turn(
     shared ``_chat_json_with_retry`` helper returns the exact same fallback object on
     failure, never a new one, so ``result is fallback`` is a reliable "this was invalid"
     check, not a guess based on the empty-looking content of a genuinely all-empty but
-    VALID reply)."""
+    VALID reply).
+
+    ``observed_intent`` (DA-router-reliability-1): THIS turn's own ``Understanding.intent``
+    (the caller's, never the model's) -- written onto the returned summary's
+    ``last_intent`` field, overwriting whatever (if anything) the LLM itself produced for
+    that field (it is never asked to; see :class:`ConversationSummary`'s own docstring).
+    ``None`` (the default) leaves ``last_intent`` at the model's own default (``None``) --
+    today only ``api.conversations`` passes a real value."""
     fallback = ConversationSummary()
     messages = build_memory_messages(
         previous_summary=previous_summary, last_turn=last_turn, question=question, answer=answer
@@ -151,6 +169,8 @@ def summarize_turn(
     if result is fallback:
         logger.warning("conversation summary was invalid; memory left unchanged")
         return None
+    if observed_intent is not None:
+        result = result.model_copy(update={"last_intent": observed_intent})
     return result.model_dump_json()
 
 
@@ -175,3 +195,18 @@ def select_last_turn(turns: Sequence[tuple[str, str, bool]]) -> str | None:
             if prev_role == "user":
                 return format_last_turn(prev_text, text)
     return None
+
+
+def previous_intent_from_summary(summary: str | None) -> str | None:
+    """DA-router-reliability-1: the ``last_intent`` field piggybacked onto the stored
+    :class:`ConversationSummary` (see its own docstring for why there is no new database
+    column). Best-effort, same "never crash on bad stored data" discipline as
+    :func:`rag_app.assistant.router._memory_subject`: an absent/unparseable summary (or one
+    written before this change, which simply has no ``last_intent`` key) yields ``None``,
+    never an exception."""
+    if not summary:
+        return None
+    try:
+        return ConversationSummary.model_validate_json(summary).last_intent
+    except Exception:  # noqa: BLE001 - any parse failure -> no previous intent available
+        return None

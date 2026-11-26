@@ -97,7 +97,7 @@ def test_decrypted_turns_carries_the_error_flag() -> None:
 def test_load_memory_is_none_none_for_a_brand_new_conversation() -> None:
     key = generate_user_key()
     conv = Conversation(summary_encrypted=None)
-    assert _load_memory(key, conv, []) == (None, None)
+    assert _load_memory(key, conv, []) == (None, None, None)
 
 
 def test_load_memory_reads_the_summary_and_the_last_clean_turn() -> None:
@@ -107,9 +107,21 @@ def test_load_memory_reads_the_summary_and_the_last_clean_turn() -> None:
         Message(role="user", content_encrypted=_encrypt_json(key, {"text": "q1"})),
         Message(role="assistant", content_encrypted=_encrypt_json(key, {"text": "a1"})),
     ]
-    summary, last_turn = _load_memory(key, conv, messages)
+    summary, last_turn, previous_intent = _load_memory(key, conv, messages)
     assert summary == '{"topics": ["sqli"]}'
     assert last_turn == "User: q1\nAssistant: a1"
+    assert previous_intent is None  # DA-router-reliability-1: no last_intent in this summary
+
+
+def test_load_memory_reads_the_previous_intent_from_the_summary() -> None:
+    """DA-router-reliability-1 (F24-into-14): ``last_intent``, piggybacked onto the stored
+    ``ConversationSummary``, round-trips through ``_load_memory`` as ``previous_intent``."""
+    key = generate_user_key()
+    conv = Conversation(
+        summary_encrypted=encrypt(key, '{"topics": ["sqli"], "last_intent": "ambiguous"}')
+    )
+    _summary, _last_turn, previous_intent = _load_memory(key, conv, [])
+    assert previous_intent == "ambiguous"
 
 
 def test_load_memory_never_crosses_conversations() -> None:
@@ -128,8 +140,8 @@ def test_load_memory_never_crosses_conversations() -> None:
         Message(role="user", content_encrypted=_encrypt_json(key, {"text": "about B"})),
         Message(role="assistant", content_encrypted=_encrypt_json(key, {"text": "reply B"})),
     ]
-    summary_a, last_turn_a = _load_memory(key, conv_a, messages_a)
-    summary_b, last_turn_b = _load_memory(key, conv_b, messages_b)
+    summary_a, last_turn_a, _pi_a = _load_memory(key, conv_a, messages_a)
+    summary_b, last_turn_b, _pi_b = _load_memory(key, conv_b, messages_b)
     assert summary_a == '{"topics": ["a-only"]}' and "b-only" not in summary_a
     assert summary_b == '{"topics": ["b-only"]}' and "a-only" not in summary_b
     assert last_turn_a == "User: about A\nAssistant: reply A"
@@ -140,5 +152,6 @@ def test_load_memory_treats_a_summary_from_another_key_as_unreadable_not_a_crash
     key = generate_user_key()
     wrong_key = generate_user_key()
     conv = Conversation(summary_encrypted=encrypt(wrong_key, '{"topics": ["x"]}'))
-    summary, _last_turn = _load_memory(key, conv, [])
+    summary, _last_turn, previous_intent = _load_memory(key, conv, [])
     assert summary is None
+    assert previous_intent is None

@@ -434,7 +434,7 @@ def test_answer_question_stream_forwards_summary_and_last_turn_into_understand(
     ``summary``/``last_turn`` kwargs -- this test proves they reach ``understand()``
     unchanged, without needing a real conversation/DB. Fails on the pre-14-C1 code with a
     ``TypeError`` (``answer_question_stream`` took no such kwargs at all)."""
-    calls: list[tuple[str, str | None, str | None]] = []
+    calls: list[tuple[str, str | None, str | None, str | None]] = []
     real_understand = generation.understand
 
     def spy(
@@ -443,10 +443,11 @@ def test_answer_question_stream_forwards_summary_and_last_turn_into_understand(
         *,
         summary: str | None = None,
         last_turn: str | None = None,
+        previous_intent: str | None = None,
     ) -> object:
-        calls.append((query, summary, last_turn))
+        calls.append((query, summary, last_turn, previous_intent))
         return real_understand(  # type: ignore[arg-type]
-            chat, query, summary=summary, last_turn=last_turn
+            chat, query, summary=summary, last_turn=last_turn, previous_intent=previous_intent
         )
 
     monkeypatch.setattr(generation, "understand", spy)
@@ -458,10 +459,13 @@ def test_answer_question_stream_forwards_summary_and_last_turn_into_understand(
             chat=_FakeChatSync(""),
             summary='{"topics": ["sqli"]}',
             last_turn="User: hello\nAssistant: hi there",
+            previous_intent="ambiguous",
         )
     )
 
-    assert calls == [("hi", '{"topics": ["sqli"]}', "User: hello\nAssistant: hi there")]
+    assert calls == [
+        ("hi", '{"topics": ["sqli"]}', "User: hello\nAssistant: hi there", "ambiguous")
+    ]
 
 
 def test_answer_question_stream_defaults_memory_to_none() -> None:
@@ -527,9 +531,14 @@ def test_answer_question_retrieves_with_the_standalone_query_not_the_original(
     """T14.2.7: a follow-up's raw message means nothing to hybrid search on its own --
     retrieval must search with the router's resolved, self-contained English
     ``standalone_query``. Fails on pre-14-C2 code: ``hybrid_search`` would be called with the
-    ORIGINAL message, never the rewrite."""
+    ORIGINAL message, never the rewrite.
+
+    ``intent="security"`` here (not ``"followup"``): ``answer_question`` has no conversation
+    memory at all (TF24/DEC-059), so DA-router-reliability-2's guard would otherwise untrust
+    a context-free raw ``"followup"`` -- ``retrieval_query`` uses ``standalone_query`` the
+    SAME way for both intents, so this test's own mechanism is unaffected."""
     router_output = RouterOutput(
-        intent="followup",
+        intent="security",
         language="en",
         standalone_query="How does SQL injection rank in the OWASP Top 10 2021?",
     )
@@ -553,7 +562,7 @@ def test_answer_question_still_generates_with_the_original_message(
     """Generation must still address what the user actually typed, in their own language
     (D14.1) -- the ``standalone_query`` is for retrieval only (T14.2.7)."""
     router_output = RouterOutput(
-        intent="followup", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
+        intent="security", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
     )
     chat = _FakeChatSyncWithRouterOutput(router_output, "Queda en el puesto 3 [1].")
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
@@ -616,7 +625,7 @@ def test_answer_question_stream_retrieves_with_the_standalone_query_not_the_orig
     embed call, the hybrid search and the rerank call must all search with the rewritten
     English ``standalone_query``, not the original message."""
     router_output = RouterOutput(
-        intent="followup",
+        intent="security",
         language="en",
         standalone_query="How does the OS command injection ranking compare?",
     )
@@ -667,7 +676,7 @@ def test_answer_question_scopes_retrieval_to_a_named_owasp_edition(
     scoped to it. Fails on pre-14-C3 code: ``version`` would always be ``None`` here (the
     caller passed none explicitly)."""
     router_output = RouterOutput(
-        intent="followup",
+        intent="security",
         language="en",
         standalone_query="What rank does SQL injection have in the 2021 OWASP Top 10?",
     )
@@ -717,7 +726,7 @@ def test_answer_question_an_explicit_version_wins_over_the_named_edition(
     """A caller-supplied ``version`` (e.g. the CLI's ``--version``) is an explicit, deliberate
     choice -- it must never be silently overridden by the auto-detected named edition."""
     router_output = RouterOutput(
-        intent="followup",
+        intent="security",
         language="en",
         standalone_query="What rank does SQL injection have in the 2021 OWASP Top 10?",
     )
@@ -748,7 +757,7 @@ def test_answer_question_stream_scopes_retrieval_to_a_named_owasp_edition(
 ) -> None:
     """Streaming twin of ``test_answer_question_scopes_retrieval_to_a_named_owasp_edition``."""
     router_output = RouterOutput(
-        intent="followup",
+        intent="security",
         language="en",
         standalone_query="What rank does injection have in the 2025 OWASP Top 10?",
     )
@@ -785,7 +794,7 @@ def test_answer_question_stream_still_generates_with_the_original_message(
     """The streamed reply must still address what the user actually typed, in their own
     language (D14.1) -- T14.2.7 only changes what retrieval searches with."""
     router_output = RouterOutput(
-        intent="followup", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
+        intent="security", language="es", standalone_query="REWRITTEN ENGLISH QUERY"
     )
     chat = _FakeChatStreamSeqWithRouterOutput(router_output, [["Use ", "[1]."], ["GROUNDED"]])
     monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
