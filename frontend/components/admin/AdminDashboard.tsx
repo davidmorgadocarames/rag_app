@@ -34,6 +34,7 @@ import {
   chatLatencySummary,
   erasureQueueSummary,
   featuresHealthySummary,
+  qualityNavTag,
 } from "@/lib/adminKpi";
 import { closedReasonMessage, parseAdminStreamData, sortAlertsBySeverity } from "@/lib/adminStream";
 import { resolveAlertJump, sortFeaturesWorstFirst, type TriageFilterKey } from "@/lib/adminTriage";
@@ -409,7 +410,7 @@ export default function AdminDashboard({ initial }: AdminDashboardProps) {
   const navTag: Record<Section, string> = {
     triage: `${health.critical + health.warning} to look at`,
     pipeline: `${latency?.stages.length ?? 0} stages`,
-    quality: evalResult ? (evalResult.passed ? "passed" : "regressed") : "no data",
+    quality: qualityNavTag(evalResult),
     erasure: `${queueSummary.pending} pending`,
     lab: "local",
   };

@@ -3,6 +3,7 @@
 // `/admin/erasure`), never a new backend aggregate, kept directly unit-testable here.
 
 import { countFeaturesByStatus, type TriageFeature } from "./adminTriage.ts";
+import { currencySymbol } from "./chatCost.ts";
 
 export interface FeaturesHealthySummary {
   healthy: number;
@@ -89,4 +90,27 @@ export function chatLatencySummary(
     }
   }
   return { avgSeconds: total?.avg_seconds ?? null, slowestStage };
+}
+
+// DEBT-065: the Quality nav tag must reflect whether an eval has actually been RECORDED on
+// this replica (`last_run_at`), never `evalResult.passed` alone -- the backend's own
+// `admin_eval()` defaults `passed=True` when nothing has been observed at all (every metric
+// value is `null`, so nothing trips below_floor/regressed), so a tag computed from `passed`
+// alone said "passed" on a replica with NO evaluation recorded, directly contradicting the
+// SAME response's own `QualityPanel` body ("No evaluation recorded yet"). Pulled out as its
+// own pure function (same C5 pattern as the rest of this file) so the nav tag and the panel
+// body can never drift apart again -- both now gate on the identical `last_run_at` check.
+export function qualityNavTag(
+  evalResult: { last_run_at: string | null; passed: boolean } | null,
+): string {
+  if (evalResult === null || evalResult.last_run_at === null) return "no data";
+  return evalResult.passed ? "passed" : "regressed";
+}
+
+// T14.5.4: the Pipeline panel's aggregate cost line -- "aggregate, no per-user data, no
+// message content" (PHASE_PLANNING 14.5). A local Ollama replica always shows 0 (see
+// rag_app.cost.estimate_cost); the SAME currencySymbol lookup the chat footer uses.
+export function formatAggregateCost(total: number, currency: string): string {
+  const symbol = currencySymbol(currency);
+  return total > 0 ? `${symbol}${total.toFixed(4)}` : `${symbol}0`;
 }

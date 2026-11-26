@@ -65,6 +65,7 @@ from rag_app.assistant.fast_path import match_fast_path
 from rag_app.assistant.memory import previous_intent_from_summary, select_last_turn, summarize_turn
 from rag_app.authz import require_permission
 from rag_app.config import get_settings
+from rag_app.cost import estimate_cost
 from rag_app.crypto import decrypt, encrypt, unwrap_key
 from rag_app.csrf import require_csrf
 from rag_app.db.models import Conversation, Message, User
@@ -566,6 +567,21 @@ def _chat_events(
 
             if counted:
                 add_tokens(session, usage.total_tokens)
+            # T14.5.4: estimated cost for THIS turn's tracked usage (generate + groundedness
+            # -- the SAME `usage` the chat footer's existing token counts already come from).
+            # Self-reported boundary (also in the ADR): the router's and the memory-summary
+            # write's own LLM calls are not yet threaded into `usage` at all (a pre-existing
+            # gap, not introduced by this row -- see assistant.core.understand's own
+            # docstring) and so are not counted in this estimate either; `"incl. router +
+            # summary"` is a documented follow-up, not silently claimed as done here.
+            cost_settings = get_settings()
+            cost = estimate_cost(
+                cost_settings.llm_provider,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                cost_settings,
+            )
+            metrics.observe_estimated_cost(cost.amount)
             payload = {
                 "text": answer.text,
                 "citations": _citation_dicts(answer),
@@ -621,6 +637,8 @@ def _chat_events(
                         "total_tokens": usage.total_tokens,
                     },
                     "conversation_total_tokens": total,
+                    "estimated_cost": cost.amount,
+                    "cost_currency": cost.currency,
                 }
             )
         except GeneratorExit:

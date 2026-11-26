@@ -1446,6 +1446,146 @@ NOT pinned here -- that is `eval/golden_set_v2*`'s job).
   EXPANDED list shows the full text unbounded. Acceptable given the existing token bound;
   flagged for whoever next changes that bound.
 
+## Decision — latency, cost, dashboard + ride-alongs (block 14-D3)
+
+**T14.5.1 -- router stage in the `latency` gate step.** `eval.latency.run_latency_benchmark`
+now calls the shared `understand()` step once per golden-set question, timed under the SAME
+`"classify"` stage name `generation.answer_question`/`.answer_question_stream` already use
+around their own `with timing.stage("classify"): understand(...)` call -- not a new stage
+name, so this benchmark measures exactly the production router cost. A new absolute floor,
+`ROUTER_FLOOR_ABSOLUTE_MS = 1500.0` (1.5 s local -- the SAME number `eval/
+golden_set_v2_floors.json`'s `router_p95_s_local` already enforces in the dialogue-eval
+gate, mirrored here as its own constant rather than imported, same pattern
+`rerank_matrix.FLOOR_ABSOLUTE_MS` already uses), is checked unconditionally in
+`check_against_adopted_baseline` -- the SAME hard-ceiling treatment `rerank_inference`'s own
+floor already gets, never loosened by the relative-tolerance comparison. The router's own
+return value is discarded: retrieval in this benchmark still searches with the raw question,
+unchanged from before this row (wiring the router's `standalone_query` rewrite into this
+benchmark's own retrieval call is a separate, not-yet-done follow-up, named below).
+
+**T14.5.2 -- assistant/router telemetry (intent distribution, rewrite rate, clarification
+rate, router fallback rate).** Four new Prometheus counters
+(`secrag_understanding_intent_total`, `secrag_understanding_rewrite_total`,
+`secrag_understanding_clarification_total`, `secrag_router_fallback_total`), every one
+labelled ONLY `intent` -- the closed, reviewed, 5-value `Intent` vocabulary (chitchat/
+security/followup/ambiguous/off_topic). `metrics.ALLOWED_INTENTS` +
+`UnknownIntentError`/`_checked_intent` reject any value outside that set at write time
+(the SAME "dev-time bug signal, never a real-traffic outcome" discipline `observe_step`
+already enforces for `STEP_ALLOWLIST`), so a programmer error can never widen this into an
+unbounded-cardinality or user-text label; every real call site passes an already-classified,
+Pydantic-`Literal`-typed intent, never raw text. Wired into `assistant.core.understand()`
+(intent on every turn, fast path included; rewrite when the router's `standalone_query`
+genuinely differs from the raw message; clarification only for `intent == "ambiguous"`) and
+`assistant.router.route()`'s two genuine, failure-driven fallback returns (a chat-client
+exception; a structurally valid but suspicious reply) -- deliberately NOT the separate
+"followup with no context" business-logic reclassification a few lines later in the same
+function, which is a classification correction, not a failure. Registered on the existing
+`assistant-conversational-core` feature entry (no new entry needed -- it already represents
+"the new assistant features" this row is about).
+
+**T14.5.3 (DEBT-049) -- the misspelling-tolerance probe becomes must-pass.**
+`FeatureEntry` gains `must_pass_quality_probes: tuple[str, ...] = ()`, a field deliberately
+SEPARATE from `quality_probes` itself: a probe can be listed there (reported, documented)
+without being must-pass. `quality-misspelling-probe`'s entry sets
+`must_pass_quality_probes=("misspelling-tolerance",)` -- the single-item probe, genuinely
+passing on every `--full`/`--only registry,eval` run since 13-E -- while deliberately NOT
+listing `misspelling-tolerance-variants`: DEBT-049 itself already documents some (item,
+typo-strategy) combinations as a known, tracked, non-blocking gap; making the harder probe
+must-pass would turn an honestly-reported partial result into a gate failure for a gap that
+was never meant to block. `registry_check.py`'s quality-probe loop is refactored into
+`check_quality_probes(entries, session)` (previously inlined in `main()`, untested) so this
+rule -- and the pre-existing `expected-fail`-now-passes rule -- are both unit-testable
+without a live app/DB.
+
+**T14.5.4 -- token cost per answer.** `rag_app.cost.estimate_cost(provider, prompt_tokens,
+completion_tokens, settings)` returns `0.0` for any provider other than `"azure_openai"`
+(today only `"ollama"`) -- local Ollama can never cost anything, by construction, regardless
+of how a future Settings default is tuned. Azure OpenAI's per-1,000-token prices are plain
+`Settings` fields (`azure_openai_cost_per_1k_input_tokens`/`_output_tokens`, `cost_currency`)
+with a deliberately approximate documented default -- **never** read from the private
+`status/azure_prices.json` file, which this running application must never open (PHASE_
+PLANNING 14.5's own rule); an operator overrides the defaults via env vars for an accurate
+estimate. Wired into `/chat/stream`'s existing "done" SSE event (`estimated_cost`/
+`cost_currency`, additive fields) using the SAME `usage: Usage` accumulator the chat
+footer's pre-existing token counts already come from, and into a new aggregate, UNLABELLED
+`secrag_estimated_cost_total` counter (`metrics.observe_estimated_cost`) -- aggregate, no
+per-user data, no message content (the Phase 14.5 plan's own rule), read back via
+`metrics.counter_value` (the SAME in-process, "this replica since start" computation
+`stage_latency_summary` already uses, never the generic cross-replica `MetricsBackend`) into
+`AdminLatencyResponse.estimated_cost_total`/`cost_currency`. **Frontend:** a new small chat
+footer line (`lib/chatCost.ts::formatCostFooter`, no mockup for this element -- the existing
+chat style exactly, same muted/mono text classes the header's own `{convTotal} tokens`
+already uses) shows the LAST answer's tokens in/out + estimated cost (never a persisted
+historical total -- "token cost per answer" is per-turn by design); a local Ollama turn
+always shows `€0`. The admin Pipeline panel's existing "This replica since start... N
+chats..." header line gains one more clause, `est. cost €X.XXXX` (or `€0`), using the SAME
+`lib/adminKpi.ts::formatAggregateCost` currency formatting as the chat footer (shared via
+`chatCost.ts::currencySymbol`) -- no new KPI tile, no layout change, so the approved mockup's
+own 4-tile grid is unaffected.
+
+**Ride-along (a), DEBT-065 -- the admin Quality nav tag now reflects the real state.**
+`AdminDashboard.tsx`'s `navTag.quality` computed `evalResult.passed ? "passed" :
+"regressed"` whenever `evalResult` was merely non-`null`, even when `evalResult.last_run_at
+=== null` (no eval ever recorded on this replica) -- directly contradicting the SAME
+response's own `QualityPanel` body ("No evaluation recorded yet"), because the backend's own
+`admin_eval()` defaults `passed=True` when nothing has been observed at all (every metric
+value is `null`, so nothing trips `below_floor`/`regressed`). Pulled out as a pure
+`lib/adminKpi.ts::qualityNavTag(evalResult)` function (same C5 pattern as the rest of that
+file) so the nav tag and the panel body can never drift apart again -- both now gate on the
+identical `last_run_at` check.
+
+**Ride-along (b), DA-14-D2-1 -- Playwright screenshot evidence for the plan panel.**
+`e2e/plan-panel.spec.ts` now captures `page.screenshot()` evidence for the collapsed
+(default) and expanded (after the real `Enter`-keypress toggle) states against the real
+running app with seeded data -- closing DA-14-D2.md's own low finding ("no screenshot
+evidence for a user-visible UI component... e2e text/attribute assertions cannot catch a
+purely visual regression"). No mockup exists for this panel (14-D2's own "no mockup, follow
+the existing chat style exactly" note still applies) -- the screenshots are evidence of
+CURRENT rendering, not a mockup-diff proof.
+
+**Ride-along (c), DA-14-D2-2 -- a mechanical guard against re-tripping the e2e signup
+budget.** `lib/e2eSignupBudget.test.ts` pins the reviewed, already-counted set of e2e specs
+that call `registerAndReachChat` (`admin.spec.ts`, `mfa.spec.ts`,
+`security-headers.spec.ts` -- `auth.spec.ts` registers INLINE, never through this helper, so
+it is correctly absent) and fails the moment a NEW spec file adds another call outside that
+set -- the SAME silent-opt-in risk DEC-039's `_DOD_GRANDFATHERED_IDS` size-pin already
+guards against for a different list. This is the general, now-automated version of the
+one-off fix 14-D2-fix had to apply by hand after `plan-panel.spec.ts` became the 6th real
+registration and 403-ed an unrelated test (`auth.spec.ts`'s own Mailpit flow) without
+anyone noticing until a `--full` run failed.
+
+### Known limitations (self-reported, not just design) -- 14-D3
+
+- **T14.5.4's "token cost per answer" does NOT yet include the router's or the
+  memory-summary write's own LLM calls (the Phase 14.5 plan's own "incl. router + summary"
+  wording) -- only the final generate + groundedness calls (the SAME `usage` accumulator
+  the chat footer's pre-existing token counts already came from, before this block).**
+  `assistant.core.understand()`/`assistant.memory.summarize_turn()` call `chat.chat_json(...)`
+  without ever passing a `usage` accumulator -- `chat_json`'s own `ChatClient` protocol has
+  no `usage` parameter at all (unlike `chat_stream`, which does), so the router and
+  memory-summary LLM calls are simply never metered today, a PRE-EXISTING gap this block
+  does not introduce but also does not close. Threading `usage` through `chat_json` (both
+  implementations), `route()`, `understand()` and `summarize_turn()` is a larger, riskier
+  change (several call-site signatures, several existing tests patch module-qualified
+  names) than this row's own scope -- tracked as a follow-up, not silently claimed as done.
+  The displayed/estimated cost is therefore a LOWER BOUND on the real per-turn LLM cost on
+  Azure OpenAI, never an overstatement.
+- **The chit-chat/ambiguous/off_topic/abstention reply paths never populate `usage` at all**
+  (`generate_chitchat_reply`/`clarifying_reply`/`generate_offtopic_reply`/
+  `_conversational_abstention_text` do not thread the shared `usage` accumulator through
+  either, pre-existing since before this block) -- their "done" event's `estimated_cost` is
+  always `0.0` regardless of provider, the SAME pre-existing limitation the chat footer's
+  own token counts already had for these paths (a `0`/empty token count), not a new gap.
+- **The aggregate `secrag_estimated_cost_total` counter is per-process, "this replica since
+  it last started," never historical or cross-replica** -- the SAME R6-4 caveat every other
+  number on the Pipeline panel already carries (no managed Prometheus on Azure); a scale-to-
+  zero event resets it to 0, same as the chat-count/latency numbers beside it.
+- **`run_latency_benchmark`'s router call still searches retrieval with the RAW question,
+  never the router's own `standalone_query` rewrite** (see T14.5.1 above) -- a deliberate,
+  narrow scope decision to avoid changing this benchmark's existing recall numbers as a side
+  effect of adding a timing-only measurement; revisiting retrieval quality for this
+  benchmark specifically is out of this row's scope.
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
@@ -1556,3 +1696,19 @@ behaviour unchanged, and a summary written before this change simply has no `las
 key (read back as `None`). A plain `git revert` of this block's commit(s) restores the
 router-reliability head's behaviour exactly; no data migration of any kind is needed either
 way (`last_intent` is just a JSON key inside an already-opaque encrypted blob).
+
+14-D3: no schema, no migration, no deployed-image step beyond the usual image rebuild. Every
+new field is additive (`"done"` SSE event's `estimated_cost`/`cost_currency`,
+`AdminLatencyResponse.estimated_cost_total`/`cost_currency`, the four new Prometheus
+counters, `FeatureEntry.must_pass_quality_probes`) — an older frontend build simply never
+reads the new fields, and a response built before this block's code existed still
+type-checks (same `?`-optional convention `AdminLatencyResponse.pipeline` already used).
+T14.5.3's must-pass rule is the one genuinely BEHAVIOUR-changing piece: reverting it makes a
+real `misspelling-tolerance` regression silently pass the `registry` gate step again
+(printed, never failing) — a conscious trade a revert accepts, not a hidden side effect.
+T14.5.1's new absolute router floor in `check_against_adopted_baseline` can likewise fail a
+future `--full`/`--only latency` run that was passing before if the router call genuinely
+regresses past 1.5s local; reverting removes that check (the dialogue-eval gate's own
+`router_p95_s_local` floor, T14.2.8, is unaffected either way — a SEPARATE, already-existing
+enforcement point this row does not touch). A plain `git revert` of this block's commit(s)
+restores the pre-14-D3 registry/latency/metrics/cost behaviour exactly.

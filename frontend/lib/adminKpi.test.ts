@@ -7,6 +7,8 @@ import {
   chatLatencySummary,
   erasureQueueSummary,
   featuresHealthySummary,
+  formatAggregateCost,
+  qualityNavTag,
 } from "./adminKpi.ts";
 import type { TriageFeature } from "./adminTriage.ts";
 
@@ -90,4 +92,30 @@ test("chatLatencySummary never reports 'total' or 'ttft' as the slowest real sta
 
 test("chatLatencySummary on no observations yet returns nulls, never a crash", () => {
   assert.deepEqual(chatLatencySummary([]), { avgSeconds: null, slowestStage: null });
+});
+
+// DEBT-065: "no data" must win even when the backend's own `passed=True` default would
+// otherwise say "passed" -- fails on the pre-fix code, which read `evalResult.passed` alone.
+test("qualityNavTag reports 'no data' when no eval has ever run, even though passed defaults true", () => {
+  assert.equal(qualityNavTag({ last_run_at: null, passed: true }), "no data");
+});
+
+test("qualityNavTag reports 'passed' once a real eval run passed", () => {
+  assert.equal(qualityNavTag({ last_run_at: "2026-11-26T00:00:00Z", passed: true }), "passed");
+});
+
+test("qualityNavTag reports 'regressed' once a real eval run failed", () => {
+  assert.equal(qualityNavTag({ last_run_at: "2026-11-26T00:00:00Z", passed: false }), "regressed");
+});
+
+test("qualityNavTag reports 'no data' for a null evalResult (no response yet)", () => {
+  assert.equal(qualityNavTag(null), "no data");
+});
+
+test("formatAggregateCost shows €0 for a zero (or local-Ollama-only) replica", () => {
+  assert.equal(formatAggregateCost(0, "EUR"), "€0");
+});
+
+test("formatAggregateCost shows a real estimate once Azure OpenAI has priced some tokens", () => {
+  assert.equal(formatAggregateCost(1.2345, "EUR"), "€1.2345");
 });

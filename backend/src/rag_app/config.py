@@ -181,6 +181,19 @@ class Settings(JobSettings):
     azure_openai_deployment: str = ""
     azure_openai_api_version: str = "2024-10-21"
 
+    # --- Token cost estimation (T14.5.4) ---
+    # Plain Settings, NEVER the private status/azure_prices.json file (that file must never
+    # be read by the running app -- PHASE_PLANNING 14.5/ADR). Local Ollama is always free (no
+    # Settings field could ever make it otherwise -- rag_app.cost.estimate_cost hard-codes
+    # 0.0 for any provider other than "azure_openai", never reads these two fields for it).
+    # The defaults below are a deliberately approximate, documented stand-in for Azure
+    # OpenAI's real published per-1k-token price (which varies by model/region/time) -- an
+    # operator sets the real figures via env vars for an accurate estimate; a wrong default
+    # only ever skews the chat footer/admin dashboard's own ESTIMATE, never a real Azure bill.
+    azure_openai_cost_per_1k_input_tokens: float = 0.00015
+    azure_openai_cost_per_1k_output_tokens: float = 0.0006
+    cost_currency: str = "EUR"
+
     # --- Ingestion / chunking ---
     chunk_size: int = 1200
     chunk_overlap: int = 150

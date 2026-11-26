@@ -14,6 +14,7 @@ import { useState } from "react";
 
 import type { AdminLatencyResponse } from "@/lib/api";
 import { buildPipelineWaterfall, waterfallBarPercent, type WaterfallStage } from "@/lib/adminPipeline";
+import { formatAggregateCost } from "@/lib/adminKpi";
 
 interface LatencyPanelProps {
   latency: AdminLatencyResponse | null;
@@ -148,6 +149,12 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
   // "total" (timing.py's recorder.emit()) counts every chat turn, RAG or chit-chat alike --
   // the one authoritative chat count, never derived from the pipeline sum (DA-13-G1-1).
   const chatCount = latency?.stages.find((s) => s.stage === "total")?.count ?? null;
+  // T14.5.4: aggregate, process-wide estimated cost -- never per-user/per-conversation; the
+  // SAME "this replica since start" scope every other number in this header already uses.
+  const costLabel = formatAggregateCost(
+    latency?.estimated_cost_total ?? 0,
+    latency?.cost_currency ?? "EUR",
+  );
 
   return (
     <section
@@ -162,7 +169,11 @@ export default function LatencyPanel({ latency }: LatencyPanelProps) {
         <span className="text-xs text-vault-text-muted">
           This replica since start &middot;{" "}
           <span className="font-mono text-vault-steel-light">{chatCount ?? "n/a"}</span> chats &middot;
-          not per-request (per-request traces: 16-F)
+          est. cost{" "}
+          <span data-testid="admin-estimated-cost" className="font-mono text-vault-steel-light">
+            {costLabel}
+          </span>{" "}
+          &middot; not per-request (per-request traces: 16-F)
         </span>
       </div>
 

@@ -222,6 +222,23 @@ def test_admin_latency_pipeline_lists_every_allowlisted_step_in_order(api_env: E
         assert never_observed["avg_seconds"] is None
 
 
+def test_admin_latency_reports_an_aggregate_estimated_cost_total(api_env: Engine) -> None:
+    """T14.5.4: an aggregate, unlabelled, process-wide figure on the SAME response the
+    pipeline waterfall already uses -- never per-user/per-conversation. Fails on the old
+    code: no ``estimated_cost_total``/``cost_currency`` key existed at all."""
+    from rag_app import metrics as real_metrics
+
+    before = real_metrics.counter_value("secrag_estimated_cost_total")
+    real_metrics.observe_estimated_cost(0.0042)
+    client = _client()
+    headers = _admin_headers(api_env, stepped_up=True)
+    response = client.get("/admin/latency", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["estimated_cost_total"] == pytest.approx(before + 0.0042)
+    assert body["cost_currency"] == "EUR"
+
+
 def test_admin_eval_reports_aggregate_metrics_only(api_env: Engine) -> None:
     client = _client()
     headers = _admin_headers(api_env, stepped_up=True)

@@ -291,6 +291,11 @@ class AdminLatencyResponse(BaseModel):
     # T13.8.2: additive -- `stages` (the pre-existing secrag_chat_stage_seconds view) is
     # unchanged; `pipeline` is the new per-atomic-step waterfall view.
     pipeline: list[PipelineStageLatencyOut] = []
+    # T14.5.4: aggregate estimated token cost, this replica since it last started (same
+    # "no history, this process only" caveat as `stages`/`pipeline` above) -- an aggregate
+    # only, never per-user/per-conversation.
+    estimated_cost_total: float = 0.0
+    cost_currency: str = "EUR"
 
 
 class EvalMetricOut(BaseModel):

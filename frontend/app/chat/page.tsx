@@ -17,6 +17,7 @@ import {
   renameConversation as apiRenameConversation,
   streamChat,
 } from "@/lib/api";
+import { formatCostFooter, type TurnUsage } from "@/lib/chatCost";
 import { conversationLoadError } from "@/lib/chatStream";
 import { createRetryGuard } from "@/lib/retryGuard";
 import { usePlanSteps } from "@/lib/usePlanSteps";
@@ -71,6 +72,10 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
   const [convTotal, setConvTotal] = useState(0);
+  // T14.5.4: the LAST answer's own tokens in/out + estimated cost (never a historical/
+  // persisted aggregate -- "token cost per answer", per-turn by design); null before the
+  // first turn in this session.
+  const [lastUsage, setLastUsage] = useState<TurnUsage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const threadRef = useRef<HTMLDivElement>(null);
@@ -153,6 +158,9 @@ export default function ChatPage() {
           0,
         ),
       );
+      // T14.5.4: a stored message carries no persisted cost (per-answer, live-only display)
+      // -- switching to another conversation starts with no "last answer" to show.
+      setLastUsage(null);
     } catch (err) {
       const status = err instanceof ApiError ? err.status : undefined;
       if (status === 401) {
@@ -167,6 +175,7 @@ export default function ChatPage() {
         setActiveId(null);
         setMessages([]);
         setConvTotal(0);
+        setLastUsage(null);
         if (status === 404) void refreshConversations();
       }
       setError(outcome.message);
@@ -177,6 +186,7 @@ export default function ChatPage() {
     setActiveId(null);
     setMessages([]);
     setConvTotal(0);
+    setLastUsage(null);
     setError(null);
     setSidebarOpen(false);
   }
@@ -255,6 +265,13 @@ export default function ChatPage() {
             streaming: false,
           });
           setConvTotal(d.conversation_total_tokens);
+          // T14.5.4: this turn's own tokens in/out + estimated cost for the chat footer.
+          setLastUsage({
+            prompt_tokens: d.usage.prompt_tokens,
+            completion_tokens: d.usage.completion_tokens,
+            estimated_cost: d.estimated_cost,
+            cost_currency: d.cost_currency,
+          });
           setActiveId(d.conversation_id);
           void refreshConversations();
           wake.reset();
@@ -428,6 +445,18 @@ export default function ChatPage() {
         </div>
 
         <form onSubmit={onSubmit} className="border-t border-vault-steel-dark px-4 py-3">
+          {lastUsage && (
+            // T14.5.4: "token cost per answer" -- the LAST answer's own tokens in/out +
+            // estimated cost for the active provider (local Ollama always shows €0), same
+            // small, muted text style the header's own `{convTotal} tokens` already uses (no
+            // mockup for this footer -- existing chat style, exactly).
+            <p
+              data-testid="chat-cost-footer"
+              className="mx-auto mb-2 max-w-2xl text-xs text-vault-steel-dark"
+            >
+              {formatCostFooter(lastUsage)}
+            </p>
+          )}
           <div className="mx-auto flex max-w-2xl items-end gap-3">
             <textarea
               rows={2}

@@ -615,6 +615,24 @@ documented as pre-existing, not caused by this fix, in the ADR's "Known limitati
   (`eval/latency_adopted_baseline.json`, distinct from the frozen "before" baseline) with a
   documented tolerance, plus a hard absolute `rerank_inference` floor (≤ 1.5 s) that is never
   loosened by the baseline. Full rule and rationale: ADR 11 decision 8, "Landed in 11.6b".
+- **Router stage in the `latency` gate step (T14.5.1, block 14-D3):** the SAME `"classify"`
+  stage name `generation.py`'s own `timing.stage("classify")` call around `understand()`
+  already uses (not a new stage) now ALSO gets an absolute floor, `ROUTER_FLOOR_ABSOLUTE_MS`
+  (1.5 s local — the SAME number `eval/golden_set_v2_floors.json`'s `router_p95_s_local`
+  already enforces in the dialogue-eval gate, a separate enforcement point measuring the
+  same cost a different way), unconditionally checked like `rerank_inference`'s own floor.
+- **Token cost per answer (T14.5.4, block 14-D3):** `rag_app.cost.estimate_cost` is `0.0` for
+  any provider other than `azure_openai` (local Ollama can never cost anything); Azure
+  OpenAI's per-1,000-token prices are plain `Settings` fields with a deliberately
+  approximate documented default — **never** read from the private `status/
+  azure_prices.json` file. Surfaced per-turn in `/chat/stream`'s "done" SSE event and the
+  chat UI's own small footer (tokens in/out + estimate; local Ollama shows `€0`), and as an
+  aggregate, unlabelled, process-wide `secrag_estimated_cost_total` counter on the admin
+  Pipeline panel ("aggregate, no per-user data, no message content"). Self-reported
+  boundary: the router's and the memory-summary write's own LLM calls are not yet metered at
+  all (`chat_json`'s `ChatClient` protocol has no `usage` parameter, unlike `chat_stream`) —
+  the displayed cost is a lower bound on the real Azure OpenAI cost, never an overstatement
+  (see the ADR's 14-D3 "Known limitations" section).
 
 ## 8. Security & abuse
 

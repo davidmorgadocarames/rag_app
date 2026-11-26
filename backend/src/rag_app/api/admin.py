@@ -360,7 +360,17 @@ def admin_latency() -> AdminLatencyResponse:
         )
         for pipeline_stage, steps in metrics.STEP_ALLOWLIST
     ]
-    return AdminLatencyResponse(stages=stages, pipeline=pipeline)
+    # T14.5.4: the SAME in-process reasoning as `stages`/`pipeline` above, read via
+    # `metrics.counter_value` -- never through the generic `MetricsBackend` (which on the
+    # local stack would query the SHARED Prometheus container, a different, cross-replica
+    # number this panel deliberately avoids for everything else it shows too).
+    estimated_cost_total = metrics.counter_value("secrag_estimated_cost_total")
+    return AdminLatencyResponse(
+        stages=stages,
+        pipeline=pipeline,
+        estimated_cost_total=estimated_cost_total,
+        cost_currency=get_settings().cost_currency,
+    )
 
 
 # --- T13.1.4: last eval run vs baseline and floors -----------------------------------------

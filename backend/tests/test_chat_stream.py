@@ -262,6 +262,47 @@ def test_the_stream_emits_embed_query_step_events_around_the_real_retrieving_sta
     _assert_no_orphans(db_engine, user)
 
 
+def test_the_done_event_carries_an_estimated_cost_for_the_active_provider(
+    client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T14.5.4, through the REAL ``/chat/stream`` SSE wire: local Ollama (this fixture's
+    provider) is always free, regardless of how many tokens the turn used -- fails on the
+    old code, which had no ``estimated_cost``/``cost_currency`` key in the "done" event at
+    all."""
+    from rag_app import generation, reranking
+
+    class _TwoCallChat:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat_stream(self, *_a: object, usage: Any = None, **_kw: object) -> Any:
+            self.calls += 1
+            if usage is not None:
+                usage.add(generation.Usage(prompt_tokens=10_000, completion_tokens=5_000))
+            if self.calls == 1:
+                yield "Use prepared statements "
+                yield "to stop SQL injection [1]."
+            else:
+                yield "GROUNDED"
+
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.1] * 1024)
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_fake_chunk()])
+    monkeypatch.setattr(
+        reranking.CrossEncoderReranker, "rerank", lambda _self, _q, chunks, _n: chunks
+    )
+    monkeypatch.setattr(generation, "make_chat_client", lambda *_a, **_k: _TwoCallChat())
+    user = _make_user(db_engine)
+    events = _stream(db_engine, client, user, "How do I prevent SQL injection?")
+    done = events[-1]
+    assert done["type"] == "done"
+    # Two chat_stream calls (generate + groundedness), 15,000 tokens each.
+    assert done["usage"]["total_tokens"] == 30_000
+    # Local Ollama -- always free, however many tokens the turn used.
+    assert done["estimated_cost"] == 0.0
+    assert done["cost_currency"] == "EUR"
+    _assert_no_orphans(db_engine, user)
+
+
 def test_an_llm_failure_ends_with_an_error_event(
     client: Any, db_engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

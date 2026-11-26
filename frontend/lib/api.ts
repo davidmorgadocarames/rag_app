@@ -66,6 +66,10 @@ export interface ChatDone {
   citations: Citation[];
   usage: Usage;
   conversation_total_tokens: number;
+  // T14.5.4: estimated cost of this turn's tracked usage, for the active provider -- always
+  // 0 for local Ollama.
+  estimated_cost: number;
+  cost_currency: string;
 }
 
 export interface ConversationSummary {
@@ -339,6 +343,11 @@ export interface AdminLatencyResponse {
   // expandable rows (13-G2/13-G3 frontend, this replica only). Optional so a response
   // observed before this field existed still type-checks.
   pipeline?: PipelineStageLatencyOut[];
+  // T14.5.4: aggregate estimated token cost, this replica since it last started -- an
+  // aggregate only, never per-user/per-conversation. Optional for the same reason as
+  // `pipeline` above.
+  estimated_cost_total?: number;
+  cost_currency?: string;
 }
 
 export interface EvalMetricOut {
