@@ -711,6 +711,24 @@ catalogue analysis; this is the implementation summary.
   abstention/failure paths) — the banner now stays up for the whole slow pipeline instead of
   disappearing just as the real wait begins. Login/the admin dashboard are untouched (the
   plain banner, no steps).
+- **Visible "plan" panel in the chat UI** (T14.4.1/T14.4.2/T14.4.3, block 14-D2): reuses the
+  SAME `step` SSE event above rather than a new mechanism — `generation.StreamStep` gains an
+  optional `detail: str | None` field, carried for four NEW steps: `understood` (every turn,
+  incl. chitchat/ambiguous/off_topic — "Understood: `<intent>/<language>`"), `searching`/
+  `found_sources` (retrieval path only — "Searching: `<standalone_query>` (`<edition>`)" /
+  "Found `<N>` sources"), `writing_answer` (right before generation — fixed label, no
+  dynamic content). `detail` is built EXCLUSIVELY from already-classified/derived values —
+  never the system prompt, a raw/few-shot prompt or a `<<<`/`>>>` delimiter marker (a canary
+  test, `backend/tests/test_assistant_plan_events.py`, asserts this across every branch).
+  `frontend/lib/planSteps.ts` is a SEPARATE pure reducer from `wakeSteps.ts` (a growing
+  transcript — each recognised step appends one entry — rather than a fixed small set of
+  rows); `frontend/components/PlanPanel.tsx` renders it collapsed by default with a live
+  one-line status (the latest entry), a plain `<button>` (`aria-expanded`/`aria-controls`)
+  expands the full transcript. No approved mockup exists for this panel — it reuses the
+  existing chat/app style exactly (WakeBanner.tsx's own design tokens, the app's single
+  monospace typeface). The `standalone_query` text inside a `searching` entry is
+  user-derived and rendered as a plain JSX text child only (React's own escaping) — never
+  `dangerouslySetInnerHTML`, never a markdown/HTML renderer.
 - **Custom 404 page** (`frontend/app/not-found.tsx`, T13.10.1/T13.10.2/DEBT-057): Next's App
   Router renders it automatically, with a real HTTP 404 status, for any request matching no
   route — never a soft-404 200; `/api/*`'s own catch-all route (`app/api/[...path]/route.ts`)

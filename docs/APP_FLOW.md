@@ -160,6 +160,14 @@ Admin dashboard (/admin)  [authenticated, role=admin, MFA set on the session]
      (the one that wakes Ollama's own scaled-to-zero `bge-m3` replica on a cold start) starts
      and ends. Additive to the contract above: an older/other client simply ignores an
      unrecognised event type.
+   - **Visible plan (T14.4.1/T14.4.2, block 14-D2):** the SAME `step` event also carries four
+     more steps, each with an optional, human-readable `detail` built only from already-
+     classified/derived values (never a prompt): `understood` (every turn — the detected
+     intent/language), `searching`/`found_sources` (security/follow-up turns only — the
+     English standalone query + detected OWASP edition, then the retrieved chunk count),
+     `writing_answer` (right before generation). The chat UI's collapsed-by-default "plan"
+     panel renders these as a short, expandable transcript of what the assistant is doing —
+     never the system prompt, never raw retrieved text.
    - **Every failure** — data key cannot be unwrapped, storage, embeddings/retrieval, reranking, LLM —
      ends the stream with an `error` event (`code` + user-facing `detail`), never a cut stream. The
      failed turn is stored as an **assistant error marker**, so no conversation holds a user message

@@ -17,11 +17,15 @@ export interface StreamEvent {
 export interface StreamHandlers {
   onConversation?: (id: string) => void;
   onStage?: (stage: string) => void;
-  // T13.12.5 (DEBT-062): a real sub-step boundary WITHIN the current stage (today only
-  // retrieving/embed_query, the dominant cold-start cost). Additive to the SSE contract --
-  // an older client (or this one, before 13-J3b) simply never wires `onStep` and ignores
-  // the frame entirely (see `dispatch` below: an unrecognised `type` does nothing).
-  onStep?: (stage: string, step: string, phase: "start" | "end") => void;
+  // T13.12.5 (DEBT-062): a real sub-step boundary WITHIN the current stage (today
+  // retrieving/embed_query, the dominant cold-start cost, plus T14.4.1's four plan-panel
+  // steps). Additive to the SSE contract -- an older client (or this one, before 13-J3b)
+  // simply never wires `onStep` and ignores the frame entirely (see `dispatch` below: an
+  // unrecognised `type` does nothing). `detail` (T14.4.1, block 14-D2): an optional
+  // human-readable string for the chat UI's visible-plan panel -- `undefined` for the
+  // pre-existing embed_query start/end pair (the server sends JSON `null`, normalised to
+  // `undefined` here so callers can use a simple `??` default).
+  onStep?: (stage: string, step: string, phase: "start" | "end", detail?: string) => void;
   onToken?: (text: string) => void;
   onDone?: (event: StreamEvent) => void;
   onError?: (detail: string, conversationId: string | null) => void;
@@ -123,7 +127,8 @@ export async function consumeChatStream(
     if (event.type === "stage") handlers.onStage?.(String(event.stage));
     else if (event.type === "step") {
       const phase = event.phase === "end" ? "end" : "start";
-      handlers.onStep?.(String(event.stage), String(event.step), phase);
+      const detail = typeof event.detail === "string" ? event.detail : undefined;
+      handlers.onStep?.(String(event.stage), String(event.step), phase, detail);
     } else if (event.type === "token") handlers.onToken?.(String(event.text));
     else if (event.type === "done") {
       finished = true;

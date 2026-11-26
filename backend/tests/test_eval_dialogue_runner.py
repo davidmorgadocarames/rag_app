@@ -537,11 +537,12 @@ def test_evaluate_dialogues_retrieves_with_the_standalone_query_not_the_raw_mess
     dialogue = Dialogue(
         id="dlg-followup",
         turns=(
-            # DA-router-reliability-2 (F24-into-14): a raw "followup" verdict on a
-            # context-free first turn is no longer trusted (it falls through to
-            # 'ambiguous' instead) -- a real preceding turn (exact fast-path greeting,
-            # never calls the router) gives turn 1 genuine context so this test can still
-            # exercise its OWN target mechanism (standalone_query used for retrieval).
+            # DA-router-reliability-2 (F24-into-14), widened by the 14-D2 ride-along: a raw
+            # "followup" verdict on a context-free first turn is no longer trusted (it
+            # falls through to 'security' instead) -- a real preceding turn (exact
+            # fast-path greeting, never calls the router) gives turn 1 genuine context so
+            # this test can still exercise its OWN target mechanism (standalone_query used
+            # for retrieval).
             Turn(message="hi", expected_intent="chitchat", language="en"),
             Turn(
                 message="what about that one, which rank is it?",

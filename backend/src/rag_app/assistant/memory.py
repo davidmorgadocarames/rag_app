@@ -47,10 +47,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from rag_app.assistant.fast_path import escape_delimiter_markers
+from rag_app.assistant.router import Intent
 from rag_app.config import get_settings
 from rag_app.llm import ChatClient, Message
 
@@ -59,6 +61,12 @@ logger = logging.getLogger("rag_app.assistant.memory")
 # Bounded like every other LLM call (DA-31b-3). T14.2.6's own number ("~300 tokens") --
 # generous headroom for a few short list items per field, not a tight fit.
 MEMORY_SUMMARY_MAX_TOKENS = 300
+
+# 14-D2 ride-along (DA-F24-into-14 Finding 2): the known ``Intent`` value set, used both by
+# `ConversationSummary`'s own validator below and by `summarize_turn`'s caller-value guard --
+# a single source of truth, no second hard-coded list to drift out of sync with
+# ``rag_app.assistant.router.Intent``.
+_VALID_INTENTS: frozenset[str] = frozenset(get_args(Intent))
 
 
 class ConversationSummary(BaseModel):
@@ -73,13 +81,35 @@ class ConversationSummary(BaseModel):
     this change). NEVER set by the LLM itself (the memory prompt below does not ask for
     it, on purpose: this is a plain code-set/code-read value, not something a model should
     be trusted to report about itself) -- only :func:`summarize_turn`'s caller sets it, via
-    the new ``observed_intent`` parameter."""
+    the new ``observed_intent`` parameter.
+
+    Typed to the real ``Intent`` value set (14-D2 ride-along, DA-F24-into-14 Finding 2 --
+    was a bare ``str``, so a forged/corrupted stored summary could carry an arbitrary
+    string). Unlike a plain ``Literal`` field (which would RAISE on an unrecognised value,
+    turning a corrupted-but-otherwise-valid stored summary into a hard parse failure for
+    EVERY field, not just this one), the validator below maps any value outside
+    ``Intent``'s 5 options to ``None`` -- the same safe default as a summary written before
+    this field existed. The only consumer (``router._previous_turn_asked_the_
+    clarification``) does a strict ``== "ambiguous"`` check, so an unexpected value was
+    already a silent no-op; this closes the gap at the schema level too, for any future
+    reader."""
 
     topics: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
     owasp_version: str | None = None
     open_questions: list[str] = Field(default_factory=list)
-    last_intent: str | None = None
+    last_intent: Intent | None = None
+
+    @field_validator("last_intent", mode="before")
+    @classmethod
+    def _unknown_last_intent_becomes_none(cls, value: object) -> object:
+        """Never raise on a bad/unexpected stored value -- same "never crash on bad stored
+        data" discipline as :func:`previous_intent_from_summary`/``router._memory_subject``.
+        Runs BEFORE the ``Intent`` ``Literal`` validation, so an unknown string never even
+        reaches it."""
+        if value is None or value in _VALID_INTENTS:
+            return value
+        return None
 
 
 _MEMORY_SYSTEM = (
@@ -146,7 +176,10 @@ def summarize_turn(
     ``last_intent`` field, overwriting whatever (if anything) the LLM itself produced for
     that field (it is never asked to; see :class:`ConversationSummary`'s own docstring).
     ``None`` (the default) leaves ``last_intent`` at the model's own default (``None``) --
-    today only ``api.conversations`` passes a real value."""
+    today only ``api.conversations`` passes a real value. 14-D2 ride-along: an unrecognised
+    ``observed_intent`` string also becomes ``None`` here -- ``model_copy(update=...)``
+    bypasses pydantic validation entirely, so this check cannot be left to the field
+    validator alone."""
     fallback = ConversationSummary()
     messages = build_memory_messages(
         previous_summary=previous_summary, last_turn=last_turn, question=question, answer=answer
@@ -170,7 +203,8 @@ def summarize_turn(
         logger.warning("conversation summary was invalid; memory left unchanged")
         return None
     if observed_intent is not None:
-        result = result.model_copy(update={"last_intent": observed_intent})
+        safe_intent = observed_intent if observed_intent in _VALID_INTENTS else None
+        result = result.model_copy(update={"last_intent": safe_intent})
     return result.model_dump_json()
 
 

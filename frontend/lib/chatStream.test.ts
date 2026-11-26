@@ -32,8 +32,8 @@ function record() {
     handlers: {
       onConversation: (id: string) => calls.push(`conversation:${id}`),
       onStage: (stage: string) => calls.push(`stage:${stage}`),
-      onStep: (stage: string, step: string, phase: string) =>
-        calls.push(`step:${stage}:${step}:${phase}`),
+      onStep: (stage: string, step: string, phase: string, detail?: string) =>
+        calls.push(`step:${stage}:${step}:${phase}${detail !== undefined ? `:${detail}` : ""}`),
       onToken: (text: string) => calls.push(`token:${text}`),
       onDone: () => calls.push("done"),
       onError: (detail: string, id: string | null) => calls.push(`error:${id}:${detail}`),
@@ -71,6 +71,25 @@ test("T13.12.5: a step event dispatches onStep with stage/step/phase", async () 
     "stage:retrieving",
     "step:retrieving:embed_query:start",
     "step:retrieving:embed_query:end",
+    "done",
+  ]);
+});
+
+test("T14.4.1: a step event's detail is forwarded; a missing/null detail is undefined", async () => {
+  const { calls, handlers } = record();
+  await consumeChatStream(
+    body(
+      sse({ type: "conversation", conversation_id: "c1" }),
+      sse({ type: "step", stage: "classifying", step: "understood", phase: "end", detail: "security/en" }),
+      sse({ type: "step", stage: "retrieving", step: "embed_query", phase: "start", detail: null }),
+      sse({ type: "done", conversation_id: "c1" }),
+    ),
+    handlers,
+  );
+  assert.deepEqual(calls, [
+    "conversation:c1",
+    "step:classifying:understood:end:security/en",
+    "step:retrieving:embed_query:start",
     "done",
   ]);
 });

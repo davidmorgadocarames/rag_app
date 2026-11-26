@@ -497,11 +497,25 @@ class StreamStep:
     ``("retrieving", "embed_query")``, the dominant cold-start cost (Ollama waking
     ``bge-m3``). Reuses the SAME (stage, step) vocabulary as the latency metrics
     (``metrics.py``'s ``secrag_chat_step_seconds`` histogram) -- no separate naming, no
-    timing guesses: these are the real moments the pipeline enters/leaves the step."""
+    timing guesses: these are the real moments the pipeline enters/leaves the step.
+
+    ``detail`` (T14.4.1, block 14-D2): an OPTIONAL short, human-readable string for the
+    chat UI's visible-plan panel -- used only by the four NEW steps this block adds
+    (``understood``/``searching``/``found_sources``/``writing_answer``), ``None`` for the
+    pre-existing ``embed_query`` start/end pair (unchanged, the wake banner never reads this
+    field). Built EXCLUSIVELY from already-derived, already-safe values the UI is allowed to
+    see -- the detected ``{intent}/{language}``, the retrieval ``standalone_query`` (+ the
+    detected OWASP edition, if any) and the retrieved chunk count -- NEVER the system prompt,
+    a raw/few-shot prompt, a delimiter marker or any conversation-summary content (see this
+    module's own canary test, ``test_generation.py``, and ``test_assistant_plan_events.py``).
+    The ``standalone_query`` is user-derived text: the frontend renders it as a plain text
+    node (React's default escaping), never as HTML -- see ``frontend/components/
+    PlanPanel.tsx``."""
 
     stage: str
     step: str
     phase: str  # "start" | "end"
+    detail: str | None = None
 
 
 @dataclass
@@ -634,6 +648,18 @@ def answer_question_stream(
     the LLM router); a chit-chat reply is now LLM-generated (P14-D1) instead of a fixed
     canned template.
 
+    T14.4.1 (block 14-D2): four ``StreamStep`` events carry the chat UI's visible "plan"
+    panel -- ``understood`` (every turn), ``searching``/``found_sources`` (retrieval path
+    only), ``writing_answer`` (right before generation). Each ``detail`` string is built
+    exclusively from already-classified/derived values (intent, language, the standalone
+    query, the detected edition, the chunk count) -- NEVER the system prompt, a raw/
+    few-shot prompt or a delimiter marker (see the canary test,
+    ``test_assistant_plan_events.py``). Reuses the SAME ``StreamStep``/SSE contract 13-J3b
+    shipped for the wake banner's ``embed_query`` sub-step (DEBT-062, 14-0 re-check #3) --
+    an unrecognised ``step`` name is a forward-compatible no-op for any OLDER consumer
+    (``frontend/lib/wakeSteps.ts``'s own reducer already treats any step other than
+    ``embed_query`` this way).
+
     T14.3.1/T14.3.3/T14.3.4 (block 14-D1): ``ambiguous``/``off_topic`` now get their own
     conversational reply (a clarifying question / a polite redirect, see
     ``assistant.replies``) instead of falling through to retrieval; every abstention from
@@ -696,6 +722,17 @@ def answer_question_stream(
             decision = understand(
                 chat, query, summary=summary, last_turn=last_turn, previous_intent=previous_intent
             )
+        # T14.4.1 (block 14-D2): the chat UI's visible-plan panel reuses this SAME StreamStep
+        # contract (14-0 re-check #3, DEBT-062) -- "Understood: <intent>/<language>" is
+        # emitted for EVERY turn, regardless of intent (chitchat/ambiguous/off_topic included
+        # -- the panel's own first, and sometimes only, line). `detail` carries only the
+        # already-classified intent/language pair, never the router's prompt or the message.
+        yield StreamStep(
+            stage="classifying",
+            step="understood",
+            phase="end",
+            detail=f"{decision.intent}/{decision.language}",
+        )
         if decision.intent == "chitchat":
             yield StreamStage(stage="responding")
             with timing.stage("responding"):
@@ -743,6 +780,15 @@ def answer_question_stream(
         # T14.2.9 (DEC-062): see `answer_question`'s identical comment -- an explicit
         # caller-supplied `version` always wins over the auto-detected named edition.
         search_version = version if version is not None else named_owasp_version(search_query)
+        # T14.4.1: "Searching: <standalone query> (edition)" -- `search_query` is the
+        # ENGLISH standalone query (or the raw query, see `retrieval_query`), never the
+        # system prompt; `search_version` is the detected/explicit OWASP edition, if any.
+        yield StreamStep(
+            stage="retrieving",
+            step="searching",
+            phase="start",
+            detail=f"{search_query} ({search_version})" if search_version else search_query,
+        )
         embedder = OllamaEmbedder()
         yield StreamStep(stage="retrieving", step="embed_query", phase="start")
         query_vector = embed_query(embedder, search_query)
@@ -763,6 +809,13 @@ def answer_question_stream(
         else:
             chunks = chunks[:top_n]
 
+        # T14.4.1: "Found N sources" -- the final retrieved chunk count, AFTER rerank (or
+        # the plain top_n slice) settles it; emitted even when N is 0 (the abstention
+        # branch right below), so the plan panel always reports a real outcome.
+        yield StreamStep(
+            stage="retrieving", step="found_sources", phase="end", detail=str(len(chunks))
+        )
+
         if not chunks:
             yield StreamResult(
                 answer=Answer(
@@ -776,6 +829,9 @@ def answer_question_stream(
             return
 
         yield StreamStage(stage="generating")
+        # T14.4.1: "Writing answer" -- no dynamic content, just the plan panel's own fixed
+        # label for this stage.
+        yield StreamStep(stage="generating", step="writing_answer", phase="start")
         raw = ""
         first_token = True
         generate_start = time.perf_counter()

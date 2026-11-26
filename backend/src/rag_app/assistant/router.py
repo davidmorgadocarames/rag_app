@@ -121,6 +121,27 @@ turn -- so a guard that falls through to ``"ambiguous"`` whenever ``result.inten
 whole golden set, and lets change 3's existing security-term check still classify both
 regressed items correctly (both name a security term in the message itself: "control de
 acceso" / "injection").
+
+**14-D2 ride-along (DA-F24-into-14's own Finding 1, MEDIUM):** that guard's fall-through to
+``"ambiguous"`` still left a real coverage gap -- it only reaches ``"security"`` when
+change 3's own :func:`_names_a_security_term` regex happens to match the message's own
+words. The regex is a fixed keyword list, not exhaustive (the DA's own review found 4
+golden-set ``security`` turns -- "rotate AWS IAM access keys", "harden a Kubernetes
+cluster", "¿Cómo detecto malware...?", "detailed database error messages" -- whose own
+wording would NOT trip it). None of those happen to be mis-routed ``"followup"`` TODAY, but
+if the model ever does mislabel a context-free, real FIRST-turn security question this way,
+the message's own wording might not rescue it, and the user would be met with a clarifying
+question instead of an answer -- the exact outcome T14.4's plan panel exists to make
+visible, and exactly the outcome DEC-066's own framing ("a first-turn real security
+question must be answered") argues against. **Fix:** a context-free raw ``"followup"``
+verdict now falls through directly to ``"security"`` (the SAME conservative default every
+other router failure mode already degrades to -- timeouts, suspicious output, HTTP errors),
+never to ``"ambiguous"`` -- unconditionally, independent of whether the message happens to
+name a recognised security term. Change 3's security-term check is therefore never reached
+for this guard's own cases any more (it still applies, unchanged, to the model's OWN raw
+``"ambiguous"`` verdicts). Tests (not in the golden set, en + es, deliberately OUTSIDE
+``_SECURITY_TERM_RE``'s vocabulary -- "How do I rotate AWS IAM access keys?", "¿Cómo detecto
+malware en un servidor Linux?") prove the fix answers rather than asks for clarification.
 """
 
 from __future__ import annotations
@@ -441,25 +462,29 @@ def route(
 
     context = f"{summary or ''}\n{last_turn or ''}"
 
-    # DA-router-reliability-2 (DA finding 2, F24-into-14): a raw model "followup" with NO
-    # context (no summary and no last_turn) is never trustworthy -- there is nothing
-    # resolvable to follow up ON. Querying the golden set directly (per the DA's own review)
-    # confirms zero turns ever expect "followup" on a context-free first turn. Falling
-    # through as "ambiguous" instead of trusting the unfounded "followup" verdict lets the
-    # SAME existing tie-breakers below (change 3's security-term check, in particular) still
-    # classify it correctly -- this is what fixes the 2 regressions change 2's prompt
-    # wording introduced (``es-bac-rank-2021``/``dlg-followup-doc-version`` turn 0, both
-    # context-free and both naming a security term the message itself).
+    # DA-router-reliability-2 (DA finding 2, F24-into-14), widened by the 14-D2 ride-along
+    # (DA-F24-into-14's own Finding 1): a raw model "followup" with NO context (no summary
+    # and no last_turn) is never trustworthy -- there is nothing resolvable to follow up ON.
+    # Querying the golden set directly (per the DA's own review) confirms zero turns ever
+    # expect "followup" on a context-free first turn. This now falls through STRAIGHT to
+    # "security" -- the SAME conservative default every other router failure mode already
+    # uses (timeout, suspicious output, HTTP error) -- rather than "ambiguous", so a genuine
+    # first-turn security question is answered, not met with a clarifying question, even
+    # when its own wording does not happen to match change 3's `_names_a_security_term`
+    # keyword list (the real gap the DA's Finding 1 found). This never fires when existing
+    # rules already classified the turn "chitchat"/"off_topic" (a model verdict of
+    # "followup" is, by construction, neither -- this guard only matches "followup").
     if result.intent == "followup" and not (summary or last_turn):
         logger.info(
             "router said 'followup' with no context (no summary, no last turn); treating "
-            "as 'ambiguous' instead (DA-router-reliability-2 guard)"
+            "as 'security' instead (DA-router-reliability-2 guard, widened 14-D2)"
         )
+        resolved = result.standalone_query.strip() or query
         result = RouterOutput(
-            intent="ambiguous",
+            intent="security",
             language=result.language,
-            standalone_query=result.standalone_query,
-            clarification=result.clarification,
+            standalone_query=resolved,
+            clarification=None,
         )
 
     # Change (existing, T14.2.9-fix/DEC-063, corrected 14-D1): the model said "ambiguous" but

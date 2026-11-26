@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import ChatSidebar from "@/components/ChatSidebar";
+import PlanPanel from "@/components/PlanPanel";
 import WakeBanner from "@/components/WakeBanner";
 import {
   type Citation,
@@ -18,6 +19,7 @@ import {
 } from "@/lib/api";
 import { conversationLoadError } from "@/lib/chatStream";
 import { createRetryGuard } from "@/lib/retryGuard";
+import { usePlanSteps } from "@/lib/usePlanSteps";
 import { useWakeState } from "@/lib/useWakeState";
 import { useWakeSteps } from "@/lib/useWakeSteps";
 import { sendWakePing } from "@/lib/wakePing";
@@ -82,6 +84,10 @@ export default function ChatPage() {
   // T13.12.6 (DEBT-062): the real pipeline sub-steps shown INSIDE the wake banner above, once
   // it is actually visible (`wake.state !== "idle"`) -- chat only, see lib/useWakeSteps.ts.
   const wakeSteps = useWakeSteps();
+  // T14.4.1/T14.4.2 (block 14-D2): the visible "plan" panel -- a SEPARATE transcript from
+  // the wake banner above (different purpose: "what is the assistant doing", not "is the
+  // server still cold"), fed by the SAME `onStep` SSE events, see lib/usePlanSteps.ts.
+  const planSteps = usePlanSteps();
   const lastQuestionRef = useRef<{ question: string; conversationId: string | null } | null>(
     null,
   );
@@ -205,6 +211,7 @@ export default function ChatPage() {
     setStage("classifying");
     wake.reset();
     wakeSteps.reset();
+    planSteps.reset();
     // T13.11.5 (DEBT-060): purely visual -- pending "until the first byte/token arrives"
     // (never until the full answer: a real cold start is exactly as likely to HOLD the
     // request, with no error at all, as to refuse it -- see lib/pendingWake.ts's header).
@@ -227,8 +234,9 @@ export default function ChatPage() {
           wakeSteps.onStage(s);
           setStage(s);
         },
-        onStep: (stage, step, phase) => {
+        onStep: (stage, step, phase, detail) => {
           wakeSteps.onStep(stage, step, phase);
+          planSteps.onStep(step, detail);
         },
         onToken: (t) => {
           wake.clearPending();
@@ -407,6 +415,7 @@ export default function ChatPage() {
             {busy && stage && wake.state === "idle" && (
               <p className="text-xs tracking-[0.1em] text-vault-amber">{STAGE_LABELS[stage] ?? stage}</p>
             )}
+            {wake.state === "idle" && <PlanPanel state={planSteps.state} />}
             <WakeBanner
               state={wake.state}
               onRetry={() => void onRetryWake()}

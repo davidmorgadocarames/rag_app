@@ -530,15 +530,19 @@ def _chat_events(
                         yield _sse({"type": "stage", "stage": event.stage})
                     elif isinstance(event, StreamStep):
                         # T13.12.5 (DEBT-062): a real sub-step boundary WITHIN the current
-                        # stage (today only retrieving/embed_query) -- existing clients
-                        # ignore an unknown "type" (frontend/lib/chatStream.ts's `dispatch`),
-                        # so this is additive, never a breaking change to the SSE contract.
+                        # stage (today retrieving/embed_query plus T14.4.1's four plan-panel
+                        # steps) -- existing clients ignore an unknown "type"
+                        # (frontend/lib/chatStream.ts's `dispatch`), so this is additive,
+                        # never a breaking change to the SSE contract. T14.4.1: `detail` is
+                        # included (even when ``None``, as JSON ``null``) rather than
+                        # omitted, so the frontend never has to special-case a missing key.
                         yield _sse(
                             {
                                 "type": "step",
                                 "stage": event.stage,
                                 "step": event.step,
                                 "phase": event.phase,
+                                "detail": event.detail,
                             }
                         )
                     elif isinstance(event, StreamToken):

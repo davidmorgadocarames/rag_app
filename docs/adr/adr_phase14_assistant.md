@@ -1352,7 +1352,113 @@ a real value there today; this is parity, not a new capability.
   confirmed working against the real native Ollama server during this block (found its PID,
   read its real `OLLAMA_NUM_PARALLEL=1` from `/proc/<pid>/environ` directly).
 
+## Decision — Visible plan panel + ride-alongs (block 14-D2)
+
+**Ride-along 1 (DA-F24-into-14's own Finding 1, done FIRST, per the brief):** the
+`DA-router-reliability-2` guard (F24-into-14) fell through to `"ambiguous"` for a
+context-free raw `"followup"` verdict, relying on change 3's `_names_a_security_term`
+regex to rescue it to `"security"` when the message happens to name a recognised term. The
+DA proved that regex is not exhaustive (4 golden-set `security` turns whose own wording
+would not trip it: "rotate AWS IAM access keys", "harden a Kubernetes cluster", "¿Cómo
+detecto malware...?", "detailed database error messages"). The guard now falls through
+STRAIGHT to `"security"` -- the SAME conservative default every other router failure mode
+already uses (timeout, suspicious output, HTTP error) -- independent of whether the message
+matches the regex. New tests (`test_assistant_router.py`, en + es, deliberately OUTSIDE
+`_SECURITY_TERM_RE`'s vocabulary) prove a genuine first-turn security question like "How do
+I rotate AWS IAM access keys?" is now answered, not met with a clarifying question.
+
+**Ride-along 2:** `ConversationSummary.last_intent` (`assistant/memory.py`) is now typed to
+the real `Intent` value set (`Literal["chitchat","security","followup","ambiguous",
+"off_topic"] | None`) rather than a bare `str` -- closing DA-F24-into-14's Finding 2. A
+`field_validator(mode="before")` maps any value OUTSIDE that set to `None` (never raises --
+a forged/corrupted stored summary degrades to the same safe default as a summary written
+before this field existed) rather than a plain `Literal` field, which would turn one bad
+key into a hard parse failure for the WHOLE summary. `summarize_turn`'s own
+`model_copy(update=...)` call -- which bypasses pydantic validation entirely -- gets the
+SAME unknown-value guard inline, since the field validator alone cannot catch that path.
+
+**T14.4.1 -- stage events.** Four new `StreamStep` events (reusing the exact
+`{"type":"step",stage,step,phase}` SSE contract 13-J3b shipped for the wake banner's
+`embed_query` sub-step, DEBT-062, per 14-0 re-check #3): `understood` (every turn, incl.
+chitchat/ambiguous/off_topic), `searching`/`found_sources` (retrieval path only),
+`writing_answer` (right before generation). `StreamStep` gains an optional `detail: str |
+None` field, built EXCLUSIVELY from already-classified/derived values -- the detected
+`{intent}/{language}`, the retrieval `standalone_query` (+ detected OWASP edition), the
+chunk count -- never the system prompt, a raw/few-shot prompt or a delimiter marker. A
+canary test (`test_assistant_plan_events.py`) asserts no step's `detail`, across every
+branch (chitchat/ambiguous/off_topic/security), ever contains a fragment of `_ROUTER_SYSTEM`
+/`_MEMORY_SYSTEM` or a `<<<`/`>>>` delimiter marker. An unrecognised `step` name (including
+these four, for an OLDER frontend build) is a forward-compatible no-op, same convention
+`reduceWakeStep` already uses.
+
+**T14.4.2 -- plan panel.** No approved mockup exists for this panel (memory: "follow
+mockup exactly" -> "no mockup, follow the existing chat/app style exactly") --
+`components/PlanPanel.tsx` reuses WakeBanner.tsx's own design tokens (`vault-amber` for the
+live/current line, `vault-steel-dark` borders, `vault-steel-light` for past entries) and the
+app's single monospace typeface; no new colours/fonts. Collapsed by default, showing only
+the latest step's label as a live one-line status; a plain, native `<button>` (always
+keyboard-reachable) toggles the full transcript, `aria-expanded` reflects the state,
+`aria-controls` points at the expanded list. `prefers-reduced-motion`: the panel starts no
+animation of its own (expand/collapse is a plain conditional render, not a CSS transition)
+-- the project-wide `globals.css` rule already neutralises every `animate-pulse`/transition
+utility elsewhere, so there is nothing extra to opt out of. **XSS:** every label (which may
+contain the user's own `standalone_query` text, via the `searching` step) is rendered as a
+plain JSX text child -- React's default escaping -- never `dangerouslySetInnerHTML`, never
+passed through a markdown/HTML renderer; `lib/planSteps.test.ts` has a dedicated test
+proving an XSS-shaped detail string survives the reducer as a literal string, unparsed.
+
+**T14.4.3 -- tests.** Backend: the canary above, plus unit tests for the event sequence,
+content and ordering on the security/chitchat/ambiguous/abstention paths
+(`test_assistant_plan_events.py`); two pre-existing `test_generation.py` tests narrowed
+their own filter to `embed_query`/no-embedding specifically (the new `understood` step is
+additive and was breaking their blanket "no StreamStep at all" assertions). Frontend:
+`lib/planSteps.test.ts` (the pure reducer) and an extended `lib/chatStream.test.ts` (the
+`detail` field is forwarded; a JSON `null` becomes `undefined`). E2E:
+`e2e/plan-panel.spec.ts` drives a real registered user through one real chat turn and
+asserts the panel is collapsed by default, shows a live status, expands via a real `Enter`
+keypress on the toggle (not only a mouse click), and lists all four steps in order with the
+expected fixed label shape (the LLM's own exact `standalone_query` wording is deliberately
+NOT pinned here -- that is `eval/golden_set_v2*`'s job).
+
+### Known limitations (self-reported, not just design) -- 14-D2
+
+- **Ride-along 1's new guard can answer a genuinely off-topic, context-free message as
+  `"security"`** if the model mislabels it `"followup"` with no context AND the message
+  does not land in the fast path's exact chitchat/greeting set. Before this ride-along the
+  same mislabel degraded to `"ambiguous"` (a clarifying question); now it degrades to
+  `"security"` (an attempt to answer, which the existing retrieve -> generate ->
+  groundedness-check -> cite-or-abstain path then either answers for real or abstains on,
+  never an uncited claim). This is the deliberate, documented trade-off DEC-066's own framing
+  argues for ("a first-turn real security question must be answered") -- accepted as a
+  known, conservative-but-possible mismatch, not chased further this block (no golden-set
+  item exercises it either way).
+- **The plan panel's transcript is never auto-collapsed or cleared once a turn finishes** --
+  it stays expanded/collapsed at whatever state the user left it, showing the completed
+  turn's steps, until the NEXT question resets it (`usePlanSteps.ts`'s `reset()`, called
+  alongside the existing `wakeSteps.reset()`). This is intentional (a small, free "what did
+  it just do" transcript) but means the panel's live status line can show a stale
+  "Writing answer" after the real answer has already finished streaming -- never incorrect,
+  just no longer literally "live" at that point.
+- **The `searching` step's `detail` is not length-bounded for display** -- it is the
+  router's own `standalone_query` (already bounded by `ROUTER_MAX_TOKENS`, T14.1.1), so a
+  pathological length is not reachable today, but `PlanPanel.tsx` relies on `truncate` (a
+  CSS ellipsis on the COLLAPSED one-line view only) rather than a hard string cap; the
+  EXPANDED list shows the full text unbounded. Acceptable given the existing token bound;
+  flagged for whoever next changes that bound.
+
 ## Rollback
+
+14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
+becomes `"security"` instead of `"ambiguous"` -- see "Known limitations" above); ride-along
+2 is additive/defensive only (a stricter, still-defaulted type on an already-opaque
+encrypted JSON field -- no migration, no data loss, an unknown stored value simply reads
+back as `None` instead of an arbitrary string). T14.4.1/T14.4.2's four new `StreamStep`
+events and the `detail` field are additive to the SSE contract (an older frontend build
+simply never requests/renders them); no schema, no migration, no new persisted data, no
+deployed-image step. A plain `git revert` of this block's commit(s) restores F24-into-14's
+behaviour exactly (the plan panel and its new steps disappear; the followup guard reverts to
+`"ambiguous"`, reopening the DA's own Finding 1 coverage gap; `last_intent` reverts to a
+bare `str`).
 
 router-reliability: changes LIVE runtime behaviour (the router prompt text and 3 new
 deterministic tie-breakers; `assistant.fast_path.match_fast_path` fast-paths a lone

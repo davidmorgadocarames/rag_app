@@ -45,14 +45,15 @@ def test_exact_fast_path_match_skips_the_router_entirely() -> None:
 
 
 def test_non_exact_message_calls_the_router_and_measures_its_latency() -> None:
-    """DA-router-reliability-2 (F24-into-14): a raw 'followup' verdict with no context
-    (no summary/last_turn passed here) is no longer trusted -- it falls through to
-    'ambiguous' (this message names no security term either, so it stops there). This
-    test's own purpose (the router WAS called, and latency WAS measured) is unaffected."""
+    """DA-router-reliability-2 (F24-into-14), widened by the 14-D2 ride-along: a raw
+    'followup' verdict with no context (no summary/last_turn passed here) is no longer
+    trusted -- it now falls through directly to 'security' (the conservative default),
+    never 'ambiguous'. This test's own purpose (the router WAS called, and latency WAS
+    measured) is unaffected."""
     result = RouterOutput(intent="followup", language="en", standalone_query="x")
     chat = _FakeChat(result=result)
     decision = understand(chat, "what about that?")  # type: ignore[arg-type]
-    assert decision.intent == "ambiguous"
+    assert decision.intent == "security"
     assert decision.used_fast_path is False
     assert chat.chat_json_calls == 1
     assert decision.router_latency_s is not None

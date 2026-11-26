@@ -832,7 +832,11 @@ def test_answer_question_stream_emits_embed_query_start_and_end_exactly_once_in_
 ) -> None:
     """The security path brackets the (potentially slow, cold-start) embed call with
     exactly one start and one end ``StreamStep``, in the right place: after the
-    "retrieving" stage, before any further stage event."""
+    "retrieving" stage, before any further stage event. T14.4.1 (block 14-D2) now also
+    emits plan-panel steps (``understood``/``searching``/``found_sources``/
+    ``writing_answer``) around this SAME pipeline -- this test narrows its own filter to
+    ``embed_query`` specifically, its original and only target (see the new
+    ``test_assistant_plan_events.py`` for the new steps' own coverage)."""
     monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
     monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
     monkeypatch.setattr(
@@ -848,17 +852,22 @@ def test_answer_question_stream_emits_embed_query_start_and_end_exactly_once_in_
         )
     )
 
-    steps = [e for e in events if isinstance(e, StreamStep)]
-    assert [(s.stage, s.step, s.phase) for s in steps] == [
+    embed_steps = [e for e in events if isinstance(e, StreamStep) and e.step == "embed_query"]
+    assert [(s.stage, s.step, s.phase) for s in embed_steps] == [
         ("retrieving", "embed_query", "start"),
         ("retrieving", "embed_query", "end"),
     ]
     # The embed step sits strictly between the "retrieving" stage event and the next
-    # ("reranking") stage event -- never before/after the wrong stage.
-    kinds = [
-        ("stage", e.stage) if isinstance(e, StreamStage) else ("step", e.phase)
+    # ("reranking") stage event -- never before/after the wrong stage. Filtered to
+    # stage events + embed_query steps ONLY, ignoring the new interleaved "searching" step
+    # (T14.4.1), which this test is not about.
+    relevant = [
+        e
         for e in events
-        if isinstance(e, StreamStage | StreamStep)
+        if isinstance(e, StreamStage) or (isinstance(e, StreamStep) and e.step == "embed_query")
+    ]
+    kinds = [
+        ("stage", e.stage) if isinstance(e, StreamStage) else ("step", e.phase) for e in relevant
     ]
     retrieving_idx = kinds.index(("stage", "retrieving"))
     reranking_idx = kinds.index(("stage", "reranking"))
@@ -867,12 +876,16 @@ def test_answer_question_stream_emits_embed_query_start_and_end_exactly_once_in_
     assert retrieving_idx + 2 < reranking_idx
 
 
-def test_answer_question_stream_chitchat_never_emits_a_step_event() -> None:
-    """The chit-chat fast path never touches retrieval/embedding at all -- no StreamStep,
-    ever (DA-less regression guard: a future refactor that accidentally always embeds would
-    fail this)."""
+def test_answer_question_stream_chitchat_never_touches_retrieval_or_embedding() -> None:
+    """The chit-chat fast path never touches retrieval/embedding at all. T14.4.1 (block
+    14-D2): it NOW emits the plan panel's own "understood" step (every turn gets exactly
+    one, by design, including chit-chat) -- this test narrows to confirm no embedding/
+    retrieval-specific step ever fires for chit-chat (DA-less regression guard: a future
+    refactor that accidentally always embeds would fail this)."""
     events = list(generation.answer_question_stream(None, "hi", chat=_FakeChatSync("")))  # type: ignore[arg-type]
-    assert not [e for e in events if isinstance(e, StreamStep)]
+    steps = [e for e in events if isinstance(e, StreamStep)]
+    assert [(s.stage, s.step, s.phase) for s in steps] == [("classifying", "understood", "end")]
+    assert steps[0].detail == "chitchat/en"
 
 
 def test_answer_question_emits_one_timing_record_with_no_pii(

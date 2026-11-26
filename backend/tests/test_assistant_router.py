@@ -510,15 +510,14 @@ def test_route_leaves_ambiguous_alone_when_the_message_names_no_security_term() 
     assert out.intent == "ambiguous"
 
 
-# --- DA-router-reliability-2: an untrusted raw "followup" with no context falls through to --
-# the "ambiguous" tie-breakers (F24-into-14, DA finding 2) -----------------------------------
+# --- DA-router-reliability-2, widened by the 14-D2 ride-along (DA-F24-into-14 Finding 1): --
+# an untrusted raw "followup" with no context falls through STRAIGHT to "security" --------
 
 
 def test_route_does_not_trust_a_raw_followup_verdict_with_no_context_at_all() -> None:
     """Not in the golden set. The model answers 'followup' on a context-free first turn that
-    also names its own security term -- the guard falls through to 'ambiguous', and change
-    3's existing security-term check then classifies it as 'security' (never trusts the raw,
-    unfounded 'followup')."""
+    also names its own security term -- the guard now falls through directly to 'security'
+    (never trusts the raw, unfounded 'followup'; never stops at 'ambiguous' first)."""
     result = RouterOutput(
         intent="followup", language="en", standalone_query="is my firewall configuration safe"
     )
@@ -538,14 +537,44 @@ def test_route_does_not_trust_a_raw_followup_verdict_with_no_context_in_spanish(
     assert out.intent == "security"
 
 
-def test_route_falls_back_to_ambiguous_when_the_untrusted_followup_names_no_security_term() -> None:
-    """When the context-free 'followup' verdict names no security term either, it still falls
-    through to 'ambiguous' (never stays 'followup', never jumps straight to 'security') --
-    the normal, conservative "ask for clarification" classification."""
+def test_route_falls_back_to_security_when_the_untrusted_followup_names_no_security_term() -> None:
+    """14-D2 ride-along (fails on the pre-ride-along code, which stopped at 'ambiguous'
+    here): even when the context-free 'followup' verdict names no recognised security term
+    either, it still falls through to 'security' -- the SAME conservative default every
+    other router failure mode already uses, not a clarifying question."""
     result = RouterOutput(intent="followup", language="en", standalone_query="what about that")
     chat = _FakeChat(result=result)
     out = route(chat, "What about that?", summary=None, last_turn=None)  # type: ignore[arg-type]
-    assert out.intent == "ambiguous"
+    assert out.intent == "security"
+    assert out.clarification is None
+
+
+def test_route_answers_a_first_turn_security_question_outside_the_security_term_regex_en() -> None:
+    """14-D2 ride-along, DA-F24-into-14 Finding 1 (not in the golden set, deliberately OUTSIDE
+    `_SECURITY_TERM_RE`'s vocabulary): a genuine first-turn security question the model
+    mislabels 'followup' with no context is still answered (-> 'security'), not met with a
+    clarifying question, even though its own wording never matches the keyword list."""
+    assert not _names_a_security_term("How do I rotate AWS IAM access keys?")
+    result = RouterOutput(
+        intent="followup", language="en", standalone_query="how do I rotate AWS IAM access keys"
+    )
+    chat = _FakeChat(result=result)
+    out = route(chat, "How do I rotate AWS IAM access keys?", summary=None, last_turn=None)  # type: ignore[arg-type]
+    assert out.intent == "security"
+    assert out.clarification is None
+
+
+def test_route_answers_a_first_turn_security_question_outside_the_security_term_regex_es() -> None:
+    """Spanish twin of the test above, also outside `_SECURITY_TERM_RE`."""
+    assert not _names_a_security_term("¿Cómo detecto malware en un servidor Linux?")
+    result = RouterOutput(
+        intent="followup",
+        language="es",
+        standalone_query="how do I detect malware on a linux server",
+    )
+    chat = _FakeChat(result=result)
+    out = route(chat, "¿Cómo detecto malware en un servidor Linux?", summary=None, last_turn=None)  # type: ignore[arg-type]
+    assert out.intent == "security"
 
 
 def test_route_trusts_a_followup_verdict_when_real_context_exists() -> None:
