@@ -537,6 +537,12 @@ def test_evaluate_dialogues_retrieves_with_the_standalone_query_not_the_raw_mess
     dialogue = Dialogue(
         id="dlg-followup",
         turns=(
+            # DA-router-reliability-2 (F24-into-14): a raw "followup" verdict on a
+            # context-free first turn is no longer trusted (it falls through to
+            # 'ambiguous' instead) -- a real preceding turn (exact fast-path greeting,
+            # never calls the router) gives turn 1 genuine context so this test can still
+            # exercise its OWN target mechanism (standalone_query used for retrieval).
+            Turn(message="hi", expected_intent="chitchat", language="en"),
             Turn(
                 message="what about that one, which rank is it?",
                 expected_intent="followup",
@@ -681,6 +687,9 @@ def test_evaluate_dialogues_still_generates_the_answer_from_the_raw_message(
     dialogue = Dialogue(
         id="dlg-followup-es",
         turns=(
+            # DA-router-reliability-2 (F24-into-14): see the English sibling test above --
+            # a real preceding turn gives turn 1 genuine context.
+            Turn(message="hola", expected_intent="chitchat", language="es"),
             Turn(
                 message="¿y eso, en qué puesto queda?",
                 expected_intent="followup",
@@ -732,6 +741,9 @@ def test_evaluate_dialogues_scopes_retrieval_to_a_named_owasp_edition(
     dialogue = Dialogue(
         id="dlg-followup-version",
         turns=(
+            # DA-router-reliability-2 (F24-into-14): see the first test in this file's
+            # "T14.2.7" section -- a real preceding turn gives turn 1 genuine context.
+            Turn(message="hi", expected_intent="chitchat", language="en"),
             Turn(
                 message="where does it rank?",
                 expected_intent="followup",

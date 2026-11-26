@@ -107,6 +107,20 @@ genuine ``ambiguous`` items (still ``"ambiguous"`` after the fix), the 6 noisy g
 items (``typo-injecion-what`` now ``"security"``; the other 5 unchanged), and a full
 golden-set router replay (68/75 vs. 67/75 raw intent matches on the same probe at baseline --
 every other mismatch, before and after, is identical and pre-existing).
+
+**DA-router-reliability-2 (F24-into-14, DA finding 2 on the router-reliability block):**
+change 2's new prompt wording fixed its 3 target items but regressed 2 OTHERS
+(``es-bac-rank-2021``/``dlg-followup-doc-version`` turn 0) -- both are context-free first
+turns where the model, despite the prompt, directly answers ``"followup"`` instead of
+``"ambiguous"`` or ``"security"``. There was no code-level guard symmetric to the existing
+``"ambiguous"`` -> ``"followup"`` tie-breakers' own ``bool(summary or last_turn)`` check: the
+model's raw ``"followup"`` verdict was trusted unconditionally. The DA proved, by querying
+the golden set directly, that zero turns ever expect ``"followup"`` on a context-free first
+turn -- so a guard that falls through to ``"ambiguous"`` whenever ``result.intent ==
+"followup"`` and neither ``summary`` nor ``last_turn`` exist is provably safe against the
+whole golden set, and lets change 3's existing security-term check still classify both
+regressed items correctly (both name a security term in the message itself: "control de
+acceso" / "injection").
 """
 
 from __future__ import annotations
@@ -426,6 +440,27 @@ def route(
         return fallback
 
     context = f"{summary or ''}\n{last_turn or ''}"
+
+    # DA-router-reliability-2 (DA finding 2, F24-into-14): a raw model "followup" with NO
+    # context (no summary and no last_turn) is never trustworthy -- there is nothing
+    # resolvable to follow up ON. Querying the golden set directly (per the DA's own review)
+    # confirms zero turns ever expect "followup" on a context-free first turn. Falling
+    # through as "ambiguous" instead of trusting the unfounded "followup" verdict lets the
+    # SAME existing tie-breakers below (change 3's security-term check, in particular) still
+    # classify it correctly -- this is what fixes the 2 regressions change 2's prompt
+    # wording introduced (``es-bac-rank-2021``/``dlg-followup-doc-version`` turn 0, both
+    # context-free and both naming a security term the message itself).
+    if result.intent == "followup" and not (summary or last_turn):
+        logger.info(
+            "router said 'followup' with no context (no summary, no last turn); treating "
+            "as 'ambiguous' instead (DA-router-reliability-2 guard)"
+        )
+        result = RouterOutput(
+            intent="ambiguous",
+            language=result.language,
+            standalone_query=result.standalone_query,
+            clarification=result.clarification,
+        )
 
     # Change (existing, T14.2.9-fix/DEC-063, corrected 14-D1): the model said "ambiguous" but
     # its OWN standalone_query already resolved the reference from real context -- a

@@ -115,11 +115,18 @@ def test_guess_language_defaults_to_english() -> None:
 
 
 def test_route_returns_a_valid_structured_reply_unchanged() -> None:
+    """A real last_turn is passed so DA-router-reliability-2's guard (a context-free raw
+    'followup' is untrusted) does not apply here -- this test is about the happy path
+    (a valid reply passed straight through), not about that guard."""
     result = RouterOutput(
         intent="followup", language="en", standalone_query="What about OS commands?"
     )
     chat = _FakeChat(result=result)
-    out = route(chat, "What about that?")  # type: ignore[arg-type]
+    out = route(
+        chat,
+        "What about that?",
+        last_turn="User: How do I prevent SQL injection?\nAssistant: Use parameterized " "queries.",
+    )  # type: ignore[arg-type]
     assert out == result
 
 
@@ -495,6 +502,70 @@ def test_route_leaves_ambiguous_alone_when_the_message_names_no_security_term() 
     chat = _FakeChat(result=result)
     out = route(chat, "Can you help me?")  # type: ignore[arg-type]
     assert out.intent == "ambiguous"
+
+
+# --- DA-router-reliability-2: an untrusted raw "followup" with no context falls through to --
+# the "ambiguous" tie-breakers (F24-into-14, DA finding 2) -----------------------------------
+
+
+def test_route_does_not_trust_a_raw_followup_verdict_with_no_context_at_all() -> None:
+    """Not in the golden set. The model answers 'followup' on a context-free first turn that
+    also names its own security term -- the guard falls through to 'ambiguous', and change
+    3's existing security-term check then classifies it as 'security' (never trusts the raw,
+    unfounded 'followup')."""
+    result = RouterOutput(
+        intent="followup", language="en", standalone_query="is my firewall configuration safe"
+    )
+    chat = _FakeChat(result=result)
+    out = route(chat, "Is my firewall configuration safe?", summary=None, last_turn=None)  # type: ignore[arg-type]
+    assert out.intent == "security"
+    assert out.clarification is None
+
+
+def test_route_does_not_trust_a_raw_followup_verdict_with_no_context_in_spanish() -> None:
+    """Not in the golden set, Spanish."""
+    result = RouterOutput(
+        intent="followup", language="es", standalone_query="mi firewall esta bien configurado"
+    )
+    chat = _FakeChat(result=result)
+    out = route(chat, "¿Mi firewall está bien configurado?", summary=None, last_turn=None)  # type: ignore[arg-type]
+    assert out.intent == "security"
+
+
+def test_route_falls_back_to_ambiguous_when_the_untrusted_followup_names_no_security_term() -> None:
+    """When the context-free 'followup' verdict names no security term either, it still falls
+    through to 'ambiguous' (never stays 'followup', never jumps straight to 'security') --
+    the normal, conservative "ask for clarification" classification."""
+    result = RouterOutput(intent="followup", language="en", standalone_query="what about that")
+    chat = _FakeChat(result=result)
+    out = route(chat, "What about that?", summary=None, last_turn=None)  # type: ignore[arg-type]
+    assert out.intent == "ambiguous"
+
+
+def test_route_trusts_a_followup_verdict_when_real_context_exists() -> None:
+    """Negative control: this guard only fires with NO context at all -- a 'followup' verdict
+    backed by a real last_turn is left exactly as the model said, same as before this change."""
+    result = RouterOutput(intent="followup", language="en", standalone_query="what about XSS")
+    chat = _FakeChat(result=result)
+    out = route(
+        chat,
+        "What about XSS?",
+        last_turn="User: How do I prevent SQL injection?\nAssistant: Use parameterized " "queries.",
+    )
+    assert out.intent == "followup"
+
+
+def test_route_trusts_a_followup_verdict_when_a_summary_exists_even_without_last_turn() -> None:
+    """Negative control: a summary alone (no last_turn) also counts as real context."""
+    result = RouterOutput(intent="followup", language="en", standalone_query="what about XSS")
+    chat = _FakeChat(result=result)
+    out = route(
+        chat,
+        "What about XSS?",
+        summary='{"topics":["SQL injection"],"entities":[]}',
+        last_turn=None,
+    )
+    assert out.intent == "followup"
 
 
 # --- change 4: _previous_turn_asked_the_clarification + the "reply to a clarification is a --
