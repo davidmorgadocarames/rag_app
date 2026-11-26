@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from rag_app import generation, reranking, timing
+from rag_app.assistant.core import Understanding
 from rag_app.eval import latency
 from rag_app.generation import Answer
 from rag_app.retrieval import RetrievedChunk
@@ -76,12 +77,24 @@ def _fake_chunk() -> RetrievedChunk:
 
 
 def test_run_latency_benchmark_aggregates_every_stage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The real call shape ``generation.answer_question`` uses (a fresh
-    ``CrossEncoderReranker()`` per question via ``reranking.retrieve``, then
-    ``answer_from_chunks``) with the actual model calls stubbed: stage durations still flow
-    through the real ``timing`` contextvar machinery into THIS benchmark's own ``on_stage``
-    callback (not nested inside another recorder — see ``run_latency_benchmark``'s
-    docstring)."""
+    """The real call shape ``generation.answer_question`` uses (T14.5.1: the shared router
+    stage under ``understand()``, a fresh ``CrossEncoderReranker()`` per question via
+    ``reranking.retrieve``, then ``answer_from_chunks``) with the actual model calls stubbed:
+    stage durations still flow through the real ``timing`` contextvar machinery into THIS
+    benchmark's own ``on_stage`` callback (not nested inside another recorder — see
+    ``run_latency_benchmark``'s docstring). Fails on the old code: pre-T14.5.1,
+    ``run_latency_benchmark`` never called ``understand()`` at all, so ``"classify"`` never
+    appeared in ``report.stages_ms``."""
+
+    def fake_understand(*_args: Any, **_kwargs: Any) -> Understanding:
+        return Understanding(
+            intent="security",
+            language="en",
+            standalone_query="q",
+            clarification=None,
+            used_fast_path=False,
+            router_latency_s=0.01,
+        )
 
     def fake_retrieve(*_args: Any, **_kwargs: Any) -> list[RetrievedChunk]:
         with timing.stage("rerank_load"):
@@ -97,6 +110,7 @@ def test_run_latency_benchmark_aggregates_every_stage(monkeypatch: pytest.Monkey
             pass
         return Answer(text="ok [1]", citations=[], abstained=False, grounded=True)
 
+    monkeypatch.setattr(latency, "understand", fake_understand)
     monkeypatch.setattr(reranking, "retrieve", fake_retrieve)
     monkeypatch.setattr(generation, "answer_from_chunks", fake_answer_from_chunks)
     monkeypatch.setattr(latency, "OllamaChat", lambda: object())
@@ -116,7 +130,14 @@ def test_run_latency_benchmark_aggregates_every_stage(monkeypatch: pytest.Monkey
 
     assert report.n_runs == 2
     assert report.n_questions == 3
-    expected_stages = {"rerank_load", "rerank_inference", "generate", "groundedness", "total"}
+    expected_stages = {
+        "classify",
+        "rerank_load",
+        "rerank_inference",
+        "generate",
+        "groundedness",
+        "total",
+    }
     assert expected_stages <= set(report.stages_ms)
     for name in expected_stages:
         stats = report.stages_ms[name]
@@ -491,6 +512,36 @@ def test_check_against_adopted_baseline_enforces_the_absolute_rerank_floor_regar
 
     assert not result.ok
     assert any("absolute" in f for f in result.failures)
+
+
+def test_check_against_adopted_baseline_enforces_the_absolute_router_floor_regardless_of_tolerance() -> (  # noqa: E501
+    None
+):
+    """T14.5.1: same hard-ceiling treatment as rerank_inference's own absolute floor above,
+    for the router ("classify" stage) -- fails on the old code, which had no "classify"
+    entry in STAGE_NAMES's measured output at all and no absolute-floor check for it."""
+    loose_p95 = latency.ROUTER_FLOOR_ABSOLUTE_MS * 1.2
+    baseline = _adopted_baseline(
+        {"classify": {"n": 1, "mean": loose_p95, "p50": loose_p95, "p95": loose_p95}}
+    )
+    report = _report({"classify": {"n": 1, "mean": loose_p95, "p50": loose_p95, "p95": loose_p95}})
+
+    result = latency.check_against_adopted_baseline(report, baseline)
+
+    assert not result.ok
+    assert any("classify" in f and "absolute" in f for f in result.failures)
+
+
+def test_check_against_adopted_baseline_passes_when_the_router_stage_is_within_its_floor() -> None:
+    """A new ``"classify"`` stage with no adopted-baseline counterpart yet (T14.5.1, before
+    the next ``--update-adopted-baseline``) is never relative-compared, but still passes the
+    absolute floor check when it genuinely is under 1.5s."""
+    report = _report({"classify": {"n": 1, "mean": 900.0, "p50": 900.0, "p95": 1000.0}})
+
+    result = latency.check_against_adopted_baseline(report, _adopted_baseline({}))
+
+    assert result.ok
+    assert result.failures == []
 
 
 def test_check_against_adopted_baseline_fails_on_a_config_mismatch() -> None:

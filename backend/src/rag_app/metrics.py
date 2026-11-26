@@ -14,6 +14,13 @@ T13.8.1 adds a SECOND histogram, ``secrag_chat_step_seconds``, labelled ``stage`
 with its OWN fixed, reviewed allow-list (``STEP_ALLOWLIST``) of atomic steps within the
 UI-facing pipeline stages (classifying/retrieving/reranking/generating/checking/
 responding) -- same no-PII discipline, enforced at write time by :func:`observe_step`.
+
+T14.5.2 adds the assistant/router telemetry counters below, all labelled ONLY ``intent`` --
+the closed, reviewed, 5-value ``rag_app.assistant.router.Intent`` vocabulary (chitchat/
+security/followup/ambiguous/off_topic), never a user id, question text or answer text.
+``ALLOWED_INTENTS``/:func:`_checked_intent` reject anything outside that vocabulary at write
+time (a programmer error, never real-traffic input, same "dev-time bug signal" discipline
+:func:`observe_step` already enforces for ``STEP_ALLOWLIST``).
 """
 
 from __future__ import annotations
@@ -160,6 +167,131 @@ OLLAMA_WARMUP_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+# T14.5.2: assistant/router telemetry -- intent distribution, rewrite rate, clarification
+# rate and router fallback rate (PHASE_PLANNING 14.5), every one labelled ONLY ``intent``.
+# ``ALLOWED_INTENTS`` mirrors ``rag_app.assistant.router.Intent`` (not imported -- this
+# module has no dependency on ``assistant`` today and this is the one small, stable, already
+# fully-reviewed vocabulary that needs it); :func:`_checked_intent` rejects anything outside
+# it before it ever reaches a Prometheus label value, so a programmer error can never turn
+# into an unbounded-cardinality label (real user text is never a candidate here -- every
+# caller passes an already-classified ``Understanding.intent``/``RouterOutput.intent``, both
+# themselves Pydantic ``Literal``-typed, never a raw string).
+ALLOWED_INTENTS: frozenset[str] = frozenset(
+    {"chitchat", "security", "followup", "ambiguous", "off_topic"}
+)
+
+
+class UnknownIntentError(ValueError):
+    """Raised by the understanding/router telemetry counters for an intent value outside
+    ``ALLOWED_INTENTS`` -- rejected, never emitted as a label (T14.5.2)."""
+
+
+def _checked_intent(intent: str) -> str:
+    if intent not in ALLOWED_INTENTS:
+        raise UnknownIntentError(
+            f"{intent!r} is not in metrics.ALLOWED_INTENTS -- refusing to emit it as a label"
+        )
+    return intent
+
+
+UNDERSTANDING_INTENT_TOTAL = Counter(
+    "secrag_understanding_intent_total",
+    "Turns classified by the shared understanding step (fast path or LLM router), by the"
+    " turn's final intent (T14.5.2) -- labelled ONLY by the fixed Intent vocabulary, never"
+    " user text.",
+    ["intent"],
+    registry=REGISTRY,
+)
+
+UNDERSTANDING_REWRITE_TOTAL = Counter(
+    "secrag_understanding_rewrite_total",
+    "Turns where the router rewrote the message into a different standalone_query (e.g. a"
+    " resolved follow-up or a translation), by the turn's final intent (T14.5.2).",
+    ["intent"],
+    registry=REGISTRY,
+)
+
+UNDERSTANDING_CLARIFICATION_TOTAL = Counter(
+    "secrag_understanding_clarification_total",
+    "Turns the router sent back a clarifying follow-up for (intent == 'ambiguous'), by"
+    " intent (T14.5.2) -- the label is always 'ambiguous' today, kept consistent with the"
+    " other understanding counters above rather than a bare, label-less count.",
+    ["intent"],
+    registry=REGISTRY,
+)
+
+ROUTER_FALLBACK_TOTAL = Counter(
+    "secrag_router_fallback_total",
+    "Router calls that degraded to the conservative security fallback (a chat-client"
+    " exception, or a structurally valid but suspicious reply -- rag_app.assistant.router."
+    " route's own two explicit fallback paths), by the fallback's own intent (T14.5.2) --"
+    " always 'security' today, by construction (assistant.router._security_fallback).",
+    ["intent"],
+    registry=REGISTRY,
+)
+
+
+def observe_understanding_intent(intent: str) -> None:
+    """Record one turn's final routed intent (T14.5.2), fast path or LLM router alike."""
+    UNDERSTANDING_INTENT_TOTAL.labels(intent=_checked_intent(intent)).inc()
+
+
+def observe_understanding_rewrite(intent: str) -> None:
+    """Record one turn where the router's ``standalone_query`` genuinely rewrote the message
+    (T14.5.2) -- never called for the fast path, which never rewrites anything."""
+    UNDERSTANDING_REWRITE_TOTAL.labels(intent=_checked_intent(intent)).inc()
+
+
+def observe_understanding_clarification(intent: str) -> None:
+    """Record one turn the router asked a clarifying question for (T14.5.2)."""
+    UNDERSTANDING_CLARIFICATION_TOTAL.labels(intent=_checked_intent(intent)).inc()
+
+
+def observe_router_fallback(intent: str) -> None:
+    """Record one router call that degraded to the conservative fallback (T14.5.2)."""
+    ROUTER_FALLBACK_TOTAL.labels(intent=_checked_intent(intent)).inc()
+
+
+# T14.5.4: the aggregate estimated token cost for every answered turn (chat footer + admin
+# dashboard), unlabelled by design -- an aggregate, process-wide total, never per-user/
+# per-conversation (PHASE_PLANNING 14.5's own "aggregate, no per-user data" rule). Local
+# Ollama answers always add 0.0 (see rag_app.cost.estimate_cost) -- this counter only ever
+# grows on a real Azure OpenAI answer.
+ESTIMATED_COST_TOTAL = Counter(
+    "secrag_estimated_cost_total",
+    "Estimated token cost of every answered turn, summed across this replica's own process"
+    " lifetime (T14.5.4) -- an aggregate only, never per-user/per-conversation; always 0 for"
+    " a local Ollama answer.",
+    registry=REGISTRY,
+)
+
+
+def observe_estimated_cost(amount: float) -> None:
+    """Add ``amount`` (always >= 0.0) to :data:`ESTIMATED_COST_TOTAL` (T14.5.4)."""
+    if amount > 0.0:
+        ESTIMATED_COST_TOTAL.inc(amount)
+
+
+def counter_value(name: str, registry: CollectorRegistry = REGISTRY) -> float:
+    """The current value of an unlabelled counter/gauge, summed across any label combination
+    it might carry -- the SAME in-process computation ``InProcessMetricsBackend.current_value``
+    uses for the Azure admin dashboard (T13.4.3), exposed here too for call sites (the latency
+    panel, T14.5.4) that want THIS process's own "since start" aggregate directly, consistent
+    with :func:`stage_latency_summary`'s identical in-process-only reasoning, rather than
+    through the generic ``MetricsBackend`` (which on the local stack queries the SHARED
+    Prometheus container instead -- a different, cross-replica number the latency panel
+    deliberately avoids, see its own docstring). ``0.0`` for an unregistered name (never
+    raises)."""
+    total = 0.0
+    found = False
+    for metric in registry.collect():
+        for sample in metric.samples:
+            if sample.name == name:
+                found = True
+                total += sample.value
+    return total if found else 0.0
+
+
 # T13.8.1: the atomic steps WITHIN each UI-facing pipeline stage (``generation.StreamStage``'s
 # own vocabulary: classifying/retrieving/reranking/generating/checking/responding -- a
 # DIFFERENT, higher-level grouping than STAGE_SECONDS's own ``stage`` label, e.g. "retrieving"
@@ -223,7 +355,7 @@ STEP_SECONDS = Histogram(
 # automatically, the moment a new ``Counter``/``Gauge``/``Histogram`` module-level object
 # declares a label name that was never reviewed, without anyone having to add a new test.
 SAFE_METRIC_LABELS: frozenset[str] = frozenset(
-    {"stage", "step", "result", "kind", "route_group", "reason"}
+    {"stage", "step", "result", "kind", "route_group", "reason", "intent"}
 )
 
 

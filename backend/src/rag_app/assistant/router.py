@@ -152,6 +152,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from rag_app import metrics
 from rag_app.assistant.fast_path import escape_delimiter_markers
 from rag_app.config import get_settings
 from rag_app.llm import ChatClient, Message
@@ -455,9 +456,11 @@ def route(
         logger.warning(
             "router call failed (%s); falling back to security intent", type(exc).__name__
         )
+        metrics.observe_router_fallback(fallback.intent)
         return fallback
     if _looks_suspicious(result):
         logger.warning("router output looked suspicious; falling back to security intent")
+        metrics.observe_router_fallback(fallback.intent)
         return fallback
 
     context = f"{summary or ''}\n{last_turn or ''}"

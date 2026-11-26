@@ -95,6 +95,13 @@ class FeatureEntry:
     metrics: tuple[str, ...] = ()
     defence_probes: tuple[str, ...] = ()
     quality_probes: tuple[str, ...] = ()
+    # T14.5.3 (DEBT-049): the subset of `quality_probes` above that must PASS whenever a live
+    # DB makes it runnable -- a regression here fails the `registry` gate step, not merely a
+    # printed line. Deliberately a SEPARATE, narrower list from `quality_probes` itself: a
+    # probe can be listed there (reported, documented) without being must-pass (e.g.
+    # `misspelling-tolerance-variants` stays a tracked, honestly-reported partial gap per
+    # DEBT-049, never a registry-blocking failure -- see that probe's own docstring).
+    must_pass_quality_probes: tuple[str, ...] = ()
     router_tags: tuple[str, ...] = ()
     modules: tuple[str, ...] = ()
     dev_only: bool = False
@@ -564,6 +571,9 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         phase="11a",
         status="enabled",
         health_probe=route_probe("POST", "/chat/stream"),
+        # T14.5.4: the aggregate estimated token cost counter -- unlabelled, process-wide,
+        # never per-user/per-conversation (see metrics.ESTIMATED_COST_TOTAL's own docstring).
+        metrics=("secrag_estimated_cost_total",),
         docs="docs/TRD.md",
     ),
     FeatureEntry(
@@ -585,8 +595,17 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         # "responding" stage labels (``generation.answer_question``/``answer_question_stream``'s
         # own `timing.stage(...)` calls around `understand()`) rather than a new metric name --
         # see `assistant/core.py`'s own self-reported limitation on why no new fine-grained
-        # step metric was added in this block.
-        metrics=("secrag_chat_stage_seconds",),
+        # step metric was added in this block. T14.5.2 adds the four telemetry counters below
+        # (intent distribution, rewrite rate, clarification rate, router fallback rate) --
+        # every one labelled ONLY `intent` (the bounded, 5-value Intent vocabulary), never
+        # user text (see metrics.py's own module docstring).
+        metrics=(
+            "secrag_chat_stage_seconds",
+            "secrag_understanding_intent_total",
+            "secrag_understanding_rewrite_total",
+            "secrag_understanding_clarification_total",
+            "secrag_router_fallback_total",
+        ),
         docs="docs/adr/adr_phase14_assistant.md",
     ),
     # --- Quality ---------------------------------------------------------------------
@@ -633,6 +652,14 @@ REGISTRY: tuple[FeatureEntry, ...] = (
         status="enabled",
         health_probe=None,
         quality_probes=("misspelling-tolerance", "misspelling-tolerance-variants"),
+        # T14.5.3 (DEBT-049): the single-item probe becomes MUST-PASS -- it has genuinely
+        # passed on every `--full` run since 13-E (13-E, 14-D2, 14-D2-fix); a future
+        # regression now fails the `registry` gate step, not merely a printed line.
+        # Deliberately does NOT include `misspelling-tolerance-variants`: that probe's own
+        # docstring already documents some (item, typo-strategy) combinations as a KNOWN,
+        # tracked gap (DEBT-049) -- making it must-pass would turn an honestly-reported
+        # partial result into a gate failure for a gap that was never meant to block.
+        must_pass_quality_probes=("misspelling-tolerance",),
         docs="docs/adr/adr_phase13_dashboard.md",
     ),
     # --- Identity ------------------------------------------------------------------------

@@ -7,6 +7,9 @@ exist yet).
 
 from __future__ import annotations
 
+from prometheus_client import Counter
+
+from rag_app import metrics
 from rag_app.assistant.core import (
     Understanding,
     named_owasp_version,
@@ -99,6 +102,66 @@ def test_router_failure_still_degrades_to_security_with_a_measured_latency() -> 
     assert decision.standalone_query == "how do I prevent SQL injection?"
     assert decision.used_fast_path is False
     assert decision.router_latency_s is not None
+
+
+# --- T14.5.2: understanding telemetry (intent distribution, rewrite, clarification) --------
+
+
+def _reset(counter: Counter, intent: str) -> None:
+    counter.labels(intent=intent)._value.set(0)
+
+
+def _value(counter: Counter, intent: str) -> float:
+    return counter.labels(intent=intent)._value.get()
+
+
+def test_understand_records_intent_distribution_for_the_fast_path() -> None:
+    """Fails on the old code: before T14.5.2 the fast path never touched any counter."""
+    _reset(metrics.UNDERSTANDING_INTENT_TOTAL, "chitchat")
+    before = _value(metrics.UNDERSTANDING_INTENT_TOTAL, "chitchat")
+    understand(_FakeChat(), "hola")  # type: ignore[arg-type]
+    assert _value(metrics.UNDERSTANDING_INTENT_TOTAL, "chitchat") == before + 1.0
+
+
+def test_understand_records_intent_distribution_for_a_router_call() -> None:
+    result = RouterOutput(intent="security", language="en", standalone_query="x")
+    _reset(metrics.UNDERSTANDING_INTENT_TOTAL, "security")
+    understand(_FakeChat(result=result), "how do I prevent XSS?")  # type: ignore[arg-type]
+    assert _value(metrics.UNDERSTANDING_INTENT_TOTAL, "security") == 1.0
+
+
+def test_understand_records_a_rewrite_when_standalone_query_differs_from_the_message() -> None:
+    """Fails on the old code: no rewrite counter existed before T14.5.2."""
+    result = RouterOutput(
+        intent="followup", language="en", standalone_query="a genuinely different rewrite"
+    )
+    _reset(metrics.UNDERSTANDING_REWRITE_TOTAL, "security")  # the DA-router-reliability-2
+    # guard turns a context-free "followup" into "security" -- see test above.
+    understand(_FakeChat(result=result), "what about that?")  # type: ignore[arg-type]
+    assert _value(metrics.UNDERSTANDING_REWRITE_TOTAL, "security") == 1.0
+
+
+def test_understand_never_records_a_rewrite_when_standalone_query_matches_the_message() -> None:
+    result = RouterOutput(intent="security", language="en", standalone_query="same message")
+    _reset(metrics.UNDERSTANDING_REWRITE_TOTAL, "security")
+    understand(_FakeChat(result=result), "same message")  # type: ignore[arg-type]
+    assert _value(metrics.UNDERSTANDING_REWRITE_TOTAL, "security") == 0.0
+
+
+def test_understand_records_a_clarification_only_for_an_ambiguous_verdict() -> None:
+    result = RouterOutput(
+        intent="ambiguous", language="en", standalone_query="x", clarification="what do you mean?"
+    )
+    _reset(metrics.UNDERSTANDING_CLARIFICATION_TOTAL, "ambiguous")
+    understand(_FakeChat(result=result), "how do I fix this?")  # type: ignore[arg-type]
+    assert _value(metrics.UNDERSTANDING_CLARIFICATION_TOTAL, "ambiguous") == 1.0
+
+
+def test_understand_never_records_a_clarification_for_a_non_ambiguous_verdict() -> None:
+    result = RouterOutput(intent="security", language="en", standalone_query="x")
+    _reset(metrics.UNDERSTANDING_CLARIFICATION_TOTAL, "ambiguous")
+    understand(_FakeChat(result=result), "how do I prevent SQL injection?")  # type: ignore[arg-type]
+    assert _value(metrics.UNDERSTANDING_CLARIFICATION_TOTAL, "ambiguous") == 0.0
 
 
 # --- retrieval_query (T14.2.7, block 14-C2) -------------------------------------------------

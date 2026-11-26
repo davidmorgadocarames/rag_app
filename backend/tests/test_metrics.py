@@ -8,6 +8,7 @@ import time
 
 import httpx
 import pytest
+from prometheus_client import CollectorRegistry, Counter
 
 from rag_app import metrics
 
@@ -400,3 +401,77 @@ def test_step_sums_cover_exactly_the_stage_time_for_the_three_fixed_stages() -> 
         assert stage_total is not None, stage_name
         assert step_sum <= stage_total + tolerance, (stage_name, step_sum, stage_total)
         assert step_sum >= stage_total - tolerance, (stage_name, step_sum, stage_total)
+
+
+# --- T14.5.2: assistant/router telemetry (intent-only labels, bounded vocabulary) ----------
+
+
+def test_understanding_and_router_counters_have_only_an_intent_label() -> None:
+    assert metrics.UNDERSTANDING_INTENT_TOTAL._labelnames == ("intent",)
+    assert metrics.UNDERSTANDING_REWRITE_TOTAL._labelnames == ("intent",)
+    assert metrics.UNDERSTANDING_CLARIFICATION_TOTAL._labelnames == ("intent",)
+    assert metrics.ROUTER_FALLBACK_TOTAL._labelnames == ("intent",)
+
+
+def test_allowed_intents_matches_the_reviewed_router_vocabulary() -> None:
+    assert metrics.ALLOWED_INTENTS == {
+        "chitchat",
+        "security",
+        "followup",
+        "ambiguous",
+        "off_topic",
+    }
+
+
+def test_observe_understanding_intent_rejects_an_intent_outside_the_allowlist() -> None:
+    """Fails on the old code: before T14.5.2 there was no bounded-vocabulary guard at all,
+    so any string could have been emitted as a label value."""
+    with pytest.raises(metrics.UnknownIntentError):
+        metrics.observe_understanding_intent("not-a-real-intent")
+
+
+def test_observe_understanding_intent_increments_the_counter() -> None:
+    metrics.UNDERSTANDING_INTENT_TOTAL.labels(intent="security")._value.set(0)
+    metrics.observe_understanding_intent("security")
+    assert metrics.UNDERSTANDING_INTENT_TOTAL.labels(intent="security")._value.get() == 1.0
+
+
+def test_observe_router_fallback_increments_the_counter() -> None:
+    metrics.ROUTER_FALLBACK_TOTAL.labels(intent="security")._value.set(0)
+    metrics.observe_router_fallback("security")
+    assert metrics.ROUTER_FALLBACK_TOTAL.labels(intent="security")._value.get() == 1.0
+
+
+# --- T14.5.4: aggregate estimated cost counter (unlabelled, process-wide) ------------------
+
+
+def test_estimated_cost_total_has_no_labels() -> None:
+    assert metrics.ESTIMATED_COST_TOTAL._labelnames == ()
+
+
+def test_observe_estimated_cost_adds_a_positive_amount() -> None:
+    metrics.ESTIMATED_COST_TOTAL._value.set(0)
+    metrics.observe_estimated_cost(0.0042)
+    assert metrics.ESTIMATED_COST_TOTAL._value.get() == pytest.approx(0.0042)
+
+
+def test_observe_estimated_cost_ignores_a_zero_amount() -> None:
+    """A local Ollama answer's cost is always 0.0 (rag_app.cost.estimate_cost) -- never a
+    reason to touch the counter at all (``Counter.inc(0)`` is harmless but pointless)."""
+    metrics.ESTIMATED_COST_TOTAL._value.set(0)
+    metrics.observe_estimated_cost(0.0)
+    assert metrics.ESTIMATED_COST_TOTAL._value.get() == 0.0
+
+
+def test_counter_value_sums_every_sample_for_a_registered_name() -> None:
+    registry = CollectorRegistry()
+    counter = Counter("test_sum_counter_total", "test", ["intent"], registry=registry)
+    counter.labels(intent="security").inc(2)
+    counter.labels(intent="chitchat").inc(3)
+
+    assert metrics.counter_value("test_sum_counter_total", registry) == 5.0
+
+
+def test_counter_value_is_zero_for_an_unregistered_name() -> None:
+    registry = CollectorRegistry()
+    assert metrics.counter_value("not_a_real_metric_total", registry) == 0.0

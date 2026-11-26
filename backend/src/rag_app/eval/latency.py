@@ -79,6 +79,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from rag_app import timing
+from rag_app.assistant.core import understand
 from rag_app.config import get_settings
 from rag_app.db.session import make_engine, make_session_factory
 from rag_app.eval.dataset import DEFAULT_GOLDEN_SET, GoldenItem, load_golden_set
@@ -183,6 +184,16 @@ def _percentile(values: list[float], pct: float) -> float:
 ADOPTED_REL_TOLERANCE = 0.5  # +50% of the adopted baseline's own p95
 ADOPTED_ABS_MARGIN_MS = 25.0  # flat floor under the relative term, for near-zero-ms stages
 
+# T14.5.1: the router's own absolute floor -- the SAME local number
+# `eval/golden_set_v2_floors.json`'s `router_p95_s_local` already enforces in the dialogue-
+# eval gate (that file measures router_latency_s across a different, dialogue-shaped
+# fixture; this one measures it as one more per-stage benchmark sample, under the "classify"
+# stage name production already uses). Mirrored here as its own constant, deliberately NOT
+# imported from that JSON file (same "own hard-coded constant, not a cross-gate import"
+# pattern `rerank_matrix.FLOOR_ABSOLUTE_MS` already uses) -- the two numbers are reviewed
+# together and must be changed together if ever revisited.
+ROUTER_FLOOR_ABSOLUTE_MS = 1500.0
+
 # Settings this check requires to match between the live config and the adopted baseline's
 # recorded machine info -- a mismatch means the two numbers are not comparable (e.g. someone
 # changed `top_k` without re-adopting a baseline) and the step must FAIL loudly rather than
@@ -232,6 +243,9 @@ def check_against_adopted_baseline(
     3. absolute rerank floor -- ``rerank_inference`` p95 must not exceed
        ``rerank_matrix.FLOOR_ABSOLUTE_MS`` (1.5 s, DA-11bE-2's judged 2-thread number),
        regardless of what the baseline itself says -- a hard ceiling untouched by tolerance.
+    4. absolute router floor (T14.5.1) -- ``classify`` (the router call, see
+       ``run_latency_benchmark``'s docstring) p95 must not exceed ``ROUTER_FLOOR_ABSOLUTE_MS``
+       (1.5 s local), same unconditional-hard-ceiling treatment as check 3.
     """
     from rag_app.eval.rerank_matrix import FLOOR_ABSOLUTE_MS
 
@@ -247,7 +261,10 @@ def check_against_adopted_baseline(
     for name, stats in report.stages_ms.items():
         base_stats = baseline_stages.get(name)
         if not base_stats:
-            continue  # a stage new to this run isn't compared (shouldn't happen in practice)
+            # A stage genuinely new to this run (e.g. "classify", T14.5.1, before the next
+            # `--update-adopted-baseline`) is simply not relative-compared -- it still gets
+            # its own absolute floor check below, same as rerank_inference always did.
+            continue
         base_p95 = float(cast("float | int | str", base_stats["p95"]))
         allowed = base_p95 * (1 + ADOPTED_REL_TOLERANCE) + ADOPTED_ABS_MARGIN_MS
         if stats["p95"] > allowed:
@@ -262,6 +279,13 @@ def check_against_adopted_baseline(
         failures.append(
             f"rerank_inference: p95 {rerank_stats['p95']:.1f} ms > the absolute"
             f" {FLOOR_ABSOLUTE_MS:.0f} ms floor (2-thread pinned, DA-11bE-2)"
+        )
+
+    router_stats = report.stages_ms.get("classify")
+    if router_stats is not None and router_stats["p95"] > ROUTER_FLOOR_ABSOLUTE_MS:
+        failures.append(
+            f"classify (router): p95 {router_stats['p95']:.1f} ms > the absolute"
+            f" {ROUTER_FLOOR_ABSOLUTE_MS:.0f} ms floor (1.5s local, T14.5.1)"
         )
 
     return LatencyCheckResult(ok=not failures, failures=failures)
@@ -366,15 +390,28 @@ def run_latency_benchmark(
     reranker_mode: str = "shared",
 ) -> LatencyReport:
     """Run the golden set ``n_runs`` times through the exact same calls
-    ``generation.answer_question`` makes (``reranking.retrieve`` then
-    ``answer_from_chunks``), collecting every stage duration via our OWN
-    ``timing.recorder(on_stage=...)``. ``reranker_mode`` picks which reranker instance(s)
-    the loop uses — see this module's docstring.
+    ``generation.answer_question`` makes (the shared ``understand()`` router stage, T14.5.1,
+    then ``reranking.retrieve``/``answer_from_chunks``), collecting every stage duration via
+    our OWN ``timing.recorder(on_stage=...)``. ``reranker_mode`` picks which reranker
+    instance(s) the loop uses — see this module's docstring.
 
     Deliberately inlined rather than calling ``answer_question`` itself: that function opens
     its own recorder with the Prometheus ``observe_stage`` callback hard-wired (correct for
     the live API), and a recorder cannot be nested — an outer one here would never see any
     stage duration (`timing.stage()` always reports to the innermost active recorder).
+
+    T14.5.1: the router call is timed under the SAME ``"classify"`` stage name
+    ``generation.answer_question``/``answer_question_stream`` already use around their own
+    ``with timing.stage("classify"): understand(...)`` call (see those functions) — not a
+    new stage name — so this benchmark measures exactly the production router cost, and
+    :func:`check_against_adopted_baseline`'s absolute floor (``ROUTER_FLOOR_ABSOLUTE_MS``)
+    applies to the SAME numbers the live API would emit. The golden set's questions are real
+    security questions, never an exact greeting/thanks/farewell, so ``understand()``'s fast
+    path (T14.2.2) never short-circuits here — every sample is a genuine LLM router call, the
+    one this floor is meant to judge. The router's own return value is discarded: this
+    benchmark's retrieval step still searches with the RAW question (unchanged from before
+    this row), matching the pre-T14.5.1 recall numbers exactly -- wiring the router's
+    ``standalone_query`` rewrite into retrieval here too is out of this row's scope.
     """
     from rag_app.generation import answer_from_chunks
     from rag_app.reranking import retrieve
@@ -390,6 +427,8 @@ def run_latency_benchmark(
     for _ in range(n_runs):
         for item in items:
             with timing.recorder(streaming=False, on_stage=on_stage):
+                with timing.stage("classify"):
+                    understand(chat, item.question)
                 chunks = retrieve(
                     session, item.question, reranker=reranker_for(), version=item.version
                 )

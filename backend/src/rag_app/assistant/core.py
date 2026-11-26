@@ -42,6 +42,7 @@ import re
 import time
 from dataclasses import dataclass
 
+from rag_app import metrics
 from rag_app.assistant.fast_path import match_fast_path
 from rag_app.assistant.router import route
 from rag_app.llm import ChatClient
@@ -77,6 +78,7 @@ def understand(
     from ``last_turn`` text."""
     fast_language = match_fast_path(query)
     if fast_language is not None:
+        metrics.observe_understanding_intent("chitchat")
         return Understanding(
             intent="chitchat",
             language=fast_language,
@@ -90,6 +92,14 @@ def understand(
         chat, query, summary=summary, last_turn=last_turn, previous_intent=previous_intent
     )
     router_latency_s = time.perf_counter() - start
+    # T14.5.2: intent distribution (every router call), rewrite rate (a genuine
+    # standalone_query rewrite, never the fast path above) and clarification rate --
+    # labelled ONLY by intent, see metrics.py's own module docstring.
+    metrics.observe_understanding_intent(router_out.intent)
+    if router_out.standalone_query.strip().lower() != query.strip().lower():
+        metrics.observe_understanding_rewrite(router_out.intent)
+    if router_out.intent == "ambiguous":
+        metrics.observe_understanding_clarification(router_out.intent)
     return Understanding(
         intent=router_out.intent,
         language=router_out.language,

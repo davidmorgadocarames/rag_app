@@ -321,9 +321,11 @@ step_private-names() { need_venv && "$PY" -m rag_app.devtools.private_names --ro
 step_threat-catalogue() { need_venv && "$PY" -m rag_app.devtools.threat_catalogue --root "$REPO_ROOT"; }
 
 # T13.0.5: router tags/metrics/modules match rag_app.features.REGISTRY; every health probe
-# answers <= 2s; the misspelling quality probe (expected-fail) still fails whenever a live
-# DB happens to be reachable (the gate's own DATABASE_URL -- a stopped port in --fast, the
-# real gate DB once --full/--only has brought the stack up).
+# answers <= 2s. T14.5.3 (DEBT-049): the single-item misspelling quality probe is now
+# must-pass -- it FAILS the step whenever a live DB is reachable (the gate's own
+# DATABASE_URL -- a stopped port in --fast, the real gate DB once --full/--only has brought
+# the stack up) and the probe itself comes back "failed" (a genuine regression); the harder
+# `misspelling-tolerance-variants` probe stays a tracked, non-blocking gap (DEBT-049).
 step_registry() { need_venv && "$PY" -m rag_app.devtools.registry_check --root "$REPO_ROOT"; }
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }

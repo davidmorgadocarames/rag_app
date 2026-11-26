@@ -14,9 +14,13 @@ Always runs, with or without a live stack (DATABASE_URL is the gate's — a stop
 2. every entry's health probe, each under its own ``≤ 2 s`` deadline (never a build-time
    failure if the stack happens to be down — a probe that returns ``down`` gracefully is
    fine; one that cannot even ANSWER within 2 s is a FAIL).
-3. every registered quality probe, with a real DB session when one is reachable (``--full``);
-   an ``expected-fail`` entry whose probe now PASSES is a FAIL (the registry must be updated,
-   not silently left stale).
+3. every registered quality probe (:func:`check_quality_probes`), with a real DB session
+   when one is reachable (``--full``): an ``expected-fail`` entry whose probe now PASSES is
+   a FAIL (the registry must be updated, not silently left stale); T14.5.3 (DEBT-049) ALSO
+   fails whenever a probe listed in an entry's ``must_pass_quality_probes`` comes back
+   ``failed`` — a real regression, not merely a printed line (a probe NOT in that list, e.g.
+   the harder ``misspelling-tolerance-variants``, can still fail without blocking the gate —
+   DEBT-049's own, honestly-tracked partial gap).
 
     python -m rag_app.devtools.registry_check [--root REPO]
 """
@@ -40,7 +44,49 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
     from sqlalchemy.orm import Session
 
+    from rag_app.features import FeatureEntry
+
 _CONNECT_TIMEOUT_SECONDS = 2
+
+
+def check_quality_probes(entries: tuple[FeatureEntry, ...], session: Session | None) -> list[str]:
+    """Run every registered quality probe once, with ``session`` (or ``None`` — no live DB,
+    every probe reports ``skipped``). Two independent rules can each add a problem for the
+    SAME (entry, probe) pair, for two different reasons:
+
+    1. an ``expected-fail`` entry whose probe now PASSES (T13.0.5) — the registry must be
+       updated, not silently left stale.
+    2. T14.5.3 (DEBT-049): a probe id listed in ``entry.must_pass_quality_probes`` that comes
+       back ``failed`` — a real regression in a probe that has genuinely passed since 13-E,
+       not merely a printed line. A probe NOT in that list (e.g. the harder, honestly-tracked
+       ``misspelling-tolerance-variants``, DEBT-049's own documented partial gap) can still
+       fail without ever adding a problem here.
+
+    Prints one line per probe either way (unchanged from before this function existed) so a
+    human reading the gate log always sees every probe's real outcome, pass/fail/must-pass
+    or not."""
+    problems: list[str] = []
+    for entry in entries:
+        for probe_id in entry.quality_probes:
+            probe = QUALITY_PROBES.get(probe_id)
+            if probe is None:
+                continue  # already reported by check_registry
+            quality_result = probe(session)
+            print(
+                f"  quality probe '{probe_id}' ({entry.id}): {quality_result.outcome} —"
+                f" {quality_result.detail}"
+            )
+            if entry.status == "expected-fail" and quality_result.outcome == "passed":
+                problems.append(
+                    f"{entry.id}: status is 'expected-fail' but quality probe '{probe_id}'"
+                    " now PASSES — update the registry status"
+                )
+            if probe_id in entry.must_pass_quality_probes and quality_result.outcome == "failed":
+                problems.append(
+                    f"{entry.id}: quality probe '{probe_id}' is must-pass (T14.5.3,"
+                    f" DEBT-049) but FAILED — {quality_result.detail}"
+                )
+    return problems
 
 
 def _open_session() -> tuple[Session | None, Engine | None]:
@@ -99,21 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     session, engine = _open_session()
     print(f"registry: quality-probe DB session {'available' if session else 'unavailable'}")
     try:
-        for entry in REGISTRY:
-            for probe_id in entry.quality_probes:
-                probe = QUALITY_PROBES.get(probe_id)
-                if probe is None:
-                    continue  # already reported by check_registry
-                quality_result = probe(session)
-                print(
-                    f"  quality probe '{probe_id}' ({entry.id}): {quality_result.outcome} —"
-                    f" {quality_result.detail}"
-                )
-                if entry.status == "expected-fail" and quality_result.outcome == "passed":
-                    problems.append(
-                        f"{entry.id}: status is 'expected-fail' but quality probe '{probe_id}'"
-                        " now PASSES — update the registry status"
-                    )
+        problems.extend(check_quality_probes(REGISTRY, session))
     finally:
         if session is not None:
             session.close()
