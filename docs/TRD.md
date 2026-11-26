@@ -412,6 +412,46 @@ real follow-up still flips) and
 `test_route_leaves_a_genuinely_ambiguous_spanish_message_with_unrelated_context_alone` (a
 translation-only "resolution" with unrelated context no longer does).
 
+### 6.4d Router reliability: 5 deterministic fixes for the 10 misses (DEC-066, block
+router-reliability), closing 14-D1 + eval-determinism
+
+**What changed.** Block eval-determinism (ADR-only — fixed a non-determinism bug in the eval
+harness itself, `config.Settings.ollama_seed`, no router/prompt change; see the ADR's own
+"eval-determinism" section) proved the router's remaining 10/75 deterministic misses are
+real, not noise. Five fixes close them:
+1. `assistant.fast_path.match_fast_path` also fast-paths a LONE word within one edit of a
+   greeting root ("hello"/"hola") — never inside a sentence. No router/model call at all for
+   these messages, so this fix is 100% deterministic by construction.
+2. `router._ROUTER_SYSTEM`'s `security` bullet now names security infrastructure (firewalls,
+   proxies, TLS, WAF) as in-scope even when our corpus does not cover the specific vendor
+   product (the ANSWER step's abstention handles that, not routing); `off_topic` is reserved
+   for subjects not about security at all.
+3. `router._names_a_security_term`: a deterministic tie-breaker overriding `ambiguous` to
+   `security` when the message itself already names a security term (en/es), independent of
+   context.
+4. `router._previous_turn_asked_the_clarification` + a new `previous_intent` parameter on
+   `understand()`/`route()`: the reply to a clarifying question is a NEW security question,
+   never a followup to the old topic. Caller-tracked (never inferred from reply text — an
+   `off_topic` redirect can also end in "?").
+5. `router._is_bare_reference_query` + `_memory_subject`: a bare pronoun/reference question
+   ("what rank does it have...") with a real subject in the conversation summary's own
+   `topics`/`entities` is always a followup, resolved from memory directly rather than
+   trusting the model's own (sometimes unresolved) rewrite.
+
+**Order preserved.** All three new tie-breakers (3/4/5) run strictly after the existing
+delimited-untrusted-data → schema validation → security fallback → suspicious-output-screen
+sequence (§6.2/§6.3) — none adds a new attacker-reachable path; each only relabels an output
+the already-screened router produced. None can ever produce `chitchat` (the only
+cap-exempt/fast-path intent) — only `security`/`followup`, both still running the full
+retrieve → generate → groundedness-check → cite-or-abstain path.
+
+**Measured effect.** 10/75 → 2/75 deterministic misses, on 2 byte-identical `--only eval` runs
+(`intent_accuracy` 0.867 → 0.973, `follow_up_resolution` 0.700 → 1.0, `conversational_reply_rate`
+0.833 → 1.0, now also enforced). See the ADR's "router-reliability" decision section for the
+full table, the 2 new misses change 2's prompt wording introduced (a self-reported, accepted
+trade-off — fixing them cleanly re-opened a different deterministic miss instead, not a net
+improvement), and the greeting-typo fast path's own known false-positive risk.
+
 ### 6.5 Conversational answers (T14.3.1–T14.3.5, block 14-D1)
 
 **What changed.** The THREE entry points that already call `understand()`/dispatch on

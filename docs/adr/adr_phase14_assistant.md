@@ -1166,7 +1166,137 @@ router-prompt fix (out of DEC-064's scope, and 14-D1's own report already names 
 needed, separate router-reliability block). See "Needs the user's decision" in the senior's
 handback for how to proceed with 14-D1's closure given this.
 
+## Decision — router-reliability: 5 deterministic fixes for the 10 misses (DEC-066), closing
+14-D1 + eval-determinism
+
+DEC-066's own concrete 6-change plan, implemented exactly:
+
+1. **Greeting typos (`assistant.fast_path.match_fast_path`), no router/model involved at
+   all.** A LONE word within one edit (substitution/insertion/deletion) of a greeting root
+   ("hello"/"hola") now fast-paths — never inside a sentence (the whole, punctuation-trimmed
+   message must be exactly that one word). Fixes `typo-hol-greeting`/`typo-hell-greeting`/
+   `dlg-typo-then-followup` turn 0 (observed `off_topic`, expected `chitchat`) 100%
+   deterministically, since the router is never even called for these messages. **Known,
+   accepted false-positive risk** (self-reported, same discipline as every other block's
+   boundary): a one-edit check cannot distinguish a genuine typo ("holz") from a real,
+   unrelated short word that happens to also be one edit from a root ("hold" vs "hola") — low
+   risk (a standalone "hold" routed to chit-chat is a minor UX quirk, never a security issue;
+   proven by the compound/injection security tests in `test_assistant_router.py`/
+   `test_assistant_fast_path.py`, which show this never widens past a LONE word).
+2. **Security infrastructure our corpus does not cover is still `security`, never
+   `off_topic`** (`router._ROUTER_SYSTEM`, prompt text only). The `security` bullet now names
+   configuring security infrastructure (firewalls, proxies, TLS, WAF) as in-scope even when
+   our own OWASP corpus does not cover the specific vendor product — that is the ANSWER
+   step's job to abstain on, never a routing decision; `off_topic` is now explicitly reserved
+   for subjects that are not about security at all. Fixes `abstain-en-cisco`/
+   `abstain-es-nginx`/`dlg-abstention-then-recover` turn 0.
+3. **A self-contained security question is never `ambiguous`**
+   (`router._names_a_security_term`, a deterministic code-level tie-breaker). When the model
+   says `ambiguous` but the message ITSELF already names a recognisable security term (en/es),
+   the verdict is corrected to `security`, independent of conversation context. Fixes
+   `dlg-abstention-then-recover` turn 1.
+4. **The reply to a clarifying question is a NEW security question**
+   (`router._previous_turn_asked_the_clarification`). When the PREVIOUS turn's own decision
+   was `ambiguous` (its reply was the clarifying question itself) and this turn's raw
+   intent is `followup`/`ambiguous`, it is corrected to `security` — never a followup to
+   whatever topic preceded the clarification. `route()`/`understand()` grow a caller-tracked
+   `previous_intent` parameter (never inferred from `last_turn` TEXT: an `off_topic` redirect
+   reply can also end in a question mark, e.g. "Would you like to ask about security
+   instead?", which would misfire on an unrelated, already-correct multi-turn-back follow-up
+   — change 5's own dialogues). **Self-reported boundary:** only `eval.runner
+   .evaluate_dialogues` tracks and passes `previous_intent` today — `api.conversations` (the
+   live `/chat/stream` path) does not yet persist a per-turn intent, so this fix benefits the
+   deterministic eval now; extending it to live chat needs a small schema/wiring follow-up.
+   Fixes `dlg-ambiguous-then-clarify` turn 1.
+5. **A bare pronoun/reference question with a subject in memory is always a followup**
+   (`router._is_bare_reference_query` + `_memory_subject`). A message that names no content
+   word of its own beyond generic position/edition/version vocabulary (en/es) — "what rank
+   does IT have...", or the Spanish pro-drop equivalent with no pronoun at all — is resolved
+   from the conversation summary's own `topics`/`entities` fields DIRECTLY (parsed from the
+   real JSON `summarize_turn` writes) rather than trusting the model's own (sometimes
+   unresolved) `standalone_query`. Fixes the `dlg-followup-3-back*` family's final,
+   several-turns-back follow-up turn, in both languages.
+6. **Persistent `OLLAMA_NUM_PARALLEL=1`.** `tools/ops/resume.sh` (private, orchestrator-owned
+   per the brief) now exports it before every `ollama serve` it starts — outside this block's
+   `touches`, confirmed already done before this block began. **Follow-up needed, not done by
+   this block (outside `touches`):** `scripts/gate.sh` should warn when it finds a native
+   Ollama server already running WITHOUT the var — recorded in `status/blocks/
+   router-reliability.md`, not implemented here (another branch, `f24-check`, also edits
+   `scripts/gate.sh`; this block was briefed not to touch it).
+
+### Order preserved (security)
+
+Every new tie-breaker (3, 4, 5) runs strictly AFTER the existing, already-reviewed sequence:
+delimited-untrusted-data handling (`build_router_messages`) → strict schema validation
+(`chat_json`) → the conservative `security` fallback on ANY failure → the suspicious-output
+screen (`_looks_suspicious`). A reply that echoes a delimiter marker still falls back to
+`security` with the ORIGINAL query regardless of how "ambiguous"-shaped or security-term-laden
+the message is (`test_security_term_tie_breaker_never_fires_on_a_suspicious_reply`) — none of
+the 3 new tie-breakers adds a new attacker-reachable code path; each only relabels an output
+the already-screened router itself produced, same reasoning DA-14-C4's own review already
+established for the pre-existing tie-breaker. None can ever produce `chitchat` (the only
+intent the daily-cap/fast-path exemption grants) — they only ever resolve TOWARDS `security`/
+`followup`, both of which still run the full retrieve → generate → groundedness-check →
+cite-or-abstain path.
+
+### Measured effect — 2 real `--only eval` runs on the final code, BYTE-IDENTICAL (n=75)
+
+| Metric | eval-determinism baseline (83bf53c) | Run 1 (`gate-20261126T003647Z-3588786.log`) | Run 2 (`gate-20261126T004905Z-3590916.log`) | Floor | Met (both)? | Enforced? |
+|---|---|---|---|---|---|---|
+| intent_accuracy | 0.867 | 0.9733333333333334 | 0.9733333333333334 | ≥ 0.90 | **yes** | yes (already) |
+| follow_up_resolution | 0.700 | 1.0 | 1.0 | ≥ 0.85 | **yes** | yes (already) |
+| noisy_recall | 1.000 | 1.0 | 1.0 | ≥ 0.90 | yes | yes (already) |
+| conversational_reply_rate | 0.833 | 1.0 | 1.0 | ≥ 1.00 | **yes, both runs** | **yes, from this block** |
+| greeting_reply_p95_s | 1.628 | 1.5902445820102002 | 1.6275182380049955 | ≤ 2.0s | yes | yes (already) |
+| router_p95_s | 1.222 | 1.116358497994952 | 1.0969021230121143 | ≤ 1.5s local | yes | yes (already) |
+
+v1 clean metrics, both runs: `retrieval_recall`/`faithfulness`/`correctness`/
+`correct_abstention` all **1.0** (unchanged). `scripts/gate.sh --only eval`'s own
+`eval/golden_set_v2_results.json` is BYTE-IDENTICAL between the two runs (confirmed by a full
+structural diff) except the timing fields — the fix did not reintroduce the non-determinism
+DEC-064 eliminated.
+
+**10/75 → 2/75 misses.** 8 of the original 10 deterministic misses are fixed (all 3 greeting
+typos, all 3 uncovered-security-infra items, the self-contained-question item, the
+reply-to-clarification item, and both `dlg-followup-3-back*`/`-es*` 3-back follow-up turns —
+change 5 fixes BOTH the originally-named `-2025` variants AND the plain/`-es` variants, which
+this run's own measurement also showed missing at the `83bf53c` baseline, not just the 2 DEC-066
+named explicitly).
+
+### Known limitation (self-reported, not just design) — 2 new misses from change 2's prompt
+wording
+
+Change 2's prompt rewording introduced **2 new deterministic misses NOT present in the
+10-item baseline**: `es-bac-rank-2021` turn 0 and `dlg-followup-doc-version` turn 0 (both
+FIRST turns, no conversation context at all — expected `security`, observed `followup`).
+Root-cause isolated with a disposable `git worktree --detach 83bf53c` and direct `route()`
+probes (same technique as 14-C4's own re-diagnosis): restoring the ORIGINAL (pre-change-2)
+prompt wording on top of this block's own tie-breaker code makes both items pass again,
+confirming the new misses are caused by the prompt text change itself (most likely the new
+Cisco-ASA few-shot interacting with 14-C3's own pre-existing "rank in edition" follow-up
+few-shot, which shares near-identical wording with these two self-contained, no-context
+questions) — not by any of the 3 new code-level tie-breakers, none of which can fire on a
+first turn with no `summary`/`last_turn` at all. A milder prompt wording was tried and
+confirmed to avoid this specific regression, but then left `abstain-en-cisco` itself
+unfixed (it only fixed the Spanish nginx item) — trading one deterministic miss for another,
+not a net improvement. **Decision: keep the stronger wording** (this is a NET improvement,
+10 → 2 misses, both floors cleared with a large margin on both runs) rather than chase a
+zero-regression prompt that 14-D1's own report already warned is a real risk ("two reworded
+few-shot attempts, both reverted after causing new regressions elsewhere" — the same
+whack-a-mole this block avoids repeating). Tracked as a known, accepted trade-off, not hidden.
+
 ## Rollback
+
+router-reliability: changes LIVE runtime behaviour (the router prompt text and 3 new
+deterministic tie-breakers; `assistant.fast_path.match_fast_path` fast-paths a lone
+greeting-typo word) — no new schema, no migration, no new persisted data, no deployed-image
+step. `understand()`/`route()` gain an additive, defaulted `previous_intent: str | None =
+None` parameter — every pre-existing caller that does not pass it keeps its old behaviour
+unchanged. A plain `git revert` of this block's commit(s) restores eval-determinism's
+behaviour exactly (reopening the 10/75 deterministic misses this block fixes to 2/75); if
+reverted, `eval/golden_set_v2_floors.json`'s `enforce.conversational_reply_rate` must also
+revert to `false` in the same revert or `gate.sh --full` will fail on the lower, pre-block
+number (0.833, below its own 1.00 floor).
 
 eval-determinism: `config.Settings.ollama_seed` is new, additive settings surface (default
 `42`, sent as `options.seed`) — no schema, no migration, no deployed-image step; reverting

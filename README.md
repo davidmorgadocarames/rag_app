@@ -189,10 +189,18 @@ cd rag_app
 ```bash
 scripts/dev/create_dev_volume.sh               # once: the database volume (never recreated)
 docker compose up -d db db-roles               # PostgreSQL 16 + pgvector on :5432, DB roles
-ollama serve &                                 # or run Ollama as a desktop app / service
+OLLAMA_NUM_PARALLEL=1 ollama serve &           # or run Ollama as a desktop app / service
 ollama pull bge-m3                             # embeddings
 ollama pull qwen2.5:7b-instruct-q4_K_M         # chat model
 ```
+
+`OLLAMA_NUM_PARALLEL=1` (router-reliability, DEC-066 change 6) disables Ollama's own
+server-side concurrent-request batching/slot reuse — needed, together with the app's fixed
+`ollama_seed` (`backend/src/rag_app/config.py`), for a reproducible `eval` gate step. Without
+it, two runs of IDENTICAL code can land on different (each internally consistent) router
+decisions on a close call, which can make `--only eval`/`--full` pass or fail at random
+(eval-determinism, DEC-064). `tools/ops/resume.sh` already exports it before every `ollama
+serve` it starts.
 
 The development database lives in one fixed Docker volume, `rag_ia_pgdata`, declared
 `external` in `docker-compose.yml`: compose never creates or deletes it (not even with
@@ -379,7 +387,7 @@ the script's own re-entrant calls never write a log file; nothing prunes the dir
 The containers use a **native** Ollama (GPU, `ollama serve` in WSL2) by default:
 
 ```bash
-ollama serve &                                   # listens on 127.0.0.1:11434 only
+OLLAMA_NUM_PARALLEL=1 ollama serve &             # listens on 127.0.0.1:11434 only
 ollama pull bge-m3 && ollama pull qwen2.5:7b-instruct-q4_K_M
 scripts/dev/create_dev_volume.sh                 # once
 JWT_SECRET=... DATA_MASTER_KEY=... docker compose up -d --build   # db → roles → migrate → backend :8000, frontend :3000
