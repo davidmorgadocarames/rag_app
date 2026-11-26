@@ -1,22 +1,37 @@
 // T14.4.1/T14.4.2/T14.4.3 (block 14-D2): the chat UI's visible "plan" panel, through a real
-// chat turn (register -> one streamed security question, same backend+frontend pair every
+// chat turn (login -> one streamed security question, same backend+frontend pair every
 // other spec in this directory uses, scripts/gate.sh's `e2e` step; --full only). Proves, in
 // a real browser, what lib/planSteps.test.ts can only prove against synthetic events: the
 // REAL SSE "step" events (T14.4.1) actually drive the panel end to end -- collapsed by
 // default, a live one-line status, expandable via a real keyboard-operable <button>, and
 // the full ordered transcript once expanded.
+//
+// E2E_PLAN_PANEL_EMAIL (scripts/gate.sh's own e2e_seed_admin): seeded directly, never
+// registered through the UI (14-D2-fix: this test's own intent is "does the plan panel
+// render during a real chat turn", not "does registration work" -- auth.spec.ts already
+// proves registration end to end). 14-D2's original version used `registerAndReachChat`,
+// a real `/auth/register` call -- the 5th real UI registration sharing this gate step's one
+// backend process, which tipped `rag_app.risk.SignupTracker`'s already-documented
+// 5-signups/hour/IP budget (scripts/gate.sh's E2E_PLAN_PANEL_EMAIL comment has the detail)
+// and deterministically 403-ed an unrelated test, auth.spec.ts's Mailpit-verify flow,
+// reproduced 4/4 times and root-caused running `gate.sh --only e2e`.
 import { expect, test } from "@playwright/test";
 
-import { registerAndReachChat, uniqueEmail } from "./helpers.ts";
+import { loginAndReachChat } from "./helpers.ts";
 
 const SECURITY_QUESTION = "How do I prevent SQL injection?";
+const PLAN_PANEL_EMAIL = process.env.E2E_PLAN_PANEL_EMAIL;
+const PLAN_PANEL_PASSWORD = process.env.E2E_ADMIN_PASSWORD;
+
+test.skip(
+  !PLAN_PANEL_EMAIL || !PLAN_PANEL_PASSWORD,
+  "E2E_PLAN_PANEL_EMAIL/E2E_ADMIN_PASSWORD not set -- only scripts/gate.sh's step_e2e sets these",
+);
 
 test("chat: the plan panel is collapsed by default, shows a live status, and expands via keyboard to the full ordered transcript", async ({
   page,
 }) => {
-  const email = uniqueEmail("e2e-plan");
-  const password = "correct-horse-battery-staple";
-  await registerAndReachChat(page, email, password);
+  await loginAndReachChat(page, PLAN_PANEL_EMAIL as string, PLAN_PANEL_PASSWORD as string);
   await expect(page).toHaveURL(/\/chat$/);
 
   const thread = page.getByTestId("chat-thread");

@@ -623,6 +623,19 @@ E2E_PLAIN_USER_EMAIL="e2e-plain-user@example.test"
 # enrols/step-ups MFA on that exact account) can never interleave with wakeup.spec.ts's own
 # chat/login traffic on the one account.
 E2E_WAKEUP_EMAIL="e2e-wakeup@example.test"
+# T14.4.1-fix (block 14-D2-fix): plan-panel.spec.ts's own plain user, seeded directly for the
+# SAME signup-velocity reason as E2E_PLAIN_USER_EMAIL/E2E_WAKEUP_EMAIL above. 14-D2 itself
+# wired this spec through `registerAndReachChat` (a real `/auth/register` call) -- the 5th
+# real UI registration sharing this step's one backend process (admin.spec.ts, mfa.spec.ts,
+# auth.spec.ts's two inline registrations already used 4), which tipped `rag_app.risk.
+# SignupTracker`'s already-documented 5-signups/hour/IP budget (see E2E_PLAIN_USER_EMAIL's
+# own comment -- "a 6th registration in one run tripped it") and deterministically 403-ed
+# whichever registration happened to land 6th in THIS run's own worker scheduling: auth.spec
+# .ts's unrelated Mailpit-verify test (`auth.spec.ts:92:5`, reproduced 4/4 times, root-caused
+# running `gate.sh --only e2e` and reading `test-results/.../error-context.md`: "signup
+# blocked by risk check"). Never shares E2E_WAKEUP_EMAIL itself so a parallel wakeup*.spec.ts
+# run's own chat/login traffic can never interleave with this one account's.
+E2E_PLAN_PANEL_EMAIL="e2e-plan-panel@example.test"
 # DEC-036 (DA-13-C-6): step_security-headers's own admin for its /admin walk -- separate from
 # step_e2e's so the two steps' real MFA enrolments never collide in one gate DB lifetime.
 E2E_SECHDR_ADMIN_EMAIL="e2e-sechdr-admin@example.test"
@@ -775,7 +788,10 @@ e2e_seed_admin() {
     "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_PLAIN_USER_EMAIL" --role user) \
     && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
     DATA_MASTER_KEY="$E2E_MASTER_KEY" \
-    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_WAKEUP_EMAIL" --role user)
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_WAKEUP_EMAIL" --role user) \
+    && (cd "$REPO_ROOT/backend" && DATABASE_URL="$DATABASE_URL" E2E_ADMIN_PASSWORD="$E2E_ADMIN_PASSWORD" \
+    DATA_MASTER_KEY="$E2E_MASTER_KEY" \
+    "$VENV/bin/python" -m rag_app.devtools.e2e_seed_admin --email "$E2E_PLAN_PANEL_EMAIL" --role user)
 }
 
 step_e2e() {
@@ -815,11 +831,13 @@ step_e2e() {
   # not-found.spec.ts (T13.10.3/DEBT-057): the custom 404 page -- real HTTP 404 status, single
   # "Back to login" link, no path echo, /api/... negative control, phone width, no extra env.
   # plan-panel.spec.ts (T14.4.1-3, block 14-D2): the chat UI's visible-plan panel, through a
-  # real registered user + one real chat turn -- no extra env needed (same `registerAndReach
-  # Chat` helper auth.spec.ts already uses). Added to this explicit list because this step
-  # never runs the whole `e2e/` directory -- a spec not named here simply never executes in
-  # `gate.sh --full`/CI (found running this block's own first `--full` attempt: the spec was
-  # committed and in `touches`, but never appeared in the 29-test run until added here).
+  # real chat turn. Added to this explicit list because this step never runs the whole
+  # `e2e/` directory -- a spec not named here simply never executes in `gate.sh --full`/CI
+  # (found running this block's own first `--full` attempt: the spec was committed and in
+  # `touches`, but never appeared in the 29-test run until added here). **Fixed (14-D2-fix):**
+  # originally registered through the UI (`registerAndReachChat`) -- see E2E_PLAN_PANEL_EMAIL's
+  # own comment above for why that tipped the signup-velocity budget and 403-ed an unrelated
+  # test; now logs in with its own seeded account instead, same pattern as E2E_WAKEUP_EMAIL.
   # MAILPIT_API_URL (T12.4.4): auth.spec.ts's register -> Mailpit -> verify test reads the
   # verification email through the gate's own Mailpit (e2e_ensure_mailpit, above).
   (cd "$REPO_ROOT/frontend" && E2E_BASE_URL="http://localhost:$E2E_FRONTEND_PORT" \
@@ -829,6 +847,7 @@ step_e2e() {
     E2E_ERASE_TARGET_EMAIL="$E2E_ERASE_TARGET_EMAIL" \
     E2E_PLAIN_USER_EMAIL="$E2E_PLAIN_USER_EMAIL" \
     E2E_WAKEUP_EMAIL="$E2E_WAKEUP_EMAIL" \
+    E2E_PLAN_PANEL_EMAIL="$E2E_PLAN_PANEL_EMAIL" \
     npx playwright test e2e/auth.spec.ts e2e/admin.spec.ts e2e/admin-dashboard.spec.ts \
       e2e/mfa.spec.ts e2e/wakeup.spec.ts e2e/wakeup-slow.spec.ts e2e/wakeup-pipeline.spec.ts \
       e2e/not-found.spec.ts e2e/plan-panel.spec.ts)
