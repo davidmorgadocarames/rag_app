@@ -168,8 +168,10 @@ eval runner alike by ONE shared understanding step, `rag_app.assistant.core.unde
    greeting/thanks/farewell (en/es — e.g. `"hi"`, `"hola"`, `"thanks"`) skips the LLM router
    only; the reply is itself LLM-generated (`generate_chitchat_reply`, ≤ 80 tokens, P14-D1)
    with a bilingual template fallback on any failure (timeout, HTTP error, empty reply) —
-   never a hard failure of the chat turn. A lone typo ("hol", "hell") is deliberately NOT an
-   exact match, so it reaches the router instead (the plan's own phrasing for this rule).
+   never a hard failure of the chat turn. **Updated (router-reliability, DEC-066 change 1):**
+   a LONE word within one edit of a greeting root ("hello"/"hola" — "hol", "hell", "helo",
+   "holaa") ALSO fast-paths now (superseding the plan's original "a lone typo is NOT exact"
+   phrasing) — never inside a sentence/compound message (§6.4d).
 2. **LLM router** (`rag_app.assistant.router.route`, T14.2.3): `chat_json` against
    `RouterOutput {intent: chitchat|security|followup|ambiguous|off_topic, language, standalone_query,
    clarification?}`. The user's message (and, from 14-C1, the conversation summary/last turn)
