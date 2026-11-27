@@ -1816,7 +1816,7 @@ hard-coded locations (`REPO_ROOT/status/...` and `~/proyectos/rag_app/status/...
 clone at any OTHER path than `~/proyectos/wt/<name>`/`~/proyectos/rag_app` still needs either
 `--prices` or `$SECRAG_AZURE_PRICES` set explicitly — not auto-discovered by any smarter search
 (e.g. walking parent directories). Documented rather than solved further, since both repo
-locations are this project's own fixed convention (ORCHESTRATION.md's Environment section).
+locations are this project's own fixed, documented environment convention.
 
 ## Rollback
 
