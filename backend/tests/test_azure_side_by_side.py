@@ -130,6 +130,173 @@ def test_cost_guard_from_file_raises_cleanly_when_path_is_missing(tmp_path: Path
         sbs.CostGuard.from_file(1.0, path=tmp_path / "does-not-exist.json")
 
 
+# --- CostGuard.settle(): true-up to real usage (DA-14.7-migration-live-2a-1, part 2d) -------
+
+
+def test_cost_guard_settle_reduces_spent_eur_when_real_usage_is_lower() -> None:
+    guard = _guard(max_eur=1.0)
+    entry = guard.reserve("phase", model="gpt-5-mini", tokens_in=200.0, tokens_out=3072.0)
+    reserved_eur = entry["eur"]
+    settled = guard.settle(entry, tokens_in=200.0, tokens_out=50.0)
+    assert guard.spent_eur < reserved_eur
+    assert guard.spent_eur == pytest.approx(settled["actual_eur"])
+    assert entry["actual_tokens_out"] == 50.0
+
+
+def test_cost_guard_settle_a_fake_gpt5_mini_large_reasoning_token_count_trues_up_not_blocks() -> (
+    None
+):
+    """A fake gpt-5-mini response reporting a LARGE ``completion_tokens`` (reasoning tokens
+    counted as part of the output total, same as Azure's own usage field) settles the cost guard
+    UP to the real usage -- never raises, even past the worst-case bound that was reserved: the
+    call already happened and cannot be undone."""
+    guard = _guard(max_eur=1.0)
+    entry = guard.reserve(
+        "token-budget:answer", model="gpt-5-mini", tokens_in=200.0, tokens_out=100.0
+    )
+    settled = guard.settle(entry, tokens_in=200.0, tokens_out=50_000.0)
+    assert settled["actual_tokens_out"] == 50_000.0
+    assert guard.spent_eur == pytest.approx(settled["actual_eur"])
+    assert guard.spent_eur > entry["eur"]  # trued UP well past the worst-case reservation
+
+
+# --- make_guarded_post: per-CALL reservation + settlement (DA-14.7-migration-live-2a-1) -----
+
+
+_FAKE_GPT5_URL = (
+    "https://fake.example.openai.azure.com/openai/deployments/gpt-5-mini/"
+    "chat/completions?api-version=2024-10-21"
+)
+
+
+def test_make_guarded_post_reserves_the_real_per_call_bound_not_a_flat_estimate() -> None:
+    def fake_post(url: str, *, headers: Any, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 10, "prompt_tokens": 20},
+            },
+        )
+
+    guard = _guard(max_eur=1.0)
+    guarded = sbs.make_guarded_post(guard, "test-phase", post=fake_post)
+    guarded(
+        _FAKE_GPT5_URL,
+        headers={},
+        json={"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 3072},
+        timeout=30,
+    )
+    assert guard.log[0]["model"] == "gpt-5-mini"
+    assert guard.log[0]["tokens_out"] == 3072.0  # the real worst case reserved, not a flat 600
+    assert guard.log[0]["actual_tokens_out"] == 10.0  # settled down to the real usage
+    assert guard.spent_eur == pytest.approx(guard.log[0]["actual_eur"])
+
+
+def test_make_guarded_post_refuses_a_call_with_no_max_tokens_bound() -> None:
+    calls: list[int] = []
+
+    def fake_post(*_a: Any, **_kw: Any) -> httpx.Response:
+        calls.append(1)
+        raise AssertionError("must never be called without a reservable bound")
+
+    guard = _guard(max_eur=1.0)
+    guarded = sbs.make_guarded_post(guard, "test-phase", post=fake_post)
+    with pytest.raises(RuntimeError, match="no worst case to reserve"):
+        guarded(_FAKE_GPT5_URL, headers={}, json={"messages": []}, timeout=30)
+    assert calls == []
+    assert guard.log == []
+
+
+def test_make_guarded_post_negative_control_blocks_before_the_real_call() -> None:
+    calls: list[int] = []
+
+    def fake_post(*_a: Any, **_kw: Any) -> httpx.Response:
+        calls.append(1)
+        raise AssertionError("must never be called once the cap is exhausted")
+
+    guard = _guard(max_eur=0.0)
+    guarded = sbs.make_guarded_post(guard, "test-phase", post=fake_post)
+    with pytest.raises(sbs.CostCapExceeded):
+        guarded(
+            _FAKE_GPT5_URL,
+            headers={},
+            json={"messages": [], "max_completion_tokens": 100},
+            timeout=30,
+        )
+    assert calls == []
+
+
+def test_make_guarded_post_429_retry_re_reserves_without_double_counting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sbs.time, "sleep", lambda *_a, **_kw: None)
+    attempts: list[int] = []
+
+    def fake_post(url: str, *, headers: Any, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        request = httpx.Request("POST", url)
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(429, request=request, json={"error": {"message": "slow down"}})
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 10, "prompt_tokens": 20},
+            },
+        )
+
+    guard = _guard(max_eur=1.0)
+    guarded = sbs.make_guarded_post(guard, "test-phase", post=fake_post)
+    response = guarded(
+        _FAKE_GPT5_URL,
+        headers={},
+        json={"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 3072},
+        timeout=30,
+    )
+    assert response.status_code == 200
+    assert len(attempts) == 2
+    assert len(guard.log) == 2  # one log entry per attempt, kept for audit
+    assert guard.log[0]["actual_eur"] == 0.0  # the rejected 429 attempt billed nothing
+    # the running total reflects ONLY the successful retry -- never double-counted.
+    assert guard.spent_eur == pytest.approx(guard.log[1]["actual_eur"])
+
+
+def test_make_guarded_post_stops_before_call_n_when_the_cap_is_tight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def fake_post(url: str, *, headers: Any, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        calls.append(1)
+        request = httpx.Request("POST", url)
+        # No "usage" key -- settle() then falls back to the full worst-case bound, so each
+        # successful call's TRUED-UP cost still equals its own reservation (makes the running
+        # total grow predictably, call after call, for this test's cap-sizing arithmetic).
+        return httpx.Response(
+            200, request=request, json={"choices": [{"message": {"content": "ok"}}]}
+        )
+
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 3072}
+    # tokens_in exactly matches `_estimate_input_tokens` on this body's own messages (len("hi")
+    # / 4 == 0.5) so the cap below lines up exactly with what `_guarded` will actually reserve.
+    one_call_eur = _guard(max_eur=1.0).estimate(
+        model="gpt-5-mini", tokens_in=0.5, tokens_out=3072.0
+    )["eur"]
+    # cap big enough for exactly 2 calls' worst case, too tight for a 3rd.
+    guard = _guard(max_eur=one_call_eur * 2.0 + one_call_eur * 0.5)
+    guarded = sbs.make_guarded_post(guard, "test-phase", post=fake_post)
+
+    guarded(_FAKE_GPT5_URL, headers={}, json=body, timeout=30)
+    guarded(_FAKE_GPT5_URL, headers={}, json=body, timeout=30)
+    with pytest.raises(sbs.CostCapExceeded):
+        guarded(_FAKE_GPT5_URL, headers={}, json=body, timeout=30)
+    assert len(calls) == 2  # stopped BEFORE the 3rd call, never made it
+
+
 # --- resolve_prices_path: resolution order (part 2c, F22-class worktree bug) ----------------
 #
 # The bug this part fixes: a worktree's own status/ (e.g. ~/proyectos/wt/14-A1/status/) has no
@@ -547,14 +714,66 @@ def test_measure_token_budget_never_stores_prompt_or_response_text(
         assert measurement["visible_tokens"] == 40
     assert "the answer text" not in json.dumps(result)
     assert result["recommended_max_tokens"] is not None
+    # DA-14.7-migration-live-2a-1: the cost guard settled DOWN to the real completion_tokens
+    # (120), not left at whatever max_tokens bound was reserved.
+    assert guard.log[-1]["actual_tokens_out"] == 120.0
+
+
+def test_measure_token_budget_continues_after_one_prompt_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-live-2a-2: a single failed representative prompt (HTTP 500) must not
+    crash this whole phase -- it records error_type/status_code for that one measurement and
+    continues to the remaining prompts, exactly like run_smoke already does per call."""
+    calls: list[int] = []
+
+    def fake_post(url: str, *, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        calls.append(1)
+        request = httpx.Request("POST", url)
+        if len(calls) == 1:
+            return httpx.Response(500, request=request, json={"error": {"message": "boom"}})
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "completion_tokens": 120,
+                    "completion_tokens_details": {"reasoning_tokens": 80},
+                },
+            },
+        )
+
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    result = sbs.measure_token_budget(settings, guard, _fixture_dialogues(), post=fake_post)
+
+    assert len(result["measurements"]) == 3  # router/answer/groundedness all attempted
+    assert result["measurements"][0]["error_type"] == "HTTPStatusError"
+    assert result["measurements"][0]["status_code"] == 500
+    assert result["measurements"][0]["completion_tokens"] is None
+    assert result["measurements"][1]["reasoning_tokens"] == 80
 
 
 # --- Side-by-side phase: cost guard still gates it, metrics flow through -------------------
 
 
-def test_run_side_by_side_reserves_cost_before_evaluating_and_reports_metrics(
+class _FakeSession:
+    def __enter__(self) -> _FakeSession:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def test_run_side_by_side_reserves_per_call_not_a_flat_phase_estimate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """DA-14.7-migration-live-2a-1 fix: no more flat per-deployment reservation -- when
+    ``evaluate_dialogues`` makes ZERO real Azure calls (faked here, as in part 2b's own test),
+    the cost guard must not charge anything for a deployment it never actually called. Also
+    covers the DA-14.7-migration-live-2a-3 fix: per_turn rows (dialogue_id/turn_index/correct/
+    latency_s/tokens_in/tokens_out/eur, never reply_text) and dialogue progress counters."""
     fixture_result = DialogueTurnResult(
         dialogue_id="fixture-1",
         turn_index=0,
@@ -578,23 +797,134 @@ def test_run_side_by_side_reserves_cost_before_evaluating_and_reports_metrics(
         lambda session, dialogues, chat=None, top_n=None: [fixture_result],
     )
 
-    class _FakeSession:
-        def __enter__(self) -> _FakeSession:
-            return self
-
-        def __exit__(self, *exc: Any) -> None:
-            return None
-
     guard = _guard(max_eur=1.0)
     settings = _fake_settings()
     subset = sbs.azure_subset(_fixture_dialogues(), size=30)
     result = sbs.run_side_by_side(settings, guard, lambda: _FakeSession(), subset)
 
-    assert set(result) == {sbs.BASELINE_DEPLOYMENT, sbs.CANDIDATE_DEPLOYMENT}
-    for entry in result.values():
+    assert guard.log == []  # no real Azure call was made -> nothing reserved (2a-1 fix)
+    assert set(result) == {sbs.BASELINE_DEPLOYMENT, sbs.CANDIDATE_DEPLOYMENT, "flipped"}
+    for deployment in (sbs.BASELINE_DEPLOYMENT, sbs.CANDIDATE_DEPLOYMENT):
+        entry = result[deployment]
         assert entry["n_turns"] == 1
         assert entry["metrics"]["intent_accuracy"] == 1.0
-    assert len(guard.log) == 2  # one reservation per deployment
+        assert entry["dialogues_completed"] == 1
+        assert entry["dialogues_total"] == 1
+        row = entry["per_turn"][0]
+        assert set(row) == {
+            "dialogue_id",
+            "turn_index",
+            "correct",
+            "latency_s",
+            "tokens_in",
+            "tokens_out",
+            "eur",
+        }
+        assert row["dialogue_id"] == "fixture-1"
+        assert row["correct"] is True
+        assert "reply_text" not in row
+    assert result["flipped"] == []  # identical fixture for both deployments -> nothing flipped
+
+
+def test_run_side_by_side_stops_before_the_dialogue_that_exceeds_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-live-2a-1: when the cost guard would be exceeded partway through the
+    subset, run_side_by_side stops BEFORE that dialogue and reports exactly how many dialogues
+    completed for the deployment it was running -- not just a generic "blocked" message."""
+    calls: list[int] = []
+
+    def fake_evaluate(
+        session: Any, dialogues: list[Dialogue], chat: Any = None, top_n: Any = None
+    ) -> list[DialogueTurnResult]:
+        calls.append(1)
+        if len(calls) == 2:  # the 2nd dialogue of the FIRST deployment's run
+            raise sbs.CostCapExceeded("side-by-side: projected EUR would exceed --max-eur")
+        return [
+            DialogueTurnResult(
+                dialogue_id=dialogues[0].id,
+                turn_index=0,
+                expected_intent="security",
+                observed_intent="security",
+                is_noisy=False,
+                retrieved_docs=[],
+                expected_doc=None,
+                answerable=True,
+                abstained=False,
+                reply_text="x",
+                correct=True,
+                clarified=False,
+                abstention_no_claims=None,
+                latency_s=0.1,
+            )
+        ]
+
+    monkeypatch.setattr(sbs, "evaluate_dialogues", fake_evaluate)
+
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    dialogues = [
+        Dialogue(id=f"d{i}", turns=(Turn(message="hi", expected_intent="security", language="en"),))
+        for i in range(3)
+    ]
+
+    with pytest.raises(sbs.CostCapExceeded) as excinfo:
+        sbs.run_side_by_side(settings, guard, lambda: _FakeSession(), dialogues)
+
+    partial = excinfo.value.partial_results  # type: ignore[attr-defined]
+    baseline_entry = partial[sbs.BASELINE_DEPLOYMENT]
+    assert baseline_entry["dialogues_completed"] == 1
+    assert baseline_entry["dialogues_total"] == 3
+    assert sbs.CANDIDATE_DEPLOYMENT not in partial  # never even started
+
+
+def test_run_side_by_side_flipped_list_when_correctness_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-live-2a-3: a question whose judge verdict differs between deployments
+    appears in the top-level ``flipped`` list."""
+
+    def fake_evaluate(
+        session: Any, dialogues: list[Dialogue], chat: Any = None, top_n: Any = None
+    ) -> list[DialogueTurnResult]:
+        dialogue = dialogues[0]
+        correct = chat.deployment == sbs.BASELINE_DEPLOYMENT  # baseline right, candidate wrong
+        return [
+            DialogueTurnResult(
+                dialogue_id=dialogue.id,
+                turn_index=0,
+                expected_intent="security",
+                observed_intent="security",
+                is_noisy=False,
+                retrieved_docs=[],
+                expected_doc=None,
+                answerable=True,
+                abstained=False,
+                reply_text="x",
+                correct=correct,
+                clarified=False,
+                abstention_no_claims=None,
+                latency_s=0.2,
+            )
+        ]
+
+    monkeypatch.setattr(sbs, "evaluate_dialogues", fake_evaluate)
+
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    dialogues = [
+        Dialogue(id="d0", turns=(Turn(message="hi", expected_intent="security", language="en"),))
+    ]
+    result = sbs.run_side_by_side(settings, guard, lambda: _FakeSession(), dialogues)
+
+    assert result["flipped"] == [
+        {
+            "dialogue_id": "d0",
+            "turn_index": 0,
+            f"{sbs.BASELINE_DEPLOYMENT}_correct": True,
+            f"{sbs.CANDIDATE_DEPLOYMENT}_correct": False,
+        }
+    ]
 
 
 def test_azure_subset_is_the_first_n_dialogues_deterministically() -> None:
@@ -637,6 +967,45 @@ def test_summarize_reports_a_cost_guard_block(monkeypatch: pytest.MonkeyPatch) -
     }
     text = sbs.summarize(report)
     assert "COST GUARD STOPPED smoke_blocked" in text
+
+
+# --- main()'s top-level safety net (DA-14.7-migration-live-2a-2, part 2d) ------------------
+
+
+def test_main_sanitizes_an_unexpected_exception_and_never_leaks_the_planted_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Simulate a phase raising an httpx.HTTPStatusError whose own str() embeds a planted
+    endpoint -- exactly what a REAL Azure call's exception would do. main()'s outermost
+    try/except must sanitize it (exception CLASS + HTTP status only) before it reaches stdout,
+    stderr, or the evidence file, and exit non-zero."""
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    output_dir = tmp_path / "evidence"
+    planted_endpoint = "https://PLANTED-LEAK-ENDPOINT.openai.azure.com/some/path"
+
+    def _boom_run_smoke(*_a: Any, **_kw: Any) -> Any:
+        request = httpx.Request("POST", planted_endpoint)
+        response = httpx.Response(500, request=request, json={"error": "boom"})
+        raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+    monkeypatch.setattr(sbs, "run_smoke", _boom_run_smoke)
+    monkeypatch.setattr(sbs, "get_settings", lambda: _fake_settings())
+
+    exit_code = sbs.main(["--prices", str(prices_path), "--output-dir", str(output_dir)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    blob = captured.out + captured.err
+    assert planted_endpoint not in blob
+    assert "HTTPStatusError" in blob
+    assert "500" in blob
+
+    evidence_text = (output_dir / "summary.md").read_text(encoding="utf-8")
+    results_text = (output_dir / "results.json").read_text(encoding="utf-8")
+    assert planted_endpoint not in evidence_text
+    assert planted_endpoint not in results_text
+    assert "HTTPStatusError" in evidence_text
 
 
 # --- The shell script: shellcheck-clean, syntax-clean, never echoes the key, keeps +x ------

@@ -1,4 +1,5 @@
-"""Azure OpenAI gpt-4.1-mini vs gpt-5-mini live side-by-side check (14.7-migration-live, part 2b).
+"""Azure OpenAI gpt-4.1-mini vs gpt-5-mini live side-by-side check (14.7-migration-live, part 2b,
+fixed in part 2d per DA-14.7-migration-live-2a-1/2a-2/2a-3).
 
 **Built and unit-tested entirely OFFLINE** (mocked ``httpx``, see ``test_azure_side_by_side.py``)
 by the senior-engineer agent -- this module makes **zero** network calls on import or by being
@@ -29,11 +30,74 @@ call is made (never after):
 (c) **side-by-side eval** -- unless ``--smoke-only``, runs Option B
     (``status/blocks/14.7-migration.md`` §4: fresh baseline + candidate re-run on the same golden
     set v2 Azure subset) against both deployments, reusing
-    ``rag_app.eval.runner.evaluate_dialogues``/``metrics``/``judge``. Token/EUR numbers for this
-    phase are the PLAN's own per-question estimate (:data:`TOKENS_IN_PER_QUESTION`/
-    :data:`TOKENS_OUT_PER_QUESTION`), not measured per-call ``usage`` the way phase (b) is --
-    self-reported limitation: wiring real per-call usage through
-    ``DialogueTurnResult``/``runner.py`` is out of this block's declared ``touches``.
+    ``rag_app.eval.runner.evaluate_dialogues``/``metrics``/``judge``, one DIALOGUE at a time (see
+    :func:`run_side_by_side`'s own docstring for why this is behaviourally identical to one call
+    over the whole subset, and what it buys: a per-dialogue progress count and real per-dialogue
+    cost figures).
+
+**Part 2d fix (DA-14.7-migration-live-2a-1, HIGH): per-CALL cost reservation, not per-phase.**
+Part 2b's phase (c) reserved one flat, FIXED estimate
+(``TOKENS_IN_PER_QUESTION``/``TOKENS_OUT_PER_QUESTION`` -- the original plan's arithmetic, ~600
+output tokens/question) per deployment, upfront, for the WHOLE 30-question run -- this understated
+``gpt-5-mini``'s real worst case by ~6x (up to 3584 output tokens in a single turn:
+``settings.azure_openai_reasoning_max_tokens`` + ``...groundedness_max_tokens``, part 2a). Every
+phase now routes its Azure HTTP calls through :func:`make_guarded_post`, which:
+
+1. Reserves the real worst case for THAT ONE call, read straight off the request body's
+   ``max_completion_tokens``/``max_tokens`` field -- this is already exactly
+   ``settings.effective_max_tokens()`` for an answer call, ``effective_groundedness_max_tokens()``
+   for a groundedness check, or the router's/chit-chat's/off-topic's/memory's/judge's own fixed
+   bound for a ``chat_json`` or short reply call (every call site in ``generation.py``/
+   ``assistant/*.py``/``eval/judge.py`` already passes its own real bound as ``max_tokens`` --
+   reading it off the wire, rather than re-deriving it here, means this guard is correct for ANY
+   call site, including ones this block never had to enumerate by hand).
+2. Makes the call ONLY if that reservation fits under ``--max-eur``'s remaining budget (never a
+   whole phase/deployment upfront) -- :class:`CostCapExceeded` is raised BEFORE the HTTP call if
+   it would not fit.
+3. **Settles** the reservation down (or up) to the REAL ``usage.completion_tokens`` the response
+   reports once the call succeeds (reasoning tokens counted as part of the output total, since
+   Azure's own ``completion_tokens`` already includes them) -- :meth:`CostGuard.settle`. A failed
+   call (network error or non-2xx) settles to ZERO (nothing is billed for a rejected request).
+4. Retries at most ONCE on HTTP 429 (:func:`_call_with_single_retry`, unchanged contract): the
+   failed attempt's reservation is settled to zero BEFORE a FRESH reservation is made for the
+   retry, so the two attempts are never double-counted and the retry's own worst case is checked
+   against the remaining cap again, not assumed to still fit.
+5. Reservation/settlement are protected by :class:`CostGuard`'s own lock, making them atomic --
+   today every phase in this module makes its Azure calls strictly SEQUENTIALLY (no threads, no
+   concurrency anywhere in this file), so the lock is pure insurance against a future caller that
+   might not be, never a currently-exercised code path.
+
+If a call's worst case would exceed the remaining budget, the guard stops BEFORE that call;
+:func:`run_side_by_side` catches this at the per-DIALOGUE boundary (a dialogue's own in-memory
+state is reset fresh by ``evaluate_dialogues`` for every new dialogue anyway, so replaying one at
+a time is behaviourally identical to replaying the whole subset in one call) and reports exactly
+how many of the subset's dialogues completed for EACH deployment, not just "blocked".
+
+**Part 2d fix (DA-14.7-migration-live-2a-2, medium): every phase is exception-safe, and so is
+``main()``.** Every raw HTTP call site in this module now sits inside a
+``try/except (httpx.HTTPStatusError, httpx.HTTPError, ValueError)`` (the same three exception
+types :func:`run_smoke` already caught -- ``ValueError`` covers
+:func:`rag_app.llm.parse_azure_chat_response` on a malformed body, the other DA-14.7-migration-
+live-2a-2 gap). Only ``status_code``/exception CLASS NAME are ever recorded or printed -- never
+``str(exc)``, which for ``httpx.HTTPStatusError`` embeds the full request URL (the live endpoint).
+``main()`` ALSO wraps its entire run in one more, outermost ``try/except Exception`` as a
+last-resort safety net: if anything still escapes every phase's own handling, it is sanitized the
+same way (exception class + HTTP status only) before being printed or written to the evidence
+file, and the process exits non-zero -- never a raw Python traceback (which could otherwise embed
+the endpoint via ``HTTPStatusError.__str__``) reaches the terminal or the evidence file.
+
+**Part 2d fix (DA-14.7-migration-live-2a-3, medium): per-question ids + a flipped list.**
+:func:`run_side_by_side` now keeps a ``per_turn`` list per deployment (``dialogue_id``,
+``turn_index``, ``correct``, ``latency_s``, ``tokens_in``/``tokens_out``/``eur`` -- never
+``reply_text``/prompt text) and a top-level ``flipped`` list: every ``(dialogue_id, turn_index)``
+whose ``correct`` verdict differs between ``gpt-4.1-mini`` and ``gpt-5-mini``. Self-reported
+boundary: real per-CALL token/EUR usage is not wired through ``DialogueTurnResult``/``runner.py``
+(out of this block's declared ``touches``, unchanged from part 2b) -- the ``tokens_in``/
+``tokens_out``/``eur`` figures on each ``per_turn`` row are the REAL per-DIALOGUE total the cost
+guard measured (summed over however many calls that one dialogue actually made), divided EVENLY
+across that dialogue's own turns. This is an honest approximation (a dialogue's turns can each
+make a different number of LLM calls -- the exact fast path skips the router entirely), not a true
+per-call attribution; it is still real measured usage, not the old flat plan estimate.
 
 Cost guard (:class:`CostGuard`): estimates EUR from ``status/azure_prices.json``'s
 ``datazone_standard`` tier for BOTH models (DEC-061's migration target deployment is
@@ -41,8 +105,7 @@ DataZoneStandard-only; pricing both deployments on that tier keeps the side-by-s
 apples-to-apples with the SKU the candidate will actually run on) BEFORE each reservation, adds it
 to the running total, and raises :class:`CostCapExceeded` -- **no call is made** -- rather than
 ever letting the running total exceed ``--max-eur`` (default 0.30, this block's
-``PARALLEL_PLAN.md`` budget line). Retries: :func:`_call_with_single_retry` allows at most ONE
-retry, only on HTTP 429, with a short fixed backoff -- never a retry loop.
+``PARALLEL_PLAN.md`` budget line).
 
 Output discipline (never violated anywhere in this module): the report this module builds and
 prints/writes contains only ids, call types, status codes, exception CLASS NAMES (never
@@ -52,17 +115,13 @@ figures. It never contains an endpoint, an API key, or full prompt/response text
 **Part 2c fix (worktree prices-file bug, F22-class).** ``status/`` is a symlink into the
 private planning folder only in the MAIN repo clone (``~/proyectos/rag_app``); a `git worktree`
 such as ``~/proyectos/wt/14-A1`` has no such symlink -- its own ``status/`` holds only the
-tracked ``status/blocks/`` directory, never ``azure_prices.json``. Part 2b's
-``DEFAULT_PRICES_PATH`` pointed unconditionally at ``REPO_ROOT/status/azure_prices.json``, which
-is exactly this missing path when run from a worktree -- the cost guard would have crashed with
-a raw ``FileNotFoundError`` before any Azure call, which is fail-safe by accident, not by design,
-and the error message named no alternative. :func:`resolve_prices_path` now tries, in order,
-stopping at the first path that exists: the explicit ``--prices`` CLI flag, the
+tracked ``status/blocks/`` directory, never ``azure_prices.json``. :func:`resolve_prices_path`
+tries, in order, stopping at the first path that exists: the explicit ``--prices`` CLI flag, the
 ``SECRAG_AZURE_PRICES`` env var, ``REPO_ROOT/status/azure_prices.json`` (works from the main repo
 clone), then ``~/proyectos/rag_app/status/azure_prices.json`` (the hard-coded main-repo fallback,
 so a worktree run finds the real file without the user having to pass anything). If none exists
 it raises :class:`FileNotFoundError` naming every path it tried, BEFORE ``get_settings()`` is even
-called (so before any possible Azure call) -- never "no cost guard, proceed anyway". The new
+called (so before any possible Azure call) -- never "no cost guard, proceed anyway". The
 ``--check-config`` flag resolves this path and the golden-set path and prints the
 ``gpt-4.1-mini``/``gpt-5-mini`` DataZone prices with zero env-file read and zero network call, so
 the user can prove path resolution works from their own worktree before running anything live.
@@ -71,10 +130,13 @@ the user can prove path resolution works from their own worktree before running 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import json
 import os
+import re
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -162,14 +224,32 @@ GA_API_VERSION_PROBE_ORDER: tuple[str, ...] = (
 # deterministically (azure_subset()).
 AZURE_SUBSET_SIZE = 30
 
-# Per-question token arithmetic from status/blocks/14.7-migration.md §4 ("router ~500 in / ~200
-# out, answer ~3400 in / ~400 out" per question, 2 LLM calls -> ~3900 in / ~600 out). Reused here
-# as phase (c)'s cost-guard reservation AND -- absent real per-call usage plumbing through
-# runner.py/DialogueTurnResult (out of this block's declared touches) -- as the reported
-# token/EUR numbers themselves. Self-reported limitation: these are the PLAN's ESTIMATED tokens,
-# not measured per-call usage the way phase (b) is.
-TOKENS_IN_PER_QUESTION = 3900.0
-TOKENS_OUT_PER_QUESTION = 600.0
+# Crude chars/4 estimate for the INPUT side of a per-call reservation only (never the final,
+# settled EUR figure) -- the same heuristic `rag_app.llm._estimate_prompt_tokens` uses for its own
+# context-overflow warning, duplicated here rather than imported because that name is private to
+# `rag_app.llm` and this module's declared `touches` do not include `llm.py`. Deliberately crude:
+# it only sizes the WORST-CASE reservation (which the output bound already dominates -- every
+# model's output price per token is several times its input price), never what gets billed.
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _estimate_input_tokens(messages: list[Message]) -> float:
+    return sum(len(m.get("content", "")) for m in messages) / _CHARS_PER_TOKEN_ESTIMATE
+
+
+_DEPLOYMENT_URL_RE = re.compile(r"/openai/deployments/([^/]+)/chat/completions")
+
+
+def _deployment_from_url(url: str) -> str:
+    """Parse the Azure deployment name out of a Chat Completions URL -- never returns or logs
+    the URL itself (only the deployment NAME, never a secret) if parsing fails."""
+    match = _DEPLOYMENT_URL_RE.search(url)
+    if match is None:
+        raise RuntimeError(
+            "cost guard: could not identify the Azure deployment from the request URL -- "
+            "refusing to proceed without knowing which model to price"
+        )
+    return match.group(1)
 
 
 # ---------------------------------------------------------------------------
@@ -184,18 +264,25 @@ class CostCapExceeded(RuntimeError):
 
 @dataclass
 class CostGuard:
-    """Tracks EUR spent (estimated) this run and refuses to let it exceed ``max_eur``.
+    """Tracks EUR spent (estimated, then settled to real usage) this run and refuses to let it
+    exceed ``max_eur``.
 
-    ``reserve()`` must be called before every group of Azure OpenAI calls a phase is about to
-    make; it estimates the EUR cost of the given tokens from ``prices`` (never from a live call),
-    and either commits the estimate to ``spent_eur`` and returns it, or raises
-    :class:`CostCapExceeded` with the running total left untouched.
+    ``reserve()`` must be called before every SINGLE Azure OpenAI call (never once for a whole
+    phase or deployment, DA-14.7-migration-live-2a-1) with that one call's real worst-case output
+    bound; it estimates the EUR cost from ``prices`` (never from a live call), and either commits
+    the estimate to ``spent_eur`` and returns the log entry, or raises :class:`CostCapExceeded`
+    with the running total left untouched. ``settle()`` then trues up that same entry to the real
+    usage the response reported once the call completes (or to zero if it failed). Both methods
+    hold ``self._lock`` for their whole body: every phase in this module calls Azure strictly
+    sequentially today, so this is defensive insurance for a concurrent caller that does not exist
+    yet, not a currently-exercised code path.
     """
 
     prices: dict[str, Any]
     max_eur: float
     spent_eur: float = 0.0
     log: list[dict[str, Any]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @classmethod
     def from_file(cls, max_eur: float, path: Path) -> CostGuard:
@@ -233,21 +320,45 @@ class CostGuard:
     def reserve(
         self, phase: str, *, model: str, tokens_in: float, tokens_out: float
     ) -> dict[str, Any]:
-        """Estimate BEFORE the call. Raises :class:`CostCapExceeded` (no call made, ``spent_eur``
-        unchanged) if committing this estimate would push the running total over ``max_eur``;
-        otherwise commits it and returns the estimate dict (also appended to ``self.log``)."""
-        estimate = self.estimate(model=model, tokens_in=tokens_in, tokens_out=tokens_out)
-        projected = self.spent_eur + estimate["eur"]
-        if projected > self.max_eur:
-            raise CostCapExceeded(
-                f"{phase}: projected EUR {projected:.4f} would exceed --max-eur {self.max_eur:.4f} "
-                f"(already spent {self.spent_eur:.4f} + this reservation's estimate "
-                f"{estimate['eur']:.4f} for {model}); no call made"
-            )
-        self.spent_eur = projected
-        entry = {"phase": phase, **estimate, "running_total_eur": round(self.spent_eur, 6)}
-        self.log.append(entry)
-        return entry
+        """Estimate BEFORE the call -- for exactly ONE call, never a whole phase/deployment.
+        Raises :class:`CostCapExceeded` (no call made, ``spent_eur`` unchanged) if committing
+        this estimate would push the running total over ``max_eur``; otherwise commits it and
+        returns the log entry (also appended to ``self.log``) that :meth:`settle` later mutates
+        in place."""
+        with self._lock:
+            estimate = self.estimate(model=model, tokens_in=tokens_in, tokens_out=tokens_out)
+            projected = self.spent_eur + estimate["eur"]
+            if projected > self.max_eur:
+                raise CostCapExceeded(
+                    f"{phase}: projected EUR {projected:.4f} would exceed --max-eur "
+                    f"{self.max_eur:.4f} (already spent {self.spent_eur:.4f} + this "
+                    f"reservation's estimate {estimate['eur']:.4f} for {model}); no call made"
+                )
+            self.spent_eur = projected
+            entry = {"phase": phase, **estimate, "running_total_eur": round(self.spent_eur, 6)}
+            self.log.append(entry)
+            return entry
+
+    def settle(
+        self, entry: dict[str, Any], *, tokens_in: float, tokens_out: float
+    ) -> dict[str, Any]:
+        """True up ``entry`` (the exact dict :meth:`reserve` returned for ONE call) to the REAL
+        ``tokens_in``/``tokens_out`` that call used -- reasoning tokens counted as part of
+        ``tokens_out`` (Azure's own ``completion_tokens`` already includes them). Adjusts
+        ``spent_eur`` by the DIFFERENCE between the real cost and the worst-case estimate already
+        committed -- never raises :class:`CostCapExceeded` here: the call already happened and
+        cannot be undone, so a response that genuinely used more than its own worst-case bound
+        (should not happen -- the bound IS the ceiling Azure was told not to exceed) simply grows
+        ``spent_eur`` past ``max_eur``, visible in the next ``reserve()``'s own check, rather than
+        being silently hidden."""
+        with self._lock:
+            actual = self.estimate(model=entry["model"], tokens_in=tokens_in, tokens_out=tokens_out)
+            self.spent_eur = round(self.spent_eur + actual["eur"] - entry["eur"], 6)
+            entry["actual_tokens_in"] = tokens_in
+            entry["actual_tokens_out"] = tokens_out
+            entry["actual_eur"] = actual["eur"]
+            entry["running_total_eur"] = self.spent_eur
+            return entry
 
 
 def _call_with_single_retry(fn: Callable[[], Any], *, backoff_s: float = 2.0) -> Any:
@@ -260,6 +371,105 @@ def _call_with_single_retry(fn: Callable[[], Any], *, backoff_s: float = 2.0) ->
             time.sleep(backoff_s)
             return fn()
         raise
+
+
+def make_guarded_post(
+    cost_guard: CostGuard,
+    phase: str,
+    *,
+    post: Callable[..., httpx.Response] | None = None,
+) -> Callable[..., httpx.Response]:
+    """Return a drop-in replacement for ``httpx.post`` that reserves (and later settles) its OWN
+    PER-CALL worst case from ``cost_guard`` around every single request it makes (DA-14.7-
+    migration-live-2a-1) -- never a flat estimate for a whole phase or deployment.
+
+    ``post`` (default ``None``) is resolved to the real ``httpx.post`` ONCE, right here, at
+    construction time -- deliberately NOT a dynamic per-call lookup like
+    :func:`probe_api_versions`'s own ``post`` parameter: the returned function is meant to be
+    installed as the NEW value of ``httpx.post`` (see :func:`_patched_post`), so a dynamic
+    ``httpx.post`` lookup inside the closure would recurse into itself. Resolving eagerly here,
+    before any patching happens, captures the real (or test-faked, if a test already
+    monkeypatched ``httpx.post`` before calling this function) underlying caller correctly.
+
+    The returned function never calls ``raise_for_status()`` itself for a NON-429 error: it
+    returns the raw ``Response`` so callers that inspect ``status_code`` manually
+    (:func:`probe_api_versions`) see exactly what they already expect; callers that call
+    ``raise_for_status()`` themselves (:class:`AzureOpenAIChat`, :func:`_raw_reasoning_chat_call`)
+    still get the same exception they always did. A 429 IS raised here (as
+    ``httpx.HTTPStatusError``) so :func:`_call_with_single_retry` can retry it with the cost
+    guard settled-then-re-reserved correctly (see the module docstring's point 4).
+
+    Refuses (``RuntimeError``, before any reservation) a call whose body carries no
+    ``max_completion_tokens``/``max_tokens`` -- there would be no worst case to reserve against,
+    which would silently bypass the cost guard entirely.
+    """
+    real_post = post if post is not None else httpx.post
+
+    def _guarded(
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        body = json or {}
+        deployment = _deployment_from_url(url)
+        max_out = body.get("max_completion_tokens", body.get("max_tokens"))
+        if max_out is None:
+            raise RuntimeError(
+                f"{phase}: refusing an Azure call with no max_tokens/max_completion_tokens -- "
+                "there is no worst case to reserve against (DA-14.7-migration-live-2a-1)"
+            )
+        tokens_in = _estimate_input_tokens(body.get("messages", []))
+
+        def _attempt() -> httpx.Response:
+            reservation = cost_guard.reserve(
+                phase, model=deployment, tokens_in=tokens_in, tokens_out=float(max_out)
+            )
+            try:
+                response = real_post(url, headers=headers, json=json, timeout=timeout, **kwargs)
+            except httpx.HTTPError:
+                cost_guard.settle(reservation, tokens_in=0.0, tokens_out=0.0)
+                raise
+            if response.status_code == 429:
+                cost_guard.settle(reservation, tokens_in=0.0, tokens_out=0.0)
+                raise httpx.HTTPStatusError(
+                    "429 Too Many Requests", request=response.request, response=response
+                )
+            if response.status_code >= 400:
+                cost_guard.settle(reservation, tokens_in=0.0, tokens_out=0.0)
+                return response
+            try:
+                usage = response.json().get("usage") or {}
+                actual_in = float(usage.get("prompt_tokens", tokens_in))
+                actual_out = float(usage.get("completion_tokens", max_out))
+            except Exception:  # noqa: BLE001 - a malformed/missing usage body never blocks settle
+                actual_in, actual_out = tokens_in, float(max_out)
+            cost_guard.settle(reservation, tokens_in=actual_in, tokens_out=actual_out)
+            return response
+
+        response: httpx.Response = _call_with_single_retry(_attempt)
+        return response
+
+    return _guarded
+
+
+@contextlib.contextmanager
+def _patched_post(guarded: Callable[..., httpx.Response]) -> Any:
+    """Temporarily replace the GLOBAL ``httpx.post`` with ``guarded`` so every call any code this
+    process runs makes during the ``with`` block -- regardless of which function/module issued
+    it -- goes through the per-call cost guard first. Restores the exact previous value on exit
+    (success or exception), so nothing outside this block, no other test, and no later phase is
+    ever affected. Only used around phase (a)/(c)'s calls, which go through
+    :class:`AzureOpenAIChat` (no ``post=`` injection point of its own); phase (b) passes
+    ``make_guarded_post``'s result as its own explicit ``post=`` argument instead."""
+    original = httpx.post
+    httpx.post = guarded
+    try:
+        yield
+    finally:
+        httpx.post = original
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +508,8 @@ def probe_api_versions(
     default-argument value) so a test's ``monkeypatch.setattr(module.httpx, "post", fake_post)``
     -- the same pattern every other test in this codebase uses -- takes effect here too; a bound
     default (``post: Callable = httpx.post``) would freeze the reference to whatever ``httpx.post``
-    was at import time, before any monkeypatch exists."""
+    was at import time, before any monkeypatch exists. Callers running this through the cost
+    guard (:func:`run_smoke`) pass the guarded post explicitly."""
     attempts: list[dict[str, Any]] = []
     body = {"messages": [{"role": "user", "content": "ping"}], "max_completion_tokens": 16}
     caller = post or httpx.post
@@ -327,12 +538,12 @@ def probe_api_versions(
 
 
 def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
-    """Phase (a): one ``chat`` + one ``chat_json`` call against each deployment. Reserves its
-    own (small, fixed) token estimate from ``cost_guard`` per deployment before making either
-    call for that deployment."""
+    """Phase (a): one ``chat`` + one ``chat_json`` call against each deployment. Each call
+    reserves (and settles) its OWN worst case from ``cost_guard`` -- via :func:`make_guarded_post`
+    patched into the global ``httpx.post`` for the duration of this call -- instead of one flat
+    estimate shared by both calls (DA-14.7-migration-live-2a-1)."""
     results: dict[str, Any] = {}
     for deployment, reasoning in ((BASELINE_DEPLOYMENT, False), (CANDIDATE_DEPLOYMENT, True)):
-        cost_guard.reserve("smoke", model=deployment, tokens_in=150.0, tokens_out=80.0)
         chat = AzureOpenAIChat(
             endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
@@ -340,60 +551,67 @@ def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
             reasoning_model=reasoning,
         )
         entry: dict[str, Any] = {"deployment": deployment, "reasoning_model": reasoning}
+        guarded_post = make_guarded_post(cost_guard, "smoke")
 
-        try:
-            # `chat`/`messages` default params bind THIS iteration's value explicitly
-            # (flake8-bugbear B023: a closure over a loop variable without this would read
-            # whatever `chat` is by the time the function actually runs -- harmless here since
-            # `_call_with_single_retry` calls `fn()` synchronously in the same iteration, but
-            # explicit is safer and silences the (otherwise valid-in-general) lint).
-            def _call_chat(chat: AzureOpenAIChat = chat) -> str:
-                return chat.chat(
-                    [{"role": "user", "content": "Reply with the single word: ok"}],
-                    max_tokens=16,
-                    call_type="smoke",
-                )
-
-            _call_with_single_retry(_call_chat)
-            entry["chat_ok"] = True
-            entry["api_version"] = chat.api_version
-        except httpx.HTTPStatusError as exc:
-            entry["chat_ok"] = False
-            entry["chat_status_code"] = exc.response.status_code
-            entry["chat_error_type"] = type(exc).__name__
-            if reasoning and exc.response.status_code == 400:
-                try:
-                    version, attempts = probe_api_versions(
-                        endpoint=chat.endpoint, api_key=chat.api_key, deployment=deployment
+        with _patched_post(guarded_post):
+            try:
+                # `chat` default param binds THIS iteration's value explicitly (flake8-bugbear
+                # B023: a closure over a loop variable without this would read whatever `chat` is
+                # by the time the function actually runs -- harmless here since the call happens
+                # synchronously in the same iteration, but explicit is safer and silences the
+                # otherwise-valid-in-general lint).
+                def _call_chat(chat: AzureOpenAIChat = chat) -> str:
+                    return chat.chat(
+                        [{"role": "user", "content": "Reply with the single word: ok"}],
+                        max_tokens=16,
+                        call_type="smoke",
                     )
-                    entry["api_version_probe"] = attempts
-                    entry["api_version_recommended"] = version
-                except RuntimeError as probe_exc:
-                    entry["api_version_probe_failed"] = str(probe_exc)
-        except httpx.HTTPError as exc:
-            entry["chat_ok"] = False
-            entry["chat_error_type"] = type(exc).__name__
 
-        try:
+                _call_chat()
+                entry["chat_ok"] = True
+                entry["api_version"] = chat.api_version
+            except httpx.HTTPStatusError as exc:
+                entry["chat_ok"] = False
+                entry["chat_status_code"] = exc.response.status_code
+                entry["chat_error_type"] = type(exc).__name__
+                if reasoning and exc.response.status_code == 400:
+                    try:
+                        version, attempts = probe_api_versions(
+                            endpoint=chat.endpoint,
+                            api_key=chat.api_key,
+                            deployment=deployment,
+                            post=guarded_post,
+                        )
+                        entry["api_version_probe"] = attempts
+                        entry["api_version_recommended"] = version
+                    except CostCapExceeded:
+                        raise
+                    except RuntimeError as probe_exc:
+                        entry["api_version_probe_failed"] = str(probe_exc)
+            except (httpx.HTTPError, ValueError) as exc:
+                entry["chat_ok"] = False
+                entry["chat_error_type"] = type(exc).__name__
 
-            def _call_chat_json(chat: AzureOpenAIChat = chat) -> _SmokeSchema:
-                return chat.chat_json(
-                    [{"role": "user", "content": 'Reply with JSON {"ok": true}.'}],
-                    _SmokeSchema,
-                    fallback=_SmokeSchema(ok=False),
-                    max_tokens=32,
-                    call_type="smoke",
-                )
+            try:
 
-            _call_with_single_retry(_call_chat_json)
-            entry["chat_json_ok"] = True
-        except httpx.HTTPStatusError as exc:
-            entry["chat_json_ok"] = False
-            entry["chat_json_status_code"] = exc.response.status_code
-            entry["chat_json_error_type"] = type(exc).__name__
-        except httpx.HTTPError as exc:
-            entry["chat_json_ok"] = False
-            entry["chat_json_error_type"] = type(exc).__name__
+                def _call_chat_json(chat: AzureOpenAIChat = chat) -> _SmokeSchema:
+                    return chat.chat_json(
+                        [{"role": "user", "content": 'Reply with JSON {"ok": true}.'}],
+                        _SmokeSchema,
+                        fallback=_SmokeSchema(ok=False),
+                        max_tokens=32,
+                        call_type="smoke",
+                    )
+
+                _call_chat_json()
+                entry["chat_json_ok"] = True
+            except httpx.HTTPStatusError as exc:
+                entry["chat_json_ok"] = False
+                entry["chat_json_status_code"] = exc.response.status_code
+                entry["chat_json_error_type"] = type(exc).__name__
+            except (httpx.HTTPError, ValueError) as exc:
+                entry["chat_json_ok"] = False
+                entry["chat_json_error_type"] = type(exc).__name__
 
         results[deployment] = entry
     return results
@@ -490,20 +708,30 @@ def measure_token_budget(
 ) -> dict[str, Any]:
     """Phase (b): per representative prompt, how many of the completion tokens were hidden
     "reasoning tokens" vs the visible answer -- never stores the prompt/response text itself,
-    only ids (``call_type``) and numeric counts."""
+    only ids (``call_type``) and numeric counts.
+
+    DA-14.7-migration-live-2a-2 fix: each raw call now sits inside its own
+    ``try/except (httpx.HTTPStatusError, httpx.HTTPError, ValueError)``, exactly like
+    :func:`run_smoke`'s calls -- previously this phase had NO such wrapping, so an HTTP error or
+    a malformed-body ``ValueError`` propagated uncaught all the way to ``main()``'s entry point, a
+    raw Python traceback whose ``HTTPStatusError.__str__`` embeds the live endpoint. A single
+    failed prompt now records ``error_type``/``status_code`` and this phase continues measuring
+    the REMAINING representative prompts.
+
+    DA-14.7-migration-live-2a-1 fix: routed through the SAME :func:`make_guarded_post` every
+    other phase uses -- each call's reservation is still the real per-call worst case
+    (``bound`` == ``settings.azure_openai_reasoning_max_tokens``/``...groundedness_max_tokens``,
+    exactly what phase (b) already reserved correctly in part 2b), now also SETTLED down to the
+    real ``usage.completion_tokens`` the response reports.
+    """
     measurements: list[dict[str, Any]] = []
     max_visible = 0
+    guarded_post = make_guarded_post(cost_guard, "token-budget", post=post)
     for call_type, messages in representative_prompts(dialogues):
         bound = (
             settings.azure_openai_reasoning_groundedness_max_tokens
             if call_type == "groundedness"
             else settings.azure_openai_reasoning_max_tokens
-        )
-        cost_guard.reserve(
-            f"token-budget:{call_type}",
-            model=CANDIDATE_DEPLOYMENT,
-            tokens_in=200.0,
-            tokens_out=float(bound),
         )
 
         def _call_raw(messages: list[Message] = messages, bound: int = bound) -> dict[str, Any]:
@@ -514,10 +742,37 @@ def measure_token_budget(
                 api_version=settings.azure_openai_reasoning_api_version,
                 messages=messages,
                 max_tokens=bound,
-                post=post,
+                post=guarded_post,
             )
 
-        data = _call_with_single_retry(_call_raw)
+        try:
+            data = _call_raw()
+        except httpx.HTTPStatusError as exc:
+            measurements.append(
+                {
+                    "call_type": call_type,
+                    "bound": bound,
+                    "completion_tokens": None,
+                    "reasoning_tokens": None,
+                    "visible_tokens": None,
+                    "error_type": type(exc).__name__,
+                    "status_code": exc.response.status_code,
+                }
+            )
+            continue
+        except (httpx.HTTPError, ValueError) as exc:
+            measurements.append(
+                {
+                    "call_type": call_type,
+                    "bound": bound,
+                    "completion_tokens": None,
+                    "reasoning_tokens": None,
+                    "visible_tokens": None,
+                    "error_type": type(exc).__name__,
+                    "status_code": None,
+                }
+            )
+            continue
         usage = data.get("usage", {})
         completion_tokens = int(usage.get("completion_tokens", 0))
         reasoning_tokens = int(
@@ -560,6 +815,33 @@ def azure_subset(dialogues: list[Dialogue], size: int = AZURE_SUBSET_SIZE) -> li
     return dialogues[:size]
 
 
+def _flipped_questions(results: dict[str, Any]) -> list[dict[str, Any]]:
+    """DA-14.7-migration-live-2a-3: every ``(dialogue_id, turn_index)`` whose judge verdict
+    (``correct``) differs between :data:`BASELINE_DEPLOYMENT` and :data:`CANDIDATE_DEPLOYMENT` --
+    never includes ``reply_text``/prompt text, only ids + the two verdicts."""
+    baseline = {
+        (row["dialogue_id"], row["turn_index"]): row["correct"]
+        for row in results.get(BASELINE_DEPLOYMENT, {}).get("per_turn", [])
+    }
+    candidate = {
+        (row["dialogue_id"], row["turn_index"]): row["correct"]
+        for row in results.get(CANDIDATE_DEPLOYMENT, {}).get("per_turn", [])
+    }
+    flipped: list[dict[str, Any]] = []
+    for key in sorted(set(baseline) & set(candidate)):
+        if baseline[key] != candidate[key]:
+            dialogue_id, turn_index = key
+            flipped.append(
+                {
+                    "dialogue_id": dialogue_id,
+                    "turn_index": turn_index,
+                    f"{BASELINE_DEPLOYMENT}_correct": baseline[key],
+                    f"{CANDIDATE_DEPLOYMENT}_correct": candidate[key],
+                }
+            )
+    return flipped
+
+
 def run_side_by_side(
     settings: Settings,
     cost_guard: CostGuard,
@@ -568,34 +850,90 @@ def run_side_by_side(
 ) -> dict[str, Any]:
     """Phase (c): Option B -- re-run BOTH deployments on the identical subset, reusing the real
     pipeline (``evaluate_dialogues``) so the comparison exercises router/memory/retrieval exactly
-    like production, not a synthetic shortcut."""
+    like production, not a synthetic shortcut.
+
+    DA-14.7-migration-live-2a-1 fix: no more flat per-deployment reservation. Every Azure HTTP
+    call ``evaluate_dialogues`` makes (router, chit-chat/off-topic/abstention reply, memory
+    summary, answer, groundedness, judge -- all through the SAME ``chat`` client under test) is
+    routed through :func:`make_guarded_post`, patched into the global ``httpx.post`` for this
+    deployment's run. ``subset`` is replayed ONE DIALOGUE AT A TIME (not the whole list in one
+    ``evaluate_dialogues`` call): a dialogue's own in-memory conversation state is reset fresh by
+    ``evaluate_dialogues`` for every new dialogue regardless (see its own docstring), so this is
+    behaviourally IDENTICAL to one call over the whole subset -- it just gives this function a
+    boundary at which to catch :class:`CostCapExceeded`, count how many dialogues completed, and
+    read the REAL per-dialogue tokens/EUR the cost guard just measured off ``cost_guard.log``.
+
+    If the guard stops partway through a deployment's run, this function attaches
+    ``exc.partial_results`` (everything built so far, for BOTH deployments) to the SAME
+    :class:`CostCapExceeded` and re-raises it, so ``main()``'s existing ``_fail`` handling can
+    report exactly how many of ``subset``'s dialogues completed per deployment, not just
+    "blocked".
+
+    DA-14.7-migration-live-2a-3 fix: each deployment's entry gets a ``per_turn`` list
+    (``dialogue_id``, ``turn_index``, ``correct``, ``latency_s``, ``tokens_in``/``tokens_out``/
+    ``eur`` -- never ``reply_text``); the top-level ``flipped`` list (:func:`_flipped_questions`)
+    is only computed once BOTH deployments finish without being stopped early.
+    """
     results: dict[str, Any] = {}
     n = len(subset)
     for deployment, reasoning in ((BASELINE_DEPLOYMENT, False), (CANDIDATE_DEPLOYMENT, True)):
-        cost_guard.reserve(
-            f"side-by-side:{deployment}",
-            model=deployment,
-            tokens_in=TOKENS_IN_PER_QUESTION * n,
-            tokens_out=TOKENS_OUT_PER_QUESTION * n,
-        )
         chat = AzureOpenAIChat(
             endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
             deployment=deployment,
             reasoning_model=reasoning,
         )
+        guarded_post = make_guarded_post(cost_guard, f"side-by-side:{deployment}")
+        turn_results: list[Any] = []
+        per_turn: list[dict[str, Any]] = []
+        dialogues_completed = 0
+        stopped: CostCapExceeded | None = None
         start = time.perf_counter()
-        with session_factory() as session:
-            turn_results = evaluate_dialogues(session, subset, chat=chat)
+        with session_factory() as session, _patched_post(guarded_post):
+            for dialogue in subset:
+                log_start = len(cost_guard.log)
+                try:
+                    dialogue_turns = evaluate_dialogues(session, [dialogue], chat=chat)
+                except CostCapExceeded as exc:
+                    stopped = exc
+                    break
+                dialogue_calls = cost_guard.log[log_start:]
+                dialogue_eur = sum(c.get("actual_eur", c["eur"]) for c in dialogue_calls)
+                dialogue_tokens_in = sum(
+                    c.get("actual_tokens_in", c["tokens_in"]) for c in dialogue_calls
+                )
+                dialogue_tokens_out = sum(
+                    c.get("actual_tokens_out", c["tokens_out"]) for c in dialogue_calls
+                )
+                n_turns_in_dialogue = len(dialogue_turns) or 1
+                for turn in dialogue_turns:
+                    turn_results.append(turn)
+                    per_turn.append(
+                        {
+                            "dialogue_id": turn.dialogue_id,
+                            "turn_index": turn.turn_index,
+                            "correct": turn.correct,
+                            "latency_s": round(turn.latency_s, 3),
+                            "tokens_in": round(dialogue_tokens_in / n_turns_in_dialogue, 1),
+                            "tokens_out": round(dialogue_tokens_out / n_turns_in_dialogue, 1),
+                            "eur": round(dialogue_eur / n_turns_in_dialogue, 6),
+                        }
+                    )
+                dialogues_completed += 1
         elapsed_s = time.perf_counter() - start
         metrics = compute_dialogue_metrics(turn_results)
         results[deployment] = {
             "metrics": metrics.as_dict(),
             "n_turns": len(turn_results),
             "wall_time_s": round(elapsed_s, 1),
-            "estimated_tokens_in": TOKENS_IN_PER_QUESTION * n,
-            "estimated_tokens_out": TOKENS_OUT_PER_QUESTION * n,
+            "dialogues_completed": dialogues_completed,
+            "dialogues_total": n,
+            "per_turn": per_turn,
         }
+        if stopped is not None:
+            stopped.partial_results = results  # type: ignore[attr-defined]
+            raise stopped
+    results["flipped"] = _flipped_questions(results)
     return results
 
 
@@ -632,10 +970,16 @@ def summarize(report: dict[str, Any]) -> str:
     if side_by_side:
         lines.append("side-by-side:")
         for deployment, entry in side_by_side.items():
+            if deployment == "flipped":
+                continue
             lines.append(
-                f"  {deployment}: n_turns={entry['n_turns']} wall_time_s={entry['wall_time_s']} "
-                f"metrics={entry['metrics']}"
+                f"  {deployment}: dialogues={entry.get('dialogues_completed')}/"
+                f"{entry.get('dialogues_total')} n_turns={entry['n_turns']} "
+                f"wall_time_s={entry['wall_time_s']} metrics={entry['metrics']}"
             )
+        flipped = side_by_side.get("flipped")
+        if flipped is not None:
+            lines.append(f"  flipped questions (baseline vs candidate): {len(flipped)}")
     for blocked_key in ("smoke_blocked", "token_budget_blocked", "side_by_side_blocked"):
         if report.get(blocked_key):
             lines.append(f"COST GUARD STOPPED {blocked_key}: {report[blocked_key]}")
@@ -675,6 +1019,16 @@ def check_config_lines(explicit_prices: Path | None = None) -> list[str]:
     return lines
 
 
+def _sanitized_exception_info(exc: BaseException) -> dict[str, Any]:
+    """DA-14.7-migration-live-2a-2: the ONLY two facts ever recorded about an unexpected
+    exception -- the class name and, if it is an HTTP status error, the status code. Never
+    ``str(exc)`` (which for ``httpx.HTTPStatusError`` embeds the full request URL, i.e. the live
+    endpoint) and never a traceback."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None) if response is not None else None
+    return {"exception_class": type(exc).__name__, "status_code": status_code}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Azure OpenAI gpt-4.1-mini vs gpt-5-mini live side-by-side check (part 2b)."
@@ -710,6 +1064,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    try:
+        return _run(args)
+    except Exception as exc:  # noqa: BLE001 - DA-14.7-migration-live-2a-2's last-resort safety
+        # net: if anything still escapes every phase's own exception handling above, sanitize it
+        # the same way (exception CLASS + HTTP status only -- never str(exc), never a traceback,
+        # which could otherwise embed the live endpoint via httpx.HTTPStatusError.__str__) before
+        # it reaches the terminal or the evidence file, and exit non-zero.
+        info = _sanitized_exception_info(exc)
+        print(
+            f"ERROR: unhandled {info['exception_class']} (status_code={info['status_code']})",
+            file=sys.stderr,
+        )
+        if args.output_dir is not None:
+            try:
+                args.output_dir.mkdir(parents=True, exist_ok=True)
+                (args.output_dir / "summary.md").write_text(
+                    f"UNHANDLED ERROR: {info['exception_class']} "
+                    f"(status_code={info['status_code']})\n",
+                    encoding="utf-8",
+                )
+                (args.output_dir / "results.json").write_text(
+                    json.dumps({"unhandled_error": info}, indent=2), encoding="utf-8"
+                )
+            except OSError:
+                pass
+        return 1
+
+
+def _run(args: argparse.Namespace) -> int:
     if args.check_config:
         try:
             for line in check_config_lines(args.prices):
@@ -734,6 +1117,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def _fail(key: str, exc: CostCapExceeded) -> int:
         report[key] = str(exc)
+        partial = getattr(exc, "partial_results", None)
+        if partial is not None:
+            report["side_by_side"] = partial
         report["cost_log"] = cost_guard.log
         report["total_eur"] = round(cost_guard.spent_eur, 6)
         _write_report(report, args.output_dir)

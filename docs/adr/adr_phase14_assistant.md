@@ -1818,6 +1818,78 @@ clone at any OTHER path than `~/proyectos/wt/<name>`/`~/proyectos/rag_app` still
 (e.g. walking parent directories). Documented rather than solved further, since both repo
 locations are this project's own fixed, documented environment convention.
 
+## Decision — Azure OpenAI model migration, live checks part 2d: per-call cost guard + exception
+safety + per-question ids (block 14.7-migration-live, 2026-11-28, fixes DA-14.7-migration-live-
+2a-1/2a-2/2a-3)
+
+The devil's-advocate review of parts 2a–2c found the cost guard's own hard-stop-before-any-call
+guarantee was not uniformly true (finding 2a-1, HIGH), one phase had no exception handling at all
+(finding 2a-2, medium), and the side-by-side report had no per-question ids to compare against
+(finding 2a-3, medium). All three are fixed in `backend/src/rag_app/eval/azure_side_by_side.py`
+only (plus its test file) — no change to `llm.py`/`generation.py`/`config.py`.
+
+- **2a-1 fix — per-CALL reservation, never per-phase.** `make_guarded_post()` (new) returns a
+  drop-in `httpx.post` replacement that reserves the real worst case for exactly ONE call —
+  read straight off that call's own request body (`max_completion_tokens`/`max_tokens`, which is
+  already `settings.effective_max_tokens()`/`effective_groundedness_max_tokens()`/the router's own
+  fixed bound, whichever call site sent it) — immediately before making it, then **settles**
+  (`CostGuard.settle()`, new) the reservation down or up to the real `usage.completion_tokens`
+  the response reports (reasoning tokens counted as output, matching Azure's own total) once it
+  succeeds, or to zero if it failed. All three phases now go through this one mechanism: phase
+  (a) and (c) via `_patched_post()` (temporarily replacing the global `httpx.post` for the
+  duration of a deployment's calls, since `AzureOpenAIChat` has no `post=` injection point of its
+  own), phase (b) via its existing explicit `post=` parameter. A 429 retries at most once
+  (unchanged `_call_with_single_retry` contract); the failed attempt's reservation is settled to
+  zero BEFORE the retry reserves fresh, so the two attempts are never double-counted.
+  `run_side_by_side()` now replays `subset` one DIALOGUE at a time (not the whole list in one
+  `evaluate_dialogues` call) — behaviourally identical, since a dialogue's in-memory state is
+  reset fresh per dialogue anyway — so a `CostCapExceeded` raised mid-run is caught at a dialogue
+  boundary and the exception carries `partial_results` (how many dialogues completed, per
+  deployment) back to `main()`'s existing `_fail()` handling, instead of a flat "blocked" message.
+  `CostGuard.reserve()`/`settle()` both hold a `threading.Lock` — pure insurance: every phase in
+  this module calls Azure strictly sequentially today, there is no concurrent caller yet.
+- **2a-2 fix — every phase is exception-safe, and so is `main()`.** `measure_token_budget()` (the
+  phase with no handling at all before this fix) now wraps its one HTTP call per representative
+  prompt in `try/except (httpx.HTTPStatusError, httpx.HTTPError, ValueError)` — the `ValueError`
+  case covers `parse_azure_chat_response` on a malformed body, the other DA-14.7-migration-
+  live-2a-2 gap — recording only `error_type`/`status_code` and continuing to the remaining
+  prompts. `run_smoke()`'s own equivalent handling gained the same `ValueError` branch. `main()`
+  now has ONE more, outermost `try/except Exception` (`_sanitized_exception_info()`, new) as a
+  last-resort net: anything that still escapes every phase's own handling is reduced to exception
+  CLASS + HTTP status only (never `str(exc)`, which for `httpx.HTTPStatusError` embeds the live
+  endpoint) before being printed or written to the evidence file, and the process exits non-zero.
+- **2a-3 fix — per-question ids + a flipped list.** `run_side_by_side()` now builds a `per_turn`
+  list per deployment (`dialogue_id`, `turn_index`, `correct`, `latency_s`, `tokens_in`/
+  `tokens_out`/`eur` — never `reply_text`/prompt text) and a top-level `flipped` list
+  (`_flipped_questions()`, new): every `(dialogue_id, turn_index)` whose judge verdict differs
+  between `gpt-4.1-mini` and `gpt-5-mini`, once both deployments finish without being stopped
+  early.
+
+**Self-reported boundaries (all three new, read together with part 2b's four pre-existing ones,
+unchanged):**
+
+1. The `per_turn` rows' `tokens_in`/`tokens_out`/`eur` are the REAL per-DIALOGUE total the cost
+   guard just measured (summed over however many Azure calls that one dialogue actually made —
+   router, chit-chat/off-topic/abstention reply, memory summary, answer, groundedness, judge),
+   divided EVENLY across that dialogue's own turns. This is an honest approximation, not a true
+   per-CALL attribution: a dialogue's turns do not all make the same number of LLM calls (the
+   exact fast path skips the router entirely for a turn), so an even split can under- or
+   over-state any one turn's real share. Wiring real per-call usage through
+   `DialogueTurnResult`/`runner.py` itself (which would let it be attributed exactly) remains out
+   of this block's declared `touches`, unchanged from part 2b.
+2. The cost guard's own INPUT-token estimate (used only to size the reservation, never the final
+   settled EUR) is the same crude chars/4 heuristic `rag_app.llm`'s own context-overflow warning
+   uses, duplicated here rather than imported (that name is private to `llm.py`, outside this
+   block's `touches`). It only ever affects the WORST-CASE reservation's size, never what is
+   actually billed (settlement always uses the real reported usage), and the output bound already
+   dominates the price (every Azure OpenAI chat model's output price per token is several times
+   its input price).
+3. `make_guarded_post()`'s "no `max_tokens`/`max_completion_tokens` bound -> refuse the call"
+   rule is a defensive guard, not a currently-reachable path: every call site this app has today
+   (`generation.py`, `assistant/*.py`, `eval/judge.py`) already passes an explicit bound. It
+   exists so a FUTURE call site that forgot to set one fails loudly here rather than silently
+   bypassing the cost guard.
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
@@ -1978,3 +2050,10 @@ leaves every other part of this block's and the app's behaviour completely unaff
 14.7-migration-live, part 2c: edits only the same three part-2b files (no new files) — a plain
 `git revert` restores the old, worktree-broken `DEFAULT_PRICES_PATH` behaviour with zero effect
 on anything else; same "never invoked by CI/gate.sh/any automation" property as part 2b.
+
+14.7-migration-live, part 2d: edits only the same three part-2b files (no new files), **no live
+Azure call made by this agent** (same self-reported-no-live-call boundary as every prior part of
+this block) — a plain `git revert` restores part 2c's flat-per-deployment cost reservation (the
+DA-14.7-migration-live-2a-1 finding reopens), the unguarded `measure_token_budget()` exception
+path (2a-2 reopens) and the aggregate-only side-by-side report (2a-3 reopens), with zero effect on
+anything else; same "never invoked by CI/gate.sh/any automation" property as parts 2b/2c.
