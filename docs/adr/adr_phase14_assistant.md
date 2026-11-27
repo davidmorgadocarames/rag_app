@@ -1586,6 +1586,82 @@ anyone noticing until a `--full` run failed.
   effect of adding a timing-only measurement; revisiting retrieval quality for this
   benchmark specifically is out of this row's scope.
 
+## Decision — Azure OpenAI model migration research (DEBT-036, block 14.7-migration, phase 1)
+
+Phase 1 of 14.7-migration is research + preparation only (user OK 2026-11-25 09:00): no Azure
+write, no Azure OpenAI inference call, no cost. Read-only `az` queries against
+`secrag-openai-dmc26` (region `spaincentral`) confirmed:
+
+- Today's deployment (`gpt-4.1-mini`, version `2025-04-14`, GlobalStandard, capacity 10 = 10K
+  TPM) has `lifecycleStatus: Legacy`, `deprecation.inference: 2027-04-14` — matches DEBT-036's
+  retirement date exactly.
+- **DEBT-020 re-check: DataZoneStandard quota is no longer 0 in every EU region.** As of
+  2026-11-25, `spaincentral` shows nonzero `OpenAI.DataZoneStandard.*` limits for several
+  candidate models (e.g. `gpt4.1-mini` limit 2000, `gpt-5-mini` limit 300, `gpt-5-nano` limit
+  2000 — all far above the current deployment's 10-unit capacity). This was 0 everywhere in EU
+  on 2026-09-27 (DEBT-020's original finding); it has changed since. A DataZoneStandard
+  deployment (EU data residency) is now a real option for the migration target, not blocked by
+  quota the way it was at Phase 10.5.
+- Candidate GA models in this account (`az cognitiveservices account list-models`) with longer
+  runway than `gpt-4.1-mini`: `gpt-5-mini` (`2025-08-07`, `GenerallyAvailable`, retires
+  `2027-07-13`, DataZoneStandard SKU present) and `gpt-5-nano` (same GA date, retires
+  `2027-02-09`). Both are real, documented Azure OpenAI models as of this agent's training
+  knowledge. The account also lists several newer model families (`gpt-5.1`…`gpt-6.2-*`) that
+  are beyond this agent's verifiable knowledge — their retirement dates/pricing/API shape could
+  not be confirmed against Microsoft Learn (no web-fetch tool was available in this agent's
+  session; only the account's own `az` metadata was used), so they are not recommended as a
+  deliberate target without a live human/orchestrator check of the current public docs.
+
+**Code change (this block, mocked tests only, no live call):** `AzureOpenAIChat._body`/
+`_json_body` (shared by `chat`/`chat_stream`/`chat_json`) now branch on a new
+`Settings.azure_openai_reasoning_model` flag (default `False`, no behaviour change for
+`gpt-4.1-mini`): when `True`, the request body uses `max_completion_tokens` instead of
+`max_tokens` and omits `temperature` entirely. This is required for any o-series/`gpt-5`-family
+reasoning-tier target — Azure's Chat Completions API rejects both `max_tokens` and a custom
+`temperature` on those deployments. The flag is a per-deployment switch (constructor
+`reasoning_model` kwarg falls back to the setting, same pattern as `endpoint`/`api_key`/
+`deployment`/`api_version`), not a per-call one, because the model family is fixed once a
+deployment is chosen.
+
+## Known limitations (self-reported, not just design) — 14.7-migration (phase 1)
+
+- **No live Azure call was made or is proposed yet.** The `max_completion_tokens`/no-`temperature`
+  body shape is verified only against mocked HTTP responses; the first live call against a real
+  reasoning-tier deployment (phase 2, after the user approves a target model + cost) must still
+  confirm the exact request/response shape, same discipline DEBT-036 already requires for
+  `chat_json`'s `strict: true` structured output (still unconfirmed against a live Azure
+  endpoint as of this block — no block has made that live call yet).
+- **Pricing for every candidate model is unverified.** `az` has no token-pricing query; this
+  agent had no web-fetch tool this session, so per-1M-token prices in `status/blocks/
+  14.7-migration.md`'s comparison table are either this agent's training-time knowledge (for
+  `gpt-5-mini`/`gpt-5-nano`/`gpt-4.1-mini`/`gpt-4o-mini`, which predate this agent's knowledge
+  cutoff) or explicitly marked "unverified" (for the newer model families the account lists).
+  The orchestrator/user must confirm current pricing on the public Azure OpenAI pricing page
+  before approving a target.
+- **The reasoning-model flag is coarse.** It assumes a deployment is either "fully reasoning
+  family" (no custom temperature at all, `max_completion_tokens` always) or not; it does not
+  yet model intermediate cases (e.g. a `reasoning_effort` parameter, or a model that accepts
+  `temperature` only at a fixed value like `1.0`). No such intermediate case is known to exist
+  among the verified candidates (`gpt-5-mini`/`gpt-5-nano`), so this is not a known gap today —
+  flagged in case a different target is later chosen.
+- **(DA-14.7-migration-1, high) API-version compatibility for the reasoning-model request
+  shape is unverified.** `Settings.azure_openai_api_version` still defaults to `2024-10-21`
+  (the version pinned when `strict: true` JSON-schema support was itself left unconfirmed at
+  14-B1). Azure OpenAI's reasoning-family support (`max_completion_tokens`, no custom
+  `temperature`) was introduced at specific API versions, and a GA API version does not
+  uniformly support every model family's newest parameters — it is plausible the first real
+  `gpt-5-mini` call needs a newer API version (preview or later GA), not just the body-shape
+  switch this block built. Must be checked before/at the first live `gpt-5-mini` call
+  (phase 2), distinct from the pre-existing `strict: true` unconfirmed-support note above.
+- **(DA-14.7-migration-2, medium) `GROUNDEDNESS_MAX_TOKENS`/`max_tokens` are untuned for a
+  reasoning-tier target.** Reasoning-family models (o-series/`gpt-5`) consume hidden
+  "reasoning tokens" from the same budget as `max_completion_tokens` — the visible answer
+  content can be truncated or empty if the numeric bound is too low. `config.py`'s
+  `GROUNDEDNESS_MAX_TOKENS` (16) and `settings.max_tokens` (~1024, `generation.py`) are tuned
+  for today's non-reasoning `gpt-4.1-mini`; both likely need raising for `gpt-5-mini` — e.g.
+  the 16-token groundedness check could silently return empty content. Not yet re-tuned; a
+  phase-2 prerequisite before the first live call, not just before the side-by-side eval.
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
@@ -1712,3 +1788,13 @@ regresses past 1.5s local; reverting removes that check (the dialogue-eval gate'
 `router_p95_s_local` floor, T14.2.8, is unaffected either way — a SEPARATE, already-existing
 enforcement point this row does not touch). A plain `git revert` of this block's commit(s)
 restores the pre-14-D3 registry/latency/metrics/cost behaviour exactly.
+
+14.7-migration (phase 1): no schema, no migration, no deployed-image step, **no live Azure
+call made**. `Settings.azure_openai_reasoning_model` is new, additive, defaulted to `False` —
+`AzureOpenAIChat._body`/`_json_body` take the identical, byte-unchanged `max_tokens`/
+`temperature` path for today's live `gpt-4.1-mini` deployment either way (proven by the full
+pre-existing `test_llm.py`/`test_llm_json.py` suite staying green). A plain `git revert` of
+this block's commit removes the flag and its 4 new mocked tests with zero runtime impact,
+since no caller passes `reasoning_model=True` yet. Phase 2 (a future block) is where this
+becomes live-behaviour-changing, once a deployment and the DA-14.7-migration-1/2 prerequisites
+above are resolved.

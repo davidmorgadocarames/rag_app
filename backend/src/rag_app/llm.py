@@ -386,12 +386,16 @@ class AzureOpenAIChat:
         api_key: str | None = None,
         deployment: str | None = None,
         api_version: str | None = None,
+        reasoning_model: bool | None = None,
     ) -> None:
         settings = get_settings()
         self.endpoint = (endpoint or settings.azure_openai_endpoint).rstrip("/")
         self.api_key = api_key or settings.azure_openai_api_key
         self.deployment = deployment or settings.azure_openai_deployment
         self.api_version = api_version or settings.azure_openai_api_version
+        self.reasoning_model = (
+            settings.azure_openai_reasoning_model if reasoning_model is None else reasoning_model
+        )
 
     def _url(self) -> str:
         return (
@@ -410,13 +414,24 @@ class AzureOpenAIChat:
         *,
         stream: bool,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "messages": messages,
-            "temperature": temperature,
-            "stream": stream,
-        }
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
+        """Build the Chat Completions request body.
+
+        ``self.reasoning_model`` (DEBT-036 migration prep, off by default — see
+        ``config.py``'s ``azure_openai_reasoning_model``) switches to the shape the Azure
+        OpenAI reasoning-model family (o-series, gpt-5) requires: ``max_completion_tokens``
+        instead of ``max_tokens``, and no ``temperature`` field at all (these models reject
+        any custom sampling temperature, including resending the default). The non-reasoning
+        family (today's gpt-4.1-mini) keeps the original ``max_tokens``/``temperature`` shape
+        unchanged.
+        """
+        body: dict[str, Any] = {"messages": messages, "stream": stream}
+        if self.reasoning_model:
+            if max_tokens is not None:
+                body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = temperature
+            if max_tokens is not None:
+                body["max_tokens"] = max_tokens
         if stream:
             body["stream_options"] = {"include_usage": True}
         return body
