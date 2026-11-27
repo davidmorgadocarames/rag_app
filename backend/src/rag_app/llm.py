@@ -392,9 +392,17 @@ class AzureOpenAIChat:
         self.endpoint = (endpoint or settings.azure_openai_endpoint).rstrip("/")
         self.api_key = api_key or settings.azure_openai_api_key
         self.deployment = deployment or settings.azure_openai_deployment
-        self.api_version = api_version or settings.azure_openai_api_version
         self.reasoning_model = (
             settings.azure_openai_reasoning_model if reasoning_model is None else reasoning_model
+        )
+        # DA-14.7-migration-1: a reasoning-family deployment may need its OWN api-version
+        # (`azure_openai_reasoning_api_version`, config.py) -- read only when this client is
+        # actually in reasoning-model mode, so the non-reasoning gpt-4.1-mini path's
+        # `azure_openai_api_version` is completely unaffected either way.
+        self.api_version = api_version or (
+            settings.azure_openai_reasoning_api_version
+            if self.reasoning_model
+            else settings.azure_openai_api_version
         )
 
     def _url(self) -> str:

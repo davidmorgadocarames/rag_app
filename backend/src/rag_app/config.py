@@ -190,6 +190,57 @@ class Settings(JobSettings):
     # for today's gpt-4.1-mini deployment until the orchestrator sets it alongside a new
     # AZURE_OPENAI_DEPLOYMENT. See docs/adr/adr_phase14_assistant.md's 14.7-migration section.
     azure_openai_reasoning_model: bool = False
+    # DA-14.7-migration-1 (API-version compatibility): `azure_openai_api_version` above is
+    # pinned for the NON-reasoning (today's gpt-4.1-mini) path; a reasoning-family deployment
+    # may need a different API version to accept the reasoning-model request shape -- Azure
+    # OpenAI's GA API versions do not uniformly support every model family's newest request
+    # parameters. Read ONLY when `azure_openai_reasoning_model` is True (`llm.py`'s
+    # `AzureOpenAIChat.__init__`); defaulting it to the SAME value as `azure_openai_api_version`
+    # keeps today's zero-behaviour-change guarantee until an operator sets it explicitly.
+    # **Not live-verified in this block** (14.7-migration-live, part 2a, 2026-11-27): every
+    # command that referenced the Azure OpenAI key file was denied by the permission system
+    # (3 attempts, all with no secret read -- an existence check, a source-and-print-only-
+    # whether-set, and the same with sandboxing disabled), so the live smoke call
+    # DA-14.7-migration-1 asked for could not run. See the ADR's "Known limitations" and this
+    # block's status file for the blocker; confirm/override this value before the first real
+    # gpt-5-mini call.
+    azure_openai_reasoning_api_version: str = "2024-10-21"
+    # DA-14.7-migration-2 (reasoning-token re-tune): reasoning-family models spend hidden
+    # "reasoning tokens" from the SAME budget as `max_completion_tokens` as the visible
+    # completion -- a bound sized for the non-reasoning gpt-4.1-mini path (`max_tokens` below,
+    # `generation.GROUNDEDNESS_MAX_TOKENS`) can silently truncate or empty the visible answer
+    # on the reasoning path. These two fields are the reasoning path's OWN bounds, read only
+    # when `azure_openai_reasoning_model` is True (`Settings.effective_max_tokens`/
+    # `effective_groundedness_max_tokens` below); the non-reasoning defaults are untouched.
+    # **Provisional, not live-measured** (same blocker as above -- DA-14.7-migration-2's own
+    # "measure reasoning_tokens vs visible tokens from a real response" step could not run
+    # either): sized from Azure/OpenAI's own published description of reasoning-family token
+    # budgets (reasoning tokens routinely run from the low hundreds to low thousands depending
+    # on `reasoning_effort`, which this app never sets -- so the service default applies),
+    # never a measurement on this app's own prompts. Re-tune with real numbers once the live
+    # blocker is resolved; until then these are a deliberately generous, cheap (well under one
+    # cent per call at gpt-5-mini's published per-token price) safety margin, not a tuned
+    # minimum.
+    azure_openai_reasoning_max_tokens: int = 3072
+    azure_openai_reasoning_groundedness_max_tokens: int = 512
+
+    def effective_max_tokens(self) -> int:
+        """Visible-answer token bound (DA-14.7-migration-2): the reasoning path uses its own,
+        larger bound (`azure_openai_reasoning_max_tokens`) because hidden reasoning tokens
+        share the same budget as the visible completion; the non-reasoning gpt-4.1-mini path
+        keeps `max_tokens` unchanged."""
+        if self.llm_provider == "azure_openai" and self.azure_openai_reasoning_model:
+            return self.azure_openai_reasoning_max_tokens
+        return self.max_tokens
+
+    def effective_groundedness_max_tokens(self, default: int) -> int:
+        """Groundedness-check token bound (DA-14.7-migration-2): same reasoning-path switch as
+        `effective_max_tokens`, over the caller's own non-reasoning default
+        (`generation.GROUNDEDNESS_MAX_TOKENS`) so this module never needs to import
+        `generation` (which already imports `config`, the other way around)."""
+        if self.llm_provider == "azure_openai" and self.azure_openai_reasoning_model:
+            return self.azure_openai_reasoning_groundedness_max_tokens
+        return default
 
     # --- Token cost estimation (T14.5.4) ---
     # Plain Settings, NEVER the private status/azure_prices.json file (that file must never

@@ -175,6 +175,72 @@ def test_the_bounds_are_the_documented_values() -> None:
     assert GROUNDEDNESS_MAX_TOKENS == 16
 
 
+# --- 14.7-migration-live part 2a: DA-14.7-migration-2, reasoning-path token re-tune. These
+# tests would fail on the pre-change code (``answer_from_chunks``/``answer_question_stream``/
+# ``check_groundedness`` always passed the plain ``max_tokens``/``GROUNDEDNESS_MAX_TOKENS``
+# regardless of ``azure_openai_reasoning_model`` -- no reasoning-aware branch existed). ---
+
+
+def _reasoning_settings() -> Settings:
+    return Settings(
+        llm_provider="azure_openai",
+        azure_openai_reasoning_model=True,
+        azure_openai_reasoning_max_tokens=3072,
+        azure_openai_reasoning_groundedness_max_tokens=512,
+    )
+
+
+def test_effective_max_tokens_switches_only_on_the_reasoning_path() -> None:
+    assert _reasoning_settings().effective_max_tokens() == 3072
+    assert Settings().effective_max_tokens() == Settings().max_tokens
+    # Reasoning flag alone, without the azure_openai provider, must NOT switch (Ollama never
+    # reads these reasoning-only fields).
+    assert (
+        Settings(azure_openai_reasoning_model=True).effective_max_tokens() == Settings().max_tokens
+    )
+
+
+def test_effective_groundedness_max_tokens_switches_only_on_the_reasoning_path() -> None:
+    assert _reasoning_settings().effective_groundedness_max_tokens(GROUNDEDNESS_MAX_TOKENS) == 512
+    assert Settings().effective_groundedness_max_tokens(GROUNDEDNESS_MAX_TOKENS) == (
+        GROUNDEDNESS_MAX_TOKENS
+    )
+
+
+def test_chat_path_uses_reasoning_bounds_on_the_reasoning_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generation, "get_settings", _reasoning_settings)
+    chat = _RecordingChat()
+    answer = answer_from_chunks(chat, "How do I prevent SQL injection?", [_chunk()])
+    assert not answer.abstained
+    assert chat.bounds == [("chat", 3072), ("chat", 512)]
+
+
+def test_stream_path_uses_reasoning_bounds_on_the_reasoning_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(generation, "embed_query", lambda *_a, **_k: [0.0])
+    monkeypatch.setattr(generation, "hybrid_search", lambda *_a, **_k: [_chunk()])
+    monkeypatch.setattr(generation, "get_settings", _reasoning_settings)
+    chat = _RecordingChat()
+    events = list(
+        answer_question_stream(
+            None,  # type: ignore[arg-type]
+            "How do I prevent SQL injection?",
+            chat=chat,
+            use_rerank=False,
+        )
+    )
+    result = events[-1]
+    assert isinstance(result, StreamResult) and not result.answer.abstained
+    assert chat.bounds == [
+        ("chat_json", ROUTER_MAX_TOKENS),
+        ("chat_stream", 3072),
+        ("chat_stream", 512),
+    ]
+
+
 # --- T11.3.4: explicit num_ctx per call type ------------------------------------------------
 
 

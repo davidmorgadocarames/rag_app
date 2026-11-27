@@ -292,3 +292,56 @@ def test_azure_chat_reasoning_model_setting_defaults_the_constructor_flag(
     client.chat([{"role": "user", "content": "hi"}], max_tokens=16)
     assert "max_completion_tokens" in captured
     assert "temperature" not in captured
+
+
+# --- 14.7-migration-live part 2a: DA-14.7-migration-1, per-deployment API version. These
+# tests would fail on the pre-change code (no such switch existed -- api_version always came
+# from the single azure_openai_api_version field regardless of reasoning_model). ---
+
+
+def test_azure_chat_non_reasoning_model_uses_the_plain_api_version() -> None:
+    """The gpt-4.1-mini path is completely unaffected by the new reasoning-only field."""
+    client = AzureOpenAIChat(
+        endpoint="http://fake",
+        api_key="k",
+        deployment="d",
+        reasoning_model=False,
+    )
+    settings = Settings()
+    assert client.api_version == settings.azure_openai_api_version
+
+
+def test_azure_chat_reasoning_model_uses_its_own_api_version_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-1: a reasoning-family deployment reads
+    ``azure_openai_reasoning_api_version`` instead of ``azure_openai_api_version`` -- even
+    when the two settings are given different values, so the switch is genuinely exercised
+    (not merely passing because both fields share one default)."""
+    settings = Settings(
+        azure_openai_api_version="2024-10-21",
+        azure_openai_reasoning_api_version="2024-12-01-preview",
+    )
+    monkeypatch.setattr(llm, "get_settings", lambda: settings)
+    client = AzureOpenAIChat(
+        endpoint="http://fake",
+        api_key="k",
+        deployment="d",
+        reasoning_model=True,
+    )
+    assert client.api_version == "2024-12-01-preview"
+    assert client.api_version != settings.azure_openai_api_version
+
+
+def test_azure_chat_explicit_api_version_kwarg_wins_over_either_setting() -> None:
+    """An explicit ``api_version`` kwarg (e.g. a smoke script probing candidate versions)
+    always wins, reasoning or not -- unchanged behaviour, guarded so a future refactor of the
+    new branch cannot silently drop it."""
+    client = AzureOpenAIChat(
+        endpoint="http://fake",
+        api_key="k",
+        deployment="d",
+        api_version="2025-03-01-preview",
+        reasoning_model=True,
+    )
+    assert client.api_version == "2025-03-01-preview"

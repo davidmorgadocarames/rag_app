@@ -170,11 +170,12 @@ def check_groundedness(chat: ChatClient, answer_text: str, chunks: list[Retrieve
             {"role": "user", "content": user},
         ]
     with timing.step("checking", "llm_verdict"):
+        settings = get_settings()
         raw = chat.chat(
             messages,
             temperature=0.0,
-            max_tokens=GROUNDEDNESS_MAX_TOKENS,
-            num_ctx=get_settings().num_ctx_groundedness,
+            max_tokens=settings.effective_groundedness_max_tokens(GROUNDEDNESS_MAX_TOKENS),
+            num_ctx=settings.num_ctx_groundedness,
             call_type="groundedness",
         )
     with timing.step("checking", "parse_verdict"):
@@ -208,7 +209,7 @@ def answer_from_chunks(
         )
 
     settings = get_settings()
-    max_tokens = settings.max_tokens
+    max_tokens = settings.effective_max_tokens()
     # T13.8.1: build_prompt/llm_first_token/parse_answer (pipeline stage "generating") -- a
     # separate channel from the unchanged "generate" stage total. The non-streaming path has
     # no incremental token stream (one blocking call): "llm_first_token" covers the WHOLE
@@ -578,7 +579,7 @@ def _stream_answer_tokens(
     emitting = False
     full = ""
     settings = get_settings()
-    max_tokens = settings.max_tokens
+    max_tokens = settings.effective_max_tokens()
     with timing.step("generating", "build_prompt"):
         messages = build_messages(query, chunks)
     stream = chat.chat_stream(
@@ -893,13 +894,14 @@ def _check_groundedness_counted(
             {"role": "user", "content": user},
         ]
     with timing.step("checking", "llm_verdict"):
+        settings = get_settings()
         verdict = "".join(
             chat.chat_stream(
                 messages,
                 temperature=0.0,
-                max_tokens=GROUNDEDNESS_MAX_TOKENS,
+                max_tokens=settings.effective_groundedness_max_tokens(GROUNDEDNESS_MAX_TOKENS),
                 usage=usage,
-                num_ctx=get_settings().num_ctx_groundedness,
+                num_ctx=settings.num_ctx_groundedness,
                 call_type="groundedness",
             )
         )
