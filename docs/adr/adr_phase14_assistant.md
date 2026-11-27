@@ -1771,6 +1771,53 @@ block file):**
    against the real Azure OpenAI API (the right URL shape, the real `usage` field names) is only
    confirmed once the user runs the script and pastes back the summary.
 
+## Decision — Azure OpenAI model migration, live checks part 2c: worktree prices-file fix
+(block 14.7-migration-live, 2026-11-27)
+
+Part 2b's `DEFAULT_PRICES_PATH` pointed unconditionally at `REPO_ROOT/status/azure_prices.json`.
+`status/` is a symlink into the private planning folder **only in the main repo clone**
+(`~/proyectos/rag_app`) — a `git worktree` such as `~/proyectos/wt/14-A1` has no such symlink; its
+own `status/` tracks only `status/blocks/` in git, never `azure_prices.json`. A user running
+`openai_live_check.sh` from that worktree (the worktree this whole block has been developed in)
+would have hit a raw, unhelpful `FileNotFoundError` at the cost guard before any Azure call — not
+unsafe (no call would have been made), but not a clear failure either, and with no alternative
+path offered.
+
+- **`resolve_prices_path()`** (`backend/src/rag_app/eval/azure_side_by_side.py`) now tries, in
+  this fixed order, stopping at the first candidate that **exists**: the explicit `--prices` CLI
+  flag, the `$SECRAG_AZURE_PRICES` env var, `REPO_ROOT/status/azure_prices.json` (works from the
+  main repo clone), then the hard-coded `~/proyectos/rag_app/status/azure_prices.json` (so a
+  worktree run finds the real file with zero extra configuration). If none exists, it raises
+  `FileNotFoundError` naming **every** path it tried, called before `get_settings()` and therefore
+  before any possible Azure call — fail CLOSED, never "no cost guard, proceed anyway". `main()`
+  calls it before touching `Settings`/the cost guard at all; `CostGuard.from_file` now takes a
+  pre-resolved `path` with no fallback default of its own.
+- **`--check-config`** (new CLI flag, surfaced by `openai_live_check.sh --check-config`) resolves
+  the prices path and the golden-set-v2 path and prints the `gpt-4.1-mini`/`gpt-5-mini`
+  `datazone_standard` prices — **zero env-file read, zero network call** (`check_config_lines()`
+  never calls `get_settings()`). This is the harmless first step a user runs from a new worktree
+  to PROVE path resolution finds the real prices file before running anything that could cost
+  money; verified for real from `~/proyectos/wt/14-A1` while building this fix (the worktree this
+  block lives in), not just by a mocked test — see the block file's Part 2c section for the
+  captured output.
+- **`openai_live_check.sh`**'s `--check-config`/`--prices` passthrough runs the Python module
+  directly, skipping the `$SECRET_ENV_FILE` existence check and the `set -a; . ...; set +a`
+  sourcing entirely for `--check-config` — proven by a real (non-mocked) subprocess test that
+  passes even with no secret env file present.
+- **Other worktree-relative paths checked, found already correct**: `eval/golden_set_v2.jsonl`
+  is a tracked file (not under the private `status/` symlink), so it already exists in any
+  worktree; the shell script's own venv resolution already walks up to the git common dir
+  (`MAIN_ROOT`) via `git rev-parse --path-format=absolute --git-common-dir`, which already
+  resolves correctly from a worktree (confirmed, not changed in this part); `--output-dir`
+  defaults to `None` (no default path at all, so no worktree assumption to break).
+
+**Self-reported boundary:** the fallback chain's third and fourth steps are two fixed,
+hard-coded locations (`REPO_ROOT/status/...` and `~/proyectos/rag_app/status/...`); a worktree or
+clone at any OTHER path than `~/proyectos/wt/<name>`/`~/proyectos/rag_app` still needs either
+`--prices` or `$SECRAG_AZURE_PRICES` set explicitly — not auto-discovered by any smarter search
+(e.g. walking parent directories). Documented rather than solved further, since both repo
+locations are this project's own fixed convention (ORCHESTRATION.md's Environment section).
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
@@ -1927,3 +1974,7 @@ call made by this agent** (see the self-reported boundary above) — three brand
 removes them with zero effect on anything else. The script is never invoked by CI, `gate.sh`, or
 any other automation — only by the user, by hand, so reverting (or simply never running it)
 leaves every other part of this block's and the app's behaviour completely unaffected.
+
+14.7-migration-live, part 2c: edits only the same three part-2b files (no new files) — a plain
+`git revert` restores the old, worktree-broken `DEFAULT_PRICES_PATH` behaviour with zero effect
+on anything else; same "never invoked by CI/gate.sh/any automation" property as part 2b.

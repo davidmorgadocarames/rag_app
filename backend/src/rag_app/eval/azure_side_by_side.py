@@ -48,6 +48,24 @@ Output discipline (never violated anywhere in this module): the report this modu
 prints/writes contains only ids, call types, status codes, exception CLASS NAMES (never
 ``str(exc)`` -- an exception's string form can embed the request URL), token counts and EUR
 figures. It never contains an endpoint, an API key, or full prompt/response text.
+
+**Part 2c fix (worktree prices-file bug, F22-class).** ``status/`` is a symlink into the
+private planning folder only in the MAIN repo clone (``~/proyectos/rag_app``); a `git worktree`
+such as ``~/proyectos/wt/14-A1`` has no such symlink -- its own ``status/`` holds only the
+tracked ``status/blocks/`` directory, never ``azure_prices.json``. Part 2b's
+``DEFAULT_PRICES_PATH`` pointed unconditionally at ``REPO_ROOT/status/azure_prices.json``, which
+is exactly this missing path when run from a worktree -- the cost guard would have crashed with
+a raw ``FileNotFoundError`` before any Azure call, which is fail-safe by accident, not by design,
+and the error message named no alternative. :func:`resolve_prices_path` now tries, in order,
+stopping at the first path that exists: the explicit ``--prices`` CLI flag, the
+``SECRAG_AZURE_PRICES`` env var, ``REPO_ROOT/status/azure_prices.json`` (works from the main repo
+clone), then ``~/proyectos/rag_app/status/azure_prices.json`` (the hard-coded main-repo fallback,
+so a worktree run finds the real file without the user having to pass anything). If none exists
+it raises :class:`FileNotFoundError` naming every path it tried, BEFORE ``get_settings()`` is even
+called (so before any possible Azure call) -- never "no cost guard, proceed anyway". The new
+``--check-config`` flag resolves this path and the golden-set path and prints the
+``gpt-4.1-mini``/``gpt-5-mini`` DataZone prices with zero env-file read and zero network call, so
+the user can prove path resolution works from their own worktree before running anything live.
 """
 
 from __future__ import annotations
@@ -55,6 +73,8 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -65,13 +85,58 @@ import httpx
 from pydantic import BaseModel
 
 from rag_app.config import Settings, get_settings
-from rag_app.eval.dataset import Dialogue, load_dialogues
+from rag_app.eval.dataset import DEFAULT_GOLDEN_SET_V2, Dialogue, load_dialogues
 from rag_app.eval.metrics import compute_dialogue_metrics
 from rag_app.eval.runner import evaluate_dialogues
 from rag_app.llm import AzureOpenAIChat, Message, parse_azure_chat_response
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_PRICES_PATH = REPO_ROOT / "status" / "azure_prices.json"
+
+# Part 2c (F22-class worktree bug): the env var an explicit override can use instead of --prices.
+SECRAG_AZURE_PRICES_ENV = "SECRAG_AZURE_PRICES"
+# The main repo clone's status/ IS the symlink into the private planning folder where the real
+# azure_prices.json lives; this is the last-resort fallback resolve_prices_path() tries when run
+# from a worktree (which has no status symlink of its own -- see the module docstring).
+MAIN_REPO_PRICES_PATH = Path.home() / "proyectos" / "rag_app" / "status" / "azure_prices.json"
+
+
+def resolve_prices_path(explicit: Path | None = None) -> Path:
+    """Resolve ``azure_prices.json`` in this fixed order, returning the first candidate that
+    **exists** on disk:
+
+    1. ``explicit`` (the ``--prices`` CLI flag), if given.
+    2. ``$SECRAG_AZURE_PRICES`` (the env var), if set.
+    3. ``REPO_ROOT/status/azure_prices.json`` -- works when run from the main repo clone, where
+       ``status/`` is the symlink into the private planning folder.
+    4. ``~/proyectos/rag_app/status/azure_prices.json`` -- the main repo clone's own path,
+       hard-coded as a fallback so a run from a WORKTREE (whose ``status/`` has no such symlink,
+       F22-class) still finds the real file without the user passing anything.
+
+    **Fails CLOSED**: raises :class:`FileNotFoundError` naming every path tried, in order, if
+    none of them exists -- this function is always called BEFORE any Azure network call, never
+    after, and never falls back to "no cost guard, proceed anyway".
+    """
+    candidates: list[tuple[str, Path]] = []
+    if explicit is not None:
+        candidates.append(("--prices", explicit))
+    env_value = os.environ.get(SECRAG_AZURE_PRICES_ENV)
+    if env_value:
+        candidates.append((f"${SECRAG_AZURE_PRICES_ENV}", Path(env_value)))
+    candidates.append(
+        ("REPO_ROOT/status/azure_prices.json", REPO_ROOT / "status" / "azure_prices.json")
+    )
+    candidates.append(("~/proyectos/rag_app/status/azure_prices.json", MAIN_REPO_PRICES_PATH))
+
+    for _label, candidate_path in candidates:
+        if candidate_path.is_file():
+            return candidate_path
+
+    tried = "; ".join(f"{label} ({path})" for label, path in candidates)
+    raise FileNotFoundError(
+        "no Azure OpenAI prices file found -- refusing to proceed without a cost guard "
+        f"(tried, in order: {tried})"
+    )
+
 
 BASELINE_DEPLOYMENT = "gpt-4.1-mini"
 CANDIDATE_DEPLOYMENT = "gpt-5-mini"
@@ -133,7 +198,12 @@ class CostGuard:
     log: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
-    def from_file(cls, max_eur: float, path: Path = DEFAULT_PRICES_PATH) -> CostGuard:
+    def from_file(cls, max_eur: float, path: Path) -> CostGuard:
+        """``path`` must already be a RESOLVED, existing path (see :func:`resolve_prices_path`)
+        -- this method itself still fails closed with a plain, unambiguous
+        ``FileNotFoundError``/``JSONDecodeError`` if ``path`` turns out not to be readable, but
+        callers should resolve the path first so the error message names every path tried, not
+        just the one that was finally passed in."""
         return cls(prices=json.loads(path.read_text(encoding="utf-8")), max_eur=max_eur)
 
     def estimate(self, *, model: str, tokens_in: float, tokens_out: float) -> dict[str, Any]:
@@ -580,6 +650,31 @@ def _write_report(report: dict[str, Any], output_dir: Path | None) -> None:
     (output_dir / "summary.md").write_text(summarize(report) + "\n", encoding="utf-8")
 
 
+def check_config_lines(explicit_prices: Path | None = None) -> list[str]:
+    """Part 2c: resolve the prices file + golden-set path and format the
+    ``gpt-4.1-mini``/``gpt-5-mini`` :data:`PRICE_TIER` prices, exactly what ``--check-config``
+    prints. **Zero network call, zero env-file read** (never calls :func:`get_settings`) -- only
+    path resolution and a local JSON read, so this is safe to run from any worktree to PROVE the
+    real ``azure_prices.json`` is found before anything that could cost money. Raises
+    :class:`FileNotFoundError` (unchanged, naming every path tried) if resolution fails -- the
+    caller is responsible for turning that into a clean non-zero exit, never a stack trace to the
+    user."""
+    prices_path = resolve_prices_path(explicit_prices)
+    prices = json.loads(prices_path.read_text(encoding="utf-8"))
+    lines = [f"prices file: {prices_path}"]
+    for model in (BASELINE_DEPLOYMENT, CANDIDATE_DEPLOYMENT):
+        row = prices.get("openai", {}).get("models", {}).get(model, {}).get(PRICE_TIER)
+        if row is None:
+            lines.append(f"{model} ({PRICE_TIER}): MISSING from prices file")
+            continue
+        lines.append(
+            f"{model} ({PRICE_TIER}): input={row['input_per_1m_usd']} USD/1M tokens "
+            f"output={row['output_per_1m_usd']} USD/1M tokens"
+        )
+    lines.append(f"golden set v2: {DEFAULT_GOLDEN_SET_V2} exists={DEFAULT_GOLDEN_SET_V2.is_file()}")
+    return lines
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Azure OpenAI gpt-4.1-mini vs gpt-5-mini live side-by-side check (part 2b)."
@@ -595,11 +690,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output-dir", type=Path, default=None, help="where to write results.json/summary.md"
     )
-    parser.add_argument("--prices-path", type=Path, default=DEFAULT_PRICES_PATH)
+    parser.add_argument(
+        "--prices",
+        type=Path,
+        default=None,
+        help=(
+            "explicit path to azure_prices.json (overrides $SECRAG_AZURE_PRICES and the "
+            "repo/main-repo fallback -- see resolve_prices_path())"
+        ),
+    )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help=(
+            "resolve the prices/golden-set paths and print the gpt-4.1-mini/gpt-5-mini DataZone "
+            "prices, then exit -- no env file read, no network call, no cost guard run. Use this "
+            "FIRST from a new worktree to prove path resolution works."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.check_config:
+        try:
+            for line in check_config_lines(args.prices):
+                print(line)
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
+    try:
+        prices_path = resolve_prices_path(args.prices)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
     settings = get_settings()
-    cost_guard = CostGuard.from_file(args.max_eur, path=args.prices_path)
+    cost_guard = CostGuard.from_file(args.max_eur, path=prices_path)
     report: dict[str, Any] = {
         "generated_at_utc": _dt.datetime.now(_dt.UTC).isoformat(),
         "max_eur": args.max_eur,

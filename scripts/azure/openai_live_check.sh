@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Azure OpenAI gpt-4.1-mini vs gpt-5-mini live side-by-side check (14.7-migration-live, part 2b).
+# Azure OpenAI gpt-4.1-mini vs gpt-5-mini live side-by-side check (14.7-migration-live, part 2b;
+# --check-config / --prices added in part 2c).
 #
-#   bash scripts/azure/openai_live_check.sh [--smoke-only] [--max-eur 0.30]
+#   bash scripts/azure/openai_live_check.sh --check-config [--prices <path>]
+#   bash scripts/azure/openai_live_check.sh [--smoke-only] [--max-eur 0.30] [--prices <path>]
 #
 # RUN THIS YOURSELF, in your own Ubuntu/WSL terminal, from this worktree
 # (~/proyectos/wt/14-A1 or wherever branch phase-14-assistant is checked out). NEVER from an
@@ -10,7 +12,19 @@
 # secret boundary, memory "user-secret-handling"). This script is the ONE place that boundary is
 # sanctioned to be crossed, because YOU are running it, not an agent.
 #
-# What it does:
+# --check-config (part 2c, RUN THIS FIRST): resolves the azure_prices.json/golden-set paths and
+# prints the gpt-4.1-mini/gpt-5-mini DataZone prices -- no secret env file read, no network call.
+# Proves path resolution works from THIS worktree before anything that could cost money. A
+# worktree's own status/ has no azure_prices.json (no status symlink, unlike the main repo clone)
+# -- the Python module now falls back to $SECRAG_AZURE_PRICES, then the main repo clone's
+# status/azure_prices.json, before failing closed with a clear message (see
+# backend/src/rag_app/eval/azure_side_by_side.py's resolve_prices_path() docstring).
+#
+# --prices <path>: explicit override, passed straight through to the Python module (see
+# resolve_prices_path()). Rarely needed -- the fallback chain above covers both the main repo
+# clone and a worktree without it.
+#
+# What it does (full run, not --check-config):
 #  1. Sources ~/.config/secrag/azure-openai.env (AZURE_OPENAI_ENDPOINT / _API_KEY / _DEPLOYMENT /
 #     ...) into THIS shell's environment only. The values are never echoed, never printed, never
 #     written to a log by this script -- only the Python module it calls
@@ -71,15 +85,34 @@ PY="$VENV/bin/python"
 
 smoke_only=0
 max_eur="0.30"
+check_config=0
+prices_path=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --smoke-only) smoke_only=1 ;;
     --max-eur) max_eur="${2:?--max-eur needs a value}"; shift ;;
-    -h|--help) sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --check-config) check_config=1 ;;
+    --prices) prices_path="${2:?--prices needs a value}"; shift ;;
+    -h|--help) sed -n '2,50p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+prices_args=()
+if [ -n "$prices_path" ]; then
+  prices_args=(--prices "$prices_path")
+fi
+
+# --check-config needs none of the secret-env-file machinery below: no sourcing, no evidence
+# dir, no network call -- just path resolution + a local JSON read, run through the same venv.
+if [ "$check_config" = 1 ]; then
+  echo "[openai_live_check] --check-config: resolving paths only, no env file, no network call"
+  status=0
+  (cd "$REPO_ROOT/backend" && PYTHONPATH="$REPO_ROOT/backend/src" "$PY" \
+    -m rag_app.eval.azure_side_by_side --check-config "${prices_args[@]}") || status=$?
+  exit "$status"
+fi
 
 if [ ! -f "$SECRET_ENV_FILE" ]; then
   echo "ERROR: $SECRET_ENV_FILE not found." >&2
@@ -102,6 +135,7 @@ args=(-m rag_app.eval.azure_side_by_side --max-eur "$max_eur" --output-dir "$evi
 if [ "$smoke_only" = 1 ]; then
   args+=(--smoke-only)
 fi
+args+=("${prices_args[@]}")
 
 echo "[openai_live_check] running (this talks to Azure OpenAI; cap --max-eur=$max_eur; evidence -> $evidence_dir)"
 # Same convention as scripts/gate.sh: run from backend/ with backend/src on PYTHONPATH (this

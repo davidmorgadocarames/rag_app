@@ -89,6 +89,200 @@ def test_cost_guard_running_total_accumulates_across_reservations() -> None:
     assert second["running_total_eur"] == pytest.approx(guard.spent_eur)
 
 
+def test_cost_guard_from_file_reads_prices_json(tmp_path: Path) -> None:
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    guard = sbs.CostGuard.from_file(1.0, path=prices_path)
+    assert guard.max_eur == 1.0
+    assert guard.prices == FAKE_PRICES
+
+
+def test_cost_guard_from_file_raises_cleanly_when_path_is_missing(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        sbs.CostGuard.from_file(1.0, path=tmp_path / "does-not-exist.json")
+
+
+# --- resolve_prices_path: resolution order (part 2c, F22-class worktree bug) ----------------
+#
+# The bug this part fixes: a worktree's own status/ (e.g. ~/proyectos/wt/14-A1/status/) has no
+# status symlink and so holds only status/blocks/, never azure_prices.json -- the old
+# DEFAULT_PRICES_PATH pointed unconditionally at REPO_ROOT/status/azure_prices.json, which is
+# exactly this missing path from a worktree.
+
+
+def test_resolve_prices_path_prefers_explicit_over_every_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text("{}", encoding="utf-8")
+    env_path = tmp_path / "env.json"
+    env_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(sbs.SECRAG_AZURE_PRICES_ENV, str(env_path))
+    assert sbs.resolve_prices_path(explicit) == explicit
+
+
+def test_resolve_prices_path_falls_back_to_env_var_when_no_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_path = tmp_path / "env.json"
+    env_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(sbs.SECRAG_AZURE_PRICES_ENV, str(env_path))
+    monkeypatch.setattr(sbs, "REPO_ROOT", tmp_path / "no-such-repo")
+    monkeypatch.setattr(sbs, "MAIN_REPO_PRICES_PATH", tmp_path / "no-such-main-repo.json")
+    assert sbs.resolve_prices_path(None) == env_path
+
+
+def test_resolve_prices_path_falls_back_to_repo_root_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(sbs.SECRAG_AZURE_PRICES_ENV, raising=False)
+    repo_root = tmp_path / "repo"
+    (repo_root / "status").mkdir(parents=True)
+    repo_prices = repo_root / "status" / "azure_prices.json"
+    repo_prices.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sbs, "REPO_ROOT", repo_root)
+    monkeypatch.setattr(sbs, "MAIN_REPO_PRICES_PATH", tmp_path / "no-such-main-repo.json")
+    assert sbs.resolve_prices_path(None) == repo_prices
+
+
+def test_resolve_prices_path_falls_back_to_main_repo_when_worktree_status_is_bare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact worktree bug this part fixes: REPO_ROOT/status/ exists (e.g. only
+    status/blocks/, like a real worktree) but has no azure_prices.json -- must fall through to
+    the main-repo fallback, not raise."""
+    monkeypatch.delenv(sbs.SECRAG_AZURE_PRICES_ENV, raising=False)
+    worktree_root = tmp_path / "worktree"
+    (worktree_root / "status" / "blocks").mkdir(parents=True)  # no azure_prices.json here
+    monkeypatch.setattr(sbs, "REPO_ROOT", worktree_root)
+    main_repo_prices = tmp_path / "main-repo-status" / "azure_prices.json"
+    main_repo_prices.parent.mkdir(parents=True)
+    main_repo_prices.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sbs, "MAIN_REPO_PRICES_PATH", main_repo_prices)
+    assert sbs.resolve_prices_path(None) == main_repo_prices
+
+
+def test_resolve_prices_path_fails_closed_naming_every_path_tried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing_explicit = tmp_path / "missing-explicit.json"
+    missing_env = tmp_path / "missing-env.json"
+    missing_repo_root = tmp_path / "missing-repo"
+    missing_main_repo = tmp_path / "missing-main-repo.json"
+    monkeypatch.setenv(sbs.SECRAG_AZURE_PRICES_ENV, str(missing_env))
+    monkeypatch.setattr(sbs, "REPO_ROOT", missing_repo_root)
+    monkeypatch.setattr(sbs, "MAIN_REPO_PRICES_PATH", missing_main_repo)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        sbs.resolve_prices_path(missing_explicit)
+
+    message = str(excinfo.value)
+    for expected in (
+        str(missing_explicit),
+        str(missing_env),
+        str(missing_repo_root / "status" / "azure_prices.json"),
+        str(missing_main_repo),
+    ):
+        assert expected in message
+
+
+# --- check_config_lines() / --check-config: no env file, no network ------------------------
+
+
+def test_check_config_lines_reports_resolved_path_and_datazone_prices(tmp_path: Path) -> None:
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    lines = sbs.check_config_lines(prices_path)
+    joined = "\n".join(lines)
+    assert f"prices file: {prices_path}" in joined
+    assert "gpt-4.1-mini (datazone_standard): input=0.44" in joined
+    assert "gpt-5-mini (datazone_standard): input=0.275" in joined
+    assert "golden set v2:" in joined
+
+
+def test_check_config_lines_fails_closed_when_nothing_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(sbs.SECRAG_AZURE_PRICES_ENV, raising=False)
+    monkeypatch.setattr(sbs, "REPO_ROOT", tmp_path / "no-repo")
+    monkeypatch.setattr(sbs, "MAIN_REPO_PRICES_PATH", tmp_path / "no-main-repo.json")
+    with pytest.raises(FileNotFoundError):
+        sbs.check_config_lines(None)
+
+
+def test_check_config_lines_never_calls_get_settings_or_the_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("check_config_lines must never call get_settings or the network")
+
+    monkeypatch.setattr(sbs, "get_settings", _boom)
+    monkeypatch.setattr(sbs.httpx, "post", _boom)
+    sbs.check_config_lines(prices_path)  # must not raise
+
+
+def test_main_check_config_flag_prints_lines_and_returns_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("--check-config must never touch settings or the network")
+
+    monkeypatch.setattr(sbs, "get_settings", _boom)
+    monkeypatch.setattr(sbs.httpx, "post", _boom)
+
+    exit_code = sbs.main(["--check-config", "--prices", str(prices_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"prices file: {prices_path}" in captured.out
+    assert "gpt-5-mini" in captured.out
+
+
+def test_main_without_a_resolvable_prices_file_fails_closed_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(sbs.SECRAG_AZURE_PRICES_ENV, raising=False)
+    monkeypatch.setattr(sbs, "REPO_ROOT", tmp_path / "no-repo")
+    monkeypatch.setattr(sbs, "MAIN_REPO_PRICES_PATH", tmp_path / "no-main-repo.json")
+
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("main() must fail closed before calling get_settings or the network")
+
+    monkeypatch.setattr(sbs, "get_settings", _boom)
+    monkeypatch.setattr(sbs.httpx, "post", _boom)
+
+    exit_code = sbs.main([])
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "no Azure OpenAI prices file found" in captured.err
+
+
+def test_openai_live_check_script_check_config_works_without_the_secret_env_file() -> None:
+    """--check-config must succeed even though the real $HOME/.config/secrag/azure-openai.env
+    on this machine is never sourced, read or checked for existence on this path -- proves the
+    secret-env-file gate is genuinely skipped for --check-config, not just documented as
+    skipped. Uses the real $HOME (not a fake one) specifically so the real
+    ~/proyectos/rag_app/status/azure_prices.json fallback is reachable, exactly like a real
+    worktree run."""
+    env = dict(os.environ)
+    env.pop(sbs.SECRAG_AZURE_PRICES_ENV, None)
+    result = subprocess.run(
+        ["bash", str(SCRIPT_PATH), "--check-config"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "prices file:" in result.stdout
+    assert "SECRET_ENV_FILE" not in result.stdout + result.stderr
+
+
 # --- API-version probe ----------------------------------------------------------------------
 
 
