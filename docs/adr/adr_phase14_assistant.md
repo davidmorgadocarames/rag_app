@@ -1716,6 +1716,61 @@ orchestrator or the user, in an environment where that command is not denied) sh
 record the measured numbers here, replacing the "Provisional, not live-measured" comments in
 `config.py`.
 
+## Decision — Azure OpenAI model migration, live checks part 2b: the user-run live-check script
+(block 14.7-migration-live, 2026-11-27)
+
+Part 2a's blocker (F43, `status/failures.md`) is a permission-system design choice, not a bug:
+an agent must never reference `~/.config/secrag/azure-openai.env` at all, even read-only. The
+process fix (F43's own "FIXED (process)" note) is to package every live call that needs that
+secret into **one script the USER runs themselves**, built and unit-tested entirely offline by
+the agent. This decision implements that fix for 14.7-migration-live:
+
+- **`scripts/azure/openai_live_check.sh`** — sources the env file inline
+  (`set -a; . "$SECRET_ENV_FILE"; set +a`), disables xtrace defensively (`set +o xtrace` plus an
+  `unset SHELLOPTS BASH_XTRACEFD` guard against an inherited trace being turned back on
+  mid-script), never echoes a variable value anywhere, and runs
+  `backend/src/rag_app/eval/azure_side_by_side.py` through the repo's normal backend venv (same
+  `GIT_COMMON`/`MAIN_ROOT` resolution as `scripts/gate.sh`, so it works from any worktree).
+  Shellcheck-clean; keeps its executable bit (verified in `test_azure_side_by_side.py`, not just
+  asserted).
+- **`backend/src/rag_app/eval/azure_side_by_side.py`** — three phases (smoke, token-budget
+  measurement, Option B side-by-side eval), each gated by a `CostGuard` that estimates EUR from
+  `status/azure_prices.json`'s `datazone_standard` tier **before** any call (never after) and
+  raises `CostCapExceeded` — no call made — rather than exceed `--max-eur`. At most one retry, on
+  HTTP 429 only. The report this module builds/prints contains only ids, call types, status
+  codes, exception **class names** (never `str(exc)`, which can embed a request URL), token
+  counts and EUR — never an endpoint, a key, or full prompt/response text.
+- **`backend/tests/test_azure_side_by_side.py`** — the cost guard's positive AND negative
+  control (including proving the guarded call never actually happens once the cap is already
+  exhausted), a leak test with a planted fake endpoint+key that must never appear in any output,
+  the API-version probe picking the first working candidate, the summary format, and the shell
+  script's no-echo/`set -a`/xtrace-off/executable-bit properties.
+
+**Self-reported boundaries (same discipline as part 2a's — written here, not only in the
+block file):**
+
+1. **`GA_API_VERSION_PROBE_ORDER`** (the candidate API versions `probe_api_versions` tries) is
+   this agent's training-time knowledge of Azure OpenAI's documented GA version history (cutoff
+   January 2026), not a live-verified list — the live script reports whichever candidate
+   actually works, but if Azure's true minimal-working version for `gpt-5-mini` is newer than
+   every candidate listed, the probe will report "no candidate succeeded" and the list needs a
+   manual addition before a second run.
+2. **Phase (b)'s `representative_prompts`** build router/answer/groundedness-SHAPED prompts from
+   golden-set v2 text (a turn's raw message, question + no chunks, question + ground truth as a
+   "claim") — not the exact prompts `generation.py` assembles from real retrieved chunks. Good
+   enough to see the reasoning/visible token RATIO, not a substitute for phase (c)'s real
+   pipeline run.
+3. **Phase (c)'s token/EUR numbers are the PLAN's own ESTIMATE** (`TOKENS_IN_PER_QUESTION`/
+   `TOKENS_OUT_PER_QUESTION`, `status/blocks/14.7-migration.md` §4's arithmetic), not measured
+   per-call `usage` the way phase (b) is. Wiring real per-call usage through
+   `DialogueTurnResult`/`rag_app.eval.runner` would need touching files outside this block's
+   declared `touches` — left as a follow-up for whichever block next extends the v2 eval runner's
+   usage accounting, not solved here.
+4. **No live Azure OpenAI call was made building this** (same F43 boundary as part 2a) — every
+   test in `test_azure_side_by_side.py` is offline/mocked; the module's actual correctness
+   against the real Azure OpenAI API (the right URL shape, the real `usage` field names) is only
+   confirmed once the user runs the script and pastes back the summary.
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
@@ -1864,3 +1919,11 @@ methods, but every existing bounds/api-version test (unmodified) still passes, p
 non-reasoning gpt-4.1-mini path is byte-for-byte unchanged. A plain `git revert` of this
 block's commit removes the three new fields, the two new methods and the new mocked tests with
 zero runtime impact, since `azure_openai_reasoning_model` has no live caller yet.
+
+14.7-migration-live, part 2b: no schema, no migration, no deployed-image step, **no live Azure
+call made by this agent** (see the self-reported boundary above) — three brand-new files
+(`scripts/azure/openai_live_check.sh`, `backend/src/rag_app/eval/azure_side_by_side.py`,
+`backend/tests/test_azure_side_by_side.py`), nothing existing touched, so a plain `git revert`
+removes them with zero effect on anything else. The script is never invoked by CI, `gate.sh`, or
+any other automation — only by the user, by hand, so reverting (or simply never running it)
+leaves every other part of this block's and the app's behaviour completely unaffected.
