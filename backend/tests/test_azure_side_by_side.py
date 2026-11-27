@@ -27,6 +27,34 @@ from rag_app.eval.metrics import DialogueTurnResult
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "azure" / "openai_live_check.sh"
 
+
+def _resolve_openai_live_check_venv_python() -> Path:
+    """Mirrors ``openai_live_check.sh``'s OWN venv resolution (git-common-dir -> MAIN_ROOT/
+    backend/.venv, falling back to REPO_ROOT/backend/.venv -- no ``GATE_VENV`` override, unlike
+    ``scripts/dev/verify.sh``) so the skip check below asks exactly the same question the script
+    itself asks -- never a looser/different one that could pass here and still fail inside the
+    subprocess. A CI job that runs backend pytest straight against the system interpreter (no
+    ``backend/.venv`` at all, e.g. this repo's "Backend (lint, types, tests incl. DB)" job) hits
+    that BEFORE any test assertion runs, which would otherwise surface as a confusing
+    non-zero-exit failure instead of a clean skip (same pattern as
+    ``test_feature_map_verify.py``'s own skip for ``scripts/dev/verify.sh``)."""
+    common_dir = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    main_root = Path(common_dir).parent if common_dir else REPO_ROOT
+    for candidate_root in (main_root, REPO_ROOT):
+        candidate = candidate_root / "backend" / ".venv" / "bin" / "python"
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return main_root / "backend" / ".venv" / "bin" / "python"
+
+
+_OPENAI_LIVE_CHECK_VENV_PYTHON = _resolve_openai_live_check_venv_python()
+
 FAKE_PRICES: dict[str, Any] = {
     "fx_usd_to_eur": 0.92,
     "openai": {
@@ -262,6 +290,11 @@ def test_main_without_a_resolvable_prices_file_fails_closed_before_any_call(
     assert "no Azure OpenAI prices file found" in captured.err
 
 
+@pytest.mark.skipif(
+    not os.access(_OPENAI_LIVE_CHECK_VENV_PYTHON, os.X_OK),
+    reason="needs a resolvable backend venv (scripts/azure/openai_live_check.sh's own"
+    " prerequisite -- see _resolve_openai_live_check_venv_python())",
+)
 def test_openai_live_check_script_check_config_works_without_the_secret_env_file() -> None:
     """--check-config must succeed even though the real $HOME/.config/secrag/azure-openai.env
     on this machine is never sourced, read or checked for existence on this path -- proves the
