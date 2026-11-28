@@ -1067,6 +1067,7 @@ def test_run_side_by_side_isolates_a_non_cost_cap_dialogue_failure_and_continues
     the OLD ``_deployment_from_url`` raised for a non-Azure call made through the globally
     patched ``httpx.post``) must not lose the rest of the subset or the other deployment: it is
     recorded in that deployment's ``failures`` list and the loop moves on."""
+
     def fake_evaluate(
         session: Any, dialogues: list[Dialogue], chat: Any = None, top_n: Any = None
     ) -> list[DialogueTurnResult]:
