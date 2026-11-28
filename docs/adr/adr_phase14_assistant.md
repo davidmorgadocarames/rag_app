@@ -1980,6 +1980,81 @@ this module explicitly allow-lists as built from its own fixed, hard-coded liter
    this fix's scope; Python's own default traceback for an uncaught `KeyboardInterrupt` embeds
    no secret either way).
 
+## Decision — Azure OpenAI model migration, live checks part 2f: preflight + the gate DB stack
+(block 14.7-migration-live, 2026-11-28)
+
+The user's SECOND real run (`bash scripts/azure/openai_live_check.sh --max-eur 0.30`,
+2026-11-28 13:01) finished phases (a)/(b) and lost 13/30 (`gpt-4.1-mini`) and 18/30
+(`gpt-5-mini`) phase (c) dialogues to `OperationalError`, all for the same reason: `docker ps`
+showed NO containers running at all, so `DATABASE_URL` had silently defaulted to the local
+development database's own URL (`rag_app.config.DEV_DATABASE_URL`, `localhost:5432`) and
+nothing was listening there either; only the no-retrieval dialogues (greetings/chat/off-topic)
+happened to pass. Two independent fixes, proportional to this block's rigour level (one-off
+non-deployed tooling, `--fast` only — ORCHESTRATION §0, user decision 2026-11-28):
+
+**Fix 1 — preflight, in `rag_app.eval.azure_side_by_side`, BEFORE any Azure call.**
+`preflight_db()` (reachable, `chunks` non-empty, stored embedding dimension matches
+`rag_app.db.models.EMBEDDING_DIM`) and `preflight_ollama()` (reachable, embed dimension
+matches) now run via `run_preflight()` before phase (a)'s first Azure call whenever phase (c)
+is going to run (`--smoke-only` never needs either, so it skips this entirely). Any failure
+aborts the run before `get_settings()`/`CostGuard` are even built — EUR 0 spent, one clear,
+actionable message, and (when `--output-dir` is given) a `results.json`/`summary.md` recording
+`preflight_failed` rather than nothing. `--preflight-only` runs just these two checks and exits
+(no env file, no Azure call, no cost guard) — the same `--check-config`-style discipline.
+
+**Fix 2 — `scripts/azure/openai_live_check.sh --gate-db` (the default) provides the DB.** Never
+the developer's real `rag_ia_pgdata` volume for an experiment (CLAUDE.md "Data safety"); never
+a second, hand-rolled copy of `scripts/gate.sh`'s own stack-bring-up logic either. The new
+`gate_db_up`/`gate_db_teardown` functions bring up the SAME isolated stack `scripts/gate.sh`
+uses (project `secrag-gate`, `compose.gate.yml`, port `$GATE_DB_PORT` default 15432) by calling
+the pieces that already exist as their OWN standalone, already-reviewed artifacts: the
+isolation guard (`python -m rag_app.devtools.gate_compose`), the role-grant script
+(`scripts/db/apply_roles.sh`), plain `alembic upgrade head`, and — for the seed file itself —
+`scripts/gate.sh`'s own `--resolve-seed-files <head>` re-entrant CLI entry point (F31's
+per-alembic-head seed-directory selection, including its legacy-seed fallback and
+not-found-for-this-head naming), rather than re-implementing that lookup a second time. It
+takes the SAME global gate lock (`${XDG_RUNTIME_DIR:-$HOME/.cache}/secrag/gate.lock`)
+`scripts/gate.sh`/`scripts/dev/with-lock.sh` use, NON-BLOCKING (`flock -n`, never gate.sh's own
+60-minute wait) — a running real gate (or another `--gate-db` run) makes this refuse
+immediately, naming the holder. Teardown (`compose down -v`, this project only) runs on EXIT
+via a `trap`, so it always fires, success or failure. `--no-gate-db` opts out but refuses to
+start unless `DATABASE_URL` is already set (never a silent fall-back to the dev DB).
+
+**Real-machine proof (not just offline tests):** `bash scripts/azure/openai_live_check.sh
+--check-config` and a real `bash scripts/azure/openai_live_check.sh --preflight-only` (gate DB
+up → migrate → seed restore → both checks OK → teardown, no env file, no Azure call) both ran
+successfully on the development machine during this block — see "Part 2f" in
+`status/blocks/14.7-migration-live.md` for the quoted output. A second run with the gate lock
+deliberately held by another process confirmed the non-blocking refusal fires correctly.
+
+**Known limitations (self-reported, not just design) — part 2f:**
+
+1. `gate_db_up`'s bring-up sequence (compose up, roles, migrate, seed restore) duplicates the
+   SHAPE of `scripts/gate.sh`'s own `stack_up()` (not its exact code — the genuinely reusable
+   pieces are called directly, as listed above) because extracting `stack_up()`/`stack_down()`
+   into a shared, sourceable helper both scripts could call would mean editing `scripts/gate.sh`
+   itself, out of this block's declared `touches` and against this block's own instruction to
+   stop and report rather than do that unprompted. The two copies' SEQUENCING (not the
+   delegated pieces) can drift if `gate.sh`'s own `stack_up()` changes; a future block should
+   do the extraction properly (tracked as a `DEC-` row for the orchestrator/user, not decided
+   here).
+2. `gate_db_up` does NOT reproduce `stack_up()`'s corpus/embedding-model staleness check
+   (`seeded_hash`/`current_hash`/`seeded_model`/`current_model` comparison against
+   `seed.meta`) — a stale seed (corpus or embedding model changed since `--make-seed`) is not
+   specifically diagnosed here. In practice `preflight_db()`'s own embedding-dimension check
+   (Fix 1) catches the most likely failure mode of a stale seed (a dimension mismatch), but not
+   a same-dimension corpus/model drift; this is an accepted, narrower safety net than
+   `gate.sh`'s own, proportional to this block's one-off-tooling rigour level.
+3. The non-blocking lock refusal (Fix 2) means a `--gate-db` run never queues behind a real
+   `gate.sh --full`/`--only` run already holding the lock — by design (a one-off ad-hoc check
+   should not silently wait up to an hour), but it does mean the user must retry by hand once
+   the other run finishes, rather than this script waiting for them.
+4. `scripts/gate.sh --resolve-seed-files <head>` is documented in `gate.sh` itself as a
+   "test-only" re-entrant entry point (written for `test_gate_script.py`); this part reuses it
+   as a stable CLI contract from a second script instead. It already has its own test coverage
+   and its own call pattern (used by two self-invocations today) made it safe to call this way,
+   but it was not originally designed with a second caller in mind.
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now

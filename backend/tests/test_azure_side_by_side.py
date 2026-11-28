@@ -1231,6 +1231,14 @@ def test_main_last_resort_handler_still_sanitizes_a_failure_before_any_phase_sta
         raise httpx.HTTPStatusError("boom", request=request, response=response)
 
     monkeypatch.setattr(sbs, "get_settings", _boom_get_settings)
+    # Part 2f: the preflight (DB/Ollama) now runs BEFORE get_settings() whenever phase (c) is
+    # going to run -- stub it to "pass" here so this test still exercises get_settings()
+    # itself failing (the preflight's own behaviour has its own dedicated tests below).
+    monkeypatch.setattr(
+        sbs,
+        "run_preflight",
+        lambda: [sbs.PreflightCheck("db", True, "ok"), sbs.PreflightCheck("ollama", True, "ok")],
+    )
 
     exit_code = sbs.main(["--prices", str(prices_path), "--output-dir", str(output_dir)])
     captured = capsys.readouterr()
@@ -1328,6 +1336,14 @@ def test_main_end_to_end_reproduces_and_recovers_from_the_first_real_user_run(
         "rag_app.db.session.make_session_factory",
         lambda engine=None: (lambda: _FakeSession()),
     )
+    # Part 2f: the preflight (DB/Ollama) now runs BEFORE phase (a) -- stub it to "pass" so this
+    # test still reproduces the ORIGINAL first-real-user-run failure (phase (c)'s non-Azure
+    # httpx.post call), not a DB/Ollama preflight failure (which has its own dedicated tests).
+    monkeypatch.setattr(
+        sbs,
+        "run_preflight",
+        lambda: [sbs.PreflightCheck("db", True, "ok"), sbs.PreflightCheck("ollama", True, "ok")],
+    )
 
     exit_code = sbs.main(
         ["--max-eur", "0.30", "--prices", str(prices_path), "--output-dir", str(output_dir)]
@@ -1401,3 +1417,280 @@ def test_openai_live_check_script_disables_xtrace() -> None:
 def test_openai_live_check_script_is_shellcheck_clean() -> None:
     result = subprocess.run(["shellcheck", str(SCRIPT_PATH)], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- part 2f: the DB/Ollama preflight (offline fakes only, F43) ----------------------------
+
+
+class _FakeScalarResult:
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def scalar(self) -> Any:
+        return self._value
+
+
+class _FakePreflightSession:
+    def __init__(self, scalars: list[Any]) -> None:
+        self._scalars = list(scalars)
+
+    def __enter__(self) -> _FakePreflightSession:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        return None
+
+    def execute(self, _stmt: Any) -> _FakeScalarResult:
+        return _FakeScalarResult(self._scalars.pop(0))
+
+
+def _patch_db_session_factory(monkeypatch: pytest.MonkeyPatch, scalars: list[Any]) -> None:
+    monkeypatch.setattr(
+        "rag_app.db.session.make_session_factory",
+        lambda engine=None: (lambda: _FakePreflightSession(scalars)),
+    )
+
+
+class _FakeEmbedder:
+    vector: list[float] | None = None
+    error: Exception | None = None
+
+    def __init__(self, *_a: Any, **_kw: Any) -> None:
+        pass
+
+    def embed_one(self, _text: str) -> list[float]:
+        if self.error is not None:
+            raise self.error
+        assert self.vector is not None
+        return self.vector
+
+
+def _patch_ollama_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    vector: list[float] | None = None,
+    error: Exception | None = None,
+) -> None:
+    fake_cls = type("_FakeEmbedderInstance", (_FakeEmbedder,), {"vector": vector, "error": error})
+    monkeypatch.setattr("rag_app.embeddings.OllamaEmbedder", fake_cls)
+
+
+def test_preflight_db_ok_reports_chunk_count_and_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rag_app.db.models import EMBEDDING_DIM
+
+    _patch_db_session_factory(monkeypatch, [42, EMBEDDING_DIM])
+    check = sbs.preflight_db()
+    assert check.name == "db"
+    assert check.ok is True
+    assert "42" in check.detail
+    assert str(EMBEDDING_DIM) in check.detail
+
+
+def test_preflight_db_fails_closed_on_empty_chunks_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_db_session_factory(monkeypatch, [0])
+    check = sbs.preflight_db()
+    assert check.ok is False
+    assert "empty" in check.detail
+
+
+def test_preflight_db_fails_on_embedding_dimension_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rag_app.db.models import EMBEDDING_DIM
+
+    _patch_db_session_factory(monkeypatch, [10, EMBEDDING_DIM - 1])
+    check = sbs.preflight_db()
+    assert check.ok is False
+    assert str(EMBEDDING_DIM) in check.detail
+    assert str(EMBEDDING_DIM - 1) in check.detail
+
+
+def test_preflight_db_reports_not_reachable_on_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    class _BoomSession:
+        def __enter__(self) -> _BoomSession:
+            return self
+
+        def __exit__(self, *_exc: Any) -> None:
+            return None
+
+        def execute(self, _stmt: Any) -> Any:
+            raise OperationalError("connect failed", {}, Exception("connection refused"))
+
+    monkeypatch.setattr(
+        "rag_app.db.session.make_session_factory", lambda engine=None: (lambda: _BoomSession())
+    )
+    check = sbs.preflight_db()
+    assert check.ok is False
+    assert "not reachable" in check.detail
+    assert "OperationalError" in check.detail
+
+
+def test_preflight_db_reports_session_factory_build_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(engine: Any = None) -> Any:
+        raise ValueError("bad DATABASE_URL")
+
+    monkeypatch.setattr("rag_app.db.session.make_session_factory", _boom)
+    check = sbs.preflight_db()
+    assert check.ok is False
+    assert "ValueError" in check.detail
+
+
+def test_preflight_ollama_ok_reports_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rag_app.db.models import EMBEDDING_DIM
+
+    _patch_ollama_embedder(monkeypatch, vector=[0.1] * EMBEDDING_DIM)
+    check = sbs.preflight_ollama()
+    assert check.name == "ollama"
+    assert check.ok is True
+    assert str(EMBEDDING_DIM) in check.detail
+
+
+def test_preflight_ollama_reports_not_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = httpx.Request("POST", "http://localhost:11434/api/embed")
+    _patch_ollama_embedder(monkeypatch, error=httpx.ConnectError("boom", request=request))
+    check = sbs.preflight_ollama()
+    assert check.ok is False
+    assert "not reachable" in check.detail
+    assert "ConnectError" in check.detail
+
+
+def test_preflight_ollama_fails_on_embedding_dimension_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rag_app.db.models import EMBEDDING_DIM
+
+    _patch_ollama_embedder(monkeypatch, vector=[0.1] * (EMBEDDING_DIM - 1))
+    check = sbs.preflight_ollama()
+    assert check.ok is False
+    assert str(EMBEDDING_DIM - 1) in check.detail
+
+
+def test_run_preflight_runs_both_checks_even_if_the_first_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sbs, "preflight_db", lambda: sbs.PreflightCheck("db", False, "down"))
+    monkeypatch.setattr(sbs, "preflight_ollama", lambda: sbs.PreflightCheck("ollama", True, "ok"))
+    checks = sbs.run_preflight()
+    assert [c.name for c in checks] == ["db", "ollama"]
+    assert checks[0].ok is False
+    assert checks[1].ok is True
+
+
+def test_format_preflight_prints_ok_and_fail_distinctly() -> None:
+    lines = sbs.format_preflight(
+        [sbs.PreflightCheck("db", True, "42 chunks"), sbs.PreflightCheck("ollama", False, "down")]
+    )
+    assert any("db" in line and "OK" in line and "42 chunks" in line for line in lines)
+    assert any("ollama" in line and "FAIL" in line and "down" in line for line in lines)
+
+
+def test_main_preflight_only_flag_runs_checks_and_never_touches_azure_or_cost_guard(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("--preflight-only must never touch settings, prices or the network")
+
+    monkeypatch.setattr(sbs, "get_settings", _boom)
+    monkeypatch.setattr(sbs, "resolve_prices_path", _boom)
+    monkeypatch.setattr(sbs.httpx, "post", _boom)
+    monkeypatch.setattr(
+        sbs,
+        "run_preflight",
+        lambda: [
+            sbs.PreflightCheck("db", True, "7 chunks"),
+            sbs.PreflightCheck("ollama", True, "ok"),
+        ],
+    )
+
+    exit_code = sbs.main(["--preflight-only"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "preflight db: OK" in captured.out
+    assert "preflight ollama: OK" in captured.out
+
+
+def test_main_preflight_only_flag_returns_nonzero_on_any_failed_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sbs,
+        "run_preflight",
+        lambda: [
+            sbs.PreflightCheck("db", False, "empty"),
+            sbs.PreflightCheck("ollama", True, "ok"),
+        ],
+    )
+    assert sbs.main(["--preflight-only"]) == 1
+
+
+def test_run_refuses_any_azure_call_when_preflight_fails_and_not_smoke_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    output_dir = tmp_path / "evidence"
+
+    def _boom(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("a failed preflight must never let any Azure call happen")
+
+    monkeypatch.setattr(sbs, "get_settings", _boom)
+    monkeypatch.setattr(sbs.httpx, "post", _boom)
+    monkeypatch.setattr(
+        sbs,
+        "run_preflight",
+        lambda: [
+            sbs.PreflightCheck("db", False, "the chunks table is empty"),
+            sbs.PreflightCheck("ollama", True, "ok"),
+        ],
+    )
+
+    exit_code = sbs.main(["--prices", str(prices_path), "--output-dir", str(output_dir)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "preflight failed" in (captured.out + captured.err).lower()
+    assert "the chunks table is empty" in captured.err
+
+    results = json.loads((output_dir / "results.json").read_text(encoding="utf-8"))
+    assert "preflight_failed" in results
+    assert results["preflight_failed"][0]["name"] == "db"
+    assert results["preflight_failed"][0]["ok"] is False
+
+
+def test_run_skips_preflight_entirely_for_smoke_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom() -> list[sbs.PreflightCheck]:
+        raise AssertionError("--smoke-only must never run the DB/Ollama preflight")
+
+    monkeypatch.setattr(sbs, "run_preflight", _boom)
+    monkeypatch.setattr(sbs, "get_settings", lambda: _fake_settings())
+    monkeypatch.setattr(sbs, "load_dialogues", lambda: _fixture_dialogues())
+
+    def fake_post(url: str, *, json: dict[str, Any] | None = None, **_kw: Any) -> httpx.Response:
+        body = json or {}
+        request = httpx.Request("POST", url)
+        content = '{"ok": true}' if "response_format" in body else "ok"
+        return httpx.Response(
+            200, request=request, json={"choices": [{"message": {"content": content}}]}
+        )
+
+    monkeypatch.setattr(sbs.httpx, "post", fake_post)
+
+    exit_code = sbs.main(["--smoke-only", "--prices", str(_write_fake_prices_file(monkeypatch))])
+    assert exit_code == 0
+
+
+def _write_fake_prices_file(monkeypatch: pytest.MonkeyPatch) -> Path:
+    import tempfile
+
+    fd, name = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    path = Path(name)
+    path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    monkeypatch.setattr(sbs, "REPO_ROOT", path.parent)
+    return path

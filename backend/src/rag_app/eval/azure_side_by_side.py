@@ -125,6 +125,21 @@ called (so before any possible Azure call) -- never "no cost guard, proceed anyw
 ``--check-config`` flag resolves this path and the golden-set path and prints the
 ``gpt-4.1-mini``/``gpt-5-mini`` DataZone prices with zero env-file read and zero network call, so
 the user can prove path resolution works from their own worktree before running anything live.
+
+**Part 2f fix (DA-14.7-migration-live-2f-1, HIGH): preflight the DB/Ollama phase (c) needs,
+BEFORE any Azure call.** The FIRST real user run (2026-11-28 13:01) finished the smoke and
+token-budget phases, then lost 13/30 (``gpt-4.1-mini``) and 18/30 (``gpt-5-mini``) side-by-side
+dialogues to ``OperationalError``: no container was running anywhere, so ``DATABASE_URL``
+silently defaulted to :data:`rag_app.config.DEV_DATABASE_URL` (``localhost:5432``) and only the
+no-retrieval dialogues (greetings/chat/off-topic) happened to pass. :func:`run_preflight`
+(:func:`preflight_db` + :func:`preflight_ollama`) now runs BEFORE phase (a)'s first Azure call
+whenever phase (c) is going to run (``--smoke-only`` skips it, matching that phase's own
+lack of DB/Ollama needs): DB reachable, ``chunks`` non-empty, and its embedding dimension
+matches :data:`rag_app.db.models.EMBEDDING_DIM`; Ollama reachable and its own embed dimension
+matches too. Any failure stops the run before the FIRST Azure call -- zero EUR spent -- with
+one clear, actionable message. ``--preflight-only`` runs just this (zero env-file read, zero
+Azure call, zero cost guard), so ``scripts/azure/openai_live_check.sh --gate-db
+--preflight-only`` can prove the gate DB stack works before any real/costed run.
 """
 
 from __future__ import annotations
@@ -929,6 +944,112 @@ def measure_token_budget(
 
 
 # ---------------------------------------------------------------------------
+# Preflight (part 2f): phase (c) needs a Postgres with the seeded corpus AND a reachable
+# Ollama for embeddings -- neither is an Azure call, so both are checked BEFORE phase (a)
+# even starts whenever phase (c) is going to run (``--smoke-only`` never needs either).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PreflightCheck:
+    """One named preflight check: ``ok`` plus a short, actionable, no-secrets ``detail``
+    (never a connection string, never a stack trace -- only counts/dimensions/exception
+    class names, same discipline as :func:`_diagnostic_info`)."""
+
+    name: str
+    ok: bool
+    detail: str
+
+
+def preflight_db() -> PreflightCheck:
+    """The FIRST real user run (2026-11-28 13:01) lost 13/30 and 18/30 dialogues to
+    ``OperationalError``: no gate stack was running, so ``DATABASE_URL`` silently defaulted
+    to :data:`rag_app.config.DEV_DATABASE_URL` (``localhost:5432``), nothing was listening,
+    and only the no-retrieval dialogues (greetings/chat/off-topic) happened to pass. This
+    check proves THREE things before any dialogue is replayed: the DB at the CURRENT
+    ``DATABASE_URL`` is reachable, ``chunks`` is non-empty (a corpus is actually seeded,
+    not just an empty schema), and the stored embedding dimension matches this app's own
+    :data:`rag_app.db.models.EMBEDDING_DIM` (catches a corpus built with the wrong
+    embedding model, not just "no corpus"). Never reads chunk/document text -- only a
+    count and a vector length. Imports ``rag_app.db.session``/``rag_app.db.models`` lazily
+    (same pattern :func:`_run` already uses for phase (c)) so this module's own "zero
+    network calls on import" guarantee (module docstring) still holds."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    from rag_app.db.models import EMBEDDING_DIM
+    from rag_app.db.session import make_session_factory
+
+    try:
+        session_factory = make_session_factory()
+    except Exception as exc:  # noqa: BLE001 - a bad DATABASE_URL (e.g. unparsable) is still
+        # "db not reachable", never a stack trace to the terminal/evidence file.
+        return PreflightCheck(
+            "db", False, f"could not build a DB session factory: {type(exc).__name__}"
+        )
+    try:
+        with session_factory() as session:
+            count = session.execute(text("SELECT count(*) FROM chunks")).scalar() or 0
+            if not count:
+                return PreflightCheck(
+                    "db",
+                    False,
+                    "the chunks table is empty -- no corpus seeded at this DATABASE_URL",
+                )
+            dim = session.execute(
+                text("SELECT vector_dims(embedding) FROM chunks LIMIT 1")
+            ).scalar()
+            if dim != EMBEDDING_DIM:
+                return PreflightCheck(
+                    "db",
+                    False,
+                    f"chunks.embedding dimension is {dim}, expected {EMBEDDING_DIM} "
+                    "(corpus built with a different embedding model)",
+                )
+            return PreflightCheck("db", True, f"{count} chunks, embedding dim {dim}")
+    except OperationalError as exc:
+        return PreflightCheck("db", False, f"database not reachable: {type(exc).__name__}")
+    except Exception as exc:  # noqa: BLE001 - any other DB-layer failure, same discipline.
+        return PreflightCheck("db", False, type(exc).__name__)
+
+
+def preflight_ollama() -> PreflightCheck:
+    """Retrieval's embedding call (``OllamaEmbedder.embed``, always local, independent of
+    ``LLM_PROVIDER`` -- the same call whose non-Azure URL part 2e's ``_deployment_from_url``
+    fix stopped the cost guard from refusing) needs a reachable Ollama. One cheap probe
+    embed, never a prompt/response that could carry user data."""
+    from rag_app.db.models import EMBEDDING_DIM
+    from rag_app.embeddings import OllamaEmbedder
+
+    try:
+        vector = OllamaEmbedder().embed_one("preflight probe")
+    except httpx.HTTPError as exc:
+        return PreflightCheck("ollama", False, f"not reachable: {type(exc).__name__}")
+    except Exception as exc:  # noqa: BLE001 - a malformed response is still "not usable".
+        return PreflightCheck("ollama", False, type(exc).__name__)
+    if len(vector) != EMBEDDING_DIM:
+        return PreflightCheck(
+            "ollama", False, f"embed dimension {len(vector)} != expected {EMBEDDING_DIM}"
+        )
+    return PreflightCheck("ollama", True, f"reachable, embed dimension {len(vector)}")
+
+
+def run_preflight() -> list[PreflightCheck]:
+    """Both checks phase (c) needs, run BEFORE any Azure call (never after) whenever phase
+    (c) is going to run. Always returns both results (never short-circuits on the first
+    failure) so a run with both the DB down AND Ollama down reports both at once."""
+    return [preflight_db(), preflight_ollama()]
+
+
+def format_preflight(checks: list[PreflightCheck]) -> list[str]:
+    lines = []
+    for check in checks:
+        status = "OK" if check.ok else "FAIL"
+        lines.append(f"preflight {check.name}: {status} -- {check.detail}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Phase (c): side-by-side 30-question eval (Option B)
 # ---------------------------------------------------------------------------
 
@@ -1205,6 +1326,16 @@ def main(argv: list[str] | None = None) -> int:
             "FIRST from a new worktree to prove path resolution works."
         ),
     )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "run only the DB (reachable, chunks non-empty, embedding dimension matches) and "
+            "Ollama (reachable, embedding dimension matches) checks phase (c) needs, then exit "
+            "-- no env file read, no Azure call, no cost guard run (part 2f, DA-14.7-migration-"
+            "live-2f-1). Use this to prove the gate DB stack works before a real run."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1248,11 +1379,48 @@ def _run(args: argparse.Namespace) -> int:
             return 2
         return 0
 
+    if args.preflight_only:
+        # Part 2f: zero env-file read, zero Azure call, zero cost guard -- same discipline
+        # as --check-config, proving the DB/Ollama side alone (e.g. right after bringing up
+        # the gate stack via openai_live_check.sh's own --gate-db mode).
+        checks = run_preflight()
+        for line in format_preflight(checks):
+            print(line)
+        return 0 if all(check.ok for check in checks) else 1
+
     try:
         prices_path = resolve_prices_path(args.prices)
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    # Part 2f (DA-14.7-migration-live-2f-1): the FIRST real user run lost 13/30 and 18/30
+    # dialogues to OperationalError because no DB was running at all -- checked BEFORE
+    # phase (a)'s first Azure call (never after), whenever phase (c) is going to run.
+    # --smoke-only never reaches phase (c), so it never needs the DB/Ollama either.
+    if not args.smoke_only:
+        checks = run_preflight()
+        if not all(check.ok for check in checks):
+            for line in format_preflight(checks):
+                print(line, file=sys.stderr)
+            print(
+                "ERROR: preflight failed -- refusing to make any Azure call (EUR 0 spent). "
+                "Fix the above (bring up a DB with the seeded corpus, e.g. "
+                "openai_live_check.sh's own --gate-db mode, and/or start Ollama), or pass "
+                "--smoke-only to skip phase (c) entirely.",
+                file=sys.stderr,
+            )
+            if args.output_dir is not None:
+                args.output_dir.mkdir(parents=True, exist_ok=True)
+                (args.output_dir / "summary.md").write_text(
+                    "\n".join(format_preflight(checks)) + "\nPREFLIGHT FAILED\n",
+                    encoding="utf-8",
+                )
+                (args.output_dir / "results.json").write_text(
+                    json.dumps({"preflight_failed": [vars(check) for check in checks]}, indent=2),
+                    encoding="utf-8",
+                )
+            return 2
 
     settings = get_settings()
     cost_guard = CostGuard.from_file(args.max_eur, path=prices_path)
