@@ -297,6 +297,39 @@ def test_make_guarded_post_stops_before_call_n_when_the_cap_is_tight(
     assert len(calls) == 2  # stopped BEFORE the 3rd call, never made it
 
 
+def test_deployment_from_url_returns_none_for_a_non_azure_url() -> None:
+    """DA-14.7-migration-live-2e-1: Ollama's own /api/embed (or any other non-Azure-chat
+    endpoint) must never raise -- just signal "not my concern" to the caller."""
+    assert sbs._deployment_from_url("http://localhost:11434/api/embed") is None
+    assert sbs._deployment_from_url(_FAKE_GPT5_URL) == "gpt-5-mini"
+
+
+def test_make_guarded_post_passes_a_non_azure_call_straight_through_unreserved() -> None:
+    """DA-14.7-migration-live-2e-1 (THE root-cause fix): the FIRST real user run's exact crash
+    -- the globally-patched ``httpx.post`` (``_patched_post``, used by phase (c)) also intercepts
+    an Ollama embeddings call made during real retrieval; the old ``_deployment_from_url`` raised
+    a bare ``RuntimeError`` ("could not identify the Azure deployment"), unhandled anywhere, which
+    lost every phase's already-computed results. Now it must pass straight through: real_post is
+    called, nothing is reserved, no exception."""
+    calls: list[str] = []
+
+    def fake_post(url: str, **_kw: Any) -> httpx.Response:
+        calls.append(url)
+        request = httpx.Request("POST", url)
+        return httpx.Response(200, request=request, json={"embeddings": [[0.1, 0.2]]})
+
+    guard = _guard(max_eur=1.0)
+    guarded = sbs.make_guarded_post(guard, "side-by-side:test", post=fake_post)
+    response = guarded(
+        "http://localhost:11434/api/embed",
+        json={"model": "bge-m3", "input": ["hello"]},
+        timeout=170,
+    )
+    assert response.status_code == 200
+    assert calls == ["http://localhost:11434/api/embed"]  # real_post genuinely reached
+    assert guard.log == []  # nothing reserved -- not this guard's concern
+
+
 # --- resolve_prices_path: resolution order (part 2c, F22-class worktree bug) ----------------
 #
 # The bug this part fixes: a worktree's own status/ (e.g. ~/proyectos/wt/14-A1/status/) has no
@@ -660,6 +693,75 @@ def test_run_smoke_probes_api_versions_on_a_400_for_the_reasoning_deployment(
     assert candidate_entry["api_version_recommended"] == sbs.GA_API_VERSION_PROBE_ORDER[1]
 
 
+# --- Smoke phase: reasoning-budget exhaustion (part 2e, the FIRST real user run's exact bug) -
+
+
+def test_run_smoke_uses_a_generous_bound_for_the_reasoning_deployment_not_16_or_32(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-live-2e-2: the FIRST real user run sent max_completion_tokens=32 for
+    gpt-5-mini's smoke chat_json call -- entirely consumed by hidden reasoning tokens. The
+    reasoning deployment's smoke calls must now reserve/send a much bigger bound; the
+    non-reasoning deployment's calls stay unchanged (16/32)."""
+    captured: dict[str, list[int]] = {"chat": [], "chat_json": []}
+
+    def fake_post(url: str, *, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        bound = json.get("max_completion_tokens", json.get("max_tokens"))
+        key = "chat_json" if "response_format" in json else "chat"
+        captured[key].append(bound)
+        request = httpx.Request("POST", url)
+        content = '{"ok": true}' if key == "chat_json" else "ok"
+        return httpx.Response(
+            200, request=request, json={"choices": [{"message": {"content": content}}]}
+        )
+
+    monkeypatch.setattr(sbs.httpx, "post", fake_post)
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    sbs.run_smoke(settings, guard)
+
+    assert captured["chat"] == [sbs.SMOKE_MAX_TOKENS, sbs.SMOKE_MAX_TOKENS_REASONING_MIN]
+    assert captured["chat_json"] == [sbs.SMOKE_JSON_MAX_TOKENS, sbs.SMOKE_MAX_TOKENS_REASONING_MIN]
+
+
+def test_run_smoke_records_reasoning_budget_exhausted_distinctly_not_as_a_json_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-live-2e-2: even at the new, bigger bound, a response whose hidden
+    reasoning tokens still consume the whole thing (empty content, finish_reason="length") must
+    be reported as the distinct ``"reasoning_budget_exhausted"`` error type -- never an opaque
+    JSONDecodeError, and ``chat_json_ok`` must be ``False``, never silently ``True`` via the
+    fallback (the exact false-positive the FIRST real user run's own smoke report would have
+    had, had it not crashed first)."""
+
+    def fake_post(url: str, *, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        request = httpx.Request("POST", url)
+        if "gpt-5-mini" in url:
+            return httpx.Response(
+                200,
+                request=request,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            )
+        content = '{"ok": true}' if "response_format" in json else "ok"
+        return httpx.Response(
+            200, request=request, json={"choices": [{"message": {"content": content}}]}
+        )
+
+    monkeypatch.setattr(sbs.httpx, "post", fake_post)
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    result = sbs.run_smoke(settings, guard)
+
+    candidate = result[sbs.CANDIDATE_DEPLOYMENT]
+    assert candidate["chat_ok"] is False
+    assert candidate["chat_error_type"] == "reasoning_budget_exhausted"
+    assert candidate["chat_json_ok"] is False
+    assert candidate["chat_json_error_type"] == "reasoning_budget_exhausted"
+    baseline = result[sbs.BASELINE_DEPLOYMENT]
+    assert baseline["chat_ok"] is True
+    assert baseline["chat_json_ok"] is True
+
+
 # --- Token budget phase: measurements never carry prompt/response text ---------------------
 
 
@@ -753,6 +855,36 @@ def test_measure_token_budget_continues_after_one_prompt_fails(
     assert result["measurements"][0]["status_code"] == 500
     assert result["measurements"][0]["completion_tokens"] is None
     assert result["measurements"][1]["reasoning_tokens"] == 80
+
+
+def test_measure_token_budget_tolerates_a_fully_reasoning_exhausted_response() -> None:
+    """DA-14.7-migration-live-2e-2: an empty content + finish_reason="length" response is the
+    EXPECTED/MEASURED outcome for this phase (its whole purpose is to detect exactly this), not
+    a failure -- it must still produce a normal measurement (using `usage`), never be recorded
+    under `error_type`."""
+
+    def fake_post(_url: str, **_kw: Any) -> httpx.Response:
+        request = httpx.Request("POST", "http://fake")
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {
+                    "completion_tokens": 512,
+                    "completion_tokens_details": {"reasoning_tokens": 512},
+                },
+            },
+        )
+
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    result = sbs.measure_token_budget(settings, guard, _fixture_dialogues(), post=fake_post)
+
+    for measurement in result["measurements"]:
+        assert "error_type" not in measurement
+        assert measurement["reasoning_tokens"] == 512
+        assert measurement["visible_tokens"] == 0
 
 
 # --- Side-by-side phase: cost guard still gates it, metrics flow through -------------------
@@ -927,6 +1059,62 @@ def test_run_side_by_side_flipped_list_when_correctness_differs(
     ]
 
 
+def test_run_side_by_side_isolates_a_non_cost_cap_dialogue_failure_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DA-14.7-migration-live-2e-3: the ROOT CAUSE of the FIRST real user run's crash,
+    reproduced directly -- a dialogue whose evaluation raises a plain RuntimeError (exactly what
+    the OLD ``_deployment_from_url`` raised for a non-Azure call made through the globally
+    patched ``httpx.post``) must not lose the rest of the subset or the other deployment: it is
+    recorded in that deployment's ``failures`` list and the loop moves on."""
+    def fake_evaluate(
+        session: Any, dialogues: list[Dialogue], chat: Any = None, top_n: Any = None
+    ) -> list[DialogueTurnResult]:
+        if dialogues[0].id == "d1":  # the SAME dialogue fails for BOTH deployments
+            raise RuntimeError(
+                "cost guard: could not identify the Azure deployment from the request URL"
+            )
+        return [
+            DialogueTurnResult(
+                dialogue_id=dialogues[0].id,
+                turn_index=0,
+                expected_intent="security",
+                observed_intent="security",
+                is_noisy=False,
+                retrieved_docs=[],
+                expected_doc=None,
+                answerable=True,
+                abstained=False,
+                reply_text="x",
+                correct=True,
+                clarified=False,
+                abstention_no_claims=None,
+                latency_s=0.1,
+            )
+        ]
+
+    monkeypatch.setattr(sbs, "evaluate_dialogues", fake_evaluate)
+
+    guard = _guard(max_eur=1.0)
+    settings = _fake_settings()
+    dialogues = [
+        Dialogue(id=f"d{i}", turns=(Turn(message="hi", expected_intent="security", language="en"),))
+        for i in range(3)
+    ]
+
+    result = sbs.run_side_by_side(settings, guard, lambda: _FakeSession(), dialogues)
+
+    baseline = result[sbs.BASELINE_DEPLOYMENT]
+    assert baseline["dialogues_completed"] == 2  # d0 and d2 -- d1 failed and was skipped
+    assert baseline["dialogues_total"] == 3
+    assert len(baseline["failures"]) == 1
+    assert baseline["failures"][0]["dialogue_id"] == "d1"
+    assert baseline["failures"][0]["exception_class"] == "RuntimeError"
+    # the SECOND deployment's run still happened in full -- not lost either
+    assert result[sbs.CANDIDATE_DEPLOYMENT]["dialogues_completed"] == 2
+    assert result[sbs.CANDIDATE_DEPLOYMENT]["failures"][0]["dialogue_id"] == "d1"
+
+
 def test_azure_subset_is_the_first_n_dialogues_deterministically() -> None:
     dialogues = [
         Dialogue(id=f"d{i}", turns=(Turn(message="hi", expected_intent="chitchat", language="en"),))
@@ -972,13 +1160,15 @@ def test_summarize_reports_a_cost_guard_block(monkeypatch: pytest.MonkeyPatch) -
 # --- main()'s top-level safety net (DA-14.7-migration-live-2a-2, part 2d) ------------------
 
 
-def test_main_sanitizes_an_unexpected_exception_and_never_leaks_the_planted_endpoint(
+def test_a_smoke_phase_exception_is_isolated_and_never_leaks_the_planted_endpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Simulate a phase raising an httpx.HTTPStatusError whose own str() embeds a planted
-    endpoint -- exactly what a REAL Azure call's exception would do. main()'s outermost
-    try/except must sanitize it (exception CLASS + HTTP status only) before it reaches stdout,
-    stderr, or the evidence file, and exit non-zero."""
+    """Part 2e: a phase-level exception (an httpx.HTTPStatusError whose own str() embeds a
+    planted endpoint -- exactly what a REAL Azure call's exception would do) is now isolated by
+    ``_run()`` itself (DA-14.7-migration-live-2e-2/2e-3): recorded as ``smoke_error``, sanitized
+    (exception CLASS + HTTP status + error code only, never str(exc)), and the run CONTINUES to
+    the remaining phases instead of aborting with exit code 1 -- the exact defect the FIRST real
+    user run hit (every phase's results were lost to one unhandled exception)."""
     prices_path = tmp_path / "prices.json"
     prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
     output_dir = tmp_path / "evidence"
@@ -986,11 +1176,60 @@ def test_main_sanitizes_an_unexpected_exception_and_never_leaks_the_planted_endp
 
     def _boom_run_smoke(*_a: Any, **_kw: Any) -> Any:
         request = httpx.Request("POST", planted_endpoint)
-        response = httpx.Response(500, request=request, json={"error": "boom"})
+        response = httpx.Response(500, request=request, json={"error": {"code": "boom_code"}})
         raise httpx.HTTPStatusError("boom", request=request, response=response)
 
     monkeypatch.setattr(sbs, "run_smoke", _boom_run_smoke)
     monkeypatch.setattr(sbs, "get_settings", lambda: _fake_settings())
+    # Isolate this test to the smoke phase only -- phase (b) is a no-op fixture here (it is not
+    # what this test is about), and --smoke-only below skips phase (c)/the DB entirely.
+    monkeypatch.setattr(
+        sbs,
+        "measure_token_budget",
+        lambda *_a, **_kw: {"measurements": [], "recommended_max_tokens": None},
+    )
+
+    exit_code = sbs.main(
+        ["--smoke-only", "--prices", str(prices_path), "--output-dir", str(output_dir)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0  # phase isolation: a smoke failure no longer aborts the whole run
+    blob = captured.out + captured.err
+    assert planted_endpoint not in blob
+    assert "HTTPStatusError" in blob
+    assert "500" in blob
+
+    evidence_text = (output_dir / "summary.md").read_text(encoding="utf-8")
+    results_text = (output_dir / "results.json").read_text(encoding="utf-8")
+    assert planted_endpoint not in evidence_text
+    assert planted_endpoint not in results_text
+    assert "HTTPStatusError" in evidence_text
+
+    results = json.loads(results_text)
+    assert results["smoke_error"]["exception_class"] == "HTTPStatusError"
+    assert results["smoke_error"]["status_code"] == 500
+    assert results["smoke_error"]["error_code"] == "boom_code"
+    assert "token_budget" in results  # phase (b) still ran -- not lost by phase (a)'s failure
+
+
+def test_main_last_resort_handler_still_sanitizes_a_failure_before_any_phase_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main()``'s own outermost try/except is now only a true last resort (part 2e): it still
+    fires, still sanitizes, and still exits non-zero for a failure BEFORE any phase's isolation
+    even exists yet (e.g. ``get_settings`` itself)."""
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    output_dir = tmp_path / "evidence"
+    planted_endpoint = "https://PLANTED-LEAK-ENDPOINT.openai.azure.com/some/path"
+
+    def _boom_get_settings(*_a: Any, **_kw: Any) -> Any:
+        request = httpx.Request("POST", planted_endpoint)
+        response = httpx.Response(500, request=request, json={"error": "boom"})
+        raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+    monkeypatch.setattr(sbs, "get_settings", _boom_get_settings)
 
     exit_code = sbs.main(["--prices", str(prices_path), "--output-dir", str(output_dir)])
     captured = capsys.readouterr()
@@ -1006,6 +1245,110 @@ def test_main_sanitizes_an_unexpected_exception_and_never_leaks_the_planted_endp
     assert planted_endpoint not in evidence_text
     assert planted_endpoint not in results_text
     assert "HTTPStatusError" in evidence_text
+
+
+# --- End-to-end reproduction of the FIRST real user run (part 2e) --------------------------
+
+
+def test_main_end_to_end_reproduces_and_recovers_from_the_first_real_user_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end reproduction of the EXACT first real user run (2026-11-28 01:48,
+    ``bash scripts/azure/openai_live_check.sh --max-eur 0.30``, no ``--smoke-only``): gpt-5-mini's
+    hidden reasoning tokens exhaust the smoke/token-budget bounds (empty content,
+    ``finish_reason="length"``), AND phase (c)'s real retrieval makes a non-Azure ``httpx.post``
+    call (simulating Ollama's ``/api/embed``) through the globally patched ``httpx.post``. The
+    OLD code raised an unhandled ``RuntimeError`` at exactly that point and lost every phase's
+    results -- the real run's own ``results.json`` was just
+    ``{"unhandled_error": {"exception_class": "RuntimeError", "status_code": null}}``. This test
+    proves the fix: ``main()`` now returns 0 and ``results.json`` has complete per-deployment
+    smoke/token-budget/side-by-side entries."""
+    prices_path = tmp_path / "prices.json"
+    prices_path.write_text(json.dumps(FAKE_PRICES), encoding="utf-8")
+    output_dir = tmp_path / "evidence"
+
+    def fake_post(url: str, *, json: dict[str, Any] | None = None, **_kw: Any) -> httpx.Response:
+        body = json or {}
+        request = httpx.Request("POST", url)
+        if "gpt-5-mini" in url:
+            bound = body.get("max_completion_tokens", 0)
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                    "usage": {
+                        "completion_tokens": bound,
+                        "completion_tokens_details": {"reasoning_tokens": bound},
+                    },
+                },
+            )
+        content = '{"ok": true}' if "response_format" in body else "ok"
+        return httpx.Response(
+            200, request=request, json={"choices": [{"message": {"content": content}}]}
+        )
+
+    monkeypatch.setattr(sbs.httpx, "post", fake_post)
+    monkeypatch.setattr(sbs, "get_settings", lambda: _fake_settings())
+    monkeypatch.setattr(sbs, "load_dialogues", lambda: _fixture_dialogues())
+
+    def fake_evaluate_dialogues(
+        session: Any, dialogues: list[Dialogue], chat: Any = None, top_n: Any = None
+    ) -> list[DialogueTurnResult]:
+        # THE ROOT CAUSE, reproduced directly: a non-Azure httpx.post call (Ollama's own
+        # /api/embed, made by real retrieval) through the SAME globally patched httpx.post
+        # phase (c) installs -- must NOT raise (DA-14.7-migration-live-2e-1 fix).
+        httpx.post(
+            "http://localhost:11434/api/embed",
+            json={"model": "bge-m3", "input": ["hello"]},
+            timeout=170,
+        )
+        return [
+            DialogueTurnResult(
+                dialogue_id=dialogues[0].id,
+                turn_index=0,
+                expected_intent="security",
+                observed_intent="security",
+                is_noisy=False,
+                retrieved_docs=[],
+                expected_doc=None,
+                answerable=True,
+                abstained=False,
+                reply_text="x",
+                correct=True,
+                clarified=False,
+                abstention_no_claims=None,
+                latency_s=0.05,
+            )
+        ]
+
+    monkeypatch.setattr(sbs, "evaluate_dialogues", fake_evaluate_dialogues)
+    monkeypatch.setattr(
+        "rag_app.db.session.make_session_factory",
+        lambda engine=None: (lambda: _FakeSession()),
+    )
+
+    exit_code = sbs.main(
+        ["--max-eur", "0.30", "--prices", str(prices_path), "--output-dir", str(output_dir)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0  # the real run's exit code was 1 (unhandled RuntimeError)
+    assert "ERROR: unhandled" not in captured.err
+
+    results = json.loads((output_dir / "results.json").read_text(encoding="utf-8"))
+    assert "unhandled_error" not in results  # the exact (and ONLY) field the real run's had
+
+    smoke = results["smoke"]
+    assert smoke[sbs.CANDIDATE_DEPLOYMENT]["chat_json_error_type"] == "reasoning_budget_exhausted"
+    assert smoke[sbs.BASELINE_DEPLOYMENT]["chat_json_ok"] is True
+
+    assert results["token_budget"]["measurements"]  # phase (b) ran and produced data
+
+    side_by_side = results["side_by_side"]
+    for deployment in (sbs.BASELINE_DEPLOYMENT, sbs.CANDIDATE_DEPLOYMENT):
+        assert side_by_side[deployment]["dialogues_completed"] == 1
+        assert side_by_side[deployment]["failures"] == []
 
 
 # --- The shell script: shellcheck-clean, syntax-clean, never echoes the key, keeps +x ------

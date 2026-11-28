@@ -150,7 +150,12 @@ from rag_app.config import Settings, get_settings
 from rag_app.eval.dataset import DEFAULT_GOLDEN_SET_V2, Dialogue, load_dialogues
 from rag_app.eval.metrics import compute_dialogue_metrics
 from rag_app.eval.runner import evaluate_dialogues
-from rag_app.llm import AzureOpenAIChat, Message, parse_azure_chat_response
+from rag_app.llm import (
+    AzureOpenAIChat,
+    AzureReasoningBudgetExhausted,
+    Message,
+    parse_azure_chat_response,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -240,16 +245,25 @@ def _estimate_input_tokens(messages: list[Message]) -> float:
 _DEPLOYMENT_URL_RE = re.compile(r"/openai/deployments/([^/]+)/chat/completions")
 
 
-def _deployment_from_url(url: str) -> str:
-    """Parse the Azure deployment name out of a Chat Completions URL -- never returns or logs
-    the URL itself (only the deployment NAME, never a secret) if parsing fails."""
+def _deployment_from_url(url: str) -> str | None:
+    """Parse the Azure deployment name out of an Azure OpenAI Chat Completions URL.
+
+    Returns ``None`` (DA-14.7-migration-live-2e-1, part 2e) -- never raises -- when ``url``
+    is not an Azure OpenAI chat-completions call at all. ``_guarded`` (below) patches the
+    GLOBAL ``httpx.post`` for the duration of phase (c)'s real pipeline run, which also
+    calls Ollama's own ``/api/embed`` endpoint for retrieval (``OllamaEmbedder.embed``,
+    always local/free regardless of ``LLM_PROVIDER`` -- embeddings and chat are independent
+    settings) and any other non-Azure endpoint a future call site might add. This function
+    used to raise a bare ``RuntimeError`` for exactly that case, which the FIRST real user
+    run hit: the cost guard refused to "identify the deployment" for a plain Ollama
+    embedding call, an unhandled ``RuntimeError`` propagated out of the whole script, and
+    every phase's results (including the already-finished smoke/token-budget phases) were
+    lost. ``None`` lets :func:`_guarded` recognise "not my concern" and pass the call
+    straight through, unreserved -- this cost guard only ever tracks Azure OpenAI chat
+    spend, never a local Ollama call's (zero) cost. Never returns or logs ``url`` itself
+    (only the deployment NAME, never a secret) when it *does* match."""
     match = _DEPLOYMENT_URL_RE.search(url)
-    if match is None:
-        raise RuntimeError(
-            "cost guard: could not identify the Azure deployment from the request URL -- "
-            "refusing to proceed without knowing which model to price"
-        )
-    return match.group(1)
+    return match.group(1) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +274,59 @@ def _deployment_from_url(url: str) -> str:
 class CostCapExceeded(RuntimeError):
     """Raised by :meth:`CostGuard.reserve` BEFORE any call is made -- no partial charge, no
     call happens once this is raised."""
+
+
+# --- Diagnostics (part 2e) --------------------------------------------------------------
+#
+# Every error recorded anywhere in this module goes through these two helpers, so the shape
+# is uniform and the no-secrets discipline is enforced in exactly one place rather than
+# re-implemented at every call site.
+
+# Exception types THIS module (or rag_app.llm, on its behalf) raises itself, from fixed,
+# hard-coded literal text that never interpolates a request/response body, an endpoint or a
+# key -- the only exception types whose own ``str()`` is ever safe to surface (DA-14.7-
+# migration-live-2a-2's rule, extended in part 2e: never ``str()`` of a THIRD-PARTY exception
+# such as ``httpx.HTTPStatusError``, whose ``__str__`` embeds the live request URL).
+_SAFE_MESSAGE_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+    CostCapExceeded,  # .__str__ is hand-built from phase/model/EUR floats only, see below
+    AzureReasoningBudgetExhausted,  # fixed literal text, see rag_app.llm
+)
+
+
+def _azure_error_code(response: httpx.Response | None) -> str | None:
+    """Extract ONLY the Azure error ``code`` field (a short, enum-like string such as
+    ``"unsupported_parameter"``/``"content_filter"``) from a non-2xx response body -- never
+    the ``message`` field (which can echo request content back) and never the raw body.
+    Returns ``None`` for any shape this does not recognise (never raises)."""
+    if response is None:
+        return None
+    try:
+        data = response.json()
+    except Exception:  # noqa: BLE001 - a malformed/non-JSON error body is simply "no code"
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _diagnostic_info(exc: BaseException) -> dict[str, Any]:
+    """The ONLY facts ever recorded about a caught exception, anywhere in this module (part
+    2e, used by every phase AND by ``main()``'s last-resort handler): exception class name,
+    HTTP status code (if the exception carries an ``httpx.Response``), the Azure error
+    ``code`` field (never ``message``), and -- ONLY for the explicitly allow-listed exception
+    types above, built by THIS module from safe constants -- that exception's own message
+    text. Never ``str(exc)`` for anything else (a third-party exception's ``__str__`` can
+    embed the live endpoint, e.g. ``httpx.HTTPStatusError``), and never a traceback."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None) if response is not None else None
+    info: dict[str, Any] = {
+        "exception_class": type(exc).__name__,
+        "status_code": status_code,
+        "error_code": _azure_error_code(response),
+    }
+    if isinstance(exc, _SAFE_MESSAGE_EXCEPTION_TYPES):
+        info["message"] = str(exc)
+    return info
 
 
 @dataclass
@@ -402,6 +469,13 @@ def make_guarded_post(
     Refuses (``RuntimeError``, before any reservation) a call whose body carries no
     ``max_completion_tokens``/``max_tokens`` -- there would be no worst case to reserve against,
     which would silently bypass the cost guard entirely.
+
+    **Passes straight through, unreserved** (DA-14.7-migration-live-2e-1, part 2e) a call
+    whose URL is not an Azure OpenAI chat-completions call at all (:func:`_deployment_from_url`
+    returns ``None``) -- this guard only prices Azure OpenAI chat spend; a local Ollama
+    embeddings call made through the SAME globally-patched ``httpx.post`` while phase (c)'s
+    real pipeline runs (see :func:`_patched_post`) is not this guard's concern and must never
+    be refused.
     """
     real_post = post if post is not None else httpx.post
 
@@ -415,6 +489,10 @@ def make_guarded_post(
     ) -> httpx.Response:
         body = json or {}
         deployment = _deployment_from_url(url)
+        if deployment is None:
+            # Not an Azure OpenAI chat-completions call (e.g. Ollama's /api/embed during
+            # phase (c)'s real retrieval) -- not this guard's concern; pass straight through.
+            return real_post(url, headers=headers, json=json, timeout=timeout, **kwargs)
         max_out = body.get("max_completion_tokens", body.get("max_tokens"))
         if max_out is None:
             raise RuntimeError(
@@ -537,11 +615,40 @@ def probe_api_versions(
     raise RuntimeError(f"no candidate API version succeeded for {deployment!r}: {attempts}")
 
 
+# Non-reasoning smoke bounds (gpt-4.1-mini): tiny, unchanged since part 2b -- this deployment
+# has no hidden reasoning tokens to absorb.
+SMOKE_MAX_TOKENS = 16
+SMOKE_JSON_MAX_TOKENS = 32
+# Reasoning smoke bound floor (DA-14.7-migration-live-2e-2): the FIRST real user run showed
+# SMOKE_JSON_MAX_TOKENS=32 was entirely consumed by gpt-5-mini's hidden reasoning tokens before
+# any visible content was produced (empty content, finish_reason="length", two JSONDecodeErrors
+# then a silent fallback) -- a reasoning deployment needs a much bigger bound even for a
+# one-word smoke reply. Never smaller than this floor, and never smaller than the app's own
+# already-tuned reasoning groundedness bound (part 2a) -- cheap at either model's price,
+# generous enough to leave room for the hidden reasoning tokens a trivial prompt still spends.
+SMOKE_MAX_TOKENS_REASONING_MIN = 1024
+
+
+def _smoke_bound(settings: Settings, *, reasoning: bool, non_reasoning_bound: int) -> int:
+    if not reasoning:
+        return non_reasoning_bound
+    return max(
+        SMOKE_MAX_TOKENS_REASONING_MIN, settings.azure_openai_reasoning_groundedness_max_tokens
+    )
+
+
 def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
     """Phase (a): one ``chat`` + one ``chat_json`` call against each deployment. Each call
     reserves (and settles) its OWN worst case from ``cost_guard`` -- via :func:`make_guarded_post`
     patched into the global ``httpx.post`` for the duration of this call -- instead of one flat
-    estimate shared by both calls (DA-14.7-migration-live-2a-1)."""
+    estimate shared by both calls (DA-14.7-migration-live-2a-1).
+
+    DA-14.7-migration-live-2e-2 fix: the reasoning deployment's ``chat``/``chat_json`` calls now
+    use :func:`_smoke_bound` (>= 1024, never the tiny 16/32 non-reasoning bound) -- and a response
+    whose hidden reasoning tokens STILL exhaust that bound (``AzureReasoningBudgetExhausted``,
+    ``rag_app.llm``) is recorded as a distinct, explicit ``"reasoning_budget_exhausted"`` error
+    type rather than surfacing as an opaque JSON-decode failure (or, for ``chat_json``, being
+    silently swallowed by its own retry+fallback and wrongly reported as ``chat_json_ok=True``)."""
     results: dict[str, Any] = {}
     for deployment, reasoning in ((BASELINE_DEPLOYMENT, False), (CANDIDATE_DEPLOYMENT, True)):
         chat = AzureOpenAIChat(
@@ -552,6 +659,12 @@ def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
         )
         entry: dict[str, Any] = {"deployment": deployment, "reasoning_model": reasoning}
         guarded_post = make_guarded_post(cost_guard, "smoke")
+        chat_bound = _smoke_bound(
+            settings, reasoning=reasoning, non_reasoning_bound=SMOKE_MAX_TOKENS
+        )
+        json_bound = _smoke_bound(
+            settings, reasoning=reasoning, non_reasoning_bound=SMOKE_JSON_MAX_TOKENS
+        )
 
         with _patched_post(guarded_post):
             try:
@@ -560,10 +673,10 @@ def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
                 # by the time the function actually runs -- harmless here since the call happens
                 # synchronously in the same iteration, but explicit is safer and silences the
                 # otherwise-valid-in-general lint).
-                def _call_chat(chat: AzureOpenAIChat = chat) -> str:
+                def _call_chat(chat: AzureOpenAIChat = chat, bound: int = chat_bound) -> str:
                     return chat.chat(
                         [{"role": "user", "content": "Reply with the single word: ok"}],
-                        max_tokens=16,
+                        max_tokens=bound,
                         call_type="smoke",
                     )
 
@@ -572,8 +685,10 @@ def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
                 entry["api_version"] = chat.api_version
             except httpx.HTTPStatusError as exc:
                 entry["chat_ok"] = False
-                entry["chat_status_code"] = exc.response.status_code
-                entry["chat_error_type"] = type(exc).__name__
+                info = _diagnostic_info(exc)
+                entry["chat_status_code"] = info["status_code"]
+                entry["chat_error_type"] = info["exception_class"]
+                entry["chat_error_code"] = info["error_code"]
                 if reasoning and exc.response.status_code == 400:
                     try:
                         version, attempts = probe_api_versions(
@@ -588,18 +703,27 @@ def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
                         raise
                     except RuntimeError as probe_exc:
                         entry["api_version_probe_failed"] = str(probe_exc)
+            except AzureReasoningBudgetExhausted:
+                # Distinct from a generic ValueError (DA-14.7-migration-live-2e-2): the call
+                # succeeded on the wire, but the reasoning deployment's hidden tokens consumed
+                # the whole `chat_bound` before any visible content -- raise the bound further.
+                entry["chat_ok"] = False
+                entry["chat_error_type"] = "reasoning_budget_exhausted"
+                entry["chat_bound_used"] = chat_bound
             except (httpx.HTTPError, ValueError) as exc:
                 entry["chat_ok"] = False
-                entry["chat_error_type"] = type(exc).__name__
+                entry["chat_error_type"] = _diagnostic_info(exc)["exception_class"]
 
             try:
 
-                def _call_chat_json(chat: AzureOpenAIChat = chat) -> _SmokeSchema:
+                def _call_chat_json(
+                    chat: AzureOpenAIChat = chat, bound: int = json_bound
+                ) -> _SmokeSchema:
                     return chat.chat_json(
                         [{"role": "user", "content": 'Reply with JSON {"ok": true}.'}],
                         _SmokeSchema,
                         fallback=_SmokeSchema(ok=False),
-                        max_tokens=32,
+                        max_tokens=bound,
                         call_type="smoke",
                     )
 
@@ -607,11 +731,17 @@ def run_smoke(settings: Settings, cost_guard: CostGuard) -> dict[str, Any]:
                 entry["chat_json_ok"] = True
             except httpx.HTTPStatusError as exc:
                 entry["chat_json_ok"] = False
-                entry["chat_json_status_code"] = exc.response.status_code
-                entry["chat_json_error_type"] = type(exc).__name__
+                info = _diagnostic_info(exc)
+                entry["chat_json_status_code"] = info["status_code"]
+                entry["chat_json_error_type"] = info["exception_class"]
+                entry["chat_json_error_code"] = info["error_code"]
+            except AzureReasoningBudgetExhausted:
+                entry["chat_json_ok"] = False
+                entry["chat_json_error_type"] = "reasoning_budget_exhausted"
+                entry["chat_json_bound_used"] = json_bound
             except (httpx.HTTPError, ValueError) as exc:
                 entry["chat_json_ok"] = False
-                entry["chat_json_error_type"] = type(exc).__name__
+                entry["chat_json_error_type"] = _diagnostic_info(exc)["exception_class"]
 
         results[deployment] = entry
     return results
@@ -695,7 +825,14 @@ def _raw_reasoning_chat_call(
     )
     response.raise_for_status()
     data: dict[str, Any] = response.json()
-    parse_azure_chat_response(data)  # validate the shape; raises ValueError on a malformed body
+    try:
+        parse_azure_chat_response(data)  # validate the shape; raises ValueError on a malformed body
+    except AzureReasoningBudgetExhausted:
+        # Expected/measured outcome for THIS phase, not a failure: phase (b)'s whole purpose is
+        # to detect exactly this (hidden reasoning tokens consuming the entire `max_tokens`
+        # bound, leaving no visible content) -- `usage.completion_tokens_details.reasoning_tokens`
+        # below is what this function actually reads, not the content itself.
+        pass
     return data
 
 
@@ -747,7 +884,8 @@ def measure_token_budget(
 
         try:
             data = _call_raw()
-        except httpx.HTTPStatusError as exc:
+        except (httpx.HTTPStatusError, httpx.HTTPError, ValueError) as exc:
+            info = _diagnostic_info(exc)
             measurements.append(
                 {
                     "call_type": call_type,
@@ -755,21 +893,9 @@ def measure_token_budget(
                     "completion_tokens": None,
                     "reasoning_tokens": None,
                     "visible_tokens": None,
-                    "error_type": type(exc).__name__,
-                    "status_code": exc.response.status_code,
-                }
-            )
-            continue
-        except (httpx.HTTPError, ValueError) as exc:
-            measurements.append(
-                {
-                    "call_type": call_type,
-                    "bound": bound,
-                    "completion_tokens": None,
-                    "reasoning_tokens": None,
-                    "visible_tokens": None,
-                    "error_type": type(exc).__name__,
-                    "status_code": None,
+                    "error_type": info["exception_class"],
+                    "status_code": info["status_code"],
+                    "error_code": info["error_code"],
                 }
             )
             continue
@@ -873,6 +999,14 @@ def run_side_by_side(
     (``dialogue_id``, ``turn_index``, ``correct``, ``latency_s``, ``tokens_in``/``tokens_out``/
     ``eur`` -- never ``reply_text``); the top-level ``flipped`` list (:func:`_flipped_questions`)
     is only computed once BOTH deployments finish without being stopped early.
+
+    DA-14.7-migration-live-2e-3 fix: one dialogue failing for a reason OTHER than the cost cap
+    (an Azure HTTP error, a malformed response, anything else unexpected) no longer aborts the
+    whole deployment's run -- it is recorded in that deployment's ``failures`` list
+    (``dialogue_id`` + :func:`_diagnostic_info`) and the loop continues to the NEXT dialogue,
+    exactly like :func:`run_smoke`/:func:`measure_token_budget` already isolate failures per
+    call. Only :class:`CostCapExceeded` (a deliberate budget stop, never a per-call bug) still
+    breaks the loop early.
     """
     results: dict[str, Any] = {}
     n = len(subset)
@@ -886,6 +1020,7 @@ def run_side_by_side(
         guarded_post = make_guarded_post(cost_guard, f"side-by-side:{deployment}")
         turn_results: list[Any] = []
         per_turn: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
         dialogues_completed = 0
         stopped: CostCapExceeded | None = None
         start = time.perf_counter()
@@ -897,6 +1032,11 @@ def run_side_by_side(
                 except CostCapExceeded as exc:
                     stopped = exc
                     break
+                except Exception as exc:  # noqa: BLE001 - 2e-3: one dialogue's failure must
+                    # never lose the rest of this deployment's run (or the OTHER deployment's,
+                    # which still runs normally afterwards) -- record and move on.
+                    failures.append({"dialogue_id": dialogue.id, **_diagnostic_info(exc)})
+                    continue
                 dialogue_calls = cost_guard.log[log_start:]
                 dialogue_eur = sum(c.get("actual_eur", c["eur"]) for c in dialogue_calls)
                 dialogue_tokens_in = sum(
@@ -929,6 +1069,7 @@ def run_side_by_side(
             "dialogues_completed": dialogues_completed,
             "dialogues_total": n,
             "per_turn": per_turn,
+            "failures": failures,
         }
         if stopped is not None:
             stopped.partial_results = results  # type: ignore[attr-defined]
@@ -977,12 +1118,24 @@ def summarize(report: dict[str, Any]) -> str:
                 f"{entry.get('dialogues_total')} n_turns={entry['n_turns']} "
                 f"wall_time_s={entry['wall_time_s']} metrics={entry['metrics']}"
             )
+            failures = entry.get("failures") or []
+            if failures:
+                lines.append(f"    failures: {len(failures)} dialogue(s) failed and were skipped")
         flipped = side_by_side.get("flipped")
         if flipped is not None:
             lines.append(f"  flipped questions (baseline vs candidate): {len(flipped)}")
     for blocked_key in ("smoke_blocked", "token_budget_blocked", "side_by_side_blocked"):
         if report.get(blocked_key):
             lines.append(f"COST GUARD STOPPED {blocked_key}: {report[blocked_key]}")
+    # DA-14.7-migration-live-2e-2/2e-3: a phase that failed for a reason OTHER than the cost cap
+    # still gets a line here -- the OTHER phases' results above are never erased by this.
+    for error_key in ("smoke_error", "token_budget_error", "side_by_side_error"):
+        info = report.get(error_key)
+        if info:
+            lines.append(
+                f"PHASE ERROR {error_key}: {info.get('exception_class')} "
+                f"(status_code={info.get('status_code')}, error_code={info.get('error_code')})"
+            )
     return "\n".join(lines)
 
 
@@ -1017,16 +1170,6 @@ def check_config_lines(explicit_prices: Path | None = None) -> list[str]:
         )
     lines.append(f"golden set v2: {DEFAULT_GOLDEN_SET_V2} exists={DEFAULT_GOLDEN_SET_V2.is_file()}")
     return lines
-
-
-def _sanitized_exception_info(exc: BaseException) -> dict[str, Any]:
-    """DA-14.7-migration-live-2a-2: the ONLY two facts ever recorded about an unexpected
-    exception -- the class name and, if it is an HTTP status error, the status code. Never
-    ``str(exc)`` (which for ``httpx.HTTPStatusError`` embeds the full request URL, i.e. the live
-    endpoint) and never a traceback."""
-    response = getattr(exc, "response", None)
-    status_code = getattr(response, "status_code", None) if response is not None else None
-    return {"exception_class": type(exc).__name__, "status_code": status_code}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1070,8 +1213,11 @@ def main(argv: list[str] | None = None) -> int:
         # net: if anything still escapes every phase's own exception handling above, sanitize it
         # the same way (exception CLASS + HTTP status only -- never str(exc), never a traceback,
         # which could otherwise embed the live endpoint via httpx.HTTPStatusError.__str__) before
-        # it reaches the terminal or the evidence file, and exit non-zero.
-        info = _sanitized_exception_info(exc)
+        # it reaches the terminal or the evidence file, and exit non-zero. Part 2e: with every
+        # phase in ``_run`` now isolating its own exceptions (see that function's ``_checkpoint``),
+        # this should only ever fire for a failure BEFORE any phase starts (e.g. ``get_settings``/
+        # ``CostGuard.from_file`` itself) -- there is no partial report to lose at that point.
+        info = _diagnostic_info(exc)
         print(
             f"ERROR: unhandled {info['exception_class']} (status_code={info['status_code']})",
             file=sys.stderr,
@@ -1115,14 +1261,22 @@ def _run(args: argparse.Namespace) -> int:
         "max_eur": args.max_eur,
     }
 
+    def _checkpoint() -> None:
+        """DA-14.7-migration-live-2e-2/2e-3: write whatever ``report`` holds AT EVERY phase
+        boundary (success, cost-guard stop, or an isolated phase error alike). The FIRST real
+        user run lost every phase's already-computed results to one unhandled exception in the
+        LAST phase it reached -- this ensures a failure in phase N+1 never erases phase N's
+        already-written evidence."""
+        report["cost_log"] = cost_guard.log
+        report["total_eur"] = round(cost_guard.spent_eur, 6)
+        _write_report(report, args.output_dir)
+
     def _fail(key: str, exc: CostCapExceeded) -> int:
         report[key] = str(exc)
         partial = getattr(exc, "partial_results", None)
         if partial is not None:
             report["side_by_side"] = partial
-        report["cost_log"] = cost_guard.log
-        report["total_eur"] = round(cost_guard.spent_eur, 6)
-        _write_report(report, args.output_dir)
+        _checkpoint()
         print(summarize(report))
         return 2
 
@@ -1130,12 +1284,20 @@ def _run(args: argparse.Namespace) -> int:
         report["smoke"] = run_smoke(settings, cost_guard)
     except CostCapExceeded as exc:
         return _fail("smoke_blocked", exc)
+    except Exception as exc:  # noqa: BLE001 - 2e: phase isolation -- see this function's
+        # ``_checkpoint`` and the module docstring. A failure in THIS phase must not stop the
+        # REST of the run; it is recorded and phase (b) still runs.
+        report["smoke_error"] = _diagnostic_info(exc)
+    _checkpoint()
 
     dialogues = load_dialogues()
     try:
         report["token_budget"] = measure_token_budget(settings, cost_guard, dialogues)
     except CostCapExceeded as exc:
         return _fail("token_budget_blocked", exc)
+    except Exception as exc:  # noqa: BLE001 - 2e: phase isolation, see above.
+        report["token_budget_error"] = _diagnostic_info(exc)
+    _checkpoint()
 
     if not args.smoke_only:
         from rag_app.db.session import make_session_factory
@@ -1146,10 +1308,10 @@ def _run(args: argparse.Namespace) -> int:
             report["side_by_side"] = run_side_by_side(settings, cost_guard, session_factory, subset)
         except CostCapExceeded as exc:
             return _fail("side_by_side_blocked", exc)
+        except Exception as exc:  # noqa: BLE001 - 2e: phase isolation, see above.
+            report["side_by_side_error"] = _diagnostic_info(exc)
+        _checkpoint()
 
-    report["cost_log"] = cost_guard.log
-    report["total_eur"] = round(cost_guard.spent_eur, 6)
-    _write_report(report, args.output_dir)
     print(summarize(report))
     return 0
 

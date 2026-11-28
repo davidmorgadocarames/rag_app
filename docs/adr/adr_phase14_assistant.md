@@ -1890,6 +1890,96 @@ unchanged):**
    exists so a FUTURE call site that forgot to set one fails loudly here rather than silently
    bypassing the cost guard.
 
+## Decision — Azure OpenAI model migration, live checks part 2e: fix the FIRST REAL USER RUN
+failure (block 14.7-migration-live, 2026-11-28)
+
+The user's first real run (`bash scripts/azure/openai_live_check.sh --max-eur 0.30`, no
+`--smoke-only`) crashed with `ERROR: unhandled RuntimeError (status_code=None)` and lost every
+phase's results (`results.json` was just `{"unhandled_error": {"exception_class": "RuntimeError",
+"status_code": null}}`). Reproduced end to end (offline, via a high-fidelity fake of the Azure
+Chat Completions response shape for both deployments) through `main()` itself before fixing
+anything, per this block's own instructions.
+
+**Root cause #1 (the actual crash) — `_patched_post()`'s global `httpx.post` patch also
+intercepted a non-Azure call.** Phase (c) (`run_side_by_side`) temporarily replaces the GLOBAL
+`httpx.post` for the duration of each deployment's run so every Azure chat call
+`evaluate_dialogues` makes goes through the cost guard. But retrieval's embedding step
+(`OllamaEmbedder.embed`, `rag_app/embeddings.py`) ALSO calls `httpx.post` — to Ollama's own
+`/api/embed`, always local/free, regardless of `LLM_PROVIDER` (embeddings and chat are
+independent settings) — and that call goes through the SAME patched function. The old
+`_deployment_from_url` raised a bare `RuntimeError` ("could not identify the Azure deployment
+from the request URL") for any URL that did not match the Azure chat-completions pattern — exactly
+what an Ollama embeddings URL is. That `RuntimeError` is not a `CostCapExceeded`, so nothing in
+`run_side_by_side`/`_run()`/`main()` caught it as anything but a generic unhandled exception,
+and it propagated all the way to `main()`'s outermost `except Exception`, which (before this
+fix) rebuilt the evidence file from scratch, discarding every phase computed before it.
+**Fix:** `_deployment_from_url` now returns `None` (never raises) for a non-Azure-chat URL, and
+`make_guarded_post`'s `_guarded` wrapper passes such a call straight through to the real
+`httpx.post`, unreserved — this cost guard only ever prices Azure OpenAI chat spend.
+
+**Secondary finding (real, but not the crash) — the smoke bound was far too small for a
+reasoning deployment, and `chat_json`'s fallback hid it.** `run_smoke`'s `chat_json` call used
+`max_tokens=32` for BOTH deployments; for `gpt-5-mini`, Azure's hidden reasoning tokens consumed
+the entire bound before producing any visible content (`content=""`, `finish_reason="length"`),
+which `json.loads("")` turned into a `JSONDecodeError` logged twice by `chat_json`'s own
+validate/retry/fallback contract — then silently swallowed by the fallback, with
+`chat_json_ok` wrongly left `True`. **Fix:** (1) `rag_app.llm.parse_azure_chat_response` now
+raises a new, distinct `AzureReasoningBudgetExhausted(ValueError)` for exactly this response
+shape (empty content + `finish_reason="length"`) instead of returning `""` for the caller to
+mis-parse; `chat_json`'s retry loop does NOT catch it (retrying would not help — the bound is
+fixed, the outcome would be identical), so it propagates immediately rather than being masked
+by the fallback. **Self-reported boundary:** today this changes `chat_json`'s "never raises"
+production contract specifically for `reasoning_model=True` calls — but `azure_openai_
+reasoning_model` defaults `False` everywhere in production and is not yet switched on for any
+live caller (DEC-061's switch step is still pending the 2a/2b-5 eval), so this has zero effect
+on anything actually running today; it should be re-examined if/when the production switch
+happens. (2) `run_smoke`'s reasoning-deployment calls now use `_smoke_bound()` (>= 1024, never
+the flat 16/32 bound) and catch `AzureReasoningBudgetExhausted` explicitly, recording
+`"reasoning_budget_exhausted"` as a distinct `*_error_type`, never a generic JSON error and
+never a false `*_ok=True`. (3) `measure_token_budget`'s own raw call (which deliberately
+measures this exact phenomenon) now tolerates the same exception from its shape-validation step
+instead of treating it as a per-prompt failure — this phase's whole purpose is to detect
+reasoning-budget exhaustion, not to be broken by it.
+
+**Robustness (defence in depth, on top of the root-cause fix) — every phase/dialogue now
+isolates its own exceptions, and the evidence file is written at every phase boundary.**
+`_run()` now wraps each of the three phases in its own `except Exception` (in addition to the
+existing `except CostCapExceeded`), recording `smoke_error`/`token_budget_error`/
+`side_by_side_error` (via the new, uniform `_diagnostic_info()` helper) and CONTINUING to the
+next phase rather than aborting the whole run; a `_checkpoint()` helper writes the report to the
+evidence file after every phase, success or not, so a failure in phase N+1 can never erase phase
+N's already-written results — exactly what the first real run's crash did. `run_side_by_side`
+likewise now catches a non-`CostCapExceeded` exception per DIALOGUE, recording it in that
+deployment's new `failures` list and moving on to the next dialogue, instead of losing the rest
+of the subset (or the OTHER deployment's full run, which had not even started yet) to one
+dialogue's failure.
+
+**Diagnostics.** `_diagnostic_info()` (new, replaces part 2d's narrower
+`_sanitized_exception_info()`) is now the ONE place every caught exception in this module is
+turned into a report entry: exception class name, HTTP status code (if any), the Azure error
+`code` field (`_azure_error_code()`, new — a short, enum-like string such as
+`"unsupported_parameter"`/`"content_filter"`, read from the response body's `error.code`
+key, never the `message` field, which can echo request content), and — ONLY for exception types
+this module explicitly allow-lists as built from its own fixed, hard-coded literal text
+(`CostCapExceeded`, `AzureReasoningBudgetExhausted`) — that exception's own message. Never
+`str(exc)` for anything else (a third-party exception's `__str__`, e.g.
+`httpx.HTTPStatusError`, can embed the live endpoint).
+
+**Self-reported boundaries (read together with every prior part's, unchanged):**
+
+1. `AzureReasoningBudgetExhausted` changing `chat_json`'s production fallback contract for
+   `reasoning_model=True` calls (above) — not reachable today, flagged for re-examination at the
+   production switch.
+2. The per-dialogue `failures` list records only `dialogue_id` + `_diagnostic_info()` — no
+   retry of a failed dialogue is attempted; a transient failure (e.g. one bad HTTP 500) simply
+   costs that one dialogue's data point for that deployment, not re-tried, unlike the existing
+   single-retry-on-429 contract inside `make_guarded_post` itself (unchanged).
+3. `_run()`'s own `except Exception` around each phase still does not catch `BaseException`
+   (e.g. `KeyboardInterrupt`) — the same residual, low-risk gap the devil's-advocate review
+   already flagged for part 2d (DA-14.7-migration-live-2d-2), not addressed here either (out of
+   this fix's scope; Python's own default traceback for an uncaught `KeyboardInterrupt` embeds
+   no secret either way).
+
 ## Rollback
 
 14-D2: ride-along 1 changes LIVE runtime behaviour (a context-free raw `"followup"` now
@@ -2057,3 +2147,15 @@ this block) — a plain `git revert` restores part 2c's flat-per-deployment cost
 DA-14.7-migration-live-2a-1 finding reopens), the unguarded `measure_token_budget()` exception
 path (2a-2 reopens) and the aggregate-only side-by-side report (2a-3 reopens), with zero effect on
 anything else; same "never invoked by CI/gate.sh/any automation" property as parts 2b/2c.
+
+14.7-migration-live, part 2e: edits `backend/src/rag_app/llm.py` (one new exception type + one
+new branch in `parse_azure_chat_response`) and the same two part-2b eval-module/test files (no
+new files), **no live Azure call made by this agent**. `AzureReasoningBudgetExhausted` is only
+ever raised for the `reasoning_model=True` path, which has no live production caller yet (see
+the self-reported boundary above) — a plain `git revert` of this block's commit restores the
+exact `RuntimeError` crash this fix addresses, reopens the false `chat_json_ok=True`-via-fallback
+smoke report, and removes the per-phase/per-dialogue exception isolation, with zero effect on
+anything else (same "never invoked by CI/gate.sh/any automation" property as parts 2b/2c/2d for
+the eval module/script; `llm.py`'s own existing production tests — unmodified except for the new
+additions — stay green, proving the non-reasoning `gpt-4.1-mini` path is byte-for-byte
+unchanged).

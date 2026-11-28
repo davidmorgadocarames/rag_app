@@ -15,6 +15,7 @@ from rag_app import llm
 from rag_app.config import Settings
 from rag_app.llm import (
     AzureOpenAIChat,
+    AzureReasoningBudgetExhausted,
     OllamaChat,
     make_chat_client,
     parse_azure_chat_response,
@@ -39,6 +40,46 @@ def test_parse_azure_chat_response_rejects_empty_choices() -> None:
 def test_parse_azure_chat_response_rejects_non_string_content() -> None:
     with pytest.raises(ValueError, match="azure"):
         parse_azure_chat_response({"choices": [{"message": {"content": None}}]})
+
+
+# --- AzureReasoningBudgetExhausted (14.7-migration-live, part 2e) --------------------------
+#
+# The FIRST real user run: gpt-5-mini's smoke `chat_json` call returned empty content with
+# `finish_reason="length"` (its hidden reasoning tokens consumed the whole `max_completion_tokens`
+# bound) -- json.loads("") raised JSONDecodeError twice, then chat_json's own retry+fallback
+# silently swallowed it. This is a distinct, nameable outcome, not a generic malformed body.
+
+
+def test_parse_azure_chat_response_raises_reasoning_budget_exhausted_on_empty_length_content() -> (
+    None
+):
+    data = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+    with pytest.raises(AzureReasoningBudgetExhausted):
+        parse_azure_chat_response(data)
+
+
+def test_azure_reasoning_budget_exhausted_is_a_value_error_with_a_fixed_safe_message() -> None:
+    data = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+    with pytest.raises(ValueError) as excinfo:
+        parse_azure_chat_response(data)
+    assert isinstance(excinfo.value, AzureReasoningBudgetExhausted)
+    # fixed literal text -- never echoes the (empty) content or any request/response detail
+    assert "max_completion_tokens" in str(excinfo.value)
+
+
+def test_parse_azure_chat_response_returns_empty_content_when_finish_reason_is_not_length() -> None:
+    """Empty content alone is not enough to raise -- only paired with finish_reason="length"
+    (the actual reasoning-budget-exhaustion signature); any other finish_reason with empty
+    content is returned as-is, unchanged from the pre-2e behaviour."""
+    data = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+    assert parse_azure_chat_response(data) == ""
+
+
+def test_parse_azure_chat_response_non_empty_content_never_raises_with_finish_reason_length() -> (
+    None
+):
+    data = {"choices": [{"message": {"content": "ok"}, "finish_reason": "length"}]}
+    assert parse_azure_chat_response(data) == "ok"
 
 
 def test_make_chat_client_defaults_to_ollama() -> None:

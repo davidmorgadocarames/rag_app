@@ -23,7 +23,12 @@ import pytest
 from pydantic import BaseModel
 
 from rag_app import llm
-from rag_app.llm import AzureOpenAIChat, OllamaChat, _strict_json_schema
+from rag_app.llm import (
+    AzureOpenAIChat,
+    AzureReasoningBudgetExhausted,
+    OllamaChat,
+    _strict_json_schema,
+)
 
 
 class _RouterOutput(BaseModel):
@@ -325,6 +330,34 @@ def test_ollama_chat_json_falls_back_on_a_schema_violation(
     )
     assert calls["n"] == 2
     assert result is _FALLBACK
+
+
+def test_azure_chat_json_raises_reasoning_budget_exhausted_without_retrying_or_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """14.7-migration-live part 2e: the FIRST real user run's exact failure mode -- a reasoning
+    deployment's hidden reasoning tokens consumed the whole bound, returning empty content with
+    ``finish_reason="length"``. Unlike a plain malformed-JSON body (retried once, then a safe
+    fallback), this is a DISTINCT, nameable outcome that propagates immediately -- retrying would
+    not help (same fixed bound, same outcome) and callers that care (``run_smoke``) need to tell
+    it apart from a generic JSON error rather than have it silently masked by the fallback."""
+    calls = {"n": 0}
+
+    def fake_post(_url: str, *, json: dict[str, Any], **_kw: Any) -> _FakeHttpResponse:
+        calls["n"] += 1
+        return _FakeHttpResponse(
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+        )
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = AzureOpenAIChat(
+        endpoint="http://fake", api_key="k", deployment="d", api_version="v", reasoning_model=True
+    )
+    with pytest.raises(AzureReasoningBudgetExhausted):
+        client.chat_json(
+            [{"role": "user", "content": "hi"}], _RouterOutput, fallback=_FALLBACK, max_tokens=32
+        )
+    assert calls["n"] == 1  # no retry -- a second identical call would not help
 
 
 # --- AzureOpenAIChat.chat_json ------------------------------------------------------------------

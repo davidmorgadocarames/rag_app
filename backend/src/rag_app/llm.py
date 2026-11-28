@@ -361,14 +361,40 @@ class OllamaChat:
         return _chat_json_with_retry(_call, schema, fallback, call_type=call_type)
 
 
+class AzureReasoningBudgetExhausted(ValueError):
+    """Raised by :func:`parse_azure_chat_response` when a reasoning-family deployment's
+    hidden reasoning tokens consumed the entire ``max_completion_tokens`` bound, leaving no
+    visible content at all (``finish_reason == "length"`` and ``content == ""``) --
+    14.7-migration-live part 2e. Deliberately distinct from the generic ``ValueError`` this
+    function raises for a genuinely malformed body: this is a well-understood, nameable
+    outcome (the bound was too small for this call), not a parsing failure, so callers can
+    report "reasoning budget exhausted" instead of masking it as a JSON/schema error. The
+    message is a fixed, hard-coded literal -- never interpolates the response body, the
+    endpoint or the key, so it is always safe to surface in a diagnostic (DA-14.7-migration-
+    live-2a-2's "our own exception messages only, never str() of a third-party exception"
+    rule)."""
+
+
 def parse_azure_chat_response(data: dict[str, Any]) -> str:
-    """Extract the assistant message content from an Azure OpenAI chat response."""
+    """Extract the assistant message content from an Azure OpenAI chat response.
+
+    Raises :class:`AzureReasoningBudgetExhausted` (never the generic ``ValueError`` below)
+    when the response is well-formed but a reasoning deployment's hidden reasoning tokens
+    consumed the whole output bound before any visible content was produced -- see that
+    exception's own docstring.
+    """
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError(f"unexpected azure chat response: {data!r}")
-    content = choices[0].get("message", {}).get("content")
+    choice = choices[0]
+    content = choice.get("message", {}).get("content")
     if not isinstance(content, str):
         raise ValueError(f"unexpected azure chat response: {data!r}")
+    if content == "" and choice.get("finish_reason") == "length":
+        raise AzureReasoningBudgetExhausted(
+            "reasoning deployment exhausted its token budget before producing any visible "
+            "content (finish_reason=length, content empty) -- raise max_completion_tokens"
+        )
     return content
 
 
