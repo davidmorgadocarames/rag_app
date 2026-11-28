@@ -1990,7 +1990,8 @@ showed NO containers running at all, so `DATABASE_URL` had silently defaulted to
 development database's own URL (`rag_app.config.DEV_DATABASE_URL`, `localhost:5432`) and
 nothing was listening there either; only the no-retrieval dialogues (greetings/chat/off-topic)
 happened to pass. Two independent fixes, proportional to this block's rigour level (one-off
-non-deployed tooling, `--fast` only — ORCHESTRATION §0, user decision 2026-11-28):
+non-deployed tooling, `--fast` only — the project's own "proportional rigour" rule, user
+decision 2026-11-28):
 
 **Fix 1 — preflight, in `rag_app.eval.azure_side_by_side`, BEFORE any Azure call.**
 `preflight_db()` (reachable, `chunks` non-empty, stored embedding dimension matches
